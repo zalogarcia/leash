@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TASK_ANCHOR, TITLE_MAX, briefRepo, briefTitle, stripLaneRules } from './bg-lane-rules.mjs';
+import { BTW_ANSWER_MAX, BTW_ANSWER_PREFIX } from './bg-btw.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const TMP = mkdtempSync(path.join(tmpdir(), 'bg-lane-rules-'));
@@ -68,6 +69,27 @@ t('every brief arrives carrying the lane rules', () => {
   ok(item.text.includes('Your final message IS your report'), 'rule 3 missing');
   ok(item.text.includes('[STEER from the orchestrator]'), 'rule 4 missing');
   ok(item.text.endsWith('do the thing'), 'the task must be the last thing the worker reads');
+});
+
+t('★ rule 5 arrives with the brief, so a worker meets its first btw already knowing', () => {
+  // Rule 4 teaches a steer. A btw arrives down the SAME pipe in the same shape
+  // and means the opposite, so a worker that only knew rule 4 would read a
+  // question as an instruction and re-plan because somebody asked it what repo
+  // it was in. The framing on the message says so too; this is the half that
+  // arrives BEFORE the question does.
+  const [item] = queue(['--file', brief('x')]);
+  ok(item.text.includes('[BTW #N from the orchestrator]'), 'rule 5 missing');
+  // DERIVED, not retyped. bg.mjs imports nothing (it is copied around and run
+  // from anywhere), so the marker and the budget it teaches are literals there,
+  // and a rule that asserted its own literals back would keep passing while
+  // bg-btw.mjs moved underneath it: every worker would be told the old number
+  // and the parser would be watching for a different line. This is the same
+  // gate TASK_ANCHOR and TARGET_SHAPE already get.
+  ok(item.text.includes(`${BTW_ANSWER_PREFIX} #N:`), 'the exact marker line the daemon watches for');
+  ok(item.text.includes(String(BTW_ANSWER_MAX)), 'the answer budget must be the one bg-btw.mjs states');
+  ok(/OPPOSITE of a steer/.test(item.text), 'the contrast with rule 4 is the teaching');
+  ok(item.text.includes('Side questions'), 'the report heading');
+  ok(!/[–—]/.test(item.text), 'no em or en dash in a rule the worker is told to write without them');
 });
 
 t('the rules cover Agent dispatches, not just Bash', () => {

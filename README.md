@@ -47,6 +47,7 @@ of Node that long-polls the Telegram Bot API and pipes messages into
 | 🌙 **Unlimited background workers** | Long jobs (`/goal`, `/autopilot`, test suites) run in *separate* Claude sessions. If a worker is busy, another spawns — parallel, never queued behind each other. |
 | ➡️ **Mid-task steering** | Message while a task is running and it goes *into* the running task, exactly like typing mid-turn in Claude Code. |
 | 🎯 **Steer a background worker** | `/steer latest <one more instruction>` writes into a *running* worker, so it keeps the context it has already built. Correcting a job no longer means killing it. |
+| ❓ **Ask one a side question** | `/btw did the migration apply?` puts a question to a *running* worker without changing its job. It answers in one message here, then carries on with its plan untouched. [Details.](#btw-asking-a-worker-a-question-without-changing-its-job) |
 | 🧠 **A second engine, as a peer** | OpenAI Codex, if you have it. `/engine codex` moves a whole lane to it (or `engine` in `config.json`, for an install that never had Claude), a `codex:` prefix pins one message, and switching engines carries a redacted handoff of the conversation across. While every Claude account is rate limited it keeps background work moving instead of stalling. Optional, billed separately. [Details.](#codex-second-engine-and-fallback) |
 | 📊 **Live progress** | Watch tool calls stream in as it works — including subagent activity, indented. |
 | 🎙️ **Voice notes** | Talk instead of typing. Transcribed with Whisper, run as a prompt. |
@@ -178,6 +179,7 @@ left to be guessed. The ack and the run bubble both say a quote went with the me
 | `/usage` | Live 5h-block and weekly plan usage for **every** enrolled account — which one still has headroom |
 | `/status` | Directory, session, model, and a live block per lane: elapsed, steps, current task, latest action. Names each worker's run id and whether it can still be steered. It ends with a **Peers** block: every terminal-multiplexer session on this machine that the daemon did NOT spawn (another Claude Code or Codex session someone opened in a terminal), one line each saying working-or-idle, how long, and which engine, with the last thing a working one said underneath. Read only, capped at 12 sessions, and omitted entirely when there is no multiplexer server |
 | `/steer <target> <text>` | Write one more instruction into a **running** background worker. Target is a lane (`bg2`), a run id, a pid, or `latest`. `/steer` alone lists what is running |
+| `/btw [target] <question>` | Ask a **running** background worker a SIDE question. It answers in one message, here in the chat, and carries on with its plan unchanged; it is explicitly not an instruction and not approval. No target means `latest`. Availability is identical to `/steer` |
 | `/engine [bg] claude\|codex` | Which engine a lane runs on. Bare `/engine` shows both lanes, where each value came from, the Codex model/effort and the sandbox |
 | `/codex <question>` | Ask OpenAI Codex, read-only, in the current directory, continuing this chat's Codex thread. `/codex review [<repo>] [vs <branch>]` runs its review harness over a diff; `/codex model`, `/codex effort`, `/codex network on\|off` and `/codex doctor` steer and check the engine; `/codex on\|off` toggles the rate-limit fallback |
 | `/stop [bg\|codex\|all]` | Kill the running task and clear that lane's queue. A Claude run gets SIGTERM then SIGKILL; a Codex **chat** turn gets a `turn/interrupt` the model acknowledges, leaving the shared app-server up. `codex` also reaches a one-shot Codex run, which belongs to no lane |
@@ -261,6 +263,8 @@ Workers now hold stdin open, and there are two doors onto it:
 /steer latest skip the browser step, the harness covers it   # from Telegram
 node bg.mjs steer bg2 "skip the browser step"                # from a terminal
 node bg.mjs steer latest --file ./correction.md              # anything longer
+node bg.mjs btw bg2 "which repo are you in?"                 # a side question, answered in Telegram
+node bg.mjs btw latest --file ./question.md                  # anything longer
 node bg.mjs ps                                               # what is running
 node bg.mjs --engine codex --file ./brief.md                 # hand a job to the other engine
 node bg.mjs "codex: review the last commit"                  # same, inline prefix
@@ -306,9 +310,65 @@ process entry point), so syntax checks use `node --check bridge.mjs`.
 (`steer.sock`) next to `bridge.mjs`, with no network listener of any kind,
 reachable by exactly the processes that could already read this directory, and
 that directory holds your bot token, so anything that can steer a worker could
-already do worse. It carries two operations, `steer` and `ps`; it cannot start,
-stop or kill anything. If that trade is wrong for your machine, tighten the
+already do worse. It carries three operations, `steer`, `btw` and `ps`; it cannot
+start, stop or kill anything. If that trade is wrong for your machine, tighten the
 directory's permissions rather than weakening the framing.
+
+<a name="btw-asking-a-worker-a-question-without-changing-its-job"></a>
+
+## /btw: asking a worker a question without changing its job
+
+Steering does one thing, and it is not a small one: it changes the job. Every steer is framed as "a mid-run
+instruction for your CURRENT task", and that framing is load bearing (without it a worker abandons the brief
+it is halfway through). So there was no way to ask a running worker "which repo are you in" or "did the
+migration apply" without also telling it something.
+
+`/btw` is the opposite framing on the same pipe:
+
+```bash
+node bg.mjs btw latest "did the migration apply, and to which project?"
+node bg.mjs btw bg2 --file ./question.md
+```
+
+```
+/btw did the migration apply?          # no target: the newest worker
+/btw bg2 how far through the list?     # or name one, exactly like /steer
+```
+
+The worker is told this is a side question, NOT an instruction, not a new task and not approval of anything;
+it answers immediately in one message whose first line is `BTW-ANSWER #N:` and then continues exactly where it
+was, plan unchanged. Lane rule 5 (prepended to every brief by `bg.mjs`) teaches the shape before the first
+question ever arrives, so a worker does not have to work it out from the framing alone. The daemon introduces
+itself by the `name` in `config.json`, so the worker is told who is asking by the name this install answers to.
+
+The daemon watches that worker's own output stream for the marker line, lifts the block out of the progress
+bubble AND out of the report capture (so the answer is delivered once, not three times), and edits it into the
+⏳ message you already have on screen. One message per question, from ⏳ to one of four endings:
+
+| | |
+| --- | --- |
+| ✅ | the worker answered (long answers spill into their own message rather than being truncated) |
+| ❌ `no answer` | the run finished without answering; its report may still carry it |
+| 🛑 `stopped` | you stopped the worker before it answered |
+| ❌ `answer lost` | the daemon restarted while it was pending (the pending ids are persisted with the worker, so the next daemon resolves the line instead of leaving it ticking) |
+
+After 15 minutes with no answer the line says so and **keeps listening**: a worker inside a long tool call is
+busy, not gone, and an answer at minute 40 still lands on the same message.
+
+Several questions to one worker queue in order; ids are per worker and monotonic, and an answer is matched to
+its own question by id, so an answer can never resolve a different worker's question or a different question's
+line. An answer naming an id nobody is waiting for is dropped rather than handed to the oldest.
+
+**Availability is exactly steer availability**, which is why `ps` grew no new column: a btw travels the same
+stdin pipe, so the same three workers refuse it (a survivor of a daemon restart, a run whose result is already
+in, a background Codex job that is file-backed with no stdin at all). A Codex refusal names the right escape
+hatch for a question, `/codex <question>`, rather than the re-fire a steer would suggest.
+
+`bg.mjs btw` requires a target: unlike Telegram it will not fall back to `latest`, because a scripted caller
+that named no worker has not decided which one it meant, and a side question answered by the wrong job reads
+exactly like an answer from the right one. Exit codes match `bg.mjs steer`: 0 delivered, 1 refused, 2 the
+daemon is not reachable. The answer itself never comes back to the terminal, only to the chat: the daemon is
+the only thing watching the worker's stream.
 
 <a name="codex-second-engine-and-fallback"></a>
 
@@ -662,6 +722,7 @@ node rich-format.test.mjs        # Bot API 10.2 rich blocks
 node detached-workers.test.mjs   # a worker must survive its daemon being killed
 node watchdog.test.mjs           # dead workers get reaped, live ones don't
 node bg-steer.test.mjs           # steering: target resolution, framing, the real CLI
+node bg-btw.test.mjs             # side questions: framing, marker detection, id matching, the CLI
 node bg-lane-rules.test.mjs      # the preamble bg.mjs prepends, and stripping it back off
 node bg-codex.test.mjs           # the second engine's pure half: argv, routing, parsing
 node bg-codex-wiring.test.mjs    # the real runCodex against a fake codex binary

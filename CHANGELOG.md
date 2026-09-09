@@ -2,6 +2,53 @@
 
 All notable changes to Leash. Dates are release dates.
 
+## 1.7.0 (2026-09-09)
+
+**A question you can put to a running worker without changing its job, and a `/help` that reaches the
+phone whole.**
+
+### `/btw`: a side question, answered in the chat
+
+- Steering does one thing, and it is not a small one: it changes the job. Every steer is framed as "a
+  mid-run instruction for your CURRENT task", and that framing is load bearing, so there was no way to
+  ask a running worker "which repo are you in" without also telling it something. `/btw did the
+  migration apply?` from Telegram, or `node bg.mjs btw bg2 "<question>"` from a terminal, is the
+  opposite framing on the same pipe.
+- The worker is told this is a side question, NOT an instruction, not a new task and not approval of
+  anything; it answers in one message whose first line is `BTW-ANSWER #N:` and then continues exactly
+  where it was, plan unchanged. Lane rule 5 rides in on every brief, so a worker knows the shape
+  before its first question arrives, and the daemon introduces itself by the `name` in `config.json`.
+- The daemon watches that worker's own stream for the marker, lifts the block out of the progress
+  bubble AND out of the report capture, and edits it into the ⏳ message already on screen. One
+  message per question, from waiting to one of four endings, all of them wired: answered, the run
+  ended without answering, you stopped it, or the daemon restarted under it (pending ids are
+  persisted with the worker, so the next daemon resolves the line rather than leaving it ticking). At
+  15 minutes it says so and keeps listening, because a worker inside a long tool call is busy rather
+  than gone.
+- Ids are per worker and monotonic, so an answer can only ever resolve a question asked of the worker
+  that emitted it, and an answer naming an id nobody is waiting for is dropped rather than handed to
+  the oldest. The result event does not route, it only suppresses a byte-identical duplicate, which
+  is what keeps a private answer out of the handback.
+- Availability is exactly steer availability, which is why `ps` grew no new column: same resolver,
+  same stdin pipe, so a restart survivor, a finished run and a background Codex job refuse it for the
+  same reasons. A Codex refusal names the escape hatch for a QUESTION (`/codex <question>`) rather
+  than the re-fire a steer would suggest.
+- `bg.mjs btw` requires a target and refuses loudly without one, unlike Telegram, which falls back to
+  `latest`: a scripted caller that named no worker has not decided which one it meant. The refusal is
+  its own arm, so a targetless `btw` can never fall through and spawn a background worker whose brief
+  is the question.
+
+### Fixes
+
+- **`/help` arrived with its tail missing.** The composed message was 4,077 characters against a
+  4,080 budget, so the reference was being cut at `HELP_BODY_MAX` and the last two paragraphs (the
+  attachments block and the notes line) never reached the phone, while every gate stayed green. The
+  reference is now tightened line by line, with no command and no fact dropped, and the duplicated
+  title line removed (the index above the blockquote already carries it): 3,575 characters, nothing
+  truncated, and 50 characters of headroom. The suite now measures the composed message the way it is
+  actually sent (escaped), asserts nothing was cut, and requires at least 40 characters left over, so
+  the next line added to `/help` has to be paid for rather than appended.
+
 ## 1.6.0 (2026-09-09)
 
 **Two things the daemon could not see: the message you were pointing at, and the sessions it did

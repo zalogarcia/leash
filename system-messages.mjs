@@ -355,7 +355,7 @@ const QUOTE_TAGS_LEN = 37;
 
 export const HELP_GROUPS = [
   { icon: '💬', commands: ['/new', '/chats', '/rename', '/resume', '/compact'] },
-  { icon: '🌙', commands: ['/status', '/steer', '/stop'] },
+  { icon: '🌙', commands: ['/status', '/steer', '/btw', '/stop'] },
   { icon: '🧠', commands: ['/engine', '/codex', '/model', '/yolo'] },
   { icon: '📊', commands: ['/usage', '/account', '/context'] },
   { icon: '⏰', commands: ['/remind', '/schedules', '/unschedule'] },
@@ -488,6 +488,103 @@ export function steerUsage(workers = []) {
     'Usage: /steer <lane|latest> <instruction>',
     'It keeps the context it has already built.',
     ...(list.length ? list.flatMap((w) => ['', workerStatusBlock(w)]) : ['', '⚪ No background workers running.']),
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// /btw: THE FIVE STATES OF ONE MESSAGE
+//
+// A side question put to a running worker is a WAIT, so rule 8 applies to it in
+// full: one message goes up when the question is delivered and it is edited in
+// place to whatever actually happened. Every ⏳ this file puts on screen has to
+// have a terminal state some builder here produces AND a path that reaches it,
+// and a btw has four ways to end plus one that says "not yet" without ending:
+//
+//   btwPendingLine     ⏳  delivered, waiting
+//   btwAnsweredLine    ✅  the worker answered
+//   btwEndedLine       ❌  the run finished without answering
+//   btwStoppedLine     🛑  the worker was stopped first
+//   btwLostLine        ❌  the daemon restarted while it was pending
+//   btwWaitingLine     ❌  15 minutes, still nothing (the listener stays on)
+//
+// btwWaitingLine is the odd one and deliberately so: it is a terminal TEXT on a
+// line that is not terminal. A worker inside a long tool call is not lost, it
+// is busy, and a message that kept saying "waiting" for forty minutes taught
+// nothing while a message that retired at fifteen would throw away an answer
+// that was still coming. So it says what is true and keeps listening.
+// ---------------------------------------------------------------------------
+
+/** Usage, shown for a bare /btw. Two lines: what it is, and what it is not. */
+export function btwUsage(workers = []) {
+  const list = Array.isArray(workers) ? workers : [];
+  return [
+    'Usage: /btw <lane|latest> <question>',
+    'A side question · it changes nothing.',
+    'The answer comes back here.',
+    ...(list.length ? list.flatMap((w) => ['', workerStatusBlock(w)]) : ['', '⚪ No background workers running.']),
+  ].join('\n');
+}
+
+const btwHead = (glyph, lane, tail) => [`${glyph} btw · ${clip(oneLine(lane || 'the worker'), 20)}`, tail].filter(Boolean).join(' · ');
+
+export function btwPendingLine({ lane = '', elapsedSec = null } = {}) {
+  const waited = Number.isFinite(elapsedSec) && elapsedSec > 0 ? fmtElapsed(Math.round(elapsedSec)) : null;
+  return [btwHead('⏳', lane, waited), 'Asked · waiting for the answer'].join('\n');
+}
+
+/**
+ * The answer, under a one-line receipt saying whose it is and how long it took.
+ *
+ * The answer is the worker's OWN string and is passed through verbatim: it has
+ * already been dash-normalized and escaped by the caller, and clipping it here
+ * would cut the one thing the message exists to deliver. Everything this
+ * builder authors is on the head line, which is where the house-style gates
+ * bite.
+ */
+export function btwAnsweredLine({ lane = '', elapsedSec = null, answer = '', spilled = false } = {}) {
+  const took = Number.isFinite(elapsedSec) && elapsedSec >= 0 ? fmtElapsed(Math.round(elapsedSec)) : null;
+  const body = String(answer ?? '').trim();
+  // `spilled`: the answer was too long to live inside this message, so it goes
+  // out as its own and this becomes the receipt. Saying so is the whole job of
+  // the line, because the alternative shape is a ✅ with nothing under it,
+  // which reads as an answer that was lost.
+  const shown = spilled ? 'The answer is in the next message.' : body || '(the worker answered with nothing)';
+  return [btwHead('✅', lane, took), shown].join('\n');
+}
+
+export function btwEndedLine({ lane = '' } = {}) {
+  return [btwHead('❌', lane, 'no answer'), 'The worker ended without answering.', 'Its report may still carry it.'].join('\n');
+}
+
+export function btwStoppedLine({ lane = '' } = {}) {
+  return [btwHead('🛑', lane, 'stopped'), 'The worker was stopped before it answered.'].join('\n');
+}
+
+/**
+ * The daemon died under a pending question.
+ *
+ * It does NOT say "ask again", and that is the whole point of the wording: a
+ * worker that outlived the restart is re-attached by its log with no pipe to
+ * its stdin, so it is `steerable: false` for the rest of its life and asking it
+ * again is refused every time. A line that told you to retry something the next
+ * command will refuse is a line that lies. The report is the real fallback, and
+ * a survivor still writes one.
+ */
+export function btwLostLine({ lane = '' } = {}) {
+  return [
+    btwHead('❌', lane, 'answer lost'),
+    'The daemon restarted while it waited.',
+    'That worker cannot be asked again;',
+    'its report may still carry it.',
+  ].join('\n');
+}
+
+export function btwWaitingLine({ lane = '', elapsedSec = null } = {}) {
+  const waited = Number.isFinite(elapsedSec) && elapsedSec > 0 ? fmtElapsed(Math.round(elapsedSec)) : null;
+  return [
+    btwHead('❌', lane, waited ? `${waited}, no answer yet` : 'no answer yet'),
+    'It is mid tool call. It may still answer,',
+    'and the report will carry it.',
   ].join('\n');
 }
 

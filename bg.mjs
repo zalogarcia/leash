@@ -8,6 +8,8 @@
 //   node bg.mjs --engine claude --file /tmp/b.md    (pin to Claude on a Codex-first install)
 //   node bg.mjs steer <lane|runId|pid|latest> "one more instruction"
 //   node bg.mjs steer <lane|runId|pid|latest> --file ./steer.md
+//   node bg.mjs btw <lane|runId|pid|latest> "a side question"
+//   node bg.mjs btw <lane|runId|pid|latest> --file ./btw.md
 //   node bg.mjs ps                                  (what is running, right now)
 //
 // The Leash daemon drains this drop-box each poll cycle (<=~1 min) and runs the
@@ -29,6 +31,14 @@
 // `steer` is the alternative to killing a worker: it writes one more instruction
 // into a RUNNING worker's stdin, keeping the context it has already built. Kill
 // and re-dispatch only when the brief itself was wrong.
+//
+// `btw` is the same pipe with the OPPOSITE framing: a side question that is
+// explicitly not an instruction, answered in one message and then dropped, with
+// the worker carrying on exactly where it was. Use it for "which repo are you
+// in" and "did the migration apply"; use `steer` when the job has to change.
+// The answer goes to the Telegram chat, not to this terminal: the daemon is the
+// only thing watching the worker's stream. Availability is IDENTICAL to steer,
+// so the STEER column of `bg.mjs ps` answers both questions.
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import net from 'node:net';
@@ -133,25 +143,65 @@ if (argv[0] === 'ps' && argv.length === 1) {
   process.exit(0);
 }
 
-if (argv[0] === 'steer' && TARGET_SHAPE.test(String(argv[1] ?? '').trim())) {
+// `steer` and `btw` are the same subcommand shape over the same socket and
+// differ only in the op and the framing the daemon applies, so they are one
+// arm rather than two that drift. NOTE the deliberate asymmetry with the
+// Telegram side: there, a first token that is not target-shaped is read as the
+// start of the question and the target falls back to `latest`, because you are
+// typing on a phone. HERE it is not, and must not be: `bg.mjs btw "did it
+// apply"` would then silently pick a worker for a scripted caller that named
+// none, and a side question sent to the wrong job reads as an answer about the
+// right one. The CLI prints the usage line instead.
+if ((argv[0] === 'steer' || argv[0] === 'btw') && TARGET_SHAPE.test(String(argv[1] ?? '').trim())) {
+  const op = argv[0];
   const target = argv[1].trim();
-  const usage = 'usage: node bg.mjs steer <lane|runId|pid|latest> "<text>"   |   node bg.mjs steer <target> --file <path>';
-  const steerText = payload(argv.slice(2), usage);
-  if (!steerText) {
+  const what = op === 'btw' ? '<question>' : '<text>';
+  const usage = `usage: node bg.mjs ${op} <lane|runId|pid|latest> "${what}"   |   node bg.mjs ${op} <target> --file <path>`;
+  const body = payload(argv.slice(2), usage);
+  if (!body) {
     console.error(usage);
     process.exit(1);
   }
   let res;
   try {
-    res = await ask({ op: 'steer', target, text: steerText });
+    res = await ask({ op, target, text: body });
   } catch (e) {
-    console.error(e.unreachable ? UNREACHABLE : `bg.mjs steer: ${e.message}`);
+    console.error(e.unreachable ? UNREACHABLE : `bg.mjs ${op}: ${e.message}`);
     process.exit(2);
   }
-  const line = res.ack || (res.ok ? `steered into ${res.lane} (${res.runId}, pid ${res.pid})` : `NOT delivered: ${res.reason}`);
+  const verb = op === 'btw' ? 'asked' : 'steered into';
+  const line = res.ack || (res.ok ? `${verb} ${res.lane} (${res.runId}, pid ${res.pid})` : `NOT delivered: ${res.reason}`);
   if (res.ok) console.log(line);
   else console.error(line);
   process.exit(res.ok ? 0 : 1);
+}
+
+// AND THE HALF THAT MAKES THAT ASYMMETRY REAL. Without this, `bg.mjs btw "did
+// the migration apply?"` falls straight through to the dispatch path below and
+// SPAWNS A WHOLE BACKGROUND WORKER whose brief is the question, printing
+// "handed to background lane" and exiting 0, so the caller believes it asked
+// something while a worker burns tokens on a report nobody wanted (QA,
+// 2026-09-09).
+//
+// It applies to `btw` ONLY, and the difference from `steer` is a fact about the
+// two words rather than a preference: "steer the release notes away from the
+// old template" is a real brief and the ambiguity there is a deliberate,
+// documented trade. "btw" opening a brief is not a use anyone has, and the
+// quoted form (`bg.mjs "btw also update the README"`) is one argv element, so
+// it never reaches this test at all. What is refused is the UNQUOTED form,
+// loudly and for free, instead of silently spending a worker on it.
+if (argv[0] === 'btw') {
+  console.error(
+    [
+      'usage: node bg.mjs btw <lane|runId|pid|latest> "<question>"',
+      '       node bg.mjs btw <target> --file <path>',
+      '',
+      'btw needs a target: unlike /btw in Telegram it will not fall back to `latest`,',
+      'because a side question answered by the wrong worker reads exactly like an',
+      'answer from the right one. `node bg.mjs ps` lists what is running.',
+    ].join('\n'),
+  );
+  process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +255,7 @@ if (!text) {
       '       node bg.mjs --engine codex|claude --file <path>   (pick the engine for this job)',
       '       node bg.mjs "codex: <task>" | "claude: <task>"    (same, inline prefix)',
       '       node bg.mjs steer <lane|runId|pid|latest> "<text>" | --file <path>',
+      '       node bg.mjs btw <lane|runId|pid|latest> "<question>" | --file <path>',
       '       node bg.mjs ps',
     ].join('\n'),
   );
@@ -236,6 +287,7 @@ const LANE_RULES = [
   '2. Bash caps at 600s. Anything longer must be CHUNKED into bounded foreground runs that each report and can be resumed. Never one long watch or poll loop: it gets killed at the ceiling with its outcome uncaptured.',
   '3. Your final message IS your report, and it is handed to the chat session as it stands. Do not compress, truncate or summarise it to fit a message limit; the bridge excerpts it if it has to.',
   '4. A message that starts with [STEER from the orchestrator] can arrive mid-run. It is an instruction for your CURRENT task from the session that dispatched you: fold it in at your next step, and quote it under a "Steered in" heading in your final report.',
+  '5. A message that starts with [BTW #N from the orchestrator] is the OPPOSITE of a steer: a side question, not an instruction, not approval, and not a new task. Answer it immediately in ONE message whose first line is exactly `BTW-ANSWER #N:` (plain text, under 1500 characters, no em or en dashes), then continue exactly where you were with your plan unchanged. Add one line per side question under a "Side questions" heading in your final report.',
   '',
   '--- TASK ---',
   '',

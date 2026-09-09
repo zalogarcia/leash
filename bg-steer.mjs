@@ -131,17 +131,24 @@ export function decodeLine(line) {
  * Nothing downstream re-checks these, so this is the only gate: a steer with no
  * text would otherwise write an empty user message into a live worker's stdin
  * and cost it a whole turn on nothing.
+ *
+ * `btw` (a side question, see bg-btw.mjs) validates identically to `steer` and
+ * on purpose: it travels the same socket to the same resolver down the same
+ * stdin pipe, and only the framing the daemon wraps it in differs. Two
+ * validators would be two places for "a target and some text" to disagree.
  */
+const TEXT_OPS = new Set(['steer', 'btw']);
+
 export function validateRequest(req) {
   const op = String(req?.op ?? '').trim();
   if (!op) return { ok: false, reason: REASONS.INVALID, detail: 'missing op' };
   if (op === 'ps') return { ok: true, op: 'ps' };
-  if (op !== 'steer') return { ok: false, reason: REASONS.UNKNOWN_OP, detail: `unknown op "${op}"` };
+  if (!TEXT_OPS.has(op)) return { ok: false, reason: REASONS.UNKNOWN_OP, detail: `unknown op "${op}"` };
   const target = String(req?.target ?? '').trim();
   if (!target) return { ok: false, reason: REASONS.INVALID, detail: 'missing target' };
   const text = String(req?.text ?? '').trim();
   if (!text) return { ok: false, reason: REASONS.INVALID, detail: 'missing text' };
-  return { ok: true, op: 'steer', target, text };
+  return { ok: true, op, target, text };
 }
 
 // ---------------------------------------------------------------------------
@@ -249,9 +256,18 @@ function hhmmssLocal(iso, timeZone) {
  * printed: nothing about the terminal output changes.
  */
 export function steerAckLine(res, { verbose = true, timeZone = null } = {}) {
-  if (!verbose) return phoneAckLine(res, { timeZone });
+  // Which of the two things travelled the pipe. A btw is refused for exactly
+  // the same reasons a steer is, so the refusal SHAPE is shared; only the two
+  // sentences that name an escape hatch differ, because "re-fire the job" is
+  // the answer to a steer that bounced and "ask Codex directly" is the answer
+  // to a question that did.
+  const isBtw = res?.op === 'btw';
+  if (!verbose) return phoneAckLine(res, { timeZone, isBtw });
   if (res?.ok) {
-    return `steered into ${res.lane || '?'} (${res.runId || '?'}, pid ${res.pid ?? '?'}) at ${hhmmss(res.deliveredAt)}`;
+    const verb = isBtw ? 'asked' : 'steered into';
+    return `${verb} ${res.lane || '?'} (${res.runId || '?'}, pid ${res.pid ?? '?'}) at ${hhmmss(res.deliveredAt)}${
+      isBtw ? '; the answer goes to Telegram, not to this terminal' : ''
+    }`;
   }
   const reason = res?.reason || 'unknown';
   // Name the worker whenever the refusal identified one. `not_steerable` with
@@ -266,7 +282,9 @@ export function steerAckLine(res, { verbose = true, timeZone = null } = {}) {
   const why =
     reason === REASONS.NOT_STEERABLE && res?.engine === 'codex'
       ? '\n  Codex runs take no mid-run input: the run is file-backed with no stdin to write into.'
-        + '\n  Re-fire it instead: bg.mjs --engine codex --file <brief>. On the chat lane, send the text as the next message and the thread keeps its context.'
+        + (isBtw
+          ? '\n  Ask Codex directly instead: /codex <question> in Telegram, which is read-only and keeps this chat\'s thread.'
+          : '\n  Re-fire it instead: bg.mjs --engine codex --file <brief>. On the chat lane, send the text as the next message and the thread keeps its context.')
       : '';
   return `NOT delivered: ${reason}${who}${extra}${why}`;
 }
@@ -279,13 +297,18 @@ export function steerAckLine(res, { verbose = true, timeZone = null } = {}) {
  * untypeable on a phone, and the thing they would do with them, steer again, is
  * `/steer <lane>`. `bg.mjs ps` still prints both.
  */
-function phoneAckLine(res, { timeZone = null } = {}) {
+function phoneAckLine(res, { timeZone = null, isBtw = false } = {}) {
   if (res?.ok) {
-    // HIS clock, not UTC. The CLI form ends in Z because you compare it against
-    // a run log; on a phone an unlabelled UTC time would simply be wrong by
-    // four hours, and a labelled one is noise.
+    // THEIR clock, not UTC. The CLI form ends in Z because you compare it
+    // against a run log; on a phone an unlabelled UTC time is simply wrong by
+    // however many hours they are offset, and a labelled one is noise.
     const at = timeZone ? hhmmssLocal(res.deliveredAt, timeZone) : hhmmss(res.deliveredAt);
-    return `➡️ Steered into ${res.lane || 'the worker'}${at ? ` · ${at}` : ''}`;
+    // A delivered btw does not use this line: it puts up a pending message that
+    // edits itself into the answer (btwPendingLine and friends in
+    // system-messages.mjs). This branch exists so a caller that renders one
+    // anyway says the right verb rather than claiming the job was redirected.
+    const verb = isBtw ? '❓ Asked' : '➡️ Steered into';
+    return `${verb} ${res.lane || 'the worker'}${at ? ` · ${at}` : ''}`;
   }
   const reason = res?.reason || 'unknown';
   if (reason === REASONS.AMBIGUOUS) {
@@ -299,8 +322,9 @@ function phoneAckLine(res, { timeZone = null } = {}) {
       return [
         `❌ Not delivered · ${res.lane || 'that run'} takes no mid-run input`,
         '🧠 A Codex run is file-backed, no stdin.',
-        'Re-fire it instead, or send it as the next',
-        'message so the thread keeps its context.',
+        ...(isBtw
+          ? ['Ask Codex directly: /codex <question>.']
+          : ['Re-fire it instead, or send it as the next', 'message so the thread keeps its context.']),
       ].join('\n');
     }
     return [
@@ -318,9 +342,10 @@ function phoneAckLine(res, { timeZone = null } = {}) {
   return `❌ Not delivered · ${reason}${detail}`;
 }
 
-export function steerResponse(worker, deliveredAt) {
+export function steerResponse(worker, deliveredAt, { op = 'steer' } = {}) {
   const res = {
     ok: true,
+    op,
     runId: worker?.runId ?? null,
     lane: worker?.lane ?? null,
     pid: worker?.pid ?? null,
@@ -334,6 +359,8 @@ export function steerResponse(worker, deliveredAt) {
 }
 
 export function steerFailure(reason, extra = {}) {
+  // `op` rides in `extra` so a btw that bounced is refused in its own words.
+  // Absent means steer: every caller that predates side questions is one.
   const res = { ok: false, reason, ...extra };
   return { ...res, ack: steerAckLine(res) };
 }
@@ -352,7 +379,16 @@ function elapsedLabel(sec) {
   return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}`;
 }
 
-/** The `bg.mjs ps` table. One row per running worker, widest column first. */
+/**
+ * The `bg.mjs ps` table. One row per running worker, widest column first.
+ *
+ * THE `STEER` COLUMN ANSWERS BTW TOO, and there is deliberately no second one.
+ * A side question (`bg.mjs btw`, `/btw`) travels the same stdin pipe, resolved
+ * by the same resolver above, so the three workers that cannot take a steer (a
+ * survivor of a daemon restart, a run whose result is already in, a background
+ * Codex job with no stdin at all) cannot take a btw either, for the identical
+ * reason. A column that could only ever repeat its neighbour is noise.
+ */
 export function psTable(workers) {
   const rows = (Array.isArray(workers) ? workers : []).map((w) => [
     String(w.runId ?? ''),

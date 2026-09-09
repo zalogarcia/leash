@@ -17,6 +17,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { BTW_TICK_MS, BTW_TIMEOUT_MS } from './bg-btw.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -66,15 +67,25 @@ export const url = (f) => JSON.stringify(pathToFileURL(path.join(DIR, f)).href);
 // ---------------------------------------------------------------------------
 const HARNESS = `
 import { visibleOnly, fetchingLine, fetchFailedLine, errorMessage, WALL_TICK_MS, compactingLine, compactQueuedLine, compactDoneLine, compactDiscardedLine } from ${url('system-messages.mjs')};
+import { btwPendingLine, btwAnsweredLine, btwEndedLine, btwStoppedLine, btwLostLine, btwWaitingLine } from ${url('system-messages.mjs')};
+import { BTW_RECORD_MAX, BTW_TICK_MS, BTW_TIMEOUT_MS } from ${url('bg-btw.mjs')};
+import { normalizeDashes } from ${url('dash-normalize.mjs')};
+const NO_DASHES = true;
+export const INFLIGHT = {};
+const inflight = { read: () => INFLIGHT, add: (id, rec) => { INFLIGHT[id] = rec; } };
+const clip = (s, n) => (String(s).length <= n ? String(s) : String(s).slice(0, n - 1) + '\u2026');
+const oneLine = (s) => String(s).replace(/\s+/g, ' ').trim();
 import { quoteBlock } from ${url('progress-render.mjs')};
 import { fmtElapsed } from ${url('progress-render.mjs')};
 import { escHtml, mdToTelegramHtml } from ${url('md-format.mjs')};
 export const CALLS = [];
 export let rejectHtml = false;
 export let reject429 = false;
+export let failSends = false;
+export const setFailSends = (v) => { failSends = v; };
 export const setRejectHtml = (v) => { rejectHtml = v; };
 export const setReject429 = (v) => { reject429 = v; };
-export const reset = () => { CALLS.length = 0; rejectHtml = false; reject429 = false; editCooldownUntil = 0; };
+export const reset = () => { CALLS.length = 0; rejectHtml = false; reject429 = false; failSends = false; editCooldownUntil = 0; };
 const send = async (text, { markdown = true } = {}) => tg('sendMessage', markdown ? { chat_id: CHAT_ID, text: mdToTelegramHtml(text), parse_mode: 'HTML' } : { chat_id: CHAT_ID, text });
 const CHAT_ID = '1';
 const TG_MSG_LIMIT = 4000;
@@ -87,6 +98,11 @@ export const getCooldown = () => editCooldownUntil;
 export const setCooldown = (v) => { editCooldownUntil = v; };
 async function tg(method, payload, attempt = 0, opts = {}) {
   CALLS.push({ method, payload, opts });
+  if (failSends && method === 'sendMessage') {
+    const e = new Error('sendMessage: 500 Internal Server Error');
+    e.code = 500;
+    throw e;
+  }
   if (reject429) {
     const e = new Error(\`\${method}: 429 Too Many Requests\`);
     e.code = 429;
@@ -124,7 +140,11 @@ const B = await import(
         grab('startCompactNotice'),
         grab('settleCompactNotice'),
         grab('compactElapsed', 'const'),
-        'export { sendHtml, editProgress, pendingMessage, registerLive, tickLiveMessages, liveMessages, sendError, sendSubView, tg, raiseWall, settleWall, pendWallResolution, wallNotices, startCompactNotice, settleCompactNotice, compactElapsed };',
+        grab('btwRecordForDisk'),
+        grab('drainBtw'),
+        grab('startBtwNotice'),
+        grab('resolveBtwAfterRestart'),
+        'export { sendHtml, editProgress, pendingMessage, registerLive, tickLiveMessages, liveMessages, sendError, sendSubView, tg, raiseWall, settleWall, pendWallResolution, wallNotices, startCompactNotice, settleCompactNotice, compactElapsed, btwRecordForDisk, drainBtw, startBtwNotice, resolveBtwAfterRestart };',
       ].join('\n'),
     )
 );
@@ -711,6 +731,284 @@ await B.sendSubView({ visible: '📖 no body here', body: '' });
 await t('no body, no blockquote: it goes out as a plain message', () => {
   eq(B.CALLS[0].payload.parse_mode, undefined);
   eq(B.CALLS[0].payload.text, '📖 no body here');
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n10. /btw: one ⏳ per side question, and every way it can end');
+// ---------------------------------------------------------------------------
+//
+// The pure builders are gated in system-messages.test.mjs. What is asserted
+// here is that the DAEMON drives them: one message put up per question, edited
+// exactly once to a terminal state, never edited after it, and reaching that
+// state on all four exits (answered, ended, stopped, restarted) plus the
+// fifteen-minute sentence that is not an exit.
+
+const lastText = () => B.CALLS[B.CALLS.length - 1]?.payload?.text ?? '';
+const edits = () => B.CALLS.filter((c) => c.method === 'editMessageText');
+const sends = () => B.CALLS.filter((c) => c.method === 'sendMessage');
+
+B.reset();
+let rec = { id: 1, lane: 'bg2', askedAt: Date.now() };
+await B.startBtwNotice(rec, 'bg2');
+await t('the question puts up exactly one ⏳ message', () => {
+  eq(sends().length, 1, 'one message per question, not a notice plus an ack');
+  ok(sends()[0].payload.text.startsWith('⏳ btw · bg2'), sends()[0].payload.text);
+  eq(edits().length, 0, 'nothing edited yet');
+});
+
+await t('and it registered a live line, so the wait can say something later', () => {
+  eq(B.liveMessages.size, 1);
+});
+
+rec.resolve('answered', { answer: 'delta-agents, on main' });
+await t('★ the answer EDITS the same message rather than sending a second one', () => {
+  eq(sends().length, 1, 'still one message: a wait is one message, edited');
+  eq(edits().length, 1);
+  ok(lastText().includes('✅ btw · bg2'), lastText());
+  ok(lastText().includes('delta-agents, on main'), lastText());
+});
+
+await t('and the live line retires, so nothing can write over the answer', () => {
+  B.tickLiveMessages();
+  eq(B.liveMessages.size, 0, 'a settled entry is dropped on the next sweep');
+});
+
+const after = B.CALLS.length;
+rec.resolve('ended');
+rec.resolve('answered', { answer: 'a second answer' });
+await t('★ terminal is terminal: a later resolve is ignored, not applied', () => {
+  eq(B.CALLS.length, after, 'the last word on screen must be the answer it already showed');
+});
+
+B.reset();
+rec = { id: 2, lane: 'bg', askedAt: Date.now() };
+await B.startBtwNotice(rec, 'bg');
+rec.resolve('ended');
+await t('★ a run that ends without answering resolves the ⏳ and names the report', () => {
+  ok(lastText().includes('❌ btw · bg · no answer'), lastText());
+  ok(lastText().includes('report may still carry it'), lastText());
+});
+
+B.reset();
+rec = { id: 3, lane: 'bg', askedAt: Date.now() };
+await B.startBtwNotice(rec, 'bg');
+rec.resolve('stopped');
+await t('★ /stop resolves it with the stop glyph, not a failure glyph', () => {
+  ok(lastText().startsWith('🛑'), lastText());
+});
+
+B.reset();
+rec = { id: 4, lane: 'bg', askedAt: Date.now() };
+await B.startBtwNotice(rec, 'bg');
+rec.resolve('lost');
+await t('a daemon restart resolves it as lost', () => {
+  ok(lastText().includes('answer lost'), lastText());
+});
+
+B.reset();
+rec = { id: 5, lane: 'bg2', askedAt: Date.now() - BTW_TIMEOUT_MS - 1000 };
+await B.startBtwNotice(rec, 'bg2');
+B.tickLiveMessages();
+await t('★ fifteen minutes edits the line WITHOUT dropping the listener', () => {
+  ok(lastText().includes('no answer yet'), lastText());
+  eq(B.liveMessages.size, 1, 'the entry must survive: a worker in a long tool call is busy, not gone');
+});
+
+const beforeLate = B.CALLS.length;
+B.tickLiveMessages();
+B.tickLiveMessages();
+await t('and it says it once, not every sweep', () => {
+  eq(B.CALLS.length, beforeLate, 'a line that repeats itself every 2.5s is a rate-limit incident');
+});
+
+rec.resolve('answered', { answer: 'sorry, I was in a 12 minute build' });
+await t('★ an answer that arrives AFTER the timeout still lands on the same message', () => {
+  ok(lastText().includes('✅ btw · bg2'), lastText());
+  ok(lastText().includes('12 minute build'), lastText());
+  eq(sends().length, 1, 'and it is still one message');
+});
+
+B.reset();
+rec = { id: 6, lane: 'bg', askedAt: Date.now() };
+const pendingTick = Date.now();
+await B.startBtwNotice(rec, 'bg');
+B.tickLiveMessages();
+await t('the pending line does not spend an edit before its cadence is due', () => {
+  eq(edits().length, 0, `BTW_TICK_MS is ${BTW_TICK_MS}, so an immediate sweep must be a no-op`);
+});
+rec.resolve('ended');
+
+// ---------------------------------------------------------------------------
+// The race: a worker fast enough to answer before its own ⏳ has been sent.
+// ---------------------------------------------------------------------------
+
+B.reset();
+rec = { id: 7, lane: 'bg', askedAt: Date.now() };
+const inFlight = B.startBtwNotice(rec, 'bg');
+rec.resolve('answered', { answer: 'instantly' });
+await inFlight;
+await t('★ an answer that beats its own ack is applied, not lost', () => {
+  eq(sends().length, 1, 'the ⏳ still went out (it was already in flight)');
+  eq(edits().length, 1, 'and it was edited into the answer the moment its id landed');
+  ok(lastText().includes('instantly'), lastText());
+});
+
+await t('and no live entry is left ticking on a question that is over', () => {
+  B.tickLiveMessages();
+  eq(B.liveMessages.size, 0);
+});
+
+B.reset();
+rec = { id: 8, lane: 'bg', askedAt: Date.now() };
+const inFlight2 = B.startBtwNotice(rec, 'bg');
+rec.resolve('ended');
+await inFlight2;
+await t('the same race on the ENDED path, which is the one /stop takes', () => {
+  eq(edits().length, 1);
+  ok(lastText().includes('no answer'), lastText());
+});
+
+// ---------------------------------------------------------------------------
+// A long answer, and the dash rule.
+// ---------------------------------------------------------------------------
+
+B.reset();
+rec = { id: 9, lane: 'bg', askedAt: Date.now() };
+await B.startBtwNotice(rec, 'bg');
+rec.resolve('answered', { answer: 'A'.repeat(6000) });
+await t('★ an answer too big to edit becomes a receipt plus its own message', () => {
+  eq(edits().length, 1, 'the ⏳ still reaches a terminal state');
+  ok(edits()[0].payload.text.includes('in the next message'), edits()[0].payload.text);
+  const spill = sends()[1];
+  ok(spill, 'the answer itself must actually be sent');
+  ok(spill.payload.text.includes('AAAA'), 'and it is the answer, not a fragment of the receipt');
+});
+
+B.reset();
+rec = { id: 10, lane: 'bg', askedAt: Date.now() };
+await B.startBtwNotice(rec, 'bg');
+rec.resolve('answered', { answer: 'it applied — all 41 rows' });
+await t("★ the worker's answer is dash-normalized like every other outbound text", () => {
+  ok(!/[–—]/.test(lastText()), `an em dash reached Telegram: ${lastText()}`);
+  ok(lastText().includes('41 rows'), 'and the sentence survived the normalizer');
+});
+
+// ---------------------------------------------------------------------------
+// Restart recovery: the ⏳ belongs to a process that no longer exists.
+// ---------------------------------------------------------------------------
+
+B.reset();
+for (const k of Object.keys(B.INFLIGHT)) delete B.INFLIGHT[k];
+B.INFLIGHT['bg-1788453512237-83808'] = {
+  pid: 83808,
+  lane: 'bg2',
+  btwPending: [
+    { id: 1, msgId: 4242, lane: 'bg2', askedAt: 1, question: 'which repo?' },
+    { id: 2, msgId: 4243, lane: 'bg2', askedAt: 2, question: 'did it apply?' },
+  ],
+};
+B.resolveBtwAfterRestart('bg-1788453512237-83808', B.INFLIGHT['bg-1788453512237-83808']);
+await t('★ every ⏳ the previous daemon left pending is resolved at boot', () => {
+  eq(edits().length, 2, 'one edit per stranded question, on the message ids it persisted');
+  eq(edits()[0].payload.message_id, 4242);
+  eq(edits()[1].payload.message_id, 4243);
+  ok(edits()[0].payload.text.includes('answer lost'), edits()[0].payload.text);
+});
+
+await t('and the record is cleared, so a second restart does not re-announce it', () => {
+  eq(B.INFLIGHT['bg-1788453512237-83808'].btwPending.length, 0);
+  const before = B.CALLS.length;
+  B.resolveBtwAfterRestart('bg-1788453512237-83808', B.INFLIGHT['bg-1788453512237-83808']);
+  eq(B.CALLS.length, before, 'nothing pending, nothing said');
+});
+
+B.reset();
+B.resolveBtwAfterRestart('x', { lane: 'bg' });
+B.resolveBtwAfterRestart('x', {});
+B.resolveBtwAfterRestart('x', null);
+await t('a record with no pending questions is silent, and nullish does not throw', () => {
+  eq(B.CALLS.length, 0);
+});
+
+B.reset();
+B.resolveBtwAfterRestart('y', { lane: 'bg9', btwPending: [{ id: 1, lane: 'bg9' }] });
+await t('a question whose ⏳ never got a message id is still answered, as a new one', () => {
+  eq(sends().length, 1, 'a Telegram hiccup at ask time must not cost the ending');
+  ok(sends()[0].payload.text.includes('answer lost'), sends()[0].payload.text);
+});
+
+// ---------------------------------------------------------------------------
+// The ⏳ that could never be edited: one Telegram 5xx at ask time.
+// ---------------------------------------------------------------------------
+
+B.reset();
+B.setFailSends(true);
+rec = { id: 11, lane: 'bg2', askedAt: Date.now() };
+await B.startBtwNotice(rec, 'bg2');
+B.setFailSends(false);
+const afterFailedSend = B.CALLS.length;
+for (let i = 0; i < 400; i++) B.tickLiveMessages(); // ~16 simulated minutes of sweeps
+await t('★ a ⏳ whose send failed does not tick, so one 5xx cannot become 60 messages', () => {
+  eq(B.liveMessages.size, 0, 'no ticker is armed when there is no message to edit');
+  eq(B.CALLS.length, afterFailedSend, `${B.CALLS.length - afterFailedSend} extra calls: put() degrades to a fresh send every cadence`);
+});
+
+await t('★ and the ENDING still reaches the chat, whole, as one fresh message', () => {
+  const before = B.CALLS.length;
+  rec.resolve('answered', { answer: 'yes, at 17:04' });
+  eq(B.CALLS.length - before, 1, 'a lost ⏳ must not turn one answer into a receipt plus a spill');
+  const last = B.CALLS[B.CALLS.length - 1];
+  eq(last.method, 'sendMessage', 'nothing to edit, so it is sent');
+  ok(last.payload.text.startsWith('✅ btw · bg2'), last.payload.text);
+  ok(last.payload.text.includes('yes, at 17:04'), last.payload.text);
+});
+
+await t('and a genuinely oversized answer still splits, even with no ⏳ to edit', () => {
+  const rec2 = { id: 12, lane: 'bg', askedAt: Date.now() };
+  B.setFailSends(true);
+  const p = B.startBtwNotice(rec2, 'bg');
+  B.setFailSends(false);
+  return p.then(() => {
+    const before = B.CALLS.length;
+    rec2.resolve('answered', { answer: 'A'.repeat(6000) });
+    eq(B.CALLS.length - before, 2, 'the receipt and the answer');
+    ok(B.CALLS[before].payload.text.includes('in the next message'), B.CALLS[before].payload.text);
+    ok(B.CALLS[before + 1].payload.text.includes('AAAA'), 'and the answer itself follows');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// drainBtw and the on-disk record.
+// ---------------------------------------------------------------------------
+
+await t('drainBtw resolves every outstanding question exactly once', () => {
+  const seen = [];
+  const pending = [
+    { id: 1, resolve: (s) => seen.push(['a', s]) },
+    { id: 2, resolve: (s) => seen.push(['b', s]) },
+  ];
+  const run = { btw: { drain: () => pending.splice(0, pending.length) } };
+  B.drainBtw(run, 'ended');
+  eq(JSON.stringify(seen), JSON.stringify([['a', 'ended'], ['b', 'ended']]));
+  B.drainBtw(run, 'ended');
+  eq(seen.length, 2, '★ draining twice must not resolve a question twice');
+});
+
+await t('drainBtw on a run with no tracker at all is a no-op', () => {
+  B.drainBtw(null, 'ended');
+  B.drainBtw({}, 'ended');
+  B.drainBtw({ btw: {} }, 'ended');
+});
+
+await t('★ the on-disk record carries the message id and drops the functions', () => {
+  const d = B.btwRecordForDisk({ id: 3, msgId: 99, lane: 'bg2', askedAt: 7, question: 'q', resolve: () => {}, mirror: () => {} });
+  eq(JSON.stringify(d), JSON.stringify({ id: 3, msgId: 99, lane: 'bg2', askedAt: 7, question: 'q' }));
+});
+
+await t('and a huge question is clipped before it reaches the registry', () => {
+  const d = B.btwRecordForDisk({ id: 1, question: 'Q'.repeat(50_000) });
+  ok(d.question.length <= 501, `${d.question.length} chars would be amplified across bg-inflight.json`);
+  eq(d.msgId, null, 'an absent id is null, never undefined, so JSON keeps the field');
 });
 
 console.log(`\n${pass} passed, ${failures.length} failed\n`);

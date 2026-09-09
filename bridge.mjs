@@ -100,6 +100,13 @@ import {
   HELP_GROUPS,
   workerStatusBlock,
   steerUsage,
+  btwUsage,
+  btwPendingLine,
+  btwAnsweredLine,
+  btwEndedLine,
+  btwStoppedLine,
+  btwLostLine,
+  btwWaitingLine,
   queueAck,
   queueStarted,
   queueDropped,
@@ -139,6 +146,7 @@ import {
   STEER_SOCK_NAME,
   decodeLine,
   encodeLine,
+  looksLikeTarget,
   parseRunId,
   psTable,
   resolveSteerTarget,
@@ -150,6 +158,14 @@ import {
   validateRequest,
   REASONS as STEER_REASONS,
 } from './bg-steer.mjs';
+import {
+  BTW_RECORD_MAX,
+  BTW_TICK_MS,
+  BTW_TIMEOUT_MS,
+  btwFraming,
+  createBtwTracker,
+  isBtwFramed,
+} from './bg-btw.mjs';
 import { claimSteerSock, releaseSteerSock } from './steer-sock.mjs';
 import {
   CODEX_DEFAULT_TIMEOUT_MS,
@@ -1251,7 +1267,20 @@ function runClaude(
   // `steers`: every mid-run instruction actually written into this child's
   // stdin, in order. Read back by /status, `bg.mjs ps` and the worker's own
   // handback, so the orchestrator reading a report can see what it injected.
-  const run = { child: null, startedAt: Date.now(), stopped: false, prompt: rawText, terminate: null, lane, steers: [] };
+  // `btw` is the per-worker record of side questions asked of THIS run: ids are
+  // minted from it and answers are matched against it. Per run rather than
+  // global on purpose, because that is what makes an answer from bg2
+  // structurally incapable of resolving a question asked of bg3.
+  const run = {
+    child: null,
+    startedAt: Date.now(),
+    stopped: false,
+    prompt: rawText,
+    terminate: null,
+    lane,
+    steers: [],
+    btw: createBtwTracker(),
+  };
   lane.current = run;
   return new Promise(async (resolve) => {
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'];
@@ -1447,35 +1476,113 @@ function runClaude(
     // message from 16:11: "Draft ready, not…` showed a quote of the daemon
     // instead of the two words actually typed (QA, 2026-09-08). The ack names
     // the quote; the bubble names the instruction.
-    run.steer = (t, { frame = false, note: shown = null } = {}) => {
+    //
+    // `kind` says WHICH of the two things is being written. They share the pipe
+    // and the guard and nothing else: a steer is recorded on run.steers (it
+    // changed the job, so the report has to account for it), a btw is not (it
+    // changed nothing, and counting it as a steer would inflate the SENT column
+    // of `bg.mjs ps` and put a question into the "STEERED IN" block of a report
+    // as though it had been an instruction).
+    run.steer = (t, { frame = false, note: shown = null, kind = 'steer' } = {}) => {
+      // BEFORE the write, because after it there is nothing to take back. A btw
+      // must arrive framed: `frame` defaults to false (the chat lane sends the
+      // owner's words verbatim), so a caller passing a raw question with kind
+      // 'btw' would put a bare sentence in the worker's stdin, indistinguishable
+      // from a steer, and it would re-plan. Refusing is the right failure: the
+      // caller gets the ordinary not-delivered path instead of a worker quietly
+      // acting on a question.
+      if (kind === 'btw' && !isBtwFramed(t)) {
+        console.error('[bridge] refused an unframed btw: a side question must carry its framing');
+        return false;
+      }
       if (!run.canSteer()) return false;
       try {
         child.stdin.write(userMsg(frame ? steerFraming(t) : t));
       } catch {
         return false;
       }
-      // The DELIVERED text is whatever the caller sent. What is STORED is
-      // clipped: this record is rewritten into bg-inflight.json on every later
-      // steer, and a --file steer can be hundreds of kilobytes of brief.
-      run.steers.push({ ts: new Date().toISOString(), text: clip(String(t), STEER_RECORD_MAX) });
-      // Mirror onto the on-disk record so a steer is still visible after this
-      // daemon is gone, to the report of a worker that outlives us. Best-effort:
-      // a registry write must never cost a delivery that already landed.
-      if (run.watchdogId) {
-        try {
-          const rec = inflight.read()[run.watchdogId];
-          if (rec) inflight.add(run.watchdogId, { ...rec, steers: run.steers });
-        } catch (e) {
-          console.error('[bridge] steer not mirrored to the registry:', e.message);
-        }
+      if (kind === 'steer') {
+        // The DELIVERED text is whatever the caller sent. What is STORED is
+        // clipped: this record is rewritten into bg-inflight.json on every later
+        // steer, and a --file steer can be hundreds of kilobytes of brief.
+        run.steers.push({ ts: new Date().toISOString(), text: clip(String(t), STEER_RECORD_MAX) });
+        // Mirror onto the on-disk record so a steer is still visible after this
+        // daemon is gone, to the report of a worker that outlives us.
+        // Best-effort: a registry write must never cost a delivery that already
+        // landed.
+        mirrorToRegistry({ steers: run.steers });
       }
-      const note = { kind: 'text', text: `📨 steered in: ${clip(String(shown ?? t).replace(/\s+/g, ' '), 90)}` };
+      const label = kind === 'btw' ? '❓ btw' : '📨 steered in';
+      const note = { kind: 'text', text: `${label}: ${clip(String(shown ?? t).replace(/\s+/g, ' '), 90)}` };
       progress.push(note);
       // The step counter is TOOL activity; a bg lane has no bubble to render a
       // note into, so counting it there would only inflate what /status shows.
       if (!isBgLane) toolLines.push(note);
       return true;
     };
+
+    // One writer for both mirrors, because both are best-effort patches onto
+    // the same registry record and a failed one must never cost a delivery that
+    // has already landed in the child's stdin.
+    function mirrorToRegistry(patch) {
+      if (!run.watchdogId) return;
+      try {
+        const rec = inflight.read()[run.watchdogId];
+        if (rec) inflight.add(run.watchdogId, { ...rec, ...patch });
+      } catch (e) {
+        console.error('[bridge] registry mirror failed:', e.message);
+      }
+    }
+
+    // Rewrite the pending side questions onto the on-disk record. Called again
+    // once each pending message has an id, because that id is the only handle
+    // the NEXT daemon has on a line this one put on screen.
+    run.btwMirror = () => mirrorToRegistry({ btwPending: run.btw.list().map(btwRecordForDisk) });
+
+    /**
+     * Ask this worker a side question. Returns the pending record, or null when
+     * the write did not land (the caller renders the same refusal a steer gets).
+     *
+     * The id is minted BEFORE the write because the framing quotes it back to
+     * the worker: the instruction and the parser have to be looking at the same
+     * number. A write that then fails un-mints it, or the question would sit in
+     * `pending` forever waiting on an answer nobody was ever asked for.
+     */
+    run.btwAsk = (question, entry = {}) => {
+      const record = run.btw.add({ ...entry, lane: lane.name || 'bg', askedAt: Date.now() });
+      const framed = btwFraming(record.id, question, { name: BRIDGE_NAME });
+      if (!run.steer(framed, { frame: false, kind: 'btw', note: question })) {
+        run.btw.remove(record);
+        return null;
+      }
+      // Persisted so a daemon restart can resolve the pending line this leaves
+      // on screen rather than stranding it. The message id is the load-bearing
+      // field: it is the only way the NEXT daemon can reach a message this one
+      // sent.
+      run.btwMirror();
+      return record;
+    };
+
+    /**
+     * Offer one block of the worker's own output to the side-question router.
+     *
+     * Returns true when the block WAS an answer, which is the caller's signal to
+     * drop it: an answer is already going to the chat as its own message, and
+     * leaving it in the progress bubble and in the report capture would deliver
+     * it twice and put a fragment of a private exchange into a handback.
+     */
+    run.btwTake = (text) => {
+      const res = run.btw.take(text);
+      if (res.status === 'none') return false;
+      if (res.status === 'routed') {
+        res.entry.resolve?.('answered', { answer: res.answer });
+        run.btwMirror();
+      }
+      return true; // 'routed' and 'duplicate' are both "not the worker's output"
+    };
+
+    /** Was this exact text already delivered as an answer? The result-event half. */
+    run.btwDelivered = (text) => run.btw.delivered(text);
 
     // Per-lane: chat dies at 30m, a background worker gets hours (see the
     // constants). A lane without an explicit timeoutMs falls back to the chat
@@ -1575,7 +1682,15 @@ function runClaude(
         if (!isSubagent && ev.message.usage) lastUsage = ev.message.usage;
         for (const block of ev.message.content) {
           if (block.type === 'text' && block.text?.trim()) {
-            if (!isSubagent) progress.push({ kind: 'text', text: block.text.trim() }); // subagent prose is noise; their tool calls tell the story
+            // A SIDE-QUESTION ANSWER IS NOT PROGRESS. It is addressed to the
+            // person who asked, it is already on its way to them as an edit to
+            // the pending message they have on screen, and leaving it here
+            // would show it a second time in the bubble. Subagent prose is
+            // never offered: the question went to the worker, not to something
+            // it spawned.
+            if (!isSubagent && !run.btwTake(block.text.trim())) {
+              progress.push({ kind: 'text', text: block.text.trim() }); // subagent prose is noise; their tool calls tell the story
+            }
           } else if (block.type === 'tool_use') {
             const entry = toolEntry(block, isSubagent, HOME);
             progress.push(entry);
@@ -1600,7 +1715,25 @@ function runClaude(
         // live: essay task + steered "what is 2+2" → 2 results). Collect every
         // answer; keeping only the last would silently replace the original
         // task's answer with the reply to the follow-up.
-        if (typeof ev.result === 'string' && ev.result.trim()) resultTexts.push(ev.result);
+        // ...and a btw that lands during a no-tool stretch becomes exactly such
+        // a turn, so the SAME answer arrives twice: once as the assistant
+        // content block above, once as this result. Dropping the byte-identical
+        // copy is what keeps a private answer out of the handback and out of
+        // bg-results.jsonl.
+        //
+        // ASKED AS "was this already sent", NOT offered to the router. Across
+        // 60 real run logs every result event carrying text was byte-identical
+        // to the last assistant text block of its turn (55 of 55, no
+        // concatenations), so identity is sufficient here. Routing would be
+        // wider than that evidence: it matches on the FIRST line, so a result
+        // that merely BEGAN with an answer would be swallowed whole and handed
+        // back as "ended with no output", and a second route could resolve a
+        // DIFFERENT pending question with this text (QA, 2026-09-09). The
+        // pending line is already resolved from the assistant block by the time
+        // this is asked.
+        if (typeof ev.result === 'string' && ev.result.trim() && !run.btwDelivered(ev.result.trim())) {
+          resultTexts.push(ev.result);
+        }
         // Streaming-input mode keeps the process alive waiting for more stdin —
         // closing it here is what ends the run, on EVERY lane now that a
         // background worker holds the pipe open too. A steer racing the close is
@@ -1636,6 +1769,10 @@ function runClaude(
       tail?.stop();
       closeStdin(child);
       if (lane.current === run) lane.current = null;
+      // Every pending line this run owns has to reach a terminal state on EVERY
+      // exit, and a spawn failure is one of them: the close handler never fires
+      // here, so without this the question would tick until the daemon died.
+      drainBtw(run, 'ended');
       if (run.watchdogId) inflight.clear(run.watchdogId); // reported here, not by the watchdog
       await sendError({
         title: 'Could not launch claude',
@@ -1664,6 +1801,12 @@ function runClaude(
       // tail would make the watchdog announce a worker that actually reported.
       if (run.watchdogId) inflight.clear(run.watchdogId);
       const wasStopped = run.stopped;
+      // The run is over, so nothing can answer a side question any more. AFTER
+      // the final tail pump above, which is what gives an answer written
+      // microseconds before exit its chance to land: draining first would
+      // report "no answer" over an answer already in the log. `/stop` gets its
+      // own glyph because a deliberate stop is not a failure.
+      drainBtw(run, wasStopped ? 'stopped' : 'ended');
       if (lane.current === run) lane.current = null;
       finishing++; // decremented at the end of this handler
       lane.finishing = (lane.finishing || 0) + 1; // per-lane copy so /status can see this window
@@ -1977,6 +2120,7 @@ const RESERVED_COMMANDS = new Set([
   '/cd',
   '/status',
   '/steer',
+  '/btw',
   '/codex',
   '/engine',
   '/stop',
@@ -2334,6 +2478,214 @@ function steerInto(target, text) {
   return steerResponse(w, new Date().toISOString());
 }
 
+// ---------------------------------------------------------------------------
+// /btw: a side question to a running worker, answered in the chat.
+//
+// The mechanism is steering's, the meaning is its opposite. Same resolver, same
+// stdin pipe, same three refusals; the framing (bg-btw.mjs) tells the worker
+// this one is NOT an instruction, and the daemon watches its output stream for
+// the answer instead of waiting for the report.
+//
+// The whole design rests on one rule: EVERY ⏳ THIS PUTS UP REACHES A TERMINAL
+// STATE. There are five ways a question ends and all five are wired, because a
+// pending line with an unreachable ending is exactly the defect the live-message
+// pass existed to remove:
+//
+//   answered  the stream detector routes the block   (btwAnsweredLine)
+//   ended     the run's close handler drains         (btwEndedLine)
+//   stopped   /stop, same drain, different glyph     (btwStoppedLine)
+//   lost      the next daemon resolves it at boot    (btwLostLine)
+//   waiting   15 minutes with no answer, and the listener stays on
+//             because a worker in a long tool call is busy, not gone
+//                                                    (btwWaitingLine)
+// ---------------------------------------------------------------------------
+
+/** The persisted half of a pending question: no functions, nothing unbounded. */
+function btwRecordForDisk(p) {
+  return {
+    id: p.id,
+    // Load bearing across a restart: the NEXT daemon holds no reference to
+    // anything this one made except the message id it can still edit.
+    msgId: p.msgId ?? null,
+    lane: p.lane ?? null,
+    askedAt: p.askedAt ?? null,
+    question: clip(oneLine(String(p.question ?? '')), BTW_RECORD_MAX),
+  };
+}
+
+/** End every outstanding question on a run. Called from BOTH exit handlers. */
+function drainBtw(run, state) {
+  for (const rec of run?.btw?.drain?.() ?? []) rec.resolve?.(state);
+}
+
+/**
+ * Put the ⏳ up and keep it alive until the question ends.
+ *
+ * `record.resolve` is installed SYNCHRONOUSLY, before the send is awaited: a
+ * worker can answer in under a second, and an answer that beats its own ack to
+ * the chat must be remembered rather than dropped on the floor. That is the
+ * same race trackQueueAck solves, and the same way.
+ */
+async function startBtwNotice(record, lane) {
+  const askedAt = record.askedAt || Date.now();
+  const elapsed = () => Math.round((Date.now() - askedAt) / 1000);
+  let msgId = null;
+  let sendDone = false; // has the ⏳ send come back, successfully or not
+  let pendingState = null; // an ending that arrived before the message existed
+  let settled = false;
+  let live = null;
+
+  const put = (text) => {
+    if (msgId == null) {
+      // No message to edit: a Telegram hiccup at ask time must cost the
+      // liveness, never the answer.
+      send(text, { markdown: false }).catch(() => {});
+      return;
+    }
+    editProgress(msgId, escHtml(text), () => text).catch(() => {});
+  };
+
+  const finish = (state, extra = {}) => {
+    if (state === 'answered') {
+      const clean = normalizeDashes(String(extra.answer ?? ''), { enabled: NO_DASHES });
+      const full = btwAnsweredLine({ lane, elapsedSec: elapsed(), answer: clean });
+      // One message if it fits, whether that is an edit to the ⏳ or (when the
+      // ⏳ never got sent) a fresh one. Only a genuinely oversized answer
+      // splits: the line becomes a receipt and the answer arrives on its own,
+      // rather than being truncated into a fragment that reads like all of it.
+      if (escHtml(full).length <= TG_MSG_LIMIT) {
+        put(full);
+        return;
+      }
+      put(btwAnsweredLine({ lane, elapsedSec: elapsed(), answer: clean, spilled: true }));
+      send(clean, { markdown: false }).catch(() => {});
+      return;
+    }
+    put(
+      state === 'stopped'
+        ? btwStoppedLine({ lane })
+        : state === 'lost'
+          ? btwLostLine({ lane })
+          : btwEndedLine({ lane }),
+    );
+  };
+
+  record.resolve = (state, extra = {}) => {
+    if (settled) return;
+    settled = true;
+    if (live) live.done = true;
+    // The ⏳ send is still in flight, so there is nothing to edit and no way to
+    // tell yet whether there ever will be. Remember the ending; the await below
+    // applies it the moment the send comes back. Without this, a worker that
+    // answers in under a second either loses its answer or prints it ABOVE the
+    // ⏳ that is still on its way, which then sits there forever saying waiting.
+    if (!sendDone) {
+      pendingState = { state, extra };
+      return;
+    }
+    finish(state, extra);
+  };
+
+  const m = await send(btwPendingLine({ lane, elapsedSec: 0 }), { markdown: false }).catch(() => null);
+  msgId = m?.message_id ?? null;
+  sendDone = true;
+  record.msgId = msgId;
+  record.mirror?.(); // persist the id, so a restart can still resolve this line
+
+  if (pendingState) {
+    finish(pendingState.state, pendingState.extra);
+    return;
+  }
+  if (settled) return; // resolved with nothing to say (unreachable today, cheap)
+  // NO MESSAGE, NO TICKER. `put` degrades to a fresh send when there is nothing
+  // to edit, which is right for the four ENDINGS (one message, once) and a
+  // disaster for the ticking state: a single failed send would turn a fifteen
+  // minute wait into sixty "⏳ btw · bg2 · Ns" messages, each spending the same
+  // per-chat rate-limit budget the live-message registry exists to protect
+  // (measured against the real builder: 61 sends where the healthy path spends
+  // 1 send and 60 edits). pendingMessage arms its interval on the same
+  // condition, for the same reason. The endings still arrive: `record.resolve`
+  // was installed above and does not need this entry.
+  if (msgId == null) return;
+
+  let lastBody = '';
+  let lastEditAt = Date.now();
+  let saidWaiting = false;
+  live = registerLive({
+    done: false,
+    tick(now) {
+      if (settled) {
+        this.done = true;
+        return;
+      }
+      // FIFTEEN MINUTES IS A SENTENCE, NOT AN ENDING. The listener stays
+      // registered: a worker inside a long tool call is busy, and an answer at
+      // minute 40 still lands on this same message.
+      if (!saidWaiting && now - askedAt >= BTW_TIMEOUT_MS) {
+        saidWaiting = true;
+        lastEditAt = now;
+        put(btwWaitingLine({ lane, elapsedSec: elapsed() }));
+        return;
+      }
+      if (saidWaiting) return; // it has said all it can say until something happens
+      if (now - lastEditAt < BTW_TICK_MS) return;
+      const body = btwPendingLine({ lane, elapsedSec: elapsed() });
+      if (body === lastBody) return;
+      lastBody = body;
+      lastEditAt = now;
+      put(body);
+    },
+  });
+}
+
+/**
+ * Resolve, deliver, ack. The ONE place a side question is delivered, so the
+ * socket and /btw cannot drift into two different behaviours, exactly as
+ * steerInto is for steering.
+ */
+function btwInto(target, question) {
+  const found = resolveSteerTarget(target, bgWorkerDescriptors());
+  if (!found.ok) {
+    const { ok, reason, worker, ...extra } = found;
+    return steerFailure(reason, { ...extra, op: 'btw' });
+  }
+  const w = found.worker;
+  const record = w.run?.btwAsk?.(question, { question });
+  if (!record) {
+    return steerFailure(STEER_REASONS.WRITE_FAILED, { runId: w.runId, lane: w.lane, pid: w.pid, op: 'btw' });
+  }
+  record.mirror = () => w.run?.btwMirror?.();
+  console.log(`[bridge] btw #${record.id} to ${w.lane} (${w.runId}, pid ${w.pid}): ${clip(oneLine(question), 120)}`);
+  // The ⏳ is put up here rather than by the caller, so the socket path gets one
+  // too: `bg.mjs btw` runs in a terminal the answer will never reach, and the
+  // chat is where it is going to land either way.
+  startBtwNotice(record, w.lane).catch((e) => console.error('[bridge] btw notice failed:', e.message));
+  return { ...steerResponse(w, new Date().toISOString(), { op: 'btw' }), btwId: record.id };
+}
+
+/**
+ * Close out every side question the PREVIOUS daemon left pending on one worker.
+ *
+ * Best effort by construction, and it has to be: the message ids belong to a
+ * process that is gone, the edits may 400 on a message Telegram has since
+ * forgotten, and none of that is worth a boot. The record is cleared either way
+ * so the next restart cannot re-announce the same loss.
+ */
+function resolveBtwAfterRestart(id, rec) {
+  const list = Array.isArray(rec?.btwPending) ? rec.btwPending : [];
+  if (!list.length) return;
+  for (const p of list) {
+    const text = btwLostLine({ lane: p?.lane || rec?.lane || '' });
+    if (p?.msgId) editProgress(p.msgId, escHtml(text), () => text).catch(() => {});
+    else send(text, { markdown: false }).catch(() => {});
+  }
+  try {
+    inflight.add(id, { ...rec, btwPending: [] });
+  } catch (e) {
+    console.error('[bridge] could not clear the pending btw record:', e.message);
+  }
+}
+
 function handleSteerRequest(raw) {
   const decoded = decodeLine(raw);
   if (!decoded.ok) return steerFailure(decoded.reason, { detail: decoded.detail });
@@ -2343,6 +2695,7 @@ function handleSteerRequest(raw) {
     const workers = bgWorkerDescriptors().map(publicWorker);
     return { ok: true, workers, table: psTable(workers) };
   }
+  if (req.op === 'btw') return btwInto(req.target, req.text);
   return steerInto(req.target, req.text);
 }
 
@@ -6271,6 +6624,7 @@ const BOT_COMMANDS = [
   { command: 'compact', description: 'Summarize -> fresh chat with summary' },
   { command: 'status', description: 'Live status: chat + every worker, right now' },
   { command: 'steer', description: 'Send one more instruction into a running worker' },
+  { command: 'btw', description: 'Ask a running worker a side question · answer comes back here' },
   { command: 'codex', description: 'Ask OpenAI Codex · review · model · effort · doctor · on|off' },
   { command: 'engine', description: 'Which engine each lane runs on (claude|codex)' },
   { command: 'context', description: 'Context size + 5h/weekly limits left' },
@@ -6302,39 +6656,38 @@ const BOT_COMMANDS = [
 // underscores; the owner types hyphens.
 const COMMAND_NAMES = BOT_COMMANDS.map((c) => c.command.replace(/_/g, '-'));
 
-const HELP = `${BRIDGE_NAME} on ${hostname()}
-
-Send any text: it runs in your Claude Code session (streams progress, replies with the result).
+const HELP = `Every message runs in your Claude Code session, streaming progress.
 
 Commands:
 /new [bg|all] · fresh chat (the old one is archived, not deleted)
-/chats · last 30 chats by name + id · /rename <name> names the current chat
+/chats · last 30 chats by name + id · /rename <name> names this one
 /resume <name|id> · switch back to any archived chat
-/compact · summarize this chat, then start fresh with the summary injected
-/cd <path> · set working directory (see /status for current)
-/model · show model · /model <name> sets it (fable, opus, sonnet, haiku, or full id; "default" resets). On a Codex chat lane it sets the Codex model instead.
+/compact · summarize this chat, then start fresh with the summary
+/cd <path> · set working directory (/status shows it)
+/model · show it · /model <name> sets it (fable, opus, sonnet, haiku or a full id; "default" resets), or the Codex model on a Codex chat lane
 /context · session context size + 5h-block and weekly usage
-/account (or /accounts) · which Claude account is live, plus each one's limit state, AND the Codex (ChatGPT) account with its own 5h + weekly windows, plan, credits and what it has cost · /account <name> swaps · /account capture <name> banks the current login into a slot (one-time setup, once per account)
-/usage · live 5h-block and weekly plan usage for EVERY captured Claude account (which one still has headroom)
-/status · live status: cwd, session, model + what every lane is doing right now · 🖥 Peers: the other Claude/Codex terminals on this machine
-/steer <lane|runId|pid|latest> <instruction> · write one more instruction into a RUNNING background worker (it keeps the context it already built; killing it throws that away). /steer on its own lists what is running.
-/engine [bg] claude|codex · which engine each lane runs on. /engine alone shows both lanes, the config defaults, the Codex model/effort and the sandbox. A "codex:" or "claude:" prefix on any message pins that one message.
-/codex <question> · ask OpenAI Codex (read-only, current cwd, continues this chat's Codex thread, billed separately so it answers even when Claude is walled) · /codex review [<repo>] [vs <branch>] · Codex's own code review over a diff · /codex model [<name>|default] · /codex effort [low|medium|high|xhigh|default] · /codex network on|off · /codex doctor · codex's install/auth/network check · /codex on|off · the automatic fallback: while EVERY Claude account is rate limited, background jobs run on Codex and chat messages get a degraded Codex answer instead of silence (default: on)
+/account (or /accounts) · the live Claude account and every one's limit state, plus the Codex (ChatGPT) account: 5h + weekly windows, plan, credits, cost · /account <name> swaps · capture <name> banks the current login (once per account)
+/usage · live 5h-block and weekly usage for EVERY captured Claude account (who has headroom)
+/status · cwd, session, model + what every lane is doing now · 🖥 Peers: the other Claude/Codex terminals on this machine
+/steer <lane|runId|pid|latest> <instruction> · one more instruction into a RUNNING worker, keeping the context it built (killing it throws it away) · bare /steer lists them
+/btw [target] <question> · ask a RUNNING worker a SIDE question: answered here, its plan untouched · none means latest
+/engine [bg] claude|codex · which engine each lane runs on · bare /engine shows both, the config defaults, the Codex model/effort and sandbox · a "codex:" or "claude:" prefix pins one message
+/codex <question> · ask OpenAI Codex: read-only, in the current cwd, on this chat's thread, billed separately so it answers when Claude is walled · review [<repo>] [vs <branch>] · its own review over a diff · model [<name>|default] · effort [low|medium|high|xhigh|default] · network on|off · doctor (install/auth/network) · on|off · the fallback: while EVERY Claude account is rate limited, bg jobs run on Codex and chat gets a degraded answer, not silence (default: on)
 /stop [bg|all] · kill the running task (chat lane by default)
-/restart · restart the daemon itself (if something feels stuck)
+/restart · restart the daemon (if something feels stuck)
 /logs · last lines of the daemon log
-/remind daily HH:MM <text> · /remind once [date] HH:MM <text> · /remind in 2h <text> · prefix text with "run:" to execute as a Claude task
-/schedules · list scheduled · /unschedule <id> removes one
-/yolo on|off · permission bypass (default: ON, matching how you run CC)
+/remind daily HH:MM <text> · once [date] HH:MM <text> · in 2h <text> · prefix it with "run:" to run it as a Claude task
+/schedules · list them · /unschedule <id> removes one
+/yolo on|off · permission bypass (default: ON, as you run CC)
 /help · this message
 
-Any other /command goes straight to Claude Code, so your custom commands work: /autopilot, /bug, /qa-loop, /plan, /brainstorm, /goal, …
+Custom /commands pass through to Claude Code: /autopilot, /bug, /qa-loop, /plan, /brainstorm, /goal, …
 
-Unlimited background workers: long jobs (/goal, /autopilot, /qa-loop, /bug, /go-live), scheduled tasks and anything prefixed "bg:" each get a 🌙 worker: if one is busy, a new one spawns, so nothing ever queues behind background work and the 🤖 chat lane stays free. Every worker runs a fresh, self-contained session (no history carried between jobs) and gets an hour-scale timeout instead of the chat lane's ${Math.round(TASK_TIMEOUT_MS / 60000)}-minute ceiling.
+Unlimited background workers: long jobs (/goal, /autopilot, /qa-loop, /bug, /go-live), scheduled tasks and anything prefixed "bg:" get a 🌙 worker each, another spawns when all are busy, and nothing queues behind background work, so the 🤖 chat lane stays free. Each is a fresh self-contained session (no history between jobs) with an hour-scale timeout, not the chat lane's ${Math.round(TASK_TIMEOUT_MS / 60000)}-minute ceiling.
 
-Attachments: photos, videos, and files (≤20MB each) are saved to the inbox and handed to Claude, and a caption (or a text sent right after) is the instruction. Voice notes are transcribed (Whisper) and run as prompts, so just talk. Messages sent while a task runs are steered INTO the running task, like typing mid-task in Claude Code (it folds them into the current work, or answers them right after); anything that can't be steered queues (max 5). /stop kills the task and discards the queue. Default model: ${DEFAULT_MODEL || 'CLI default'} (effort ${DEFAULT_EFFORT || 'CLI default'}).
+Attachments: photos, videos and files (≤20MB each) land in the inbox and go to Claude; a caption (or a text right after) is the instruction. Voice notes are transcribed (Whisper) and run as prompts. A message sent mid-task is steered INTO the run, as in Claude Code: folded in, or answered right after. What cannot be steered queues (max 5); /stop kills the task and drops the queue. Model: ${DEFAULT_MODEL || 'CLI default'} (effort ${DEFAULT_EFFORT || 'CLI default'}).
 
-Notes: one chat-lane task at a time (background workers unlimited) · messages older than ${Math.round(STALE_SEC / 60)} min are skipped · only works while this machine is awake.`;
+Notes: one chat-lane task at a time (workers unlimited) · messages older than ${Math.round(STALE_SEC / 60)} min are skipped · only while this machine is awake.`;
 
 function expandPath(p) {
   if (p === '~') return HOME;
@@ -6736,6 +7089,36 @@ async function handleCommand(text, msg = null) {
       // the run id, the pid and the UTC second, which are exactly what you
       // compare against a run log.
       await send(steerAckLine(res, { verbose: false, timeZone: OWNER_TZ }), { markdown: false });
+      return;
+    }
+    case '/btw': {
+      // The phone-sized half of `bg.mjs btw`. Same resolver, same delivery, and
+      // the ack is a ⏳ that edits itself into the answer, so there is nothing
+      // to send here on the happy path: btwInto puts the line up.
+      const a = arg.trim();
+      const usage = () => send(btwUsage(bgWorkerDescriptors().map(steerWorkerBlockArgs)), { markdown: false });
+      if (!a) {
+        await usage();
+        return;
+      }
+      // A LEADING TARGET IS OPTIONAL HERE AND MANDATORY IN THE CLI, on purpose.
+      // Somebody typing on a phone mid-conversation writes "which repo are you
+      // in", which is a question, not a worker called "which". So a first token
+      // that is not target-SHAPED is read as the start of the question and it
+      // goes to `latest`, which with one worker running is always the right one.
+      // The CLI refuses instead: a scripted caller that named no target has not
+      // decided which worker it meant, and a side question answered by the
+      // wrong job reads exactly like an answer from the right one.
+      const first = a.split(/\s+/)[0];
+      const targeted = looksLikeTarget(first);
+      const target = targeted ? first : 'latest';
+      const question = targeted ? a.slice(a.indexOf(first) + first.length).trim() : a;
+      if (!question) {
+        await usage();
+        return;
+      }
+      const res = btwInto(target, question);
+      if (!res.ok) await send(steerAckLine(res, { verbose: false, timeZone: OWNER_TZ }), { markdown: false });
       return;
     }
     case '/codex': {
@@ -8176,6 +8559,12 @@ async function main() {
   // reports, and what was steered into it belongs in that report.
   for (const [id, rec] of Object.entries(inflight.read())) {
     if (rec?.steers?.length) steersBeforeRestart.set(id, rec.steers);
+    // A ⏳ from the PREVIOUS daemon has no listener any more: the stream reader
+    // that would have caught the answer died with that process, and the worker
+    // itself may well have answered into a log nobody is watching. Resolving it
+    // here is what stops a restart leaving a question ticking on the phone
+    // forever, which is rule 8's whole point.
+    resolveBtwAfterRestart(id, rec);
     if (rec?.engine === 'codex') adoptCodexSurvivor(id, rec);
   }
   const survivors = reattachLiveWorkers();

@@ -36,8 +36,16 @@ import {
   helpMessage,
   HELP_GROUPS,
   HELP_BODY_MAX,
+  HELP_COMPOSED_MAX,
   workerStatusBlock,
   steerUsage,
+  btwUsage,
+  btwPendingLine,
+  btwAnsweredLine,
+  btwEndedLine,
+  btwStoppedLine,
+  btwLostLine,
+  btwWaitingLine,
   queueAck,
   queueStarted,
   queueDropped,
@@ -427,14 +435,46 @@ t('help: an oversized reference loses its tail VISIBLY, not the whole message', 
   ok(h.body.endsWith('… the rest is in README.md'), 'a silent truncation reads as "that was all of it"');
 });
 
-t('help: the real HELP reference still fits in one Telegram message', () => {
+// How much room the composed /help must have left over. Not a style rule: the
+// message is composed from a reference that grows every time a command lands,
+// and a budget met EXACTLY is one line away from silently amputating its own
+// tail. 40 characters is about one short sentence of warning.
+const HELP_HEADROOM_MIN = 40;
+
+const composedHelp = (raw) => {
+  // escape: escHtml, because the budget is on what actually GOES OUT. Measuring
+  // the raw literal understates it (every < > & expands), which is how a /help
+  // that "fit" arrived with its last paragraph missing.
+  const h = helpMessage({ name: 'Leash', host: 'dev-box', reference: raw, escape: escHtml });
+  return { h, composed: escHtml(h.visible).length + escHtml(h.body).length + 37 };
+};
+
+t('help: ★ the real HELP reference reaches the phone WHOLE, not just legally', () => {
   const raw = /^const HELP = `([\s\S]*?)`;$/m.exec(BRIDGE_SRC)?.[1] ?? '';
   ok(raw.length > 2000, 'the reference itself went missing');
   // The interpolations resolve to values SHORTER than their source, so the
   // literal is the worst case.
-  const h = helpMessage({ name: 'Leash', host: 'dev-box', reference: raw });
-  const composed = escHtml(h.visible).length + escHtml(h.body).length + '\n<blockquote expandable></blockquote>'.length;
-  ok(composed <= 4096, `${composed} chars, over Telegram's cap: /help would fail to send`);
+  const { h, composed } = composedHelp(raw);
+  ok(composed <= HELP_COMPOSED_MAX, `${composed} chars, over the ${HELP_COMPOSED_MAX} budget`);
+  // AND it arrives whole. The composed check above passes just as happily when
+  // the body has been CUT, because cutting it is what brings the length down:
+  // the reference was silently over HELP_BODY_MAX and the tail (the attachments
+  // paragraph and the notes line) never reached the phone at all, while every
+  // gate stayed green.
+  ok(!h.body.includes('… the rest is in README.md'), `the reference is ${raw.length} chars and is being truncated`);
+  ok(h.body.includes('Notes: one chat-lane task at a time'), '★ the LAST line of the reference survived');
+});
+
+t('help: ★ /btw is discoverable in BOTH halves, and the message still has room', () => {
+  // The index is what gets scanned; the reference is what gets read once. A
+  // command in neither is a command that does not exist, and the composed
+  // budget is the reason a new line has to be PAID FOR rather than appended.
+  const raw = /^const HELP = `([\s\S]*?)`;$/m.exec(BRIDGE_SRC)?.[1] ?? '';
+  ok(HELP_GROUPS.some((g) => g.commands.includes('/btw')), 'the index');
+  ok(/\/btw \[target\] <question>/.test(raw), 'the reference');
+  const { composed } = composedHelp(raw);
+  const headroom = HELP_COMPOSED_MAX - composed;
+  ok(headroom >= HELP_HEADROOM_MIN, `${headroom} chars of headroom, under the ${HELP_HEADROOM_MIN} this needs`);
 });
 
 // ---------------------------------------------------------------------------
@@ -505,6 +545,149 @@ t('steer usage: no workers is a sentence, not an empty table', () => {
 t('steer usage: nothing in it is a fixed-width column', () => {
   const s = steerUsage([W, { ...W, lane: 'bg3' }]);
   ok(!/ {4,}/.test(s.replace(/^ {3}/gm, '')), 'padEnd alignment does not survive a proportional font');
+});
+
+// ---------------------------------------------------------------------------
+// /btw: one message, five states, and every pending line has an ending some
+// builder here produces. This is rule 8 applied to a side question, and the
+// reason it gets its own block is that a btw has MORE endings than anything
+// else in this file: the worker can answer, the run can end, it can be
+// stopped, the daemon can restart under it, and it can simply take a very
+// long time.
+// ---------------------------------------------------------------------------
+
+t('btw usage: what it is, and what it explicitly is not', () => {
+  eq(
+    btwUsage([W]),
+    'Usage: /btw <lane|latest> <question>\nA side question · it changes nothing.\nThe answer comes back here.\n\n🌙 bg2 · 🟢 running 18m · 214 steps\n   "Fix the engine-switch message"\n   ↳ 💻 Bash npm test\n   steerable',
+  );
+  ok(btwUsage([]).includes('⚪ No background workers running.'));
+  ok(btwUsage().includes('⚪ No background workers running.'), 'and undefined does not throw');
+});
+
+t('btw: the pending line says asked, not started', () => {
+  eq(btwPendingLine({ lane: 'bg2' }), '⏳ btw · bg2\nAsked · waiting for the answer');
+  eq(btwPendingLine({ lane: 'bg2', elapsedSec: 252 }), '⏳ btw · bg2 · 4m 12s\nAsked · waiting for the answer');
+});
+
+t('btw: the answer arrives under a receipt naming the worker and the wait', () => {
+  eq(btwAnsweredLine({ lane: 'bg2', elapsedSec: 41, answer: 'delta-agents, on main' }), '✅ btw · bg2 · 41s\ndelta-agents, on main');
+});
+
+t('btw: a multi-line answer is passed through whole, never clipped', () => {
+  const answer = 'three things\nthe migration applied\nthe worker is on step 41\nand the suite is green';
+  ok(btwAnsweredLine({ lane: 'bg', elapsedSec: 1, answer }).endsWith(answer), 'the one thing the message exists to deliver');
+});
+
+t('btw: an answer too big for one message says where it went', () => {
+  const s = btwAnsweredLine({ lane: 'bg', elapsedSec: 5, answer: 'QQQQ'.repeat(2250), spilled: true });
+  eq(s, '✅ btw · bg · 5s\nThe answer is in the next message.');
+  ok(!s.includes('QQQQ'), '★ a ✅ with a truncated fragment under it reads as the whole answer');
+});
+
+t('btw: an empty answer says so rather than showing a bare tick', () => {
+  eq(btwAnsweredLine({ lane: 'bg', elapsedSec: 2, answer: '   ' }), '✅ btw · bg · 2s\n(the worker answered with nothing)');
+});
+
+t('btw: ★ the run ending is not silence, and it points at the report', () => {
+  eq(btwEndedLine({ lane: 'bg2' }), '❌ btw · bg2 · no answer\nThe worker ended without answering.\nIts report may still carry it.');
+});
+
+t('btw: ★ a deliberate /stop is a stop glyph, not a failure', () => {
+  const s = btwStoppedLine({ lane: 'bg2' });
+  ok(s.startsWith('🛑'), `reading your own stop as "something went wrong" is the one outcome that must not surprise: ${s}`);
+  eq(s, '🛑 btw · bg2 · stopped\nThe worker was stopped before it answered.');
+});
+
+t('btw: ★ a daemon restart resolves what it can no longer hear', () => {
+  eq(
+    btwLostLine({ lane: 'bg2' }),
+    '❌ btw · bg2 · answer lost\nThe daemon restarted while it waited.\nThat worker cannot be asked again;\nits report may still carry it.',
+  );
+  // ★ NOT "ask again once it is back". A worker that survived the restart is
+  // re-attached by its log with no pipe to its stdin, so /btw at it is refused
+  // for the rest of its life: telling him to retry would be a line that lies.
+  ok(!/[Aa]sk again once/.test(btwLostLine({ lane: 'bg2' })), 'never name a retry the next command refuses');
+});
+
+t('btw: ★ fifteen minutes is a sentence, not an ending', () => {
+  const s = btwWaitingLine({ lane: 'bg2', elapsedSec: 900 });
+  ok(s.includes('15m, no answer yet'), s);
+  ok(/may still answer/.test(s), 'the listener stays on, so the text must not read as a giving up');
+  ok(/report will carry it/.test(s), 'and the fallback is named');
+  ok(btwWaitingLine({ lane: 'bg' }).includes('no answer yet'), 'and it renders with no clock at all');
+});
+
+t('btw: a long lane name is bounded rather than allowed to wrap the head', () => {
+  const s = btwPendingLine({ lane: 'x'.repeat(60) });
+  for (const line of s.split('\n')) ok(line.length <= LINE_MAX, `line of ${line.length}: ${line}`);
+});
+
+t('btw: every state renders with no arguments at all', () => {
+  for (const [name, fn] of [
+    ['btwPendingLine', btwPendingLine],
+    ['btwAnsweredLine', btwAnsweredLine],
+    ['btwEndedLine', btwEndedLine],
+    ['btwStoppedLine', btwStoppedLine],
+    ['btwLostLine', btwLostLine],
+    ['btwWaitingLine', btwWaitingLine],
+  ]) {
+    ok(fn().includes('btw'), `${name} must degrade rather than throw`);
+    ok(fn().includes('the worker'), `${name}: an unnamed lane still needs a subject`);
+  }
+});
+
+t('btw: ★ every pending state here has a terminal glyph another builder produces', () => {
+  // Rule 8, mechanically. The pending line is the only ⏳, and each of the four
+  // endings is a different builder, so a state that lost its path would show up
+  // here as a glyph nothing produces.
+  ok(btwPendingLine({ lane: 'bg' }).startsWith('⏳'), 'the wait glyph');
+  const endings = [btwAnsweredLine({ lane: 'bg', answer: 'y' }), btwEndedLine({ lane: 'bg' }), btwStoppedLine({ lane: 'bg' }), btwLostLine({ lane: 'bg' })];
+  eq(new Set(endings.map((s) => s.slice(0, 2).trim())).size, 3, 'answered ✅, stopped 🛑, and ❌ for the two losses');
+  for (const s of endings) ok(!s.startsWith('⏳'), `an ending that is still a wait is not an ending: ${s}`);
+});
+
+t('btw: ★ every shape passes the house-style gates', () => {
+  // The ANSWER is the worker's own string and is exempt for the same reason a
+  // path and a quoted brief title are: it is not the daemon's prose, and the
+  // send path already splits it at Telegram's limit. Everything this file
+  // AUTHORS is gated, which is what the frame-only pass below proves.
+  const answer = 'delta-agents, on main, and the migration applied at 17:04 with 41 rows written';
+  const exempt = (line) => answer.includes(line);
+  for (const [where, s] of [
+    ['btwUsage', btwUsage([W])],
+    ['btwUsage/empty', btwUsage([])],
+    ['btwPendingLine', btwPendingLine({ lane: 'bg2', elapsedSec: 252 })],
+    ['btwPendingLine/fresh', btwPendingLine({ lane: 'bg2' })],
+    ['btwAnsweredLine', btwAnsweredLine({ lane: 'bg2', elapsedSec: 41, answer: 'yes' })],
+    ['btwAnsweredLine/long', btwAnsweredLine({ lane: 'bg2', elapsedSec: 41, answer })],
+    ['btwAnsweredLine/spilled', btwAnsweredLine({ lane: 'bg2', elapsedSec: 41, answer, spilled: true })],
+    ['btwAnsweredLine/empty', btwAnsweredLine({ lane: 'bg2', elapsedSec: 41 })],
+    ['btwEndedLine', btwEndedLine({ lane: 'bg2' })],
+    ['btwStoppedLine', btwStoppedLine({ lane: 'bg2' })],
+    ['btwLostLine', btwLostLine({ lane: 'bg2' })],
+    ['btwWaitingLine', btwWaitingLine({ lane: 'bg2', elapsedSec: 900 })],
+    ['btwWaitingLine/noclock', btwWaitingLine({ lane: 'bg2' })],
+  ]) {
+    houseStyle(s, where, { exempt });
+  }
+});
+
+t('btw: ★ the FRAME alone, with no worker text in it, passes unexempted', () => {
+  // The gate above waives the answer line. This one proves the waiver is not
+  // load bearing: with a one-word answer, every line of every state is the
+  // daemon's own prose and all three gates apply with no exemption at all.
+  for (const [where, s] of [
+    ['btwPendingLine', btwPendingLine({ lane: 'bg2', elapsedSec: 252 })],
+    ['btwAnsweredLine', btwAnsweredLine({ lane: 'bg2', elapsedSec: 41, answer: 'ok' })],
+    ['btwAnsweredLine/spilled', btwAnsweredLine({ lane: 'bg2', elapsedSec: 41, answer: 'ok', spilled: true })],
+    ['btwEndedLine', btwEndedLine({ lane: 'bg2' })],
+    ['btwStoppedLine', btwStoppedLine({ lane: 'bg2' })],
+    ['btwLostLine', btwLostLine({ lane: 'bg2' })],
+    ['btwWaitingLine', btwWaitingLine({ lane: 'bg2', elapsedSec: 900 })],
+  ]) {
+    houseStyle(s, where);
+  }
 });
 
 // ---------------------------------------------------------------------------
