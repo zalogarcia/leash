@@ -95,6 +95,9 @@ code {
 .split > *,
 .faq > *,
 .chat-body > *,
+.strip > *,
+.replays > *,
+.tl li > *,
 .cta > *,
 .foot-in > * {
   min-width: 0;
@@ -710,6 +713,126 @@ main[id] {
   font-size: 13px;
   background: var(--ink-2);
   color: var(--grey);
+}
+
+/* ── the rounds ────────────────────────────────────────────────────── */
+/* One stat strip, four replayed exchanges in the page's own chat styling,
+   and one day as a timeline. No card grid here: the section shows a loop. */
+.strip {
+  list-style: none;
+  margin: 0 0 40px;
+  padding: 20px 0 22px;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 20px 10px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  text-align: center;
+}
+@media (min-width: 720px) {
+  .strip {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+.strip-n {
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: clamp(28px, 5.4vw, 40px);
+  line-height: 1;
+  letter-spacing: -0.035em;
+  color: var(--orange);
+  margin: 0 0 8px;
+}
+.strip-k {
+  margin: 0;
+  color: var(--grey);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.replays {
+  display: grid;
+  gap: 30px;
+  align-items: start;
+}
+@media (min-width: 940px) {
+  .replays {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 34px 22px;
+  }
+}
+/* The eyebrow's ::after rule already draws the trailing line, so the replay
+   label only needs to be smaller and tighter than a section eyebrow. */
+.eyebrow-sm {
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  margin-bottom: 12px;
+}
+.replay .chat {
+  max-width: none;
+}
+.replay .chat-body {
+  padding: 16px;
+  gap: 10px;
+}
+.replay .bub {
+  max-width: 92%;
+  font-size: 14.5px;
+}
+.replay .bub-progress {
+  /* `.replay .bub` above is (0,2,0) and beats `.bub-progress` at (0,1,0), which
+     silently scaled the mono progress lines up and clipped them on a phone.
+     Both properties have to be re-declared at the same weight, not one. */
+  max-width: 100%;
+  font-size: 12.5px;
+}
+.replay-note {
+  margin: 12px 0 0;
+  color: var(--grey);
+  font-size: 13.5px;
+}
+
+.oneday {
+  margin-top: 46px;
+}
+.tl {
+  list-style: none;
+  margin: 0;
+  padding: 2px 0 2px 20px;
+  border-left: 1px solid var(--line-2);
+  display: grid;
+}
+.tl li {
+  position: relative;
+  display: flex;
+  gap: 14px;
+  padding: 5px 0;
+}
+.tl li::before {
+  content: "";
+  position: absolute;
+  left: -24px;
+  top: 12px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ink);
+  border: 1px solid var(--orange);
+}
+.tl-t {
+  flex: none;
+  width: 48px;
+  padding-top: 1px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--orange);
+}
+.tl-d {
+  color: var(--grey);
+  font-size: 14.5px;
 }
 
 /* ── flow ──────────────────────────────────────────────────────────── */

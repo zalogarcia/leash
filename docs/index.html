@@ -279,10 +279,128 @@
   </div>
 </section>
 
+<!-- ══ THE ROUNDS ════════════════════════════════════════════════════ -->
+<section class="band" id="rounds">
+  <div class="wrap">
+    <p class="eyebrow"><span class="tag">06</span> THE ROUNDS</p>
+    <h2 class="h2">Thirty one days. <span class="hl">Four of them, replayed.</span></h2>
+    <p class="sub">Not a feature list. This is one month of one person&rsquo;s real traffic through the bridge, 2026-08-09 to 2026-09-08, counted off the machine that ran it. The four exchanges below actually happened. They are paraphrased and every name in them has been taken out.</p>
+
+    <ul class="strip" role="list">
+      <li>
+        <p class="strip-n">1,973</p>
+        <p class="strip-k">prompts from the phone</p>
+      </li>
+      <li>
+        <p class="strip-n">217</p>
+        <p class="strip-k">spoken, not typed</p>
+      </li>
+      <li>
+        <p class="strip-n">228</p>
+        <p class="strip-k">screenshots and photos in</p>
+      </li>
+      <li>
+        <p class="strip-n">614</p>
+        <p class="strip-k">jobs handed to a worker</p>
+      </li>
+    </ul>
+
+    <div class="replays">
+
+      <article class="replay">
+        <p class="eyebrow eyebrow-sm">Round one &middot; spoken, then shipped</p>
+        <div class="chat" role="img" aria-label="A Telegram conversation. A voice note says to ship the pacing branch and live check it in production. The bot echoes the transcription, replies that it pushed and that a worker has the live check, then reports that the check passed on production with the reply arriving in four bubbles, gaps of four to ten seconds and no console errors, plus one older defect worth a look.">
+          <div class="chat-body">
+            <div class="bub bub-out">&#127897;&#65039; Voice message</div>
+            <div class="bub bub-in">&#127897;&#65039; &ldquo;ship the pacing branch, and do a live check once it is in production&rdquo;</div>
+            <div class="bub bub-in">Pushed, and production is green. The live check goes to a worker: it opens the real page, asks a question, and measures what comes back.</div>
+            <div class="bub bub-in bub-progress">
+              <div class="prog-head">&#127769; bg2 &middot; live check</div>
+              <div class="prog-step">&#128187; <span class="k">Bash</span> open the real page<span class="caret" aria-hidden="true"></span></div>
+            </div>
+            <div class="bub bub-in">Live check passed on production. The long answer came back as four bubbles with typing dots between them, gaps of four to ten seconds, zero console errors. One thing worth a look, and it predates today: a few words drop mid sentence.</div>
+          </div>
+        </div>
+        <p class="replay-note">Spoken at 16:27. The proof came back at 16:43.</p>
+      </article>
+
+      <article class="replay">
+        <p class="eyebrow eyebrow-sm">Round two &middot; a screenshot is the bug report</p>
+        <div class="chat" role="img" aria-label="A Telegram conversation. A photo of a dashboard is sent with the complaint that the totals only count the current page. The bot says it is reading the screenshot, works through the code, and replies that the problem was worse than the screenshot showed: all five tiles counted only the rows loaded on the page, they now come from an account wide count, tests 93 of 93 and the build green.">
+          <div class="chat-body">
+            <div class="bub bub-out">&#128247; Photo &middot; the totals only count what is on this page, not the whole account</div>
+            <div class="bub bub-in">Looking at the screenshot first.</div>
+            <div class="bub bub-in bub-progress">
+              <div class="prog-head">&#129302; Thinking&hellip;</div>
+              <div class="prog-step">&#128214; <span class="k">Read</span> the totals code</div>
+              <div class="prog-step">&#128187; <span class="k">Bash</span> npm test</div>
+              <div class="prog-step">&#9999;&#65039; <span class="k">Edit</span> the totals query<span class="caret" aria-hidden="true"></span></div>
+            </div>
+            <div class="bub bub-in">Worse than the screenshot: all five tiles were adding up only the rows loaded on the page, twenty at a time. They now come from an account wide count, walked in pages of a thousand because the database silently caps a query there. Tests 93 of 93, build green, committed.</div>
+          </div>
+        </div>
+        <p class="replay-note">Nine minutes from the photo to a committed fix with the tests green.</p>
+      </article>
+
+      <article class="replay">
+        <p class="eyebrow eyebrow-sm">Round three &middot; correct it, do not kill it</p>
+        <div class="chat" role="img" aria-label="A Telegram conversation. While an ad campaign job is running, a message says the headline has to be the call to action rather than the offer line. The bot steers the running worker, confirms all five ads carry the new headline, takes a second correction to add the other version as an alternative, and confirms both headlines now rotate on every ad with nothing killed or rebuilt.">
+          <div class="chat-body">
+            <div class="bub bub-out">the headline has to be the call to action, not the offer line</div>
+            <div class="bub bub-in">Good call: the page is where they try it, so the headline sells the click. Steering the campaign worker now with your line.</div>
+            <div class="bub bub-in">&#128232; Steered in. All five ads carry the one headline in the call to action slot, trimmed so it does not truncate on a phone.</div>
+            <div class="bub bub-out">add the other version as an alternative too</div>
+            <div class="bub bub-in">Done. Every ad now carries both headlines and they rotate. Same run: nothing killed, nothing rebuilt.</div>
+          </div>
+        </div>
+        <p class="replay-note">Two corrections into a job that was already running, about ninety seconds apart. Typed plainly and relayed in; <code>/steer</code> aims one at a named worker directly.</p>
+      </article>
+
+      <article class="replay">
+        <p class="eyebrow eyebrow-sm">Round four &middot; nobody asked for this one</p>
+        <div class="chat" role="img" aria-label="A Telegram conversation that starts by itself. A scheduled daily sweep reports 36 error lines across seven services and three things worth knowing. The reply asks whether the customers are actually told so they know what to fix, and the bot answers that today only one of the three raised an in app notice, its headline did not say why, the other two raised nothing, and names the first of three fixes.">
+          <div class="chat-body">
+            <div class="bub bub-in bub-progress">
+              <div class="prog-head">&#9200; #25 &middot; daily 08:30</div>
+              <div class="prog-step">&#128269; <span class="k">Grep</span> the last 24 hours</div>
+            </div>
+            <div class="bub bub-in">Last 24 hours: 36 error lines across seven services, three worth knowing. One customer&rsquo;s AI credits ran out, one customer&rsquo;s stored connection no longer decrypts, and eight texts were refused because the contact has do not disturb switched on.</div>
+            <div class="bub bub-out">do the customers actually get told, so they know what to fix?</div>
+            <div class="bub bub-in">Not today. One of the three raised an in app notice and its headline did not say why. The other two raised nothing at all. Three pieces fix that, and the first is putting the cause in the headline.</div>
+          </div>
+        </div>
+        <p class="replay-note">It fires at 08:30 every morning, into the same chat, asked or not.</p>
+      </article>
+
+    </div>
+
+    <div class="oneday">
+      <p class="eyebrow eyebrow-sm">One day, in order &middot; 2026-09-04</p>
+      <ol class="tl" role="list">
+        <li><span class="tl-t">03:00</span><span class="tl-d">two scheduled jobs run while the house sleeps</span></li>
+        <li><span class="tl-t">08:20</span><span class="tl-d">a voice note, a question about the tool itself</span></li>
+        <li><span class="tl-t">08:30</span><span class="tl-d">the daily production sweep fires on its own</span></li>
+        <li><span class="tl-t">08:52</span><span class="tl-d">two typed words, and a worker takes it</span></li>
+        <li><span class="tl-t">10:04</span><span class="tl-d">a screenshot: this message is a wall of text</span></li>
+        <li><span class="tl-t">11:11</span><span class="tl-d">a voice note asks for a launch video</span></li>
+        <li><span class="tl-t">11:35</span><span class="tl-d">a second voice note steers it, one minute in</span></li>
+        <li><span class="tl-t">11:42</span><span class="tl-d">a worker hits a usage limit, the account rotates</span></li>
+        <li><span class="tl-t">12:48</span><span class="tl-d">the recut video reports back with its numbers</span></li>
+        <li><span class="tl-t">15:17</span><span class="tl-d">a screenshot: why did it not rotate by itself</span></li>
+        <li><span class="tl-t">16:27</span><span class="tl-d">a voice note ships a branch, orders a live check</span></li>
+        <li><span class="tl-t">16:43</span><span class="tl-d">the live check reports back green from production</span></li>
+      </ol>
+      <p class="replay-note">Twelve moments from a day that carried eighty three messages. Local time, one person, one phone.</p>
+    </div>
+
+    <p class="caption">Counted off the bridge&rsquo;s own files, not from memory: the transcript each lane writes, the inbox every attachment lands in, and the live schedule. The four replays and the day above come out of those same transcripts.</p>
+  </div>
+</section>
+
 <!-- ══ INSTALL ═══════════════════════════════════════════════════════ -->
 <section class="band" id="install">
   <div class="wrap">
-    <p class="eyebrow"><span class="tag">06</span> SETUP</p>
+    <p class="eyebrow"><span class="tag">07</span> SETUP</p>
     <h2 class="h2">Three commands, <span class="hl">then talk to it</span>.</h2>
     <p class="sub">Requirements: Claude Code, Node 18 or newer, macOS with launchd or Linux with systemd, and a Telegram account.</p>
 
@@ -334,7 +452,7 @@ cd ~/leash</code></pre>
 <!-- ══ FAQ ═══════════════════════════════════════════════════════════ -->
 <section class="band" id="faq">
   <div class="wrap">
-    <p class="eyebrow"><span class="tag">07</span> QUESTIONS</p>
+    <p class="eyebrow"><span class="tag">08</span> QUESTIONS</p>
     <h2 class="h2">The ones <span class="hl">worth asking</span>.</h2>
 
     <div class="faq">
