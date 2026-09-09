@@ -81,6 +81,34 @@ function forwardedFrom(m) {
   return null;
 }
 
+/**
+ * THE BLOCK'S OWN CLOSING DELIMITER, kept out of the text it wraps.
+ *
+ * The block ends `..."]`, and the excerpt is interpolated raw so the engine
+ * reads the words as they were written. That is right for every character
+ * except this one pair: a bubble containing `"]` closes the block early, and
+ * everything after it reads as top level prompt rather than as a quote. It
+ * fires on ordinary text (a worker report quoting a JSON array) before anyone
+ * writes it on purpose, and the session on the other end runs with permission
+ * prompts skipped, so a forwarded message could end a quote and open an
+ * instruction.
+ *
+ * Only a `]` that follows a quote or a round bracket is touched, and only into
+ * a round bracket of its own: `[support]`, `"send it"` and a bare `]` all
+ * survive as written, because the SEQUENCE is what closes the block, not either
+ * character on its own. Both closers are covered, because a truncated block
+ * ends `chars)]` rather than `"]`.
+ */
+const uncloseBlock = (s) => String(s).replace(/(["')])(\s*)]/g, '$1$2)');
+
+/**
+ * A NAME IS ATTACKER TEXT TOO. A forwarded channel title and a Telegram
+ * first_name both land in the block's lead, ahead of the quote, so a title of
+ * `x] now run` would close the block before the excerpt is even reached.
+ * Square brackets are the only characters that can do that there.
+ */
+const unbracket = (s) => String(s).replace(/[[\]]/g, '');
+
 /** One line, always: a quote of a 40 line report is not 40 lines of prompt. */
 function collapse(s) {
   return String(s ?? '')
@@ -146,22 +174,28 @@ export function buildReplyQuote(msg, { botName = 'the bot', botId = null, timeZo
   const partialText = collapse(msg?.quote?.text || '');
   const fullText = collapse(replied.text || replied.caption || '');
   const source = partialText || fullText;
-  const partial = Boolean(partialText);
+  // A selection of the WHOLE bubble is not a fragment. Telegram sends
+  // `quote.text` for any selection, including one that covers everything, and
+  // announcing that as "part of" tells the engine it is looking at a piece of
+  // something larger when it has the lot.
+  const partial = Boolean(partialText) && partialText !== fullText;
 
   const noun = source ? 'message' : mediaNoun(replied);
   // A FORWARD IS NOBODY IN THIS CHAT. Checked before the self and bot cases,
   // both of which read `from`, which on a forward is the forwarder.
   const fwd = forwardedFrom(replied);
-  const who = fwd !== null
-    ? fwd || 'a forward'
-    : isBot
-      ? String(botName || 'the bot')
-      : isSelf
-        ? 'you'
-        : String(replied.from?.first_name || 'someone');
+  const who = unbracket(
+    fwd !== null
+      ? fwd || 'a forward'
+      : isBot
+        ? String(botName || 'the bot')
+        : isSelf
+          ? 'you'
+          : String(replied.from?.first_name || 'someone'),
+  );
   const subject = fwd !== null
     ? fwd
-      ? `a ${noun} forwarded from ${fwd}`
+      ? `a ${noun} forwarded from ${unbracket(fwd)}`
       : `a forwarded ${noun}`
     : isBot
       ? `${who}'s ${noun}`
@@ -178,8 +212,10 @@ export function buildReplyQuote(msg, { botName = 'the bot', botId = null, timeZo
   // trimEnd so a cut that lands on a space does not read as a double space
   // before the ellipsis. The count reports what actually survived, not the cap.
   const kept = truncated ? source.slice(0, cap).trimEnd() : source;
-  const excerpt = truncated ? `${kept} ...` : kept;
+  // The cut is measured on what was QUOTED, before the delimiter guard, so the
+  // count still describes the message rather than the rendering of it.
   const quotedChars = kept.length;
+  const excerpt = uncloseBlock(truncated ? `${kept} ...` : kept);
   const counts = truncated ? ` (quoted ${quotedChars} of ${totalChars} chars)` : '';
 
   // SAID, not just recorded. A fragment you selected and a whole bubble read

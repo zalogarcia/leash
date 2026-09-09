@@ -414,6 +414,56 @@ t('secret: a key on the line above the spinner is replaced, not clipped', () => 
   ok(!/sk-/.test(block), block);
 });
 
+t('secret: the shapes an audit found missing, each one live on this class of machine', () => {
+  // Every one of these reached a rendered detail row before the patterns below
+  // existed: the current Supabase key format (only the older personal-token
+  // prefix was listed), a Google key, and any ALL-CAPS name ending KEY/TOKEN/
+  // SECRET/AUTH whose word was not on the name list.
+  const missed = [
+    '  SUPABASE_KEY -> ' + ['sb_secret_', '9fK2mQx7Lz'].join(''), // gitleaks:allow
+    '  anon: sb_publishable_1a2b3c4d5e6f', // gitleaks:allow
+    '  ' + ['AIza', 'SyD-1234567890abcdefghijklmnopqrstu'].join(''), // gitleaks:allow
+    '  export SEGMIND_KEY=SG_1a2b3c4d5e6f7g8h', // gitleaks:allow
+    '  SERVICE_AUTH=a1b2c3d4e5f6g7h8i9j0', // gitleaks:allow
+  ];
+  for (const l of missed) ok(looksSecret(l), `not caught: ${l}`);
+  for (const l of missed) {
+    const tail = [l, '• Working (5m 12s · esc to interrupt)'].join('\n');
+    eq(parsePaneTail(tail).detail, HIDDEN_DETAIL, `it reached the detail row: ${l}`);
+  }
+});
+
+t('secret: a line that is ALSO chrome is still replaced, not skipped past', () => {
+  // The chrome skip used to run first, so a secret printed on a row the chrome
+  // class recognises was walked past to a clean line above it: the row came out
+  // safe by luck of pattern order rather than by rule.
+  const tail = [
+    '  the clean line above it',
+    '  export OPENAI_API_KEY=sk-proj-9f2ab7d41c8e5006bb · Main [default]', // gitleaks:allow
+    '✻ Cooking… (8s · esc to interrupt)',
+  ].join('\n');
+  const p = parsePaneTail(tail);
+  eq(p.detail, HIDDEN_DETAIL, 'the hunt skipped the secret and reported the line above it');
+  ok(!peersBlock([{ name: 'x', engine: 'claude', working: true, elapsed: 8, detail: p.detail }]).includes('sk-'));
+});
+
+t('block: a session whose pane was never read says so, rather than claiming idle', () => {
+  // Past PEER_CAPTURE_MAX the pane is not captured at all, and the fallback row
+  // used to be indistinguishable from a genuinely idle shell. "idle" over a
+  // session that may be mid-turn is the bug this block exists to fix, smaller.
+  const s = peersBlock([
+    { name: 'read-one', engine: 'codex', working: true, elapsed: 30, detail: 'a real line', read: true },
+    { name: 'never-read', engine: 'terminal', working: false, elapsed: null, detail: null, read: false },
+  ]);
+  ok(s.includes('🖥 never-read · not read'), s);
+  ok(!s.includes('never-read · idle'), s);
+  ok(s.includes('🖥 read-one · working 30s · Codex'), 'a captured row is unchanged');
+  houseStyle(s, 'peersBlock unread');
+  // A row with no `read` field at all keeps the old shape, so nothing that
+  // builds rows by hand changes meaning.
+  eq(peersBlock([{ name: 'y', engine: 'claude', working: false }]), '🖥 y · idle · Claude');
+});
+
 // ---------------------------------------------------------------------------
 // parseDuration
 // ---------------------------------------------------------------------------
@@ -553,6 +603,12 @@ at('read: past PEER_CAPTURE_MAX a session is listed unread rather than read', as
   const rows = await readPeers({ bin: 'tmux', run });
   eq(rows.length, names.length, 'every session is still listed');
   eq(captures, PEER_CAPTURE_MAX, 'the work is bounded, not the list');
+  // And the ones that were not read SAY they were not read. Without the flag
+  // the fallback row is the idle shape, which is a positive claim about a
+  // session nothing looked at.
+  eq(rows.filter((r) => r.read === false).length, 4, JSON.stringify(rows.map((r) => [r.name, r.read])));
+  eq(rows.filter((r) => r.read === true).length, PEER_CAPTURE_MAX);
+  ok(peersBlock(rows, { max: names.length }).includes(`🖥 ${names[names.length - 1]} · not read`));
 });
 
 t('read: the binary is resolved by path, since launchd hands over a short PATH', () => {

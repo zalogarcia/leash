@@ -33,7 +33,7 @@ import { normalizeDashes } from './dash-normalize.mjs';
 /** At most this many peers reach the block. The rest are counted, not listed. */
 export const PEER_MAX = 12;
 
-/** How many panes are worth capturing. Above this a session is listed unread. */
+/** How many panes are worth capturing. Above this a session is listed `not read`. */
 export const PEER_CAPTURE_MAX = 16;
 
 /** Per tmux call. A hung tmux server costs the Peers block, never /status. */
@@ -154,8 +154,15 @@ const SECRET_MARKERS = [
   // OWN bot token out of settings.local.json.
   /(?:token|secret|api[_-]?key|password|passwd|pwd|credential)["']?\s*[:=]\s*["']?\S/i,
   // The VALUE half, for lines that carry a credential with no label.
+  // The NAME half again, for the keys nobody named `token` or `secret`. An
+  // ALL-CAPS name ending KEY, TOKEN, SECRET or AUTH in front of a value is the
+  // shape a `.env` grep and a shell export both have, and the list above misses
+  // every one of them whose word is not on it (`SEGMIND_KEY=`, `STRIPE_SK=`).
+  /[A-Z0-9_]*(?:KEY|TOKEN|SECRET|AUTH)\s*[:=]\s*\S{8,}/,
   /\bsk-[A-Za-z0-9_-]{6,}/, // OpenAI
-  /\bsbp_[A-Za-z0-9_-]{6,}/, // Supabase
+  /\bsbp_[A-Za-z0-9_-]{6,}/, // Supabase personal token
+  /\bsb_(?:secret|publishable)_[A-Za-z0-9_-]{6,}/, // Supabase project keys, the current format
+  /\bAIza[0-9A-Za-z_-]{20,}/, // Google
   /\b\d{8,10}:[A-Za-z0-9_-]{30,}/, // Telegram bot
   /\b(?:ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}/, // GitHub
   /\bxox[abpres]-[A-Za-z0-9-]{20,}/, // Slack
@@ -250,11 +257,15 @@ export function parsePaneTail(text) {
   for (let i = at - 1; i >= Math.max(0, at - SCAN_LINES); i--) {
     const line = lines[i];
     if (!line.trim()) continue;
-    if (anyMatch(CHROME_MARKERS, line)) continue;
+    // SECRET FIRST, chrome second. A line can match both (a key printed on a row
+    // the chrome class also recognises), and with the chrome skip in front the
+    // hunt walked PAST it to a clean line above rather than stopping: the row
+    // came out looking safe by luck of pattern order rather than by rule.
     if (looksSecret(line)) {
       detail = HIDDEN_DETAIL;
       break;
     }
+    if (anyMatch(CHROME_MARKERS, line)) continue;
     const text = clip(normalizeDashes(oneLine(line)), DETAIL_MAX);
     // Nothing but punctuation left. A rule drawn out of characters the chrome
     // class does not know about survives normalizeDashes as ", , , ." and is
@@ -370,11 +381,15 @@ export async function readPeers({
   const panes = await Promise.all(
     read.map((s) => tmux(['capture-pane', '-t', `=${s.name}:`, '-p', '-S', `-${tailLines}`], opts)),
   );
-  const parsed = new Map(read.map((s, i) => [s.name, parsePaneTail(panes[i] ?? '')]));
+  const parsed = new Map(read.map((s, i) => [s.name, { ...parsePaneTail(panes[i] ?? ''), read: true }]));
   return byName.map((s) => ({
     name: s.name,
     attached: s.attached,
-    ...(parsed.get(s.name) ?? { engine: 'terminal', working: false, elapsed: null, detail: null }),
+    // `read: false` for a session past the capture cap. Its pane was never
+    // looked at, so it is UNKNOWN rather than idle: rendering the idle shape
+    // over a session that may be mid-turn is a smaller version of the bug this
+    // whole block exists to fix.
+    ...(parsed.get(s.name) ?? { engine: 'terminal', working: false, elapsed: null, detail: null, read: false }),
   }));
 }
 

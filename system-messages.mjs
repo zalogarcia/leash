@@ -652,6 +652,11 @@ export function peersBlock(rows = [], { max = 12, budget = PEERS_BLOCK_MAX, labe
   if (!all.length) return '';
   const label = (e) => (labels && labels[e]) || (e === 'codex' ? 'Codex' : e === 'claude' ? 'Claude' : 'terminal');
   const render = (r) => {
+    // `read: false` means the pane was never captured (past the capture cap), so
+    // there is no state to report and no engine to name. Saying "idle" there
+    // would be a positive claim about a session that might be mid-turn, which
+    // is the shape of the bug this block exists to fix.
+    if (r.read === false) return clip(`🖥 ${clip(oneLine(r.name), 24)} · not read`, PEER_HEAD_MAX);
     const state = r.working
       ? `working${Number.isFinite(r.elapsed) && r.elapsed > 0 ? ` ${fmtElapsed(Math.round(r.elapsed))}` : ''}`
       : 'idle';
