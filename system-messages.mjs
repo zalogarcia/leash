@@ -600,6 +600,87 @@ export function idleLaneLine({ icon = '🌙', lane = 'Background', queued = 0, f
 }
 
 // ---------------------------------------------------------------------------
+// PEERS: the sessions on this machine the daemon did not spawn
+// ---------------------------------------------------------------------------
+//
+// 2026-09-08, from the phone: /status while a Codex session in the tmux session
+// `codex-shell` had been working forty minutes on a job the daemon itself had
+// handed it. /status showed the chat lane and the two background lanes and
+// stopped, so that session did not exist as far as the phone was concerned.
+//
+// Every other block in /status renders something the daemon SPAWNED. This one
+// renders something it merely SHARES A MACHINE WITH, which is why it is last:
+// the lanes are what you can steer, the peers are what you can walk over to.
+//
+//   🖥 codex-shell · working 40m · Codex
+//      ↳ the pricing page, footer navigation
+//   🖥 dashboard · idle · Claude
+//
+// The engine label is on every row including `terminal`, because a row with no
+// engine reads as a row whose engine failed to load. The detail row appears
+// only while a session is working: on an idle one the last line above the
+// prompt is whatever it finished saying, which is history, not state.
+//
+// peers.mjs does the reading and the parsing; this owns only the shape.
+
+/**
+ * The head row's hard ceiling.
+ *
+ * Wider than the 44-character bubble on purpose, and BOUNDED rather than
+ * waived, exactly as the background-worker card's head is: this is one
+ * scannable row carrying a name, a state and an engine, and cutting it at 44
+ * would eat the engine label, which is the half of the row that says what you
+ * are looking at. 58 is the worst case the parts can produce (a 24-character
+ * name, a three-digit-hour elapsed and the longest label), so a real row never
+ * reaches it. Every OTHER line of the block still fits the bubble.
+ */
+export const PEER_HEAD_MAX = 58;
+
+/** The whole block, so twelve peers cannot crowd out the lanes above them. */
+export const PEERS_BLOCK_MAX = 1600;
+
+/**
+ * `[{ name, engine, working, elapsed, detail }]` to the block, '' for none.
+ *
+ * Returning '' rather than a "no peers" line is deliberate and is what makes
+ * the tmux-is-not-installed path free: a machine with no tmux server has no
+ * peers to report, and a line saying so would be noise on every /status for
+ * the rest of the daemon's life.
+ */
+export function peersBlock(rows = [], { max = 12, budget = PEERS_BLOCK_MAX, labels = null } = {}) {
+  const all = Array.isArray(rows) ? rows.filter((r) => r && r.name) : [];
+  if (!all.length) return '';
+  const label = (e) => (labels && labels[e]) || (e === 'codex' ? 'Codex' : e === 'claude' ? 'Claude' : 'terminal');
+  const render = (r) => {
+    const state = r.working
+      ? `working${Number.isFinite(r.elapsed) && r.elapsed > 0 ? ` ${fmtElapsed(Math.round(r.elapsed))}` : ''}`
+      : 'idle';
+    const out = [clip(`🖥 ${clip(oneLine(r.name), 24)} · ${state} · ${label(r.engine)}`, PEER_HEAD_MAX)];
+    // Only while working, and only when there is something to say: a detail row
+    // reading "↳" with nothing after it is a row that costs a line and answers
+    // nothing.
+    if (r.working && r.detail) out.push(`${STATUS_INDENT}↳ ${clip(oneLine(r.detail), 70)}`);
+    return out.join('\n');
+  };
+  const shown = [];
+  let used = 0;
+  for (const r of all.slice(0, Math.max(0, max))) {
+    const block = render(r);
+    // The overflow line has to fit too, or trimming to the budget would be what
+    // pushes the message over it.
+    if (used + block.length + 1 > budget - 24) break;
+    shown.push(block);
+    used += block.length + 1;
+  }
+  if (!shown.length) return '';
+  const hidden = all.length - shown.length;
+  // A silent drop is a lie by omission: this question got asked BECAUSE a
+  // session the owner cared about was missing from this view.
+  if (hidden > 0) shown.push(`🖥 ${hidden} more session${hidden === 1 ? '' : 's'}`);
+  return shown.join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // LIMIT WALLS: a clock that stays true no matter when they read it
 // ---------------------------------------------------------------------------
 //

@@ -75,6 +75,8 @@ SHARED_MODULES=(
 #                                        which here means the machine's own)
 #       reply-quote.mjs     + its test   (comments and fixtures name the owner and
 #                                        the private daemon's own name)
+#       peers.mjs           + its test   (comments and pane fixtures name the
+#                                        owner's own sessions, repos and clients)
 #
 # (b) This repo carries fixes the private one does not, found by the QA pass on
 #     the port (2026-09-04). Listing these would make the gate demand that the

@@ -2,6 +2,58 @@
 
 All notable changes to Leash. Dates are release dates.
 
+## 1.6.0 (2026-09-09)
+
+**Two things the daemon could not see: the message you were pointing at, and the sessions it did
+not spawn.**
+
+### Replying to a message quotes it into the prompt
+
+- Long press any bubble, pick Reply, and a bounded one-line quote of it rides in front of what you
+  typed: the engine reads `[Replying to Leash's message from 16:11: "..."]` above your own words,
+  so "for this, we need to do the support ticket ourselves" arrives with its subject attached
+  instead of as eight words with none. The name in the block is `name` from `config.json`.
+- It works on every inbound path: a new turn, a message steered into a running turn, a `codex:` or
+  `claude:` one shot, a `bg:` job, and a photo or file with a caption. No lookup is involved, so a
+  reply to a bubble from before the last restart behaves like a reply to a fresh one, and
+  Telegram's "quote part of a message" selection wins over the whole bubble when you make one.
+- The quote is DATA, never routing: it is composed after the lane and the engine have been chosen
+  from your own typed words, so a quoted bubble containing `codex:` or `/autopilot` cannot steer
+  anything. It is collapsed to one line, capped at 1,500 characters, and a cut is stated in the
+  block rather than left to be guessed. A forwarded bubble is attributed to whoever wrote it, not
+  to whoever forwarded it.
+- Everything that DESCRIBES a run stays on what you typed: the start notice, the `/status` line and
+  the `bg-results` row keep using your own words, while only the model sees the quote. The ack names
+  the quote, so a message that silently carries a page of someone else's words is impossible.
+
+### `/status` ends with a Peers block
+
+- Every other block in `/status` renders something the daemon spawned, so an interactive Claude Code
+  or Codex session someone opened in a terminal did not appear at all: from the phone, a session
+  working forty minutes on a job the daemon had handed it did not exist. `/status` now closes with
+  one line per terminal-multiplexer session on the machine, saying working or idle, how long, and
+  which engine, with the last thing a working one said underneath.
+- Read only, mechanically: every call goes through a guard that refuses any subcommand outside
+  `list-sessions` and `capture-pane`, and the suite greps the module for the write verbs. Peer
+  sessions belong to whoever is typing in them.
+- Bounded, mechanically: the multiplexer is read only when `/status` renders and never on a poll,
+  each call carries a 3s timeout, the captures run in parallel, and the whole read sits behind a 4s
+  deadline that falls back to no peers. At most 12 sessions are listed and the rest are counted,
+  because a silent drop was the reported bug. The block is omitted entirely when there is no
+  multiplexer server, so a machine without one pays nothing.
+- Pane text is untrusted input on its way into a chat log, so a detail row carrying anything
+  credential-shaped is replaced rather than clipped: the name half (token, secret, key, password
+  before a colon or an equals) and the value half (OpenAI, Supabase, Telegram, GitHub, Slack, AWS
+  and JWT shapes). Engine detection reads the last 24 lines bottom up, so a transcript that merely
+  quotes a spinner or a footer cannot lie about its own session.
+
+### Fixes
+
+- Importing `bridge.mjs` no longer boots a daemon, and only the process that created the steer
+  socket unlinks it, so a second import cannot take the running daemon's socket away.
+- The background worker card shows the engine's model and effort, so a job running on the other
+  engine no longer reads as though it were on the default one.
+
 ## 1.5.0 (2026-09-04)
 
 **Codex stops being a rescue path and becomes a peer engine, and every message the daemon writes

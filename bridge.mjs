@@ -107,6 +107,7 @@ import {
   queueFull,
   statusHeader,
   idleLaneLine,
+  peersBlock,
   newSessionLine,
   attachmentNoun,
   attachmentAck,
@@ -128,6 +129,10 @@ import {
   bothWalledLine,
   enginesBackLine,
 } from './system-messages.mjs';
+// Read only, and shelled out to ONLY from the /status arm below. Never on a
+// poll: a tmux read on every tick would be five subprocesses a second for a
+// block nobody is looking at.
+import { readPeers, sortPeers, PEER_MAX } from './peers.mjs';
 import { buildReplyQuote, composeWithQuote } from './reply-quote.mjs';
 import {
   STEER_RECORD_MAX,
@@ -6311,7 +6316,7 @@ Commands:
 /context · session context size + 5h-block and weekly usage
 /account (or /accounts) · which Claude account is live, plus each one's limit state, AND the Codex (ChatGPT) account with its own 5h + weekly windows, plan, credits and what it has cost · /account <name> swaps · /account capture <name> banks the current login into a slot (one-time setup, once per account)
 /usage · live 5h-block and weekly plan usage for EVERY captured Claude account (which one still has headroom)
-/status · live status: cwd, session, model + what every lane is doing right now
+/status · live status: cwd, session, model + what every lane is doing right now · 🖥 Peers: the other Claude/Codex terminals on this machine
 /steer <lane|runId|pid|latest> <instruction> · write one more instruction into a RUNNING background worker (it keeps the context it already built; killing it throws that away). /steer on its own lists what is running.
 /engine [bg] claude|codex · which engine each lane runs on. /engine alone shows both lanes, the config defaults, the Codex model/effort and the sandbox. A "codex:" or "claude:" prefix on any message pins that one message.
 /codex <question> · ask OpenAI Codex (read-only, current cwd, continues this chat's Codex thread, billed separately so it answers even when Claude is walled) · /codex review [<repo>] [vs <branch>] · Codex's own code review over a diff · /codex model [<name>|default] · /codex effort [low|medium|high|xhigh|default] · /codex network on|off · /codex doctor · codex's install/auth/network check · /codex on|off · the automatic fallback: while EVERY Claude account is rate limited, background jobs run on Codex and chat messages get a degraded Codex answer instead of silence (default: on)
@@ -6670,6 +6675,12 @@ async function handleCommand(text, msg = null) {
       // reply: usageLine() returns null and the line is omitted entirely
       // rather than printing an error into a "what is running right now" view.
       const liveUsage = await withDeadline(accountUsage.activeOnly(), 2_500);
+      // The sessions on this machine the daemon did not spawn. Same deadline
+      // shape as the usage row above and for the same reason: a wedged tmux
+      // server costs this block and nothing else. readPeers already caps each of
+      // its own calls at 3s and runs the captures in parallel, so 4s is one
+      // timeout plus slack rather than a second budget layered on top.
+      const peers = peersBlock(sortPeers((await withDeadline(readPeers(), 4_000, [])) || []), { max: PEER_MAX });
       await send(
         [
           statusHeader({
@@ -6694,6 +6705,12 @@ async function handleCommand(text, msg = null) {
           ...(activeBg.length || reattachedBg.length || codexBg.length
             ? []
             : ['', idleLaneLine({ lane: 'Background', note: 'spawn on demand' })]),
+          // LAST, and blank when there is no tmux server: the lanes are what you
+          // can steer from here, the peers are what you would have to walk over
+          // to. A tmux session sharing a lane's name is still listed here and
+          // never merged into it: they are two different things that happen to
+          // be named after the same repo.
+          ...(peers ? ['', peers] : []),
         ].join('\n'),
         { markdown: false }, // titles, repo names and cwds carry _ and *
       );
