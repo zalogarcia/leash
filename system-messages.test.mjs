@@ -48,6 +48,8 @@ import {
   newSessionLine,
   attachmentNoun,
   attachmentAck,
+  steeredInAck,
+  replyQuoteFrameNote,
   attachmentFrameNote,
   codexSubView,
   tightenAccountView,
@@ -899,6 +901,55 @@ t('attachments: ★ house style', () => {
   for (const k of [['photo', 'photo'], ['photo', 'video', 'file'], ['video', 'video', 'video', 'video', 'video', 'video']]) {
     houseStyle(attachmentAck(k), 'attachmentAck');
     houseStyle(attachmentFrameNote(k), 'attachmentFrameNote');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A reply to a bubble
+// ---------------------------------------------------------------------------
+
+t('reply: the ack is byte for byte the old line when nothing was quoted', () => {
+  eq(steeredInAck({}), '➡️ Sent into the running task.');
+  eq(replyQuoteFrameNote({}), null, 'the bubble stays as it was on a message that is not a reply');
+});
+
+t('reply: the quote is named on its own line, and its text on another', () => {
+  eq(
+    steeredInAck({ who: 'Leash', excerpt: 'Draft ready, not sent' }),
+    '➡️ Sent into the running task.\n↩ Quoting Leash\n"Draft ready, not sent"',
+  );
+  eq(steeredInAck({ who: 'you' }), '➡️ Sent into the running task.\n↩ Quoting you', 'a quote with no words still says whose');
+  eq(replyQuoteFrameNote({ who: 'Leash' }), '↩ quoting Leash');
+});
+
+t('reply: the ack never becomes the quote', () => {
+  const s = steeredInAck({ who: 'Leash', excerpt: 'x'.repeat(4000) });
+  const line = s.split('\n')[2];
+  ok(line.length <= 64, `${line.length} chars`);
+  ok(line.includes('…'), 'the cut is marked');
+});
+
+t('reply: a long name cannot push the line past the bubble', () => {
+  // 64 characters is a legal Telegram first_name, and a forwarded channel title
+  // is longer still. Both land in `who`.
+  const long = 'Bartholomew Fitzgerald-Montgomery the Third of Cambridgeshire';
+  const line = steeredInAck({ who: long }).split('\n')[1];
+  ok(line.length <= 44, `${line.length} chars: ${line}`);
+  ok(line.includes('…'), 'the cut is marked');
+  ok(replyQuoteFrameNote({ who: long }).length <= 44, replyQuoteFrameNote({ who: long }));
+  eq(steeredInAck({ who: 'Leash\nfake line' }).split('\n').length, 2, 'a newline in a name cannot forge a line');
+});
+
+t('reply: ★ house style', () => {
+  for (const a of [
+    {},
+    { who: 'Leash' },
+    { who: 'you', excerpt: 'Draft ready, not sent, from hello@example.com' },
+    { who: 'Bartholomew Fitzgerald-Montgomery the Third of Cambridgeshire', excerpt: 'x · y "z"' },
+    { who: 'a forward', excerpt: '' },
+  ]) {
+    houseStyle(steeredInAck(a), 'steeredInAck');
+    if (replyQuoteFrameNote(a)) houseStyle(replyQuoteFrameNote(a), 'replyQuoteFrameNote');
   }
 });
 

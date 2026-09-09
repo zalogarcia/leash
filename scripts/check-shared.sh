@@ -73,6 +73,8 @@ SHARED_MODULES=(
 #       codex-account.mjs   + its test   (comments; a city in one of them)
 #       bg-codex.mjs        + its test   (comments; a hardcoded default timezone,
 #                                        which here means the machine's own)
+#       reply-quote.mjs     + its test   (comments and fixtures name the owner and
+#                                        the private daemon's own name)
 #
 # (b) This repo carries fixes the private one does not, found by the QA pass on
 #     the port (2026-09-04). Listing these would make the gate demand that the

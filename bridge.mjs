@@ -111,6 +111,8 @@ import {
   attachmentNoun,
   attachmentAck,
   attachmentFrameNote,
+  steeredInAck,
+  replyQuoteFrameNote,
   codexSubView,
   tightenAccountView,
   compactingLine,
@@ -126,6 +128,7 @@ import {
   bothWalledLine,
   enginesBackLine,
 } from './system-messages.mjs';
+import { buildReplyQuote, composeWithQuote } from './reply-quote.mjs';
 import {
   STEER_RECORD_MAX,
   STEER_SOCK_NAME,
@@ -322,6 +325,13 @@ function confObj(key) {
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || fileConfig.botToken || claudeSettingsEnv.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || fileConfig.chatId || claudeSettingsEnv.TELEGRAM_CHAT_ID || '');
+
+// The bot's own numeric id, which is the half of the token in front of the
+// colon. It identifies OUR bubbles when you reply to one, and it is used
+// instead of `from.is_bot` because that flag is also true of any other bot in
+// the chat. Derived, never sent anywhere, and never logged: only the id half is
+// read and the secret half is not touched.
+const BOT_ID = String(TOKEN || '').split(':')[0] || null;
 
 // Only the PROGRAM dies over missing credentials. An import has nothing to
 // authenticate, and a module that calls process.exit() the moment it is loaded
@@ -1219,10 +1229,16 @@ function editWorkerNotice(runId, patch, { keepAlive = false } = {}) {
 function runClaude(
   rawText,
   lane = LANES.main,
-  { prepend = '', kinds = [], images = [], priority = false, retried = false } = {},
+  { prepend = '', kinds = [], images = [], priority = false, retried = false, replyQuote = null } = {},
 ) {
   const st = chatState();
-  const text = prepend ? `${prepend}\n\n${rawText}` : rawText;
+  // THREE STRINGS, not two, once a reply is in play: what you TYPED (rawText),
+  // what you were REPLYING TO (replyQuote.block) and what the engine is handed.
+  // composeWithQuote is the only join there is, and it runs here, well after
+  // the lane and the engine were decided from your own words, so a quoted
+  // bubble can never route anything. See reply-quote.mjs.
+  const quoted = composeWithQuote(replyQuote?.block || '', rawText);
+  const text = prepend ? `${prepend}\n\n${quoted}` : quoted;
   // Claim the busy slot synchronously — before any await — so two messages
   // arriving in one poll batch can't both pass the lane's busy check.
   // prompt = rawText so /status and the bg-result record show the user's own
@@ -1291,7 +1307,7 @@ function runClaude(
           // what it is holding.
           text: `${lane.icon} ${thinkingWord(wordSeed, THINKING_WORDS)}…${
             attachmentFrameNote(kinds) ? ` · ${attachmentFrameNote(kinds)}` : ''
-          }`,
+          }${replyQuoteFrameNote(replyQuote || {}) ? ` · ${replyQuoteFrameNote(replyQuote || {})}` : ''}`,
         });
         progressMsgId = m.message_id;
       } catch (e) {
@@ -1420,7 +1436,13 @@ function runClaude(
     // not a replacement brief — background steers only. A chat-lane message is
     // the owner typing mid-task and must reach the model exactly as written.
     // Callers fall back to the queue when this returns false.
-    run.steer = (t, { frame = false } = {}) => {
+    // `note` is what the BUBBLE says, when that is not the whole of what was
+    // delivered. A reply steers your words with the quoted bubble in front of
+    // them, and a step line reading `📨 steered in: [Replying to Leash's
+    // message from 16:11: "Draft ready, not…` showed a quote of the daemon
+    // instead of the two words actually typed (QA, 2026-09-08). The ack names
+    // the quote; the bubble names the instruction.
+    run.steer = (t, { frame = false, note: shown = null } = {}) => {
       if (!run.canSteer()) return false;
       try {
         child.stdin.write(userMsg(frame ? steerFraming(t) : t));
@@ -1442,7 +1464,7 @@ function runClaude(
           console.error('[bridge] steer not mirrored to the registry:', e.message);
         }
       }
-      const note = { kind: 'text', text: `📨 steered in: ${clip(t.replace(/\s+/g, ' '), 90)}` };
+      const note = { kind: 'text', text: `📨 steered in: ${clip(String(shown ?? t).replace(/\s+/g, ' '), 90)}` };
       progress.push(note);
       // The step counter is TOOL activity; a bg lane has no bubble to render a
       // note into, so counting it there would only inflate what /status shows.
@@ -1730,6 +1752,7 @@ function runClaude(
             prepend,
             priority,
             retried,
+            replyQuote,
           })
         : null;
 
@@ -2896,7 +2919,7 @@ function chatLimitRetryPlan(rot, { priority = false, retried = false, codexTakin
  */
 async function handleChatLimitFailure(detail, ctx = {}) {
   if (!isLimitSignal(detail)) return null;
-  const { text = '', lane = LANES.main, images = [], kinds = [], prepend = '', priority = false, retried = false } = ctx;
+  const { text = '', lane = LANES.main, images = [], kinds = [], prepend = '', priority = false, retried = false, replyQuote = null } = ctx;
   const rot = await rotateOffLimitedAccount(detail).catch((e) => {
     console.error('[bridge] chat account rotation failed:', e.message);
     return null;
@@ -2935,6 +2958,11 @@ async function handleChatLimitFailure(detail, ctx = {}) {
         images,
         kinds,
         prepend: toCodex ? null : prepend,
+        // The quote goes with it on BOTH routes, unlike the handoff block: it
+        // is what the message is about, not context the next turn can pick up
+        // instead, and a retry that loses it asks the question the feature
+        // exists to stop asking.
+        replyQuote,
       });
     },
   };
@@ -4263,7 +4291,7 @@ function deliverCodexDirect(task, outcome, id) {
  * instead of handing the report to a chat lane that cannot run.
  */
 // eslint-disable-next-line max-len -- one line on purpose: bg-codex-wiring.test.mjs extracts this function by source and stops at the first unindented line, which a wrapped signature's `) {` would be.
-function runCodex(rawText, { mode = 'ask', cwd = null, reviewScope = 'uncommitted', reason = null, pausedUntil = null, announce = true, onAnswer = null, threadId = null, images = [], sandbox = null, network = false, onStart = null, trackThread = false, outputSchema = null } = {}) {
+function runCodex(rawText, { mode = 'ask', cwd = null, reviewScope = 'uncommitted', reason = null, pausedUntil = null, announce = true, onAnswer = null, threadId = null, images = [], sandbox = null, network = false, onStart = null, trackThread = false, outputSchema = null, prompt: sendText = null } = {}) {
   // NOT bare Date.now(): drainBgHandoff dispatches a queued batch in one
   // synchronous loop, and two Codex runs in the same millisecond would share an
   // id, a log, a -o file and a report. Claude workers dodge this by lane name;
@@ -4279,7 +4307,14 @@ function runCodex(rawText, { mode = 'ask', cwd = null, reviewScope = 'uncommitte
   // The LANE RULES are facts about a headless Claude worker (the Agent tool, the
   // Bash ceiling, steering). Codex has none of them, so sending them would be a
   // page of wrong instructions, billed per token.
-  const prompt = stripLaneRules(String(rawText || '')).trim();
+  //
+  // `prompt` (the option, `sendText` here) is the SENT text when it differs from
+  // the description: a reply carries the bubble you were pointing at, and
+  // titling the run by that quote made the start notice, /status and the
+  // bg-results row all read as though the daemon had asked the question (QA,
+  // 2026-09-08). Everything that DESCRIBES the run keeps using rawText, which is
+  // what you typed.
+  const prompt = stripLaneRules(String(sendText ?? rawText ?? '')).trim();
   const runCwd = cwd && existsSync(cwd) ? cwd : DEFAULT_CWD;
   try {
     mkdirSync(RUNS_DIR, { recursive: true });
@@ -4596,10 +4631,15 @@ function stopCodexRuns() {
 const PARKED_CODEX_MAX = 10; // bound the note; a wall lasts hours, not days
 const parkedCodexChats = [];
 
-function runCodexChatFallback(text, decision, { images = [] } = {}) {
+function runCodexChatFallback(text, decision, { images = [], prompt = null } = {}) {
   const st = chatState();
   const prefix = codexFallbackPrefix(decision.pausedUntil, { timeZone: OWNER_TZ });
+  // `prompt` is what is SENT (your words behind the bubble you replied to) and
+  // `text` is what you TYPED. The records stay on your own words: a parked
+  // catch-up, a /status line and a bg-results row describing the turn by a
+  // quote of the daemon would read as though the daemon had asked it.
   runCodex(text, {
+    prompt: prompt || text,
     mode: 'ask', // read-only: a degraded answer must not also be a silent edit
     cwd: existsSync(st.cwd) ? st.cwd : DEFAULT_CWD,
     images: (images || []).filter(isCodexImage),
@@ -4967,7 +5007,11 @@ function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = f
   // whether the server is reachable, so a fall-through to here must not write a
   // second copy of the same question into the ring the handoff is built from.
   if (!retriedCold && !alreadyRinged) recordChatTurn({ engine: 'codex', role: 'user', text: rawText });
-  const started = runCodex(prompt || rawText, {
+  // Same split as the other two Codex entry points: rawText DESCRIBES the turn
+  // (it is what /status shows) and `prompt` is the only thing sent, which on a
+  // reply or a lane handoff is your words behind a block of context.
+  const started = runCodex(rawText, {
+    prompt: prompt || rawText,
     mode: 'chat',
     cwd,
     threadId: st.codexThreadId || null,
@@ -5436,14 +5480,16 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
     Boolean(threadId) &&
     Boolean(codexAppServerClient?.alive) &&
     (st[genKey] || 0) === startGen;
-  run.steer = (text) => {
+  // `note` for the same reason as the Claude lane's steer: a reply delivers the
+  // quoted bubble in front of your words, and the step line is for your words.
+  run.steer = (text, { note: shown = null, quote = null } = {}) => {
     if (!run.canSteer()) return false;
     const client = codexAppServerClient;
     const forTurn = turnId;
     // The note goes up BEFORE the request, the same way the Claude lane pushes
     // it the moment the bytes go into stdin: the owner sees their message land in
     // the step list rather than a second later.
-    const note = { kind: 'text', text: `📨 steered in: ${clip(String(text).replace(/\s+/g, ' '), 90)}` };
+    const note = { kind: 'text', text: `📨 steered in: ${clip(String(shown ?? text).replace(/\s+/g, ' '), 90)}` };
     run.steers.push({ ts: new Date().toISOString(), text: clip(String(text), STEER_RECORD_MAX) });
     pushEntry(note);
     client
@@ -5459,7 +5505,10 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
         // whose ack this one would go on to edit.
         let pushed = null;
         if (lane.queue.length < QUEUE_MAX) {
-          pushed = queueItem(text, { forcedEngine: 'codex' });
+          // YOUR WORDS AND THE QUOTE, SEPARATELY, exactly as dispatchPrompt held
+          // them: requeuing the composed string as the item text would carry the
+          // quote (good) but also title the next turn by it (not good).
+          pushed = queueItem(shown ?? text, { forcedEngine: 'codex', replyQuote: quote });
           lane.queue.push(pushed);
         }
         // THE TURN MAY ALREADY BE OVER. The refusal arrives one round trip after
@@ -5705,6 +5754,7 @@ function flushParkedWalledChats() {
       kinds: it.kinds || [],
       retried: Boolean(it.retried),
       prepend: it.prepend ?? null,
+      replyQuote: it.replyQuote ?? null,
     });
   }
 }
@@ -7331,7 +7381,7 @@ function pickLane(prompt) {
 // (grab() in bg-codex-wiring.test.mjs) and its extractor stops at the first
 // unindented line, so a signature wrapped onto a `) {` of its own is grabbed
 // truncated and the whole harness fails to parse.
-function queueItem(text, { images = [], kinds = [], forcedEngine = null, priority = false, allowCodexFallback = false, retried = false, prepend = null } = {}) {
+function queueItem(text, { images = [], kinds = [], forcedEngine = null, priority = false, allowCodexFallback = false, retried = false, prepend = null, replyQuote = null } = {}) {
   // `kinds` is what ARRIVED, not what is being sent to a model: the run bubble's
   // first frame says "📎 3 photos" so a slow album is visibly landing rather
   // than silently missing.
@@ -7349,6 +7399,11 @@ function queueItem(text, { images = [], kinds = [], forcedEngine = null, priorit
     allowCodexFallback,
     retried: Boolean(retried),
     prepend: prepend == null ? null : String(prepend),
+    // The bubble you were replying to, parsed once at the edge and carried, for
+    // the same reason `prepend` is: a queued message is drained by a different
+    // call than the one that decided it, and the update it came in on is gone
+    // by then. Kept OFF `text` so nothing downstream can route on it.
+    replyQuote: replyQuote || null,
   };
 }
 const asQueueItem = (v) => (typeof v === 'string' ? queueItem(v) : v);
@@ -7484,6 +7539,12 @@ function takeHandoffPrefix(engine) {
 
 function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
   const text = item.text;
+  // WHAT YOU TYPED stays `text`, and every routing test below reads that: is it
+  // a Claude slash command, which repo does the brief name. `sent` is the same
+  // message with the quoted bubble joined on, and only a runner ever sees it,
+  // so a reply to a bubble containing "/autopilot" or a repo name cannot
+  // decide anything. See reply-quote.mjs.
+  const sent = composeWithQuote(item.replyQuote?.block || '', text);
   // Internal payloads are NEVER refused: a handback with nowhere to go must
   // still reach the owner, which is what deliverWithoutClaude on the Claude
   // path below does. Only a message they typed gets an error bubble.
@@ -7506,10 +7567,17 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
   // meant to produce.
   if (decision.engine === 'codex' && lane === LANES.main) {
     if (laneBusy) return 'fallthrough';
-    if (decision.reason === 'claude_limited') runCodexChatFallback(text, decision, { images: item.images });
+    if (decision.reason === 'claude_limited') runCodexChatFallback(text, decision, { images: item.images, prompt: sent });
     else {
       const prefix = item.priority ? '' : takeHandoffPrefix('codex');
-      runCodexChat(text, { images: item.images, prompt: prefix ? `${prefix}\n\n${text}` : null, carriesHandoff: Boolean(prefix) });
+      runCodexChat(text, {
+        images: item.images,
+        // null means "send what you typed". A handoff block, a quote, or both
+        // make it something else, and in that order: the carried-over context
+        // first, then what you were pointing at, then your words.
+        prompt: prefix ? `${prefix}\n\n${sent}` : sent === text ? null : sent,
+        carriesHandoff: Boolean(prefix),
+      });
     }
     return 'started';
   }
@@ -7521,7 +7589,11 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
   // so routing one there would produce confident nonsense.
   const unchosenSlashCommand = unchosenCodex(decision) && BG_COMMAND_RE.test(text.trimStart());
   if (decision.engine === 'codex' && lane.isBg && !unchosenSlashCommand) {
+    // rawText = what you typed, so the start notice, /status and the bg-results
+    // row are titled by the job. `prompt` = the same thing with the quote in
+    // front, which is the only part Codex reads.
     runCodex(text, {
+      prompt: sent,
       mode: 'edit',
       // Same repo resolution as the bg.mjs drop-box path: workspace-write is
       // rooted at ONE directory, so a `bg:` job about another repo has to run
@@ -7549,7 +7621,7 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
 // priority = a completed worker's report: never drop it for queue limits, and
 // jump the line so results surface before newer user prompts.
 // One line for the same reason as queueItem above: grab() extracts it by source.
-function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallback = false, images = [], kinds = [], retried = false, prepend = null } = {}) {
+function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallback = false, images = [], kinds = [], retried = false, prepend = null, replyQuote = null } = {}) {
   // A `codex:` or `claude:` prefix on a typed message pins THIS message's
   // engine, beating both /engine and the config. Stripped before dispatch so
   // the model never sees the routing instruction as part of its prompt.
@@ -7565,7 +7637,7 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
   const p2 = parseEnginePrefix(p1.text.replace(/^\s*bg:\s*/i, ''));
   const forcedEngine = p1.engine || p2.engine;
   const text = p2.text;
-  const item = queueItem(text, { images, kinds, forcedEngine, priority, allowCodexFallback, retried, prepend });
+  const item = queueItem(text, { images, kinds, forcedEngine, priority, allowCodexFallback, retried, prepend, replyQuote });
   // BOTH ENGINES WALLED. Only for a message they typed: internal traffic ignores
   // the wall by construction (see engineForItem). Spawning here produces two
   // failures a minute on a lane that cannot answer, so the message is parked
@@ -7622,8 +7694,18 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
     // message is the whole question, so compare that.
     const runningEngine = lane.current.engine || 'claude';
     const nextEngine = decision.engine || runningEngine;
-    if (nextEngine === runningEngine && lane.current.steer && lane.current.steer(text, { frame: Boolean(lane.isBg) })) {
-      send('➡️ Sent into the running task.', { markdown: false }).catch(() => {});
+    // A REPLY STEERS WITH ITS QUOTE. Without this the mid-turn path was the one
+    // route that still handed the running session eight words with no subject,
+    // which is exactly the case the feature was built for (a reply to a notice
+    // the daemon had posted, 2026-09-08). The ack names the quote too: a message
+    // that silently carries a page of someone else's words in front of it is one
+    // whose answer cannot be predicted.
+    if (
+      nextEngine === runningEngine &&
+      lane.current.steer &&
+      lane.current.steer(composeWithQuote(replyQuote?.block || '', text), { frame: Boolean(lane.isBg), note: text, quote: replyQuote })
+    ) {
+      send(steeredInAck({ who: replyQuote?.who || '', excerpt: replyQuote?.excerpt || '' }), { markdown: false }).catch(() => {});
       return;
     }
     if (lane.queue.length >= QUEUE_MAX) {
@@ -7656,6 +7738,7 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
     images,
     priority,
     retried,
+    replyQuote,
   }).catch((e) => console.error('[bridge] runClaude error:', e));
 }
 
@@ -7722,6 +7805,8 @@ function drainQueue(lane) {
     images: item.images || [],
     priority: Boolean(item.priority),
     retried: Boolean(item.retried),
+    // And a queued REPLY still says what it was replying to.
+    replyQuote: item.replyQuote || null,
   }).catch((e) => console.error('[bridge] runClaude error:', e));
 }
 
@@ -7748,8 +7833,8 @@ function flushGroup(grp) {
       // receipt for files they watched upload.
       const ack = attachmentAck(grp.kinds);
       if (ack) send(ack, { markdown: false }).catch(() => {});
-      dispatchPrompt(buildMediaPrompt(grp.files, grp.caption), undefined, { allowCodexFallback: true, images: grp.paths, kinds: grp.kinds });
-    } else if (grp.caption) dispatchPrompt(grp.caption, undefined, { allowCodexFallback: true }); // all downloads failed: don't swallow the user's text
+      dispatchPrompt(buildMediaPrompt(grp.files, grp.caption), undefined, { allowCodexFallback: true, images: grp.paths, kinds: grp.kinds, replyQuote: grp.replyQuote || null });
+    } else if (grp.caption) dispatchPrompt(grp.caption, undefined, { allowCodexFallback: true, replyQuote: grp.replyQuote || null }); // all downloads failed: don't swallow the user's text
   }
   // if pending > 0, the in-flight download's finally-branch dispatches it
 }
@@ -7757,6 +7842,9 @@ function flushGroup(grp) {
 async function handleMedia(msg) {
   const media = pickMedia(msg);
   const caption = msg.caption?.trim() || '';
+  // A photo or a file can be a reply too: the caption is the instruction and
+  // the bubble you replied to is what it is about.
+  const replyQuote = buildReplyQuote(msg, { botName: BRIDGE_NAME, botId: BOT_ID, timeZone: OWNER_TZ });
 
   if (!msg.media_group_id) {
     let saved;
@@ -7780,7 +7868,7 @@ async function handleMedia(msg) {
         await send(`🎙️ "${heard}"`, { markdown: false });
         // Same flag as every other thing they sends: a voice note is them
         // talking, so it runs on whichever engine the chat lane is set to.
-        dispatchPrompt(caption ? `${caption}\n\n${heard}` : heard, undefined, { allowCodexFallback: true });
+        dispatchPrompt(caption ? `${caption}\n\n${heard}` : heard, undefined, { allowCodexFallback: true, replyQuote });
         return;
       }
       // NOT SILENTLY. transcribeVoice returns null when there is no OpenAI API
@@ -7807,6 +7895,7 @@ async function handleMedia(msg) {
     dispatchPrompt(buildMediaPrompt([mediaEntry(saved, media)], caption), undefined, {
       allowCodexFallback: true,
       images: [saved],
+      replyQuote,
       // THE SINGLE-FILE HALF of the attachment ack. It gets no message of its
       // own precisely because the bubble's first frame carries it, and without
       // this the frame had nothing to carry: one photo, one video or one 20MB
@@ -7820,10 +7909,16 @@ async function handleMedia(msg) {
   let grp = mediaGroup;
   if (!grp || grp.id !== msg.media_group_id || grp.done) {
     if (grp && !grp.done) flushGroup(grp); // a different album is pending — ship it, don't lose it
-    grp = { id: msg.media_group_id, files: [], paths: [], kinds: [], caption: '', pending: 0, done: false, timer: null };
+    grp = { id: msg.media_group_id, files: [], paths: [], kinds: [], caption: '', pending: 0, done: false, timer: null, replyQuote: null };
     mediaGroup = grp;
   }
   if (caption) grp.caption = caption;
+  // A LATER ITEM MUST NOT CLEAR IT. Telegram puts the caption on one item of an
+  // album and the reply on that same item, so the items around it carry no
+  // `reply_to_message` and an unguarded assignment would wipe the quote
+  // depending on which one landed last. A later item that IS a reply replaces
+  // it, the same way a later caption replaces the caption.
+  if (replyQuote) grp.replyQuote = replyQuote;
   grp.pending++;
   clearTimeout(grp.timer); // hold the debounce while this item downloads
 
@@ -7843,8 +7938,8 @@ async function handleMedia(msg) {
         if (grp.files.length) {
           const ack = attachmentAck(grp.kinds);
           if (ack) send(ack, { markdown: false }).catch(() => {});
-          dispatchPrompt(buildMediaPrompt(grp.files, grp.caption), undefined, { allowCodexFallback: true, images: grp.paths, kinds: grp.kinds });
-        } else if (grp.caption) dispatchPrompt(grp.caption, undefined, { allowCodexFallback: true });
+          dispatchPrompt(buildMediaPrompt(grp.files, grp.caption), undefined, { allowCodexFallback: true, images: grp.paths, kinds: grp.kinds, replyQuote: grp.replyQuote || null });
+        } else if (grp.caption) dispatchPrompt(grp.caption, undefined, { allowCodexFallback: true, replyQuote: grp.replyQuote || null });
       }
     } else if (grp.pending === 0) {
       grp.timer = setTimeout(() => {
@@ -7904,8 +7999,16 @@ async function handleUpdate(update) {
       { priority: true },
     );
   }
+  // THE BUBBLE YOU LONG PRESSED. Parsed once, here, at the only place every
+  // inbound text passes through, and carried from here as DATA: nothing below
+  // routes on it, and no lookup is involved, so a reply to a message sent
+  // before the last restart works exactly like a reply to a fresh one.
+  const replyQuote = buildReplyQuote(msg, { botName: BRIDGE_NAME, botId: BOT_ID, timeZone: OWNER_TZ });
   const firstToken = msg.text.trim().split(/\s+/)[0].toLowerCase().replace(/@\w+$/, '');
   if (RESERVED_COMMANDS.has(firstToken)) {
+    // The daemon's own commands are unchanged: /status is about the daemon, not
+    // about whatever you happened to reply to. /codex keeps reading the reply
+    // itself, to re-attach a photo.
     await handleCommand(msg.text, msg);
     return;
   }
@@ -7923,10 +8026,11 @@ async function handleUpdate(update) {
   if (mediaGroup && !mediaGroup.done) {
     const grp = mediaGroup;
     grp.caption = grp.caption ? `${grp.caption}\n${text}` : text;
+    if (replyQuote) grp.replyQuote = replyQuote;
     flushGroup(grp);
     return;
   }
-  dispatchPrompt(text, undefined, { allowCodexFallback: true });
+  dispatchPrompt(text, undefined, { allowCodexFallback: true, replyQuote });
 }
 
 async function pollLoop() {

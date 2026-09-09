@@ -838,6 +838,40 @@ export function attachmentFrameNote(kinds = []) {
 }
 
 // ---------------------------------------------------------------------------
+// A REPLY TO A BUBBLE
+// ---------------------------------------------------------------------------
+//
+// When you long press a message and reply to it, the quote goes into the
+// prompt (see reply-quote.mjs). These two say so on screen, because a message
+// that silently carries a page of someone else's words in front of it is a
+// message you cannot predict the answer to.
+
+/**
+ * The mid-turn ack, with the quote named when there is one.
+ *
+ * With no quote it is byte for byte the line it has always been: a reply is the
+ * only thing that adds to it.
+ */
+// A NAME IS NOT A BOUNDED STRING. Telegram allows 64 characters of first_name
+// and far more of a channel title, and the forward case puts one of those in
+// `who`. Clipped here rather than at the source, because the source also feeds
+// the prompt block, where the whole name is wanted.
+const WHO_MAX = 30;
+
+export function steeredInAck({ who = '', excerpt = '' } = {}) {
+  const lines = ['➡️ Sent into the running task.'];
+  if (who) lines.push(`↩ Quoting ${clip(oneLine(who), WHO_MAX)}`);
+  if (excerpt) lines.push(`"${clip(oneLine(excerpt), 60)}"`);
+  return lines.join('\n');
+}
+
+/** What rides on the run bubble's first frame. Null when nothing was quoted. */
+export function replyQuoteFrameNote({ who = '' } = {}) {
+  if (!who) return null;
+  return `↩ quoting ${clip(oneLine(who), WHO_MAX)}`;
+}
+
+// ---------------------------------------------------------------------------
 // The /codex sub-views: a value, a set line, and the reasoning one tap away
 // ---------------------------------------------------------------------------
 //

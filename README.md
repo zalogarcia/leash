@@ -142,6 +142,21 @@ It either folds your message into the current turn or answers it right after.
 Only when steering isn't possible (nothing running yet, run already finishing)
 does the message queue instead.
 
+## Replying to a message
+
+Long press any bubble, pick Reply, and the message you were pointing at is quoted into the prompt: the engine
+gets `[Replying to Leash's message from 16:11: "..."]` on the line above what you typed, so "for this, we need to
+do the support ticket ourselves" arrives with its subject attached instead of as eight words with none. It works
+on every inbound path (a new turn, a message steered into a running turn, a `codex:` or `claude:` one shot, a
+`bg:` job, and a photo or file with a caption), it needs no lookup so a reply to a bubble from before the last
+restart works the same as a reply to a fresh one, and Telegram's "quote part of a message" selection is used in
+preference to the whole bubble when you make one. The name in the block is whatever `name` in `config.json` says.
+
+The quote is DATA, never routing: it is composed after the lane and the engine have been chosen from your own
+typed words, so a quoted bubble containing `codex:` or `/autopilot` cannot steer anything. It is collapsed to one
+line, capped at 1500 characters, and a cut is stated in the block (`(quoted 1500 of 4200 chars)`) rather than
+left to be guessed. The ack and the run bubble both say a quote went with the message.
+
 ## Commands
 
 | Command | What it does |

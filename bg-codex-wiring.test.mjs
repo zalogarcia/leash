@@ -29,6 +29,9 @@ import { execFallbackLine } from './codex-appserver.mjs';
 // The real parser and the real phrase list, so section 8b asserts the chat
 // lane marks the reset the MESSAGE carried rather than a number of its own.
 import { isLimitSignal as isLimitSignalReal, parseResetTime as parseResetTimeReal } from './accounts.mjs';
+// The real ack builder, so the steer test asserts what actually goes out rather
+// than a copy of the string that would keep agreeing with itself.
+import { steeredInAck } from './system-messages.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const TMP = mkdtempSync(path.join(tmpdir(), 'bg-codex-wiring-'));
@@ -246,6 +249,38 @@ await t('the brief is written next to the log so a dead run can still be salvage
   const prompt = path.join(RUNS, `codex-${askRun.startedAt}.prompt.md`);
   ok(existsSync(prompt), `no prompt file at ${prompt}`);
   eq(readFileSync(prompt, 'utf8'), 'what does bg.mjs do');
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n1b. a reply: the quote is SENT, and the run is still named by your words');
+// ---------------------------------------------------------------------------
+
+B.reset();
+const QUOTE_BLOCK = `[Replying to Leash's message from 16:11: "Draft ready, not sent, id d2dc55"]`;
+const replyRun = B.runCodex('send it', { mode: 'ask', cwd: TMP, prompt: `${QUOTE_BLOCK}\n\nsend it` });
+const replyOutcome = await settled();
+
+await t('★ the quote reaches the model: `prompt` is what goes on stdin', () => {
+  ok(replyOutcome.outcome.answer.includes('Draft ready, not sent'), replyOutcome.outcome.answer);
+  ok(replyOutcome.outcome.answer.includes('send it'), replyOutcome.outcome.answer);
+});
+
+await t('★ but every RECORD of the run stays on what you typed', () => {
+  // rawText describes the run and `prompt` is only what is sent. Before the
+  // split, a reply on the Codex bg lane titled its start notice, its /status
+  // line and its bg-results row with a quote of the daemon, so a job you asked
+  // for read as though the daemon had asked it.
+  eq(replyRun.prompt, 'send it', 'run.prompt is what /status renders, and it reads as a quote of the daemon');
+  const notice = B.SENT.find((s) => s.includes('codex'));
+  ok(notice, B.SENT.join(' | '));
+  ok(!notice.includes('Replying to'), `the start notice is titled by the quote: ${notice}`);
+  ok(notice.includes('send it'), notice);
+  eq(replyOutcome.task, 'send it', 'the bg-results row is titled by the quote');
+});
+
+await t('the salvage file holds the SENT text, which is the one a rerun needs', () => {
+  const p = path.join(RUNS, `codex-${replyRun.startedAt}.prompt.md`);
+  eq(readFileSync(p, 'utf8'), `${QUOTE_BLOCK}\n\nsend it`);
 });
 
 // ---------------------------------------------------------------------------
@@ -530,7 +565,8 @@ const P = await import(
         `
 import { codexCwdForBrief, fmtUntil, parseEnginePrefix, shouldRouteToCodex } from ${url('bg-codex.mjs')};
 import { briefRepo, briefTitle, stripLaneRules } from ${url('bg-notify.mjs')};
-import { queueAck, queueStarted, queueDropped, queueRunningNow, queueFull, WALL_TICK_MS, bothWalledLine, enginesBackLine, limitWallLine, limitWallResolved, chatRotatedLine, chatWalledRetryLine } from ${url('system-messages.mjs')};
+import { queueAck, queueStarted, queueDropped, queueRunningNow, queueFull, steeredInAck, WALL_TICK_MS, bothWalledLine, enginesBackLine, limitWallLine, limitWallResolved, chatRotatedLine, chatWalledRetryLine } from ${url('system-messages.mjs')};
+import { composeWithQuote } from ${url('reply-quote.mjs')};
 import { workerLine, WORKER_TICK_MS, WORKER_IDLE_MS } from ${url('bg-notify.mjs')};
 import { claudeMissingLine, resolveEngine } from ${url('engine-state.mjs')};
 import { isLimitSignal, parseResetTime } from ${url('accounts.mjs')};
@@ -2259,8 +2295,11 @@ await t('the wiring for a Codex-first machine keeps every internal turn delivera
 
 await t('a voice note takes the engine like every other thing he sends', () => {
   const src = SRC.join('\n');
+  // The assertion is on the FLAG, not on the whole options object: a voice note
+  // that is also a reply carries `replyQuote` beside it, and pinning the exact
+  // braces made this fail on a change that has nothing to do with routing.
   ok(
-    /dispatchPrompt\(caption \? `\$\{caption\}\\n\\n\$\{heard\}` : heard, undefined, \{ allowCodexFallback: true \}\)/.test(src),
+    /dispatchPrompt\(caption \? `\$\{caption\}\\n\\n\$\{heard\}` : heard, undefined, \{ allowCodexFallback: true[,}]/.test(src),
     'the transcribed voice note still hard-routes to Claude',
   );
 });
@@ -2468,6 +2507,52 @@ await t('★ case 2: after /engine codex, the next message QUEUES instead of bei
   eq(spliced, null, `the message was spliced into the Claude turn: ${spliced}`);
   eq(P.LANES.main.queue.length, 1, 'it was neither steered nor queued');
   ok(P.SENT.join('\n').includes('🧠 Codex'), `the ack does not name the engine: ${P.SENT.join('\n')}`);
+});
+
+P.reset();
+let steeredWith = null;
+P.LANES.main.current = {
+  prompt: 'a claude turn still finishing',
+  startedAt: Date.now(),
+  engine: 'claude',
+  steer: (txt, opts = {}) => {
+    steeredWith = { txt, opts };
+    return true;
+  },
+};
+const RQ = {
+  block: `[Replying to Leash's message from 16:11: "Draft ready, not sent, id d2dc55"]`,
+  who: 'Leash',
+  excerpt: 'Draft ready, not sent',
+};
+P.dispatchPrompt('send it', undefined, { allowCodexFallback: true, replyQuote: RQ });
+
+await t('★ a REPLY steered mid-turn: the session gets the quote, the bubble gets your words', () => {
+  ok(steeredWith, 'the reply was not steered at all');
+  eq(steeredWith.txt, `${RQ.block}\n\nsend it`, 'the running session got two words with no subject');
+  // `note` is what the step line renders. Without it the bubble read
+  // `📨 steered in: [Replying to Leash's message from 16:11: "Draft ready, not…`
+  // on the exact path the feature was built for.
+  eq(steeredWith.opts.note, 'send it', 'the step line shows a quote of the daemon instead of your instruction');
+  eq(steeredWith.opts.quote, RQ, 'a refused steer requeues with no quote, losing the subject again');
+});
+
+await t('★ and the ack names the quote, so a silent page of context is impossible', () => {
+  const ack = P.SENT.find((s) => s.includes('Sent into the running task'));
+  ok(ack, P.SENT.join(' | '));
+  eq(ack, steeredInAck({ who: 'Leash', excerpt: 'Draft ready, not sent' }), ack);
+  ok(ack.includes('↩ Quoting Leash'), ack);
+});
+
+P.reset();
+P.LANES.main.current = { prompt: 'a claude turn', startedAt: Date.now(), engine: 'claude', steer: (txt, opts = {}) => ((steeredWith = { txt, opts }), true) };
+P.dispatchPrompt('and the encoder', undefined, { allowCodexFallback: true });
+
+await t('a plain message steers byte for byte the line it always did', () => {
+  eq(steeredWith.txt, 'and the encoder', 'a message that is not a reply must not be recomposed');
+  eq(steeredWith.opts.note, 'and the encoder');
+  eq(steeredWith.opts.quote, null);
+  eq(P.SENT.find((s) => s.includes('Sent into the running task')), '➡️ Sent into the running task.');
 });
 
 P.reset();
@@ -3206,7 +3291,7 @@ await t('★ the model claiming a slash command is a path does not get one count
   S.realCaptureHandoff('claude', 'codex', s.cb);
   S.EXECS[0].cb(
     null,
-    JSON.stringify({ goal: 'g', decisions: [], paths: ['/usage', '/status', '/ecs/delta-agents'], open: '', tools: [] }),
+    JSON.stringify({ goal: 'g', decisions: [], paths: ['/usage', '/status', '/ecs/api-gateway'], open: '', tools: [] }),
   );
   eq(s.out[0].ok, true);
   eq(S.STATE.handoff.paths.length, 0, JSON.stringify(S.STATE.handoff.paths));
@@ -3511,7 +3596,7 @@ const codexChatBox = ({ network = null } = {}) =>
 // The exec path is a recorder here: what matters is WHETHER the lane falls back
 // and with which reason, not what the one-shot rail then does (section 12).
 const runCodexChatExec = (rawText, opts) => { FELLBACK.push({ rawText, opts }); return null; };
-export const queueItem = (text, o = {}) => ({ text, images: o.images || [], forcedEngine: o.forcedEngine || null, priority: false, allowCodexFallback: false });
+export const queueItem = (text, o = {}) => ({ text, images: o.images || [], forcedEngine: o.forcedEngine || null, priority: false, allowCodexFallback: false, replyQuote: o.replyQuote || null });
 // The ack LIFECYCLE is asserted where the queue lives (section 15 and
 // system-wiring.test.mjs). Here the question is the refusal's routing, so this
 // only has to record that the ack was tracked against the pushed item.
@@ -3772,6 +3857,66 @@ await t('and the FINAL step list says what happened, rather than claiming it lan
   const last = AS.PROGRESS[AS.PROGRESS.length - 1].plain;
   ok(/📨 Queued instead \(that Codex turn cannot take a mid-turn message/.test(last), last);
   ok(!/📨 steered in: this will be refused/.test(last), `the bubble still claims it landed: ${last}`);
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n19d2. a refused REPLY keeps your words and its quote apart in the queue');
+// ---------------------------------------------------------------------------
+
+AS.reset();
+knobs({ holdMs: 900, notSteerable: true });
+AS.runCodexChat('another review-shaped turn');
+const live2b = await waitFor(() => (AS.LANES.main.current?.canSteer?.() ? AS.LANES.main.current : null), 8000, 'a steerable turn');
+const RQ2 = { block: `[Replying to Leash's message from 16:11: "Draft ready, id d2dc55"]`, who: 'Leash', excerpt: 'Draft ready' };
+eq(live2b.steer(`${RQ2.block}\n\nsend it`, { note: 'send it', quote: RQ2 }), true, 'the refusal must still ack optimistically');
+await waitFor(() => AS.SENT.some((s) => s.includes('could not take it mid-turn')), 8000, 'the correction line');
+
+await t('★ the requeued item is your words plus the quote, not the composed string', () => {
+  const it = AS.LANES.main.queue[0];
+  ok(it, 'the refused reply was dropped');
+  eq(it.text, 'send it', 'the next turn would be titled by a quote of the daemon');
+  eq(it.replyQuote, RQ2, 'the quote was dropped, so the retried turn loses the subject the reply existed to carry');
+  eq(it.forcedEngine, 'codex');
+});
+
+await asSettled(20000);
+knobs();
+
+await t('and no part of the quote leaks into the bubble on the way out', () => {
+  // Asserted on the FINAL frame for the same reason 19d is: the correction
+  // replaces the optimistic note in place, so whether a frame carrying the
+  // optimistic one was ever rendered is a race.
+  const last = AS.PROGRESS[AS.PROGRESS.length - 1].plain;
+  ok(!/Replying to/.test(last), `the bubble shows a quote of the daemon rather than the job: ${last}`);
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n19d3. ★ a reply STEERED in: the model gets the quote, the bubble gets your words');
+// ---------------------------------------------------------------------------
+
+AS.reset();
+knobs({ holdMs: 900 });
+AS.runCodexChat('count slowly to ten');
+const live2c = await waitFor(() => (AS.LANES.main.current?.canSteer?.() ? AS.LANES.main.current : null), 8000, 'a steerable turn');
+eq(live2c.steer(`${RQ2.block}\n\nsend it`, { note: 'send it', quote: RQ2 }), true, 'the reply was not steered at all');
+await asSettled(20000);
+knobs();
+
+await t('★ the model saw the QUOTE, which is the whole point of the feature', () => {
+  ok(AS.RESULTS[0].includes('Draft ready'), AS.RESULTS[0]);
+  ok(AS.RESULTS[0].includes('send it'), AS.RESULTS[0]);
+});
+
+await t('★ and the step line is your instruction, not a quote of the daemon', () => {
+  const last = AS.PROGRESS[AS.PROGRESS.length - 1].plain;
+  ok(/📨 steered in: send it/.test(last), last);
+  ok(!/steered in: \[Replying/.test(last), `the bubble reads as though the daemon had typed it: ${last}`);
+});
+
+await t('the DELIVERED text is what is recorded, so a salvage reruns what actually ran', () => {
+  const rec = live2c.steers[live2c.steers.length - 1];
+  ok(rec.text.startsWith('[Replying to'), rec.text);
+  ok(rec.text.endsWith('send it'), rec.text);
 });
 
 // ---------------------------------------------------------------------------
