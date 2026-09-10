@@ -26,6 +26,11 @@
 # re-attached on the next boot exactly as before, but `bg.mjs steer` can no
 # longer reach it and `bg.mjs ps` will show it as `steerable: no`. Without the
 # flag, behaviour is unchanged: the restart waits for every child.
+#
+# It costs a background CODEX job more than that, and knowingly: its app-server
+# child is on the daemon's stdio pipes, so the running turn dies with the daemon
+# and the next boot resumes the thread with a fresh, billed continuation turn.
+# The work is not lost (the thread is on OpenAI's side); the turn in flight is.
 
 ALLOW_BG=0
 ARGS=()
@@ -61,18 +66,49 @@ print(1 if kids and all(k in bg for k in kids) else 0)
 PY
 }
 
+# WHICH OF THESE PIDS ARE REGISTERED BACKGROUND WORK. Prints the subset, one per
+# line, and nothing at all when none of them are.
+#
+# This exists because `codex app-server` is no longer one kind of process. The
+# chat lane's server is a persistent, workless child (excluded below); a
+# background Codex JOB also owns one, and that one is a turn in flight, possibly
+# mid-write in workspace-write. `ps` cannot tell them apart: same binary, same
+# argv. The registry can, because bridge.mjs writes a job's child to the
+# in-flight registry at spawn and never writes the chat lane's.
+registered_pids() {
+  python3 - "$INFLIGHT" $@ <<'PY' 2>/dev/null
+import json, sys
+try:
+    recs = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit
+bg = {r.get("pid") for r in (recs or {}).values() if r.get("pid")}
+for a in sys.argv[2:]:
+    if a.isdigit() and int(a) in bg:
+        print(a)
+PY
+}
+
 while :; do
   # ps, not pgrep, for BOTH probes: pgrep -f can miss node scripts on macOS,
   # and BSD pgrep -P without a pattern silently matches nothing — a false
   # "idle" that would restart over a live run.
   DPID=$(ps aux | grep '[b]ridge\.mjs' | awk '{print $2}' | head -1)
   [ -z "$DPID" ] && break                     # daemon down — restart boots it
-  # The Codex app-server is a PERSISTENT child of the daemon (one per boot,
-  # respawned by the next boot; it reads JSON-RPC on stdin and exits on EOF).
-  # It is never work in flight, so it is excluded from both probes. Without
-  # this the chat lane never reads as idle once the app-server lane is up: a
-  # restart waits on it forever instead of finding the lane idle.
+  # The CHAT LANE's Codex app-server is a PERSISTENT child of the daemon (one
+  # per boot, respawned by the next boot; it reads JSON-RPC on stdin and exits
+  # on EOF). It is never work in flight, so it is excluded from both probes.
+  # Without this the chat lane never reads as idle once the app-server lane is
+  # up: a restart waits on it forever instead of finding the lane idle.
+  #
+  # A BACKGROUND JOB NOW HAS ONE OF ITS OWN, and that one IS work in flight:
+  # restarting over it kills a turn that may be mid-write in workspace-write,
+  # and the next boot resumes the thread with a continuation that promises the
+  # files are intact. The two children are identical in `ps`, so the exclusion
+  # asks the registry which of them are jobs and keeps those.
+  as_pids=$(ps -axo ppid=,pid=,command= | awk -v p="$DPID" '$1 == p && $0 ~ /codex app-server/ {print $2}')
   child_pids=$(ps -axo ppid=,pid=,command= | awk -v p="$DPID" '$1 == p && $0 !~ /codex app-server/ {print $2}')
+  child_pids=$(printf '%s\n%s\n' "$child_pids" "$(registered_pids $as_pids)" | grep .)
   kids=$(printf '%s\n' "$child_pids" | grep -c .)
   [ "$kids" = "0" ] && break                  # idle — safe to restart
   if [ "$ALLOW_BG" = "1" ]; then
