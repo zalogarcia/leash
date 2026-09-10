@@ -105,6 +105,12 @@ its process.**
   same way the live card does, and offers an edit or ask job the same `bg.mjs steer` command a Claude
   worker's notice offers. A review keeps `not steerable` and now says why (one-shot exec run), and a
   job with no run id says nothing about reach rather than guessing either way.
+- **The start notice blamed Codex for a limit that belongs to the exec run.** It printed `not
+  steerable (Codex runs take no mid-run input)`, which is false about Codex now that background jobs
+  hold an app-server thread, and was printed on the one run it is true of. The arm was already gated
+  on the transport, so only the words were wrong: it reads `not steerable (one-shot exec run)`, the
+  same reason the dispatch notice gives, so the two cannot disagree about why one job takes no
+  message.
 
 ## 1.7.0 (2026-09-09)
 

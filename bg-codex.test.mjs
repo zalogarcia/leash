@@ -530,7 +530,11 @@ t('the start notice is recognisably not Claude and says it cannot be steered', (
   const s = codexStartNotice({ runId: 'codex-1788453512237', mode: 'ask', cwd: '/Users/z/dev/web-app', title: 'what does bg.mjs do' });
   ok(s.includes('codex'), s);
   ok(s.includes('web-app'), s);
-  ok(s.includes('not steerable'), s);
+  // The reason blames the TRANSPORT, not the engine: background Codex jobs on
+  // the app-server take a steer, so "Codex runs take no mid-run input" would be
+  // a false sentence about Codex printed on the one run it is true of.
+  ok(s.includes('not steerable (one-shot exec run)'), s);
+  ok(!/Codex runs take no mid-run input/.test(s), 'the engine must not be blamed for an exec-mode limit');
   ok(s.includes('codex-1788453512237'), s);
 });
 
@@ -628,7 +632,11 @@ t('★ the start notice says a job CAN be steered when its transport allows it',
 });
 
 t('and still says it cannot on a one-shot run, which is the default', () => {
-  ok(/not steerable/.test(codexStartNotice({ runId: 'codex-9', mode: 'ask' })), 'the exec path is unchanged');
+  const line = codexStartNotice({ runId: 'codex-9', mode: 'ask' });
+  ok(/not steerable \(one-shot exec run\)/.test(line), 'the exec path is unchanged, and it names the exec run as the reason');
+  // The same words handoffNotice uses for the same run, so the two notices
+  // cannot disagree about why one job takes no message.
+  ok(!/Codex runs take no mid-run input/.test(line), line);
 });
 
 t('a finished job reads exactly like an exec one to everything downstream', () => {

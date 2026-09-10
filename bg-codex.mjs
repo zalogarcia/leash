@@ -606,7 +606,7 @@ export function codexStartNotice({ runId, mode = 'ask', cwd = null, title = '', 
     lines.push(
       steerable
         ? `${runId} · steerable (bg.mjs steer, /steer, /btw)`
-        : `${runId} · not steerable (Codex runs take no mid-run input)`,
+        : `${runId} · not steerable (one-shot exec run)`,
     );
   }
   return lines.join('\n');
