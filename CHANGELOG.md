@@ -2,6 +2,84 @@
 
 All notable changes to Leash. Dates are release dates.
 
+## 1.8.0 (2026-09-09)
+
+**A background Codex job you can reach while it is running, and that survives the restart that kills
+its process.**
+
+### Background Codex jobs run on `codex app-server`
+
+- A handed-over Codex job (`bg.mjs --engine codex`, a `codex:` prefix, or the rate-limit fallback)
+  now runs as a thread on its own `codex app-server` child instead of one-shot on `codex exec`. The
+  reason the background lane was left on exec was that a job "must outlive this daemon, which a child
+  on our stdio pipes cannot". That is paid for differently now: the THREAD outlives the daemon, on
+  OpenAI's side, and `thread/resume` picks it up in a fresh child. A job survives a restart by being
+  resumed rather than by its process surviving, and in exchange it gets the three things a one-shot
+  run structurally cannot have.
+- **`/steer` lands in the running turn**, as `turn/steer` carrying the turn id it was aimed at,
+  framed exactly as it is for a Claude worker, and recorded in the report under the same
+  `STEERED IN` block. A steer that arrives between turns is queued and delivered by the next
+  `turn/start` rather than refused. `bg.mjs ps` says `STEER yes`; a review and any run that fell back
+  to exec still say `no`, and the card offers the run id rather than the lane, because lane names are
+  recycled.
+- **`/btw` is answered mid-run.** The daemon watches the thread's agent messages for the
+  `BTW-ANSWER #N:` marker, routes it by id to the chat that asked, and lifts the block out of both
+  the progress bubble and the report capture. The hourglass gained a sixth ending for the one case
+  only this lane can produce: the server refusing the mid-turn write, where the job is still running
+  and asking again works, which is neither "the run ended" nor "the daemon restarted".
+- **`/stop` is a `turn/interrupt`** the model acknowledges, not a SIGTERM at a child that may be
+  mid-write in `workspace-write`. The turn ends `interrupted`, the handback says stopped, and what it
+  produced still reaches `bg-reports/`.
+- **The bubble streams the tool steps** and ends `✅ Done · Ns · N steps`, through the same renderer
+  the Claude bubble uses. `/status` reads the step count and the last action off the live run instead
+  of walking the log tail.
+- **A restart resumes the job.** On boot, every app-server job the last daemon left running gets a
+  fresh child, a `thread/resume` and one continuation turn ("your thread and any files you wrote are
+  intact, continue from your last step, do not start over"), announced with one `🧠 Resumed` line.
+  Never the brief again, which is how a resumed job starts over. The job keeps its own run id, report
+  path and original deadline, so a restart cannot quietly buy a billed run another full timeout. A
+  job whose thread was never created is handed back as a dead worker with the salvage note rather
+  than dropped, and pending questions resolve rather than ticking forever. A record still in the
+  registry is by definition a job that never reported, which is what stops a finished job being
+  re-run or handed back twice.
+- **One child per job**, not the chat lane's shared server: a job runs for an hour in
+  `workspace-write`, and sharing would mean one death takes the other's turn with it. Death mid-turn
+  retries inside the existing window and then hands back a dead-worker report with the salvage
+  instruction; a failed spawn counts as one death rather than two, and the permanent "this build has
+  no app-server" latch stays the chat lane's alone, so a slow spawn under load can no longer drop
+  every later job to one-shot for the daemon's life.
+- **Nothing downstream changed.** The handback object is key-set-identical to the exec path's,
+  asserted by test, and the run log is written in `codex exec --json` shape, so `/status`, the
+  salvage script and the outcome reader read it unchanged. The lifecycle is logged one line per step
+  with the run and thread ids and never the brief text, a question or a token.
+- **`codex exec` is the fallback, not the past.** `/codex review` stays one-shot (it reads the diff
+  itself and there is nothing to steer into), and so does every job dispatched while the app-server
+  has failed its death window. `safe-restart.sh` now asks the run registry which `codex app-server`
+  children are jobs and holds for those, while still excluding the chat lane's workless server: the
+  two are identical in `ps`, and restarting over a job mid-write was the one thing that exclusion had
+  quietly started to allow.
+
+### Fixes found reviewing the above
+
+- **A child that died while `thread/resume` or `turn/start` was in flight was reported dead after
+  ONE death, under its own log line saying it was being retried.** The death rejects the awaiting
+  call AND starts the retry, and the retry runs first, so the stale await then finished the very run
+  the retry had just claimed and the fresh child was killed on its way up. The retry owns the run
+  now; two deaths in the window is still the give-up signal, and still the only one.
+- **`/status` told you a steerable job could not be steered.** The card, `bg.mjs ps` and `/steer`
+  read steerability off the run; `/status` hardcoded "not steerable · 0 steps" beside them, on the
+  same job at the same second. It reads the run like the other three.
+- **A steer queued between turns could be acked and then silently dropped.** A steer with no live
+  turn is queued rather than refused, which is right while the job is alive, but a job that ended
+  before its next turn left that ack standing over a message nobody ever sent. It is now corrected
+  on the surface the ack went to, like any other refusal.
+- **`/stop` had no escalation if the interrupt was accepted and the turn never completed.** The exec
+  path escalates a SIGTERM to a SIGKILL; the app-server path now ends the run itself after a grace
+  window rather than leaving it in flight under a message saying it was stopped.
+- **A question pending across a restart told you the worker could not be asked again, on a job that
+  was about to be resumed.** True for a re-attached Claude survivor, which has no stdin left; false
+  for the one worker the restart brings back, and contradicted by the `Resumed` line under it.
+
 ## 1.7.0 (2026-09-09)
 
 **A question you can put to a running worker without changing its job, and a `/help` that reaches the

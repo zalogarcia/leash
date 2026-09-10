@@ -182,7 +182,7 @@ left to be guessed. The ack and the run bubble both say a quote went with the me
 | `/btw [target] <question>` | Ask a **running** background worker a SIDE question. It answers in one message, here in the chat, and carries on with its plan unchanged; it is explicitly not an instruction and not approval. No target means `latest`. Availability is identical to `/steer` |
 | `/engine [bg] claude\|codex` | Which engine a lane runs on. Bare `/engine` shows both lanes, where each value came from, the Codex model/effort and the sandbox |
 | `/codex <question>` | Ask OpenAI Codex, read-only, in the current directory, continuing this chat's Codex thread. `/codex review [<repo>] [vs <branch>]` runs its review harness over a diff; `/codex model`, `/codex effort`, `/codex network on\|off` and `/codex doctor` steer and check the engine; `/codex on\|off` toggles the rate-limit fallback |
-| `/stop [bg\|codex\|all]` | Kill the running task and clear that lane's queue. A Claude run gets SIGTERM then SIGKILL; a Codex **chat** turn gets a `turn/interrupt` the model acknowledges, leaving the shared app-server up. `codex` also reaches a one-shot Codex run, which belongs to no lane |
+| `/stop [bg\|codex\|all]` | Kill the running task and clear that lane's queue. A Claude run gets SIGTERM then SIGKILL; a Codex turn, chat or background, gets a `turn/interrupt` the model acknowledges, so whatever it produced still reaches the report. `codex` also reaches a one-shot Codex run, which belongs to no lane |
 | `/restart` | Restart the daemon remotely |
 | `/logs` | Tail the daemon log |
 | `/remind …` | `daily HH:MM <text>` · `once [YYYY-MM-DD] HH:MM <text>` · `in 90m <text>` |
@@ -359,10 +359,12 @@ Several questions to one worker queue in order; ids are per worker and monotonic
 its own question by id, so an answer can never resolve a different worker's question or a different question's
 line. An answer naming an id nobody is waiting for is dropped rather than handed to the oldest.
 
-**Availability is exactly steer availability**, which is why `ps` grew no new column: a btw travels the same
-stdin pipe, so the same three workers refuse it (a survivor of a daemon restart, a run whose result is already
-in, a background Codex job that is file-backed with no stdin at all). A Codex refusal names the right escape
-hatch for a question, `/codex <question>`, rather than the re-fire a steer would suggest.
+**Availability is exactly steer availability**, which is why `ps` grew no new column: whatever can take a
+steer can take a question. A survivor of a daemon restart and a run whose result is already in refuse both. A
+background Codex job on the app-server takes both, through `turn/steer` rather than through a stdin pipe, and
+answers mid-run exactly as a Claude worker does; a one-shot `codex exec` run (a review, or a job dispatched
+while the app-server is in its fallback window) refuses both and names the right escape hatch for a question,
+`/codex <question>`, rather than the re-fire a steer would suggest.
 
 `bg.mjs btw` requires a target: unlike Telegram it will not fall back to `latest`, because a scripted caller
 that named no worker has not decided which one it meant, and a side question answered by the wrong job reads
@@ -403,9 +405,13 @@ node bg.mjs "codex: review the last commit"     # same thing, inline prefix
 ```
 
 A Codex run shows up everywhere a background worker does: in `/status`, in
-`bg.mjs ps` with `ENGINE: codex`, in the run registry, and `/stop codex` kills
-it. It is never steerable: Codex reads its prompt once, from stdin, and never
-again.
+`bg.mjs ps` with `ENGINE: codex`, in the run registry, and `/stop codex` reaches
+it. It runs on `codex app-server`, so it is steerable like any other worker:
+`/steer` lands in the running turn, `/btw` is answered mid-run, `/stop` is an
+interrupt the model acknowledges, and the bubble streams its tool steps. A
+`/codex review` and any job dispatched while the app-server is in its fallback
+window run one-shot on `codex exec` instead, and `ps` says `STEER no` for those.
+[Details.](#a-background-codex-job-on-codex-app-server)
 
 A handed-over job runs with `--sandbox workspace-write`, which is rooted at
 **one** directory, so Leash reads which repo the brief is about and runs it
@@ -476,7 +482,7 @@ one line instead of starting a session that cannot start.
 | `/engine`, `/codex …`, `/status`, `/new`, `/cd`, `/stop`, `/yolo`, `/help`, `/restart`, `/logs` | ✅ | ✅ both engines |
 | `/model` | the Claude model | the CODEX model, and it says so |
 | `/account`, `/accounts` | Claude rows + the Codex block | the Codex block (plan, 5h/weekly windows, credits, spend) |
-| `/steer <target>` | steers a running Claude worker | still steers Claude workers; a background Codex job answers "Codex runs take no mid-run input" and names the escape hatch (`bg.mjs --engine codex --file <brief>`). A Codex CHAT turn does not need `/steer` at all: type the message and it is spliced in |
+| `/steer <target>` | steers a running Claude worker | steers Claude workers and background Codex jobs alike (both land in the running turn); a one-shot `codex exec` run answers "Codex runs take no mid-run input" and names the escape hatch (`bg.mjs --engine codex --file <brief>`). A Codex CHAT turn does not need `/steer` at all: type the message and it is spliced in |
 | `/remind`, `/schedules`, `/unschedule` | ✅ | ✅ scheduling works, and a `--run` entry now resolves the **bg engine** rather than hard-routing to Claude; with neither engine able to take it, its text is delivered to you unsummarised instead |
 | `/rename`, `/resume`, `/chats` | the Claude chat archive | reachable, but there are no Claude sessions to list |
 | `/compact` | summarises the Claude session | ❌ "needs Claude" (and on a Codex chat lane with Claude installed it refuses too: the compaction handling lives in the Claude close handler, so the summary would be billed and then dropped) |
@@ -485,9 +491,9 @@ one line instead of starting a session that cannot start.
 | `/autopilot`, `/goal`, `/bug`, `/qa-loop`, … | passed through to Claude Code | ❌ Claude Code commands. Codex is never handed one it was not explicitly asked to run: during a wall the job waits for the reset, with no Claude at all it is refused outright |
 | a completed background job's report | summarised by the assistant | delivered to you unsummarised (there is no assistant to summarise it) |
 
-**What Codex cannot do here:** a BACKGROUND Codex job cannot be steered mid-run (it runs one-shot on
-`codex exec`, file-backed, with no stdin to write into), so `/steer` at one says so rather than acking
-a lie. The CHAT lane is a different story since the app-server landed: see below. Codex has none of
+**What Codex cannot do here:** a job that fell back to one-shot `codex exec` cannot be steered mid-run
+(it is file-backed, with no stdin to write into), so `/steer` at one says so rather than acking a lie.
+Both lanes are otherwise reachable mid-run since the app-server landed: see below. Codex has none of
 this bridge's memory, skills or conversation either way, which is why every Codex answer handed to
 the assistant is framed as DATA to verify.
 
@@ -521,9 +527,7 @@ to re-send that one message, not to start over.
 **The fallback is intact.** On an older `codex` with no app-server, with `codexAppServer: false` in
 `config.json`, or after the child dies twice in a minute, the chat lane runs one-shot on `codex exec`
 exactly as it used to, and says so once: "steering unavailable on this Codex run". Background jobs
-always use `codex exec` and always will: a background worker must outlive this daemon, and a child on
-our stdio pipes cannot. `/status` shows a background Codex job's last step by reading its log, which
-is where a bg lane's activity has always been shown.
+fall back the same way, for the whole life of the job.
 
 With no `codex` binary, every Codex path answers "Codex is not installed" instead of silently running
 on Claude: a cross-family answer that quietly came from the same family is worse than an error. A
@@ -536,6 +540,51 @@ is the root of the Codex sandbox, so resuming a thread whose context is repo A w
 now points at repo B is how same-named files in the wrong tree get edited.
 `/resume` does the same whenever it moves the cwd, which it does whenever the archived chat was
 recorded somewhere else. It is the same hazard reached by a different command.
+
+### A background Codex job, on `codex app-server`
+
+A handed-over Codex job (`bg.mjs --engine codex`, a `codex:` prefix, or the rate-limit fallback) runs
+as a thread on its own `codex app-server` child rather than one-shot on `codex exec`. That buys a
+background job the three things a one-shot run structurally cannot have, and that every Claude worker
+already had:
+
+* **`/steer` lands in the running turn** (`turn/steer`, with the turn id it was aimed at), framed
+  exactly as it is for a Claude worker. `bg.mjs ps` says `STEER yes`. A steer that arrives between
+  turns is queued and delivered by the next `turn/start` rather than refused.
+* **`/btw` is answered mid-run.** The daemon watches the thread's agent messages for the
+  `BTW-ANSWER #N:` marker, routes it by id back to the chat that asked, and lifts the block out of
+  both the bubble and the report, exactly as on a Claude worker.
+* **`/stop` is a `turn/interrupt`** the model acknowledges, not a SIGTERM at a child that may be
+  mid-write in `workspace-write`. The turn ends `interrupted`, the handback says stopped, and
+  whatever it produced still reaches `bg-reports/`.
+* **The bubble streams the tool steps** and ends `✅ Done · Ns · N steps`, through the same renderer
+  the Claude and Codex chat bubbles use.
+
+**One child per job**, not the chat lane's shared server: a job runs for an hour in
+`workspace-write`, and hanging it off the process every chat turn also uses would mean one death
+takes the other's turn with it. Sandbox and network are the exec path's rules unchanged: `edit`
+writes inside its own cwd and nowhere else, `ask` cannot write at all, and a turn carrying an engine
+handoff runs with the network off.
+
+**A restart resumes the job, it does not bury it.** The child is on the daemon's stdio pipes, so it
+dies with the daemon; the THREAD is on OpenAI's side and does not. On boot, every app-server job the
+last daemon left running gets a fresh child, a `thread/resume`, and one continuation turn that says
+the files it wrote are intact and it must not start over. You get one `🧠 Resumed` line. The job
+keeps its own run id, its own report path and its original deadline, so a restart cannot quietly buy
+a billed run another full timeout. A job whose thread was never created is handed back as a dead
+worker with the salvage note rather than dropped, and a question left pending across the restart
+resolves rather than ticking forever.
+
+**The handback is byte-compatible with the exec path**, asserted by test, and the run log is written
+in `codex exec --json` shape, so `/status`, the salvage script and the outcome reader all read it
+unchanged. `safe-restart.sh` treats a job's app-server child as work in flight (the run registry
+tells it which children are jobs; the chat lane's workless server is still excluded).
+
+**What stays one-shot on `codex exec`:** `/codex review`, which reads the diff itself and has nothing
+to steer into, and every job dispatched while the app-server has failed its death window. That is
+what keeps exec the fallback rather than the past. The lifecycle is logged one line per step
+(`bg_codex_appserver_started`, `turn_started`, `steered`, `btw_routed`, `interrupted`,
+`resumed_after_restart`, `died`, `handback`) with the run and thread ids and never the brief text.
 
 ### Switching engines without losing the conversation
 
