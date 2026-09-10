@@ -43,7 +43,15 @@ done
 TIMEOUT_MIN=${ARGS[0]:-15}
 LABEL="${BRIDGE_SERVICE_LABEL:-com.claude-telegram-bridge}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INFLIGHT="${BRIDGE_INFLIGHT_FILE:-$SCRIPT_DIR/bg-inflight.json}"
+# WHERE THE DAEMON ACTUALLY WRITES IT, resolved the same way bridge.mjs resolves
+# it: BRIDGE_INFLIGHT_FILE, then `inflightFile` in config.json, then the file
+# beside this script. A filter reading a path the daemon does not write finds no
+# registered pids at all, which is not a loud failure: every app-server child
+# reads as the chat lane's workless one, and the restart goes straight over a
+# job that is mid-write in workspace-write. A missing or unparseable config.json
+# leaves this empty and falls through, which is the default anyway.
+CONF_INFLIGHT=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('inflightFile') or '')" "$SCRIPT_DIR/config.json" 2>/dev/null)
+INFLIGHT="${BRIDGE_INFLIGHT_FILE:-${CONF_INFLIGHT:-$SCRIPT_DIR/bg-inflight.json}}"
 deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
 
 # Are ALL of the daemon's live children registered background workers?

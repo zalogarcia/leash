@@ -5431,6 +5431,37 @@ await t("★ registered_pids, run for real, keeps a job's child and drops the ch
   rmSync(home, { recursive: true, force: true });
 });
 
+await t("★ the script resolves the registry the same way the daemon does", () => {
+  // The half above proves the FILTER reads $INFLIGHT. This proves $INFLIGHT is
+  // the file bridge.mjs writes: same three layers, same order. Two files that
+  // disagree about where the registry lives is the failure, and it is silent on
+  // both sides.
+  const sh = readFileSync(path.join(DIR, "safe-restart.sh"), "utf8");
+  const at = sh.indexOf("CONF_INFLIGHT=");
+  ok(at > 0, "the resolution was not found, did it get renamed?");
+  const lines = sh.slice(at, sh.indexOf("\ndeadline=", at));
+  const home = mkdtempSync(path.join(tmpdir(), "safe-restart-conf-"));
+  const resolve = (env, conf) => {
+    if (conf === null) rmSync(path.join(home, "config.json"), { force: true });
+    else writeFileSync(path.join(home, "config.json"), conf);
+    return execFileSync("/bin/bash", ["-c", `SCRIPT_DIR=${JSON.stringify(home)}\n${lines}\nprintf '%s' "$INFLIGHT"`], {
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+    });
+  };
+  eq(resolve({}, null), path.join(home, "bg-inflight.json"), "no config and no env: the file beside the script");
+  eq(resolve({}, "{}"), path.join(home, "bg-inflight.json"), "a config that names no registry falls through");
+  eq(resolve({}, '{"inflightFile":"/tmp/moved.json"}'), "/tmp/moved.json", "★ config.json moves it, exactly as it moves the daemon's");
+  eq(
+    resolve({ BRIDGE_INFLIGHT_FILE: "/tmp/env-wins.json" }, '{"inflightFile":"/tmp/moved.json"}'),
+    "/tmp/env-wins.json",
+    "and the env layer wins over the file, which is conf()'s own precedence",
+  );
+  eq(resolve({}, "{ not json at all"), path.join(home, "bg-inflight.json"), "an unparseable config must not blank the path");
+  ok(SRC.some((l) => /const INFLIGHT_FILE = conf\('inflightFile'/.test(l)), "★ and the daemon reads the same two layers, or the two sides drift");
+  rmSync(home, { recursive: true, force: true });
+});
+
 await t("a resumed job INSIDE its budget is left alone", async () => {
   BGJ.reset();
   clearCalls();
