@@ -98,6 +98,13 @@ its process.**
   the report. And a clean run whose capture is empty because its only final message WAS an answer
   reports that reason instead of "ended with no output", which reads as a dead worker and gets the
   job re-fired.
+- **The dispatch notice still told you a background Codex job could not be steered.** It printed
+  `engine: codex · not steerable · <runId>` for every Codex job and offered no command, which stopped
+  being true the moment those jobs moved onto `codex app-server`: an edit or ask job takes a steer and
+  a side question mid turn. It now takes the run's steerability from the caller that started it, the
+  same way the live card does, and offers an edit or ask job the same `bg.mjs steer` command a Claude
+  worker's notice offers. A review keeps `not steerable` and now says why (one-shot exec run), and a
+  job with no run id says nothing about reach rather than guessing either way.
 
 ## 1.7.0 (2026-09-09)
 

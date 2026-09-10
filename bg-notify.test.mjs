@@ -250,18 +250,43 @@ t('the handoff notice never leads with the lane rules', () => {
 });
 
 // ---------------------------------------------------------------------------
-// The second engine. A Codex run is not a background worker: no bridge context,
-// separate billing, no steering. The notice has to say so or the owner reads a
-// degraded answer as one of M's own.
+// The second engine. A Codex run is not a background worker: no bridge context
+// and separate billing, so the notice has to say so or the owner reads a
+// degraded answer as one of the daemon's own. STEERING is not on that list any
+// more: an edit or ask job runs on the app-server and takes a steer and a side
+// question mid turn, and only the exec runs (review, and the exec fallback)
+// refuse one.
 // ---------------------------------------------------------------------------
 
-t('a codex handoff is glyph-marked and offers no steer command', () => {
+t('★ a codex edit job is glyph-marked AND offers the steer command a Claude worker offers', () => {
+  const msg = handoffNotice({ lane: 'codex', runId: 'codex-1789042434653', repo: 'ops-dash', brief: 'fix the auth guard', running: 1, engine: 'codex', steerable: true });
+  ok(msg.startsWith('🧠 codex · ops-dash'), msg);
+  ok(msg.includes('engine: codex'), 'the engine fact is what "why is this on Codex" reads');
+  ok(msg.includes('steer: node bg.mjs steer codex-1789042434653 "..."'), msg);
+  ok(!msg.includes('not steerable'), 'the old sentence must not survive on a job that takes a steer');
+});
+
+t('a codex ask job is reachable the same way', () => {
+  const msg = handoffNotice({ lane: 'codex', runId: 'codex-1789042434999', brief: 'what does this function do', running: 1, engine: 'codex', steerable: true });
+  ok(msg.includes('steer: node bg.mjs steer codex-1789042434999 "..."'), msg);
+  ok(!msg.includes('not steerable'), msg);
+});
+
+t('a codex review keeps "not steerable", with the reason', () => {
+  // A review runs on `codex exec`, which read its prompt once and never again.
+  // Offering a steer there sends the owner to type a message that goes nowhere.
   const msg = handoffNotice({ lane: 'codex', runId: 'codex-1788453512237', repo: 'ops-dash', brief: 'review the diff', running: 1, engine: 'codex' });
   ok(msg.startsWith('🧠 codex · ops-dash'), msg);
-  ok(!msg.includes('bg.mjs steer'), 'a steer command on a Codex run would be acked and never delivered');
+  ok(!msg.includes('bg.mjs steer'), 'a steer command on a one-shot run would be acked and never delivered');
   ok(msg.includes('engine: codex'), msg);
-  ok(msg.includes('not steerable'), msg);
+  ok(msg.includes('not steerable (one-shot exec run)'), 'saying it cannot be reached without saying why raises the question it answers');
   ok(msg.includes('codex-1788453512237'), 'the run id still has to be there for /status and the report');
+});
+
+t('a steerable codex job with no target names no command rather than a placeholder one', () => {
+  const msg = handoffNotice({ brief: 'x', running: 1, engine: 'codex', steerable: true });
+  ok(!msg.includes('bg.mjs steer'), `a steer command with no target is worse than none:\n${msg}`);
+  ok(!/undefined|null/.test(msg), `placeholder leaked: ${msg}`);
 });
 
 t('a codex handoff says WHY it is on codex when it was a fallback', () => {
@@ -279,6 +304,10 @@ t('the default engine is claude and its notice is byte-identical to before', () 
   const withDefault = handoffNotice({ lane: 'bg2', repo: 'r', brief: 'x', running: 1 });
   const explicit = handoffNotice({ lane: 'bg2', repo: 'r', brief: 'x', running: 1, engine: 'claude' });
   eq(withDefault, explicit, 'adding the engine field must not change any existing notice');
+  // A Claude worker is always reachable, so the flag is a Codex fact and must
+  // not reach this line in either position.
+  eq(handoffNotice({ lane: 'bg2', repo: 'r', brief: 'x', running: 1, steerable: true }), withDefault, 'the steerable flag changed a Claude notice');
+  eq(handoffNotice({ lane: 'bg2', repo: 'r', brief: 'x', running: 1, steerable: false }), withDefault, 'the steerable flag changed a Claude notice');
   ok(withDefault.startsWith('🌙 '), withDefault);
   ok(withDefault.includes('steer: node bg.mjs steer bg2 "..."'), withDefault);
 });
@@ -651,6 +680,24 @@ t('workerLine: ★ every phase passes the house-style gates', () => {
     noDashes(str, `workerLine/${phase}`);
     linesFit(str, `workerLine/${phase}`);
     noTokensOrModels(str, `workerLine/${phase}`);
+  }
+});
+
+t('handoffNotice: ★ every engine and reach passes the house-style gates', () => {
+  // linesFit is deliberately NOT applied: this notice teaches the TERMINAL
+  // command (`node bg.mjs steer …`), which is longer than a phone row by
+  // construction and always has been. workerLine is the card that has to fit.
+  for (const [where, args] of [
+    ['claude', { lane: 'bg2', repo: 'ops-dash', brief: 'x', running: 2 }],
+    ['codex/edit', { lane: 'codex', runId: 'codex-1789042434653', repo: 'ops-dash', brief: 'x', running: 1, engine: 'codex', steerable: true }],
+    ['codex/ask', { lane: 'codex', runId: 'codex-1789042434999', brief: 'x', running: 1, engine: 'codex', steerable: true }],
+    ['codex/review', { lane: 'codex', runId: 'codex-1788453512237', repo: 'ops-dash', brief: 'x', running: 1, engine: 'codex' }],
+    ['codex/fallback', { lane: 'codex', runId: 'codex-1', brief: 'x', engine: 'codex', engineNote: 'every Claude account is limited until 17:40' }],
+  ]) {
+    const str = handoffNotice(args);
+    noDashes(str, `handoffNotice/${where}`);
+    noTokensOrModels(str, `handoffNotice/${where}`);
+    ok(!/undefined|null/.test(str), `handoffNotice/${where}: placeholder leaked\n${str}`);
   }
 });
 
@@ -1080,6 +1127,36 @@ t('★ and the card says "not steerable" again the moment the job falls back to 
   ok(notice.includes('🧠 codex · requested · not steerable'), notice);
   ok(!notice.includes('/steer'), 'offering a steer would be a lie that gets acked as delivered');
   B.setCodexTransport('appserver');
+});
+
+t('★ no notice call site in bridge.mjs may omit whether the job can be steered', () => {
+  // The flag is the only thing standing between a job that takes a steer and a
+  // card telling the owner it cannot be reached, and a call site that leaves it
+  // off gets the default (false) silently, from both builders. So the guard is
+  // on the CALL SITES rather than on the builder: nothing else fails when one
+  // of them forgets. Both builders are scanned because either can be the one a
+  // future Codex notice is written against.
+  const SRC = BRIDGE_SRC.join('\n');
+  // The payload literal, brace-matched rather than clipped at a guessed width:
+  // a window too short reads a missing flag as an absent one and passes.
+  const payload = (chunk) => {
+    const start = chunk.indexOf('{');
+    if (start === -1) return '';
+    let depth = 0;
+    for (let i = start; i < chunk.length; i++) {
+      if (chunk[i] === '{') depth++;
+      else if (chunk[i] === '}' && --depth === 0) return chunk.slice(start, i + 1);
+    }
+    return chunk.slice(start);
+  };
+  const sites = SRC.split(/startWorkerNotice\(|handoffNotice\(/)
+    .slice(1)
+    .map(payload)
+    .filter((p) => /engine: 'codex'/.test(p));
+  ok(sites.length > 0, 'no codex notice call site found at all, so this guard has stopped guarding anything');
+  for (const p of sites) {
+    ok(/steerable:/.test(p), `a codex notice built without the flag, so a steerable job is told it is not:\n${p}`);
+  }
 });
 
 t('a codex: prefix routes the same way and is stripped from the brief', () => {

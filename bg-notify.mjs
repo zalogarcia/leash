@@ -66,7 +66,20 @@ export function parseRunId(id) {
  * underscores and asterisks, and one unbalanced entity costs the WHOLE message
  * its formatting.
  */
-export function handoffNotice({ lane, runId, repo, brief, running, queued = 0, engine = 'claude', engineNote = null } = {}) {
+export function handoffNotice({
+  lane,
+  runId,
+  repo,
+  brief,
+  running,
+  queued = 0,
+  engine = 'claude',
+  engineNote = null,
+  // WHETHER THIS RUN CAN BE REACHED MID-RUN, which is a property of the
+  // transport rather than of the engine, and so has to come from the caller
+  // that started it. Default false, so a one-shot run's notice is unchanged.
+  steerable = false,
+} = {}) {
   // A run on the second engine must be identifiable as one from the first
   // glyph: Codex has none of this bridge's context and is billed separately, so
   // reading its notice as a normal worker's would be wrong on both counts. It
@@ -88,11 +101,27 @@ export function handoffNotice({ lane, runId, repo, brief, running, queued = 0, e
   // acked as delivered. `<lane>-<startedAt>` belongs to one worker forever.
   // A target or nothing: a copy-pasteable command beats a placeholder.
   const target = runId || lane;
-  // Codex takes no mid-run input, so offering a steer command would be a lie
-  // that gets acked as delivered. Say what it IS running on instead, and why:
-  // "why is this on Codex" is the only question a Codex notice raises.
-  if (isCodex) lines.push(`engine: codex${engineNote ? ` (${engineNote})` : ''} · not steerable${target ? ` · ${target}` : ''}`);
-  else if (target) lines.push(`steer: node bg.mjs steer ${target} "..."`);
+  // WHAT IT IS RUNNING ON, and whether it can be reached, on one line: "why is
+  // this on Codex" is the only question a Codex notice raises. An edit or ask
+  // job holds a live app-server thread and takes the SAME steer command a
+  // Claude worker takes, so withholding one costs the reach the app-server was
+  // built for; a review runs on `codex exec`, which read its prompt once and
+  // never again, so offering one there would be a lie that gets acked as
+  // delivered. A job that starts on the app-server and later falls back to
+  // exec is refused by the steer path and corrected in the chat, so this line
+  // reports the transport it was dispatched on rather than predicting one.
+  if (isCodex) {
+    // A steerable job with no target says NOTHING about reach rather than
+    // falling back to "not steerable", which would be the same lie in the
+    // other direction: a command with no target is worse than none, and the
+    // Claude branch below drops its line for exactly that reason.
+    const reach = steerable
+      ? target
+        ? `steer: node bg.mjs steer ${target} "..."`
+        : null
+      : `not steerable (one-shot exec run)${target ? ` · ${target}` : ''}`;
+    lines.push(`engine: codex${engineNote ? ` (${engineNote})` : ''}${reach ? ` · ${reach}` : ''}`);
+  } else if (target) lines.push(`steer: node bg.mjs steer ${target} "..."`);
   return lines.join('\n');
 }
 
