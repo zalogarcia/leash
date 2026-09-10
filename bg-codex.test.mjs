@@ -38,6 +38,8 @@ import {
   parseCodexEvents,
   parseEnginePrefix,
   shouldRouteToCodex,
+  codexAppServerDeathOutcome,
+  codexAppServerOutcome,
 } from './bg-codex.mjs';
 import { parseRunId } from './bg-steer.mjs';
 
@@ -612,6 +614,79 @@ t('a short parked pair is untouched, and never says the owner "asked"', () => {
   ok(n.includes('Sam sent: run the suite'), n);
   ok(!/asked:/.test(n), n);
   ok(!/clipped/.test(n), 'a short pair must not be decorated with a clip marker');
+});
+
+
+// ---------------------------------------------------------------------------
+// 9. a background job on the app-server
+// ---------------------------------------------------------------------------
+
+t('★ the start notice says a job CAN be steered when its transport allows it', () => {
+  const line = codexStartNotice({ runId: 'codex-9', mode: 'edit', steerable: true });
+  ok(/steerable \(bg\.mjs steer/.test(line), line);
+  ok(!/not steerable/.test(line), 'the old sentence must not survive on a job that takes a steer');
+});
+
+t('and still says it cannot on a one-shot run, which is the default', () => {
+  ok(/not steerable/.test(codexStartNotice({ runId: 'codex-9', mode: 'ask' })), 'the exec path is unchanged');
+});
+
+t('a finished job reads exactly like an exec one to everything downstream', () => {
+  const a = codexAppServerOutcome({ answer: 'the suite is green', tokens: { input_tokens: 5, output_tokens: 2 }, threadId: 't1' });
+  eq(a.status, 'finished');
+  eq(a.answer, 'the suite is green');
+  eq(a.record, 'the suite is green');
+  eq(a.threadId, 't1');
+  eq(a.failure, null);
+  // The same keys codexOutcome returns: reportCodexOutcome and handBackToChat
+  // read this object and must not be able to tell the two transports apart.
+  eq(JSON.stringify(Object.keys(a).sort()), JSON.stringify(Object.keys(codexOutcome({ lastText: 'x' })).sort()));
+});
+
+t('a job that produced nothing says so rather than handing back an empty report', () => {
+  const a = codexAppServerOutcome({ answer: '   ' });
+  eq(a.status, 'finished');
+  eq(a.record, null, 'null means leave no row, matching a silent Claude worker');
+});
+
+t('★ an interrupted turn is STOPPED, never finished', () => {
+  // The live probe caught this shape on the chat lane: an interrupted turn
+  // written as "finished" reports a turn the owner killed as a clean answer.
+  const a = codexAppServerOutcome({ answer: 'half of it', status: 'interrupted' });
+  eq(a.status, 'stopped');
+  ok(a.answer.includes('half of it'), a.answer);
+  eq(a.failure, null, 'a stop is ours, never Codex\'s: classifying it would set a wall');
+});
+
+t('a failed turn carries the classified failure, so the wall and the remedy still work', () => {
+  eq(codexAppServerOutcome({ status: 'failed', error: 'rate limit exceeded' }).failure, 'rate_limit');
+  eq(codexAppServerOutcome({ status: 'failed', error: 'no rollout found for thread id x' }).failure, 'thread_gone');
+  eq(codexAppServerOutcome({ status: 'failed', error: 'boom' }).status, 'failed');
+});
+
+t('★ a dead app-server hands back the salvage instruction, never a bare failure', () => {
+  const a = codexAppServerDeathOutcome({ reason: 'the Codex app-server died mid-turn', deaths: 2, partial: 'wrote three files' });
+  eq(a.status, 'failed');
+  ok(/bg-salvage\.py/.test(a.answer), 'a dead worker is not an empty worker, and the report has to say so');
+  ok(/A DEAD WORKER IS NOT AN EMPTY WORKER/.test(a.answer), a.answer);
+  ok(a.answer.includes('wrote three files'), 'what it managed to say is not thrown away');
+  ok(/2 restarts/.test(a.answer), a.answer);
+  eq(a.failure, null, 'a dead child is not the model refusing: it must not set the ChatGPT wall');
+});
+
+t('one death reads as one restart, not "1 restarts"', () => {
+  ok(/1 restart\b/.test(codexAppServerDeathOutcome({ deaths: 1 }).answer));
+});
+
+t('nothing either builder writes carries an em or en dash', () => {
+  for (const s of [
+    codexAppServerDeathOutcome({ deaths: 2, partial: 'x' }).answer,
+    codexAppServerOutcome({ answer: 'x' }).answer,
+    codexAppServerOutcome({ status: 'interrupted', answer: 'x' }).answer,
+    codexStartNotice({ runId: 'codex-1', steerable: true }),
+  ]) {
+    ok(!/[\u2013\u2014]/.test(s), `an em or en dash reached the owner: ${s}`);
+  }
 });
 
 console.log(`\n${pass} passed, ${failures.length} failed\n`);

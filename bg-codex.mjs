@@ -591,13 +591,24 @@ export function codexReasonText(reason, pausedUntil, opts = {}) {
  * that is not Claude must never look like one, because the answer quality, the
  * billing and the steerability are all different.
  */
-export function codexStartNotice({ runId, mode = 'ask', cwd = null, title = '', reason = null, pausedUntil = null, timeZone } = {}) {
+export function codexStartNotice({ runId, mode = 'ask', cwd = null, title = '', reason = null, pausedUntil = null, timeZone, steerable = false } = {}) {
   const why = codexReasonText(reason, pausedUntil, { timeZone });
   const head = `🧠 codex (${mode})${cwd ? ` · ${String(cwd).split('/').filter(Boolean).pop()}` : ''}`;
   const lines = [head];
   if (title) lines.push(title);
   if (why && reason === 'claude_limited') lines.push(`running on Codex because ${why}`);
-  if (runId) lines.push(`${runId} · not steerable (Codex runs take no mid-run input)`);
+  // WHETHER IT CAN BE REACHED, which is now a property of the run and not of the
+  // engine. A job on the app-server takes a steer and a side question exactly as
+  // a Claude worker does; a one-shot `codex exec` run has no stdin to write into
+  // once its prompt is in. Saying the wrong one costs a message that goes
+  // nowhere, so it is answered by the caller that knows the transport.
+  if (runId) {
+    lines.push(
+      steerable
+        ? `${runId} · steerable (bg.mjs steer, /steer, /btw)`
+        : `${runId} · not steerable (Codex runs take no mid-run input)`,
+    );
+  }
   return lines.join('\n');
 }
 
@@ -828,4 +839,71 @@ export function codexDoctorReport({ text = '', code = 0, error = null } = {}) {
   const head = code === 0 ? '🧠 codex doctor' : `🧠 codex doctor (exit ${code})`;
   const body = clean.length > DOCTOR_MAX ? `${clean.slice(0, DOCTOR_MAX)}\n… (truncated)` : clean;
   return `${head}\n\n${body || '(no output)'}`;
+}
+
+// ---------------------------------------------------------------------------
+// A BACKGROUND JOB WHOSE APP-SERVER DIED FOR GOOD
+//
+// The retry inside the death window is the daemon's job; this is what is said
+// once the window is spent. It has to carry the salvage instruction, because the
+// one thing that must never happen to a dead worker is a re-fire from zero over
+// work that is sitting finished on disk (2026-07-30: two completed 167-agent
+// workflows discarded that way).
+// ---------------------------------------------------------------------------
+
+export function codexAppServerDeathOutcome({ reason = 'the Codex app-server died', partial = '', tokens = null, deaths = 0 } = {}) {
+  const answer = [
+    `Codex FAILED: ${reason}${deaths ? ` after ${deaths} restart${deaths === 1 ? '' : 's'} inside the death window` : ''}.`,
+    '',
+    'A DEAD WORKER IS NOT AN EMPTY WORKER. Before re-firing anything: run',
+    'python3 ~/.claude/scripts/bg-salvage.py, then read the run log and the files in the',
+    'job\'s directory. Relaunch ONLY the part that is genuinely unfinished.',
+    ...(String(partial || '').trim() ? ['', `Last thing it said: ${String(partial).trim()}`] : []),
+  ].join('\n');
+  return {
+    status: 'failed',
+    answer,
+    record: `FAILED (${reason})`,
+    tokens,
+    threadId: null,
+    // Ours, not Codex's: the model never refused anything here, its server
+    // process exited. Classifying it would let a dead child set the ChatGPT
+    // wall or clear a thread.
+    failure: null,
+  };
+}
+
+/**
+ * The outcome of a background app-server job, from what the turn produced.
+ *
+ * The Codex twin of codexOutcome for the app-server transport: same
+ * { status, answer, record, tokens, threadId, failure } contract, so everything
+ * downstream (reportCodexOutcome, handBackToChat, bg-results.jsonl) cannot tell
+ * the two transports apart, which is the whole requirement.
+ */
+export function codexAppServerOutcome({ answer = '', tokens = null, threadId = null, status = 'completed', error = null, stopped = false } = {}) {
+  const text = String(answer || '').trim();
+  if (stopped || status === 'interrupted') {
+    return {
+      status: 'stopped',
+      answer: `Codex STOPPED: the turn was interrupted${text ? `. Partial answer: ${text}` : ''}`,
+      record: `STOPPED: ${text || '(no output)'}`,
+      tokens,
+      threadId,
+      failure: null,
+    };
+  }
+  if (status === 'failed' || error) {
+    const detail = String(error || 'the Codex turn failed');
+    return {
+      status: 'failed',
+      answer: `Codex FAILED: ${detail}`,
+      record: `FAILED: ${detail}`,
+      tokens,
+      threadId,
+      failure: classifyCodexFailure(detail),
+    };
+  }
+  if (!text) return { status: 'finished', answer: 'Codex ended with no output.', record: null, tokens, threadId, failure: null };
+  return { status: 'finished', answer: text, record: text, tokens, threadId, failure: null };
 }
