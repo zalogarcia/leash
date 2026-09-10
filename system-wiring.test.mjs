@@ -67,7 +67,7 @@ export const url = (f) => JSON.stringify(pathToFileURL(path.join(DIR, f)).href);
 // ---------------------------------------------------------------------------
 const HARNESS = `
 import { visibleOnly, fetchingLine, fetchFailedLine, errorMessage, WALL_TICK_MS, compactingLine, compactQueuedLine, compactDoneLine, compactDiscardedLine } from ${url('system-messages.mjs')};
-import { btwPendingLine, btwAnsweredLine, btwEndedLine, btwStoppedLine, btwLostLine, btwWaitingLine } from ${url('system-messages.mjs')};
+import { btwPendingLine, btwAnsweredLine, btwEndedLine, btwStoppedLine, btwLostLine, btwRefusedLine, btwWaitingLine } from ${url('system-messages.mjs')};
 import { BTW_RECORD_MAX, BTW_TICK_MS, BTW_TIMEOUT_MS } from ${url('bg-btw.mjs')};
 import { normalizeDashes } from ${url('dash-normalize.mjs')};
 const NO_DASHES = true;
@@ -806,6 +806,18 @@ await t('a daemon restart resolves it as lost', () => {
 });
 
 B.reset();
+rec = { id: 41, lane: 'codex', askedAt: Date.now() };
+await B.startBtwNotice(rec, 'codex');
+rec.resolve('refused', { why: 'the Codex turn had already finished' });
+await t('★ a refusal resolves it as not delivered, carrying the reason', () => {
+  // The sixth state, and the one an app-server job needs: `ended` would tell him
+  // the report may still carry an answer to a question the job never received.
+  ok(lastText().includes('not delivered'), lastText());
+  ok(lastText().includes('the Codex turn had already finished'), lastText());
+  ok(lastText().includes('Ask again'), lastText());
+});
+
+B.reset();
 rec = { id: 5, lane: 'bg2', askedAt: Date.now() - BTW_TIMEOUT_MS - 1000 };
 await B.startBtwNotice(rec, 'bg2');
 B.tickLiveMessages();
@@ -1010,6 +1022,46 @@ await t('and a huge question is clipped before it reaches the registry', () => {
   ok(d.question.length <= 501, `${d.question.length} chars would be amplified across bg-inflight.json`);
   eq(d.msgId, null, 'an absent id is null, never undefined, so JSON keeps the field');
 });
+
+// ---------------------------------------------------------------------------
+console.log('\n11. the same ⏳ over a background CODEX job');
+// ---------------------------------------------------------------------------
+//
+// A side question to a Codex job on the app-server travels a different pipe
+// (turn/steer rather than a stdin splice) and is resolved by a different
+// detector, but it puts up the SAME ⏳ and must reach the same five endings.
+// The routing is proven in bg-codex-wiring.test.mjs section 21d; what is
+// asserted here is that the lane name being `codex` changes nothing about the
+// line the owner is looking at.
+
+B.reset();
+const codexRec = { id: 1, lane: 'codex', askedAt: Date.now() };
+await B.startBtwNotice(codexRec, 'codex');
+
+await t('a question to a Codex job puts up one ⏳, named by its lane', () => {
+  eq(sends().length, 1);
+  ok(sends()[0].payload.text.startsWith('⏳ btw · codex'), sends()[0].payload.text);
+});
+
+await t('★ and its answer edits that same message, exactly as a worker\'s does', () => {
+  codexRec.resolve('answered', { answer: 'it is b.txt' });
+  eq(sends().length, 1, 'a wait is one message, edited');
+  eq(edits().length, 1);
+  ok(lastText().includes('✅ btw · codex'), lastText());
+  ok(lastText().includes('it is b.txt'), lastText());
+});
+
+for (const [state, glyph] of [['ended', '❌'], ['stopped', '🛑'], ['lost', '❌'], ['refused', '❌']]) {
+  await t(`a Codex job that ends "${state}" resolves the line rather than stranding it`, () => {
+    B.reset();
+    const r = { id: 1, lane: 'codex', askedAt: Date.now() };
+    return B.startBtwNotice(r, 'codex').then(() => {
+      r.resolve(state);
+      ok(lastText().startsWith(glyph), `${state}: ${lastText()}`);
+      eq(edits().length, 1, 'exactly one edit, to exactly one terminal state');
+    });
+  });
+}
 
 console.log(`\n${pass} passed, ${failures.length} failed\n`);
 if (failures.length) {

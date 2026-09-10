@@ -207,6 +207,11 @@ export function workerLine({
   chars = null,
   status = 'finished',
   engine = 'claude',
+  // WHETHER THIS JOB CAN BE REACHED MID-RUN, which is a property of the
+  // transport rather than of the engine: a Codex job on the app-server holds a
+  // live thread and takes a steer, a one-shot `codex exec` run read its prompt
+  // once and never again. Default false, so an exec run's card is unchanged.
+  steerable = false,
   engineNote = null,
   model = null,
   effort = null,
@@ -257,10 +262,15 @@ export function workerLine({
     if (Number.isFinite(running) && running > 0) bits.push(`${running} worker${running === 1 ? '' : 's'}`);
     if (queued > 0) bits.push(`${queued} queued`);
     lines.push(bits.join(' · '));
-    // Codex takes no mid-run input, so offering a steer would be a lie that
-    // gets acked as delivered. Say what it is running on instead: "why is this
-    // on Codex" is the only question a Codex notice raises.
-    if (isCodex) lines.push(`🧠 codex${engineNote ? ` · ${engineNote}` : ''} · not steerable`);
+    // WHAT IT IS RUNNING ON, and whether it can be reached, on ONE line: "why
+    // is this on Codex" is the only question a Codex notice raises, and the
+    // card is three lines on a phone. Offering a steer a one-shot run cannot
+    // take would be a lie that gets acked as delivered; withholding one from a
+    // job that CAN take it costs him the reach the app-server was built for.
+    if (isCodex) {
+      const reach = steerable ? `/steer ${runId || lane || 'the job'} <instruction>` : 'not steerable';
+      lines.push(`🧠 codex${engineNote ? ` · ${engineNote}` : ''} · ${reach}`);
+    }
     // The RUN id, not the lane, whenever the caller knows it: lane names are
     // recycled, so a steer copied out of an old notice would land in whatever
     // job holds the name later and be acked as delivered.

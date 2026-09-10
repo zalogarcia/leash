@@ -16,6 +16,7 @@ import { execFile, spawn as spawnProcess } from 'node:child_process';
 import {
   readFileSync,
   writeFileSync,
+  appendFileSync,
   existsSync,
   statSync,
   mkdirSync,
@@ -92,6 +93,8 @@ import {
   deadWorkerLine,
   chainPausedLine,
   codexCatchUpLine,
+  codexResumedLine,
+  codexSteerLostLine,
   errorMessage,
   classifyClaudeFailure,
   claudeFailureRemedy,
@@ -106,6 +109,7 @@ import {
   btwEndedLine,
   btwStoppedLine,
   btwLostLine,
+  btwRefusedLine,
   btwWaitingLine,
   queueAck,
   queueStarted,
@@ -165,6 +169,7 @@ import {
   btwFraming,
   createBtwTracker,
   isBtwFramed,
+  parseBtwAnswer,
 } from './bg-btw.mjs';
 import { claimSteerSock, releaseSteerSock } from './steer-sock.mjs';
 import {
@@ -192,6 +197,8 @@ import {
   shouldRouteToCodex,
   CODEX_VERIFIED_VERSION,
   classifyCodexFailure,
+  codexAppServerDeathOutcome,
+  codexAppServerOutcome,
   codexChatError,
   codexDoctorReport,
   codexFailureRemedy,
@@ -222,8 +229,14 @@ import {
 } from './engine-handoff.mjs';
 import {
   APP_SERVER_ARGS,
+  APP_SERVER_DEATH_WINDOW_MS,
   APP_SERVER_INIT_TIMEOUT_MS,
+  APP_SERVER_MAX_DEATHS,
+  RESTART_CONTINUATION,
   answerFromTurn,
+  appServerLogLine,
+  bgCodexTransport,
+  execEventForLog,
   lastActFromExecLog,
   classifyAppServerError,
   createJsonLineReader,
@@ -2195,6 +2208,22 @@ const inflight = createInflightRegistry({ file: INFLIGHT_FILE });
 // The module decides WHICH workers died; this decides what the chat lane is told
 // about them. Kept here because the wording is host policy, not shared logic.
 function onDeadWorkers(dead, reason) {
+  // A CODEX JOB MID-RETRY IS NOT A CORPSE. Its app-server child really did die
+  // and its row really does hold a dead pid, but the daemon is already spawning
+  // the replacement and rewrites the row a few hundred ms later. The reaper runs
+  // every 60s and cannot see that, so without this guard it lands in that window
+  // and says a worker died, dispatches the assistant to salvage it, and stamps
+  // the sidecar `failed` on a job that then carries on and reports normally,
+  // twice. The daemon's own map is authoritative: a run still in codexRuns and
+  // not done is one this process is still driving.
+  const stillDriven = ({ id, rec }) => {
+    if (rec?.engine !== 'codex') return false;
+    const { startedAt } = parseRunId(id);
+    const run = startedAt ? codexRuns.get(codexRunId(startedAt)) : null;
+    return Boolean(run && !run.done);
+  };
+  dead = dead.filter((d) => !stillDriven(d));
+  if (!dead.length) return;
   const lines = dead.map(({ id, rec, ageMs }) => {
     const mins = ageMs != null ? Math.round(ageMs / 60000) : '?';
     // WHOSE corpse it is. A Codex run has none of this daemon's rules and
@@ -2413,12 +2442,16 @@ function bgWorkerDescriptors() {
         run: null,
       };
     });
-  // Codex runs are background work too: they are registered, they are detached,
-  // and they take hours of wall clock in edit mode, so /status saying "idle"
-  // over one would be the same lie it used to tell over a re-attached worker.
-  // They are deliberately NOT steerable (a Codex run reads its prompt once, from
-  // stdin, and never again) and they stay isBg so the resolver refuses a steer at
-  // them BY NAME rather than by "nothing matches that".
+  // Codex runs are background work too: they are registered, they take hours of
+  // wall clock in edit mode, and /status saying "idle" over one would be the same
+  // lie it used to tell over a re-attached worker.
+  //
+  // STEERABILITY IS A PROPERTY OF THE TRANSPORT, not of the engine. A job on the
+  // app-server holds a live thread and a turn id, so a steer and a /btw reach it
+  // exactly as they reach a Claude worker. A one-shot `codex exec` run (a review,
+  // or anything dispatched while the app-server is in its fallback window) read
+  // its prompt from stdin once and never again: it stays isBg so the resolver
+  // refuses by NAME rather than by "nothing matches that".
   const codex = [...codexRuns.values()]
     .filter((r) => !r.done && !known.has(r.child?.pid))
     .map((r) => ({
@@ -2428,7 +2461,7 @@ function bgWorkerDescriptors() {
       pid: r.child?.pid ?? null,
       startedAt: r.startedAt,
       elapsedSec: Math.round((now - r.startedAt) / 1000),
-      steps: 0,
+      steps: r.steps || 0,
       // WHAT IT IS DOING RIGHT NOW, read out of its own log on demand.
       //
       // A background Codex job has no progress bubble on purpose (a bg lane's
@@ -2438,19 +2471,24 @@ function bgWorkerDescriptors() {
       // file_change items the chat bubble draws, so one backwards walk of the
       // log tail gives the same step line, through the same renderer, at the
       // cost of one file read per /status.
-      lastAct: (() => {
-        const entry = lastActFromExecLog(readTailIf(r.logPath || null), HOME);
-        return entry ? renderEntry(entry, false).replace(/^\s*↳\s*/, '') : null;
-      })(),
-      steerable: false,
-      steers: 0,
+      lastAct:
+        // An app-server job streams its items to us, so it already knows; only a
+        // file-backed exec run has to be read off disk.
+        r.lastAct ||
+        (() => {
+          const entry = lastActFromExecLog(readTailIf(r.logPath || null), HOME);
+          return entry ? renderEntry(entry, false).replace(/^\s*↳\s*/, '') : null;
+        })(),
+      steerable: r.transport === 'appserver' && !r.done && !r.killed,
+      steers: r.steers?.length || 0,
       title: briefTitle(r.prompt),
       isBg: true,
       running: true,
       engine: 'codex',
+      transport: r.transport || 'exec',
       mode: r.mode,
       cwd: r.cwd,
-      run: null,
+      run: r.handle || null,
     }));
   return [...live, ...reattached, ...codex];
 }
@@ -2566,7 +2604,11 @@ async function startBtwNotice(record, lane) {
         ? btwStoppedLine({ lane })
         : state === 'lost'
           ? btwLostLine({ lane })
-          : btwEndedLine({ lane }),
+          : // The question never reached the job, so unlike `ended` there is no
+            // report that might still carry the answer.
+            state === 'refused'
+            ? btwRefusedLine({ lane, why: extra.why })
+            : btwEndedLine({ lane }),
     );
   };
 
@@ -2674,8 +2716,14 @@ function btwInto(target, question) {
 function resolveBtwAfterRestart(id, rec) {
   const list = Array.isArray(rec?.btwPending) ? rec.btwPending : [];
   if (!list.length) return;
+  // A CODEX JOB ON THE APP-SERVER IS RESUMED a few lines after this, so for it
+  // the usual "that worker cannot be asked again" is false: it is about to be
+  // alive and steerable, and the line would be contradicted by the `Resumed`
+  // message arriving under it. The question itself is still lost either way,
+  // because the turn that was carrying it died with the last daemon.
+  const resumable = rec?.engine === 'codex' && rec?.transport === 'appserver' && Boolean(rec?.threadId);
   for (const p of list) {
-    const text = btwLostLine({ lane: p?.lane || rec?.lane || '' });
+    const text = btwLostLine({ lane: p?.lane || rec?.lane || '', resumable });
     if (p?.msgId) editProgress(p.msgId, escHtml(text), () => text).catch(() => {});
     else send(text, { markdown: false }).catch(() => {});
   }
@@ -4588,7 +4636,7 @@ function codexOutcomeFromDisk(runId) {
 // The Codex twin of reportBgOutcome, minus the account rotation: a Codex failure
 // is not a Claude limit and must never rotate an account. Same order for the
 // same reason, the durable row first, then the note to the chat lane.
-function reportCodexOutcome(task, outcome, runId, { mode = 'ask', cwd = null, reason = null, pausedUntil = null } = {}) {
+function reportCodexOutcome(task, outcome, runId, { mode = 'ask', cwd = null, reason = null, pausedUntil = null, steers = [] } = {}) {
   const id = bgReportId(runId);
   notifyOwnerBgFinished(task, outcome.status, runId);
   if (outcome.record != null) recordBgResult(task, outcome.record, bgReportPath(id));
@@ -4604,7 +4652,11 @@ function reportCodexOutcome(task, outcome, runId, { mode = 'ask', cwd = null, re
     deliverCodexDirect(task, outcome, id);
     return;
   }
-  handBackToChat(task, outcome.answer, outcome.status, id, [], {
+  // `steers` is EMPTY for an exec run and cannot be otherwise: it has no stdin to
+  // write into once its prompt is in. An app-server job can be steered exactly as
+  // a Claude worker can, and the report has to account for what the bridge wrote
+  // into it, through the same steeredInBlock the Claude path uses.
+  handBackToChat(task, outcome.answer, outcome.status, id, steers, {
     engine: 'codex',
     codex: { mode, cwd, tokens: outcome.tokens, reason, pausedUntil },
   });
@@ -4879,6 +4931,651 @@ function codexLaunchError(e) {
   return e?.message || String(e);
 }
 
+// How long a background job waits for `turn/completed` after its `turn/interrupt`
+// was accepted, before ending the run itself. The exec path escalates SIGTERM to
+// SIGKILL after ten seconds; an interrupt is gentler and the model may be
+// finishing a write, so this is longer, and it is a backstop rather than the
+// normal path (the real binary completes an interrupted turn in well under a
+// second, measured by scripts/probes/codex-bg-appserver-probe.mjs).
+const CODEX_INTERRUPT_GRACE_MS = 30_000;
+
+// ---------------------------------------------------------------------------
+// A BACKGROUND CODEX JOB ON THE APP-SERVER
+//
+// The same job `runCodex` runs one-shot, run instead as a thread on a private
+// `codex app-server` child, which buys the three things a one-shot run
+// structurally cannot have and that every Claude worker already had:
+//
+//   • a STEER lands in the running turn (turn/steer, with expectedTurnId)
+//   • a /btw is answered mid-run and the answer is lifted out of the report
+//   • /stop is an interrupt the model acknowledges, not a SIGTERM
+//
+// ONE CHILD PER JOB, deliberately not the chat lane's shared server: a bg job
+// runs for an hour in workspace-write, and hanging it off the same process every
+// chat turn also uses would mean one dying takes the other with it. The cost is
+// one extra process per running job, which is what the exec path cost anyway.
+//
+// WHAT IT GIVES UP, and how it is paid for: this child is on OUR stdio pipes, so
+// it dies with the daemon. The THREAD does not (it lives on OpenAI's side), so a
+// restart RESUMES the job rather than losing it: see recoverCodexAppServerJob.
+//
+// Everything downstream is untouched. The run is registered in bg-inflight.json
+// exactly as an exec run is, it writes the same `codex exec --json` shaped log
+// (so /status, the salvage script and codexOutcomeFromDisk read it unchanged),
+// and it reports through reportCodexOutcome, so the handback the chat lane
+// receives is the same object either way.
+// ---------------------------------------------------------------------------
+
+// eslint-disable-next-line max-len -- one line on purpose: bg-codex-wiring.test.mjs extracts this function by source and stops at the first unindented line, which a wrapped signature's `) {` would be.
+function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = null, pausedUntil = null, announce = true, network = false, carriesHandoff = false, prompt: sendText = null, resume = null } = {}) {
+  const resuming = Boolean(resume?.threadId);
+  // A resumed job keeps its OWN id, so its report, its prompt file and its
+  // bg-results row stay the ones the job started with. Only a fresh job mints
+  // one, and it mints it the same collision-free way every Codex run does.
+  const startedAt = Number(resume?.startedAt) || freeCodexStart(Date.now(), (id) => codexRuns.has(id));
+  const runId = codexRunId(startedAt);
+  const { log: logPath, last: lastFile, prompt: promptFile } = codexPaths(RUNS_DIR, startedAt);
+  const prompt = stripLaneRules(String(sendText ?? rawText ?? '')).trim();
+  const runCwd = cwd && existsSync(cwd) ? cwd : DEFAULT_CWD;
+  try {
+    mkdirSync(RUNS_DIR, { recursive: true });
+    // NOT rewritten on a resume: the brief on disk is the one the job was given,
+    // and the continuation input is not a brief.
+    if (!resuming) writeFileSync(promptFile, prompt);
+  } catch (e) {
+    console.error('[bridge] codex prompt not written:', e.message);
+  }
+  writeCodexMeta(startedAt, { runId, startedAt, mode, status: 'running', transport: 'appserver' });
+  const { model: codexModel, effort: codexEffort } = codexSettingsNow();
+  const model = codexModel || CODEX_MODEL;
+  // THE SAME SANDBOX AND NETWORK RULE AS THE EXEC PATH. `edit` may write inside
+  // its own cwd and nowhere else; `ask` cannot write at all. The network stays
+  // OFF for a turn carrying an engine handoff, exactly as the chat lane narrows
+  // it: model-written text entering a workspace-write run that can also reach
+  // the internet is the one new exfiltration surface either feature creates.
+  const sandbox = mode === 'edit' ? 'workspace-write' : 'read-only';
+  const netOn = carriesHandoff ? false : Boolean(network);
+  const run = {
+    runId,
+    watchdogId: null,
+    startedAt,
+    child: null,
+    mode,
+    cwd: runCwd,
+    reason,
+    pausedUntil,
+    prompt: rawText,
+    logPath,
+    lastFile,
+    killed: false,
+    killReason: null,
+    done: false,
+    transport: 'appserver',
+    threadId: resume?.threadId || null,
+    steers: [],
+    btw: createBtwTracker(),
+    steps: 0,
+    lastAct: null,
+    // Per JOB, not global: one job's server dying is not evidence about another
+    // job's, and the retry budget belongs to the run that is spending it.
+    deaths: [],
+  };
+  codexRuns.set(runId, run);
+
+
+  let client = null;
+  let spawning = false;
+  let unsubscribe = null;
+  let turnId = null;
+  // Armed by run.interrupt, cleared by finish(): the escalation that ends a run
+  // whose interrupt was accepted and whose turn never completed.
+  let interruptTimer = null;
+  let answer = '';
+  let tokens = null;
+  let failure = null;
+  // A steer that arrives while no turn is running: between the spawn and the
+  // first turn, or between a death and its retry. It is NOT refused (the run is
+  // alive and the message is for it), it rides the next turn/start.
+  const queuedSteers = [];
+
+  // ONE DEATH PER SPAWN ATTEMPT, recorded by whichever path notices first.
+  //
+  // Two do: a child that CLOSES during the handshake makes startAppServerChild
+  // both reject (so start()'s catch runs) and call onDeath (so onServerDeath
+  // runs), and counting it twice turns one failed spawn into the two-deaths-in-
+  // a-window signal. That signal is supposed to mean "this machine has no
+  // working app-server", and acting on it drops the CHAT lane to one-shot for a
+  // minute and every job dispatched in that minute to exec for its whole life.
+  //
+  // The global list is the shared, self-clearing half: two deaths in a window is
+  // what makes `codex exec` the fallback rather than the past.
+  let attempt = 0; // incremented by start(), so a retry's death is its own
+  let deathAttempt = -1;
+  const recordDeath = () => {
+    if (deathAttempt === attempt) return false;
+    deathAttempt = attempt;
+    run.deaths.push(Date.now());
+    codexAppServerDeaths.push(Date.now());
+    return true;
+  };
+
+  const appendEvent = (obj) => {
+    if (!obj) return;
+    try {
+      appendFileSync(logPath, `${JSON.stringify(obj)}\n`);
+    } catch (e) {
+      console.error('[bridge] codex log line not written:', e.message);
+    }
+  };
+
+  const finish = (outcome) => {
+    if (run.done) return;
+    run.done = true;
+    clearTimeout(killTimer);
+    clearTimeout(interruptTimer);
+    if (unsubscribe) unsubscribe();
+    unsubscribe = null;
+    const dying = client;
+    client = null;
+    try {
+      dying?.kill();
+    } catch {
+      /* already gone */
+    }
+    if (run.watchdogId) inflight.clear(run.watchdogId); // reported here, so the reaper must not announce it
+    codexRuns.delete(runId);
+    // The answer on disk beside the log, so a salvage run and codexOutcomeFromDisk
+    // find it where they find an exec run's.
+    try {
+      writeFileSync(lastFile, String(outcome.answer || ''));
+    } catch (e) {
+      console.error('[bridge] codex answer not written:', e.message);
+    }
+    finalizeCodexMeta(startedAt, outcome); // before delivery: a send that throws must not lose the cost
+    if (outcome.failure === 'rate_limit') noteCodexWall();
+    else if (outcome.status === 'finished') clearCodexWall();
+    // EVERY ⏳ THIS JOB LEFT UP REACHES A TERMINAL STATE. A question outstanding
+    // when the job ends is answered by the ending, not left ticking.
+    drainBtw(run, outcome.status === 'stopped' ? 'stopped' : 'ended');
+    // AND EVERY STEER THAT WAS ACKED. A message queued between turns is waiting
+    // for a `turn/start` that this ending means will never come, and an ack that
+    // said "steered in" over a message nobody ever sent is the same lie a
+    // refused steer is corrected for. Its own `refused` handler is what puts the
+    // correction on the surface the ack went to and takes the steer back out of
+    // the report.
+    for (const q of queuedSteers.splice(0, queuedSteers.length)) {
+      try {
+        q.refused?.(new Error('the Codex job ended before its next turn'));
+      } catch (e) {
+        console.error('[bridge] a queued codex steer was not corrected:', e.message);
+      }
+    }
+    console.log(appServerLogLine('handback', { runId, threadId: run.threadId, status: outcome.status }));
+    reportCodexOutcome(rawText, outcome, runId, { mode, cwd: runCwd, reason, pausedUntil, steers: run.steers });
+  };
+
+  // A side-question answer is not this job's output: it is addressed to whoever
+  // asked, it is already on its way to them, and leaving it in the report would
+  // deliver a private exchange as the job's result. Asked in TWO places (the
+  // streamed item and the authoritative turn items) because either one alone
+  // could carry it.
+  const isBtwAnswer = (text) => {
+    const s = String(text ?? '').trim();
+    if (!s) return false;
+    if (run.btw.delivered(s)) return true;
+    return run.btw.seq > 0 && Boolean(parseBtwAnswer(s));
+  };
+
+  const onNotification = (msg) => {
+    appendEvent(execEventForLog(msg, { usage: tokens }));
+    const ev = mapNotification(msg, { home: HOME });
+    if (!ev) return;
+    if (ev.threadId && run.threadId && ev.threadId !== run.threadId) return;
+    if (ev.turnId && turnId && ev.turnId !== turnId) return;
+    switch (ev.kind) {
+      case 'threadStarted':
+        if (ev.threadId) run.threadId = ev.threadId;
+        break;
+      case 'turnStarted':
+        if (ev.turnId) turnId = ev.turnId;
+        break;
+      case 'entry':
+        run.steps += 1;
+        run.lastAct = renderEntry(ev.entry, false).replace(/^\s*↳\s*/, '');
+        break;
+      case 'message': {
+        const text = String(ev.text || '').trim();
+        // Routed and swallowed, or kept as the running answer. Codex narrates
+        // before it acts, so the LAST non-answer message is the report.
+        if (run.btwTake(text)) break;
+        if (text) answer = text;
+        break;
+      }
+      case 'usage':
+        if (ev.tokens) tokens = ev.tokens;
+        break;
+      case 'error':
+        if (!ev.willRetry) failure = { message: ev.message, failure: classifyAppServerError(ev.message) };
+        break;
+      case 'turnCompleted': {
+        if (turnId && ev.turnId && ev.turnId !== turnId) break;
+        // turn/completed carries the final items, which is the authoritative
+        // answer: the streamed one can be cut short, this cannot. The side
+        // answers are filtered out of it for the same reason they are filtered
+        // out of the stream.
+        const items = (Array.isArray(ev.items) ? ev.items : []).filter(
+          (it) => !(it?.type === 'agentMessage' && isBtwAnswer(it.text)),
+        );
+        const finalAnswer = answerFromTurn({ items });
+        if (finalAnswer) answer = finalAnswer;
+        if (ev.status === 'failed' && !failure) {
+          failure = { message: String(ev.error?.message || 'the Codex turn failed'), failure: classifyAppServerError(ev.error) };
+        }
+        turnId = null;
+        finish(
+          codexAppServerOutcome({
+            answer,
+            tokens,
+            threadId: run.threadId,
+            status: ev.status,
+            error: failure?.message || null,
+            stopped: run.killed || ev.status === 'interrupted',
+          }),
+        );
+        break;
+      }
+      default:
+        break;
+    }
+  };
+
+  // ---- the steer and side-question surface, identical in shape to a worker's
+  run.mirrorRegistry = (patch) => {
+    if (!run.watchdogId) return;
+    try {
+      const rec = inflight.read()[run.watchdogId];
+      if (rec) inflight.add(run.watchdogId, { ...rec, ...patch });
+    } catch (e) {
+      console.error('[bridge] registry mirror failed:', e.message);
+    }
+  };
+  run.btwMirror = () => run.mirrorRegistry({ btwPending: run.btw.list().map(btwRecordForDisk) });
+  run.canSteer = () => !run.done && !run.killed;
+  run.steer = (text, { frame = false, kind = 'steer', onRefused = null } = {}) => {
+    // A btw must arrive FRAMED or it reads as an instruction and the job
+    // re-plans over a question. Same guard, same reason, as the Claude path.
+    if (kind === 'btw' && !isBtwFramed(text)) {
+      console.error('[bridge] refused an unframed btw: a side question must carry its framing');
+      return false;
+    }
+    if (!run.canSteer()) return false;
+    const body = frame ? steerFraming(text) : String(text);
+    const record = () => {
+      if (kind !== 'steer') return;
+      run.steers.push({ ts: new Date().toISOString(), text: clip(String(text), STEER_RECORD_MAX) });
+      run.mirrorRegistry({ steers: run.steers });
+    };
+    // THE SERVER REFUSED THE WRITE, one round trip after the ack said it landed.
+    //
+    // The chat lane requeues here, because it HAS a next turn to requeue onto. A
+    // background job runs exactly one, so queueing would mean the message was
+    // acked as delivered and then silently dropped, which is the precise lie
+    // every refusal path in this file exists to avoid. The owner is told instead,
+    // on the surface the ack went to, and the steer is taken back OUT of the
+    // report: `STEERED IN` claims the bridge wrote this into the job.
+    const refused = (e) => {
+      const cls = classifyAppServerError(e.rpc || e);
+      const why = steerRefusalNote(cls);
+      console.error(`[bridge] codex job steer refused (${cls}): ${e.message}`);
+      if (kind === 'steer') {
+        const i = run.steers.findIndex((st) => st.text === clip(String(text), STEER_RECORD_MAX));
+        if (i >= 0) run.steers.splice(i, 1);
+        run.mirrorRegistry({ steers: run.steers });
+        send(codexSteerLostLine({ lane: CODEX_LANE, runId, why }), { markdown: false }).catch(() => {});
+        return;
+      }
+      // A question resolves its own line, so it must not ALSO get one of these.
+      onRefused?.(why);
+    };
+    // NO TURN TO STEER INTO, but the job is alive: it is between turns (the
+    // spawn, or a retry after the server died). Queued, and delivered by the
+    // next turn/start, which is the difference between "in a second" and lost.
+    if (!turnId || !client?.alive) {
+      queuedSteers.push({ body, kind, record, refused });
+      return true;
+    }
+    const forTurn = turnId;
+    record();
+    client
+      .call((id) => turnSteerRequest(id, { threadId: run.threadId, turnId: forTurn, text: body }))
+      .then(() => console.log(appServerLogLine(kind === 'btw' ? 'btw_routed' : 'steered', { runId, threadId: run.threadId, turnId: forTurn })))
+      .catch(refused);
+    return true;
+  };
+  run.btwAsk = (question, entry = {}) => {
+    const record = run.btw.add({ ...entry, lane: CODEX_LANE, askedAt: Date.now() });
+    // THE ⏳ RESOLVES ON A REFUSAL rather than ticking until the job ends and
+    // then saying "the worker ended without answering. Its report may still
+    // carry it", both halves of which would be false: the job is still running
+    // and never saw the question. Removed from the tracker too, or a later
+    // answer to a DIFFERENT question could match this one's id.
+    const onRefused = (why) => {
+      run.btw.remove(record);
+      run.btwMirror();
+      record.resolve?.('refused', { why });
+    };
+    if (!run.steer(btwFraming(record.id, question), { frame: false, kind: 'btw', onRefused })) {
+      run.btw.remove(record);
+      return null;
+    }
+    run.btwMirror();
+    return record;
+  };
+  run.btwTake = (text) => {
+    const res = run.btw.take(text);
+    if (res.status === 'none') return false;
+    if (res.status === 'routed') {
+      res.entry.resolve?.('answered', { answer: res.answer });
+      run.btwMirror();
+    }
+    return true;
+  };
+  run.handle = { steer: run.steer, btwAsk: run.btwAsk, btwMirror: run.btwMirror };
+
+  // /stop and the deadline are the same thing here: an interrupt the model
+  // acknowledges, then the child is closed by finish(). Never a SIGTERM at a
+  // server the job is the only user of but the model is mid-write in.
+  run.interrupt = (why = 'a /stop from Telegram') => {
+    if (run.done) return;
+    run.killed = true;
+    run.killReason = why;
+    if (!turnId || !run.threadId || !client?.alive) {
+      finish(codexAppServerOutcome({ answer, tokens, threadId: run.threadId, stopped: true }));
+      return;
+    }
+    console.log(appServerLogLine('interrupted', { runId, threadId: run.threadId, turnId }));
+    // THE STOP ENDS THE RUN EVEN IF THE TURN NEVER DOES. `turn/interrupt` being
+    // accepted is not the ending: `turn/completed` is, and a server that acks
+    // one and never sends the other would leave the run in codexRuns forever,
+    // reported as stopped on the phone while its child keeps writing. The exec
+    // path escalates a SIGTERM to a SIGKILL for the same reason; this is the
+    // same escalation, one grace period long.
+    interruptTimer = setTimeout(() => {
+      if (run.done) return;
+      console.error('[bridge] codex job did not complete its interrupted turn, ending it here');
+      finish(codexAppServerOutcome({ answer, tokens, threadId: run.threadId, stopped: true }));
+    }, CODEX_INTERRUPT_GRACE_MS);
+    interruptTimer?.unref?.();
+    client.call((id) => turnInterruptRequest(id, { threadId: run.threadId, turnId })).catch((e) => {
+      console.error('[bridge] codex job interrupt failed:', e.message);
+      finish(codexAppServerOutcome({ answer, tokens, threadId: run.threadId, stopped: true }));
+    });
+  };
+  run.terminate = run.interrupt;
+
+  // THE DEADLINE BELONGS TO THE JOB, NOT TO THIS PROCESS. Measured from the run
+  // it started, so a resume continues the original bound instead of re-arming a
+  // fresh one: this daemon is restarted after every bridge edit, and a full
+  // window per restart is how the only cap on a BILLED run becomes unbounded in
+  // thirty minute increments. adoptCodexSurvivor does the same arithmetic on the
+  // exec path, under a comment that says exactly this.
+  const timeoutLeft =
+    Number.isFinite(CODEX_TIMEOUT_MS) && CODEX_TIMEOUT_MS > 0 ? startedAt + CODEX_TIMEOUT_MS - Date.now() : null;
+  // Zero, not negative: a job resumed past its deadline is interrupted on the
+  // next tick, and start()'s own `if (run.done)` closes the child it spawned.
+  const killTimer = timeoutLeft == null ? null : setTimeout(() => run.interrupt('the bridge timeout'), Math.max(0, timeoutLeft));
+  killTimer?.unref?.();
+
+  // The child exited under us. Retry inside the death window, then give up and
+  // hand back a dead-worker report rather than losing the job in silence.
+  const onServerDeath = () => {
+    if (run.done) return;
+    client = null;
+    turnId = null;
+    recordDeath();
+    const verdict = shouldFallBackToExec({
+      deaths: run.deaths,
+      now: Date.now(),
+      windowMs: APP_SERVER_DEATH_WINDOW_MS,
+      maxDeaths: APP_SERVER_MAX_DEATHS,
+    });
+    // A DEATH DURING THE HANDSHAKE BELONGS TO THE start() STILL AWAITING IT: the
+    // child closing is what rejects that promise, and its catch reports the job.
+    // Retrying from here would be swallowed by the `spawning` guard anyway, so
+    // the only thing claiming a retry would achieve is a log line that says
+    // giveUp=false over a job that gave up.
+    const retrying = !verdict.fallback && Boolean(run.threadId) && !spawning;
+    console.log(appServerLogLine('died', { runId, threadId: run.threadId, deaths: run.deaths.length, giveUp: !retrying }));
+    if (retrying) {
+      start({ continuing: true }).catch((e) => console.error('[bridge] codex job retry failed:', e.message));
+      return;
+    }
+    if (spawning) return; // reported by the catch in start(), which is one await away
+    finish(
+      codexAppServerDeathOutcome({
+        reason: 'the Codex app-server died mid-turn',
+        partial: answer,
+        tokens,
+        deaths: run.deaths.length,
+      }),
+    );
+  };
+
+  async function start({ continuing = resuming } = {}) {
+    // NEVER TWO CHILDREN FOR ONE JOB. Both callers (dispatch, and the death
+    // retry) come through here, and a second one arriving while the first is
+    // still handshaking would leave an orphan writing into the same repo.
+    if (run.done || spawning || client) return;
+    spawning = true;
+    attempt += 1;
+    // WHICH ATTEMPT THIS BODY IS, so a stale await can tell that the run has
+    // moved on without it. Read by the catch below.
+    const myAttempt = attempt;
+    let c = null;
+    try {
+      c = await startAppServerChild({ onDeath: onServerDeath });
+    } catch (e) {
+      spawning = false;
+      // A CHILD THAT NEVER CAME UP IS STILL A DEATH. Deduped by attempt, because
+      // which of the two paths notices depends on HOW it failed: a spawn throw
+      // or a refused `initialize` reaches only this catch, while a child that
+      // closes mid-handshake reaches onServerDeath first. Without recording it
+      // at all, an old CLI leaves every future job dying here one at a time
+      // instead of falling back to exec, which is the fallback's whole job.
+      recordDeath();
+      finish(codexAppServerDeathOutcome({ reason: `the Codex app-server could not start: ${e.message}`, partial: answer, tokens }));
+      return;
+    }
+    spawning = false;
+    if (run.done) {
+      c.kill();
+      return;
+    }
+    client = c;
+    run.child = c.child;
+    unsubscribe = c.on(onNotification);
+    // A NEW PID IS A NEW REGISTRY ROW. The old one is cleared first, or the
+    // reaper finds a record whose pid is dead and buries a job that is running.
+    if (run.watchdogId) inflight.clear(run.watchdogId);
+    if (c.child?.pid) {
+      run.watchdogId = `${runId}-${c.child.pid}`;
+      inflight.add(run.watchdogId, {
+        pid: c.child.pid,
+        task: rawText,
+        lane: CODEX_LANE,
+        startedAt,
+        log: logPath,
+        engine: 'codex',
+        transport: 'appserver', // read at boot: this one is RESUMED, not reaped
+        threadId: run.threadId || null,
+        mode,
+        cwd: runCwd,
+        model: model || null,
+        effort: codexEffort || null,
+        steers: run.steers,
+        btwPending: run.btw.list().map(btwRecordForDisk),
+      });
+    }
+    try {
+      if (run.threadId) {
+        await c.call((id) => threadResumeRequest(id, { threadId: run.threadId, cwd: runCwd, sandbox, model }));
+      } else {
+        const started = await c.call((id) => threadStartRequest(id, { cwd: runCwd, sandbox, model, effort: codexEffort }));
+        run.threadId = started?.thread?.id || null;
+        if (!run.threadId) throw new Error('codex started no thread');
+        run.mirrorRegistry({ threadId: run.threadId });
+      }
+      const res = await c.call((id) =>
+        turnStartRequest(id, {
+          threadId: run.threadId,
+          // A CONTINUATION IS NOT THE BRIEF AGAIN. Re-sending the brief to a
+          // thread that has already done half of it is how a resumed job starts
+          // over, which is the one thing the resume exists to avoid.
+          text: continuing ? RESTART_CONTINUATION : prompt,
+          model,
+          effort: codexEffort,
+          sandbox,
+          network: netOn,
+          cwd: runCwd,
+        }),
+      );
+      // The turn id is in the RESPONSE as well as in the notification, and the
+      // response comes first: taking it here is what makes a steer sent one
+      // second in land in the turn rather than queue behind it.
+      if (res?.turn?.id) turnId = res.turn.id;
+      console.log(
+        appServerLogLine(continuing ? 'resumed_after_restart' : 'turn_started', {
+          runId,
+          threadId: run.threadId,
+          turnId,
+          mode,
+          sandbox,
+        }),
+      );
+      // Anything that arrived while there was no turn to put it in.
+      const waiting = queuedSteers.splice(0, queuedSteers.length);
+      for (const q of waiting) {
+        q.record();
+        const forTurn = turnId;
+        c.call((id) => turnSteerRequest(id, { threadId: run.threadId, turnId: forTurn, text: q.body }))
+          .then(() => console.log(appServerLogLine(q.kind === 'btw' ? 'btw_routed' : 'steered', { runId, threadId: run.threadId, turnId: forTurn, queued: true })))
+          // Same correction as an unqueued one: waiting for a turn does not make
+          // a refusal any quieter, and this one has already been acked twice.
+          .catch(q.refused || ((e) => console.error(`[bridge] queued codex ${q.kind} did not land: ${e.message}`)));
+      }
+    } catch (e) {
+      const cls = classifyAppServerError(e.rpc || e);
+      // THE RETRY ALREADY OWNS THIS RUN. A child that dies under `thread/resume`
+      // or `turn/start` does two things: it rejects this await, and it calls
+      // onServerDeath. The death runs FIRST (synchronously, while this is still
+      // one microtask away) and starts the next attempt, so finishing from here
+      // would report a job that is being resumed as dead AND kill the fresh
+      // child on its way up, on the strength of one death, under a log line
+      // that already said giveUp=false.
+      if (run.done || attempt !== myAttempt) {
+        console.error(`[bridge] codex job turn lost with its child (${cls}), the retry owns it: ${e.message}`);
+        return;
+      }
+      finish(
+        codexAppServerOutcome({
+          answer,
+          tokens,
+          threadId: run.threadId,
+          status: 'failed',
+          error: String(e.message || e),
+        }),
+      );
+      console.error(`[bridge] codex job could not start its turn (${cls}): ${e.message}`);
+    }
+  }
+
+  console.log(appServerLogLine('bg_codex_appserver_started', { runId, threadId: run.threadId, mode, resumed: resuming }));
+  start().catch((e) => console.error('[bridge] codex app-server job failed to start:', e.message));
+
+  if (announce) {
+    send(
+      codexStartNotice({
+        runId,
+        mode,
+        cwd: runCwd,
+        title: briefTitle(stripLaneRules(rawText)),
+        reason,
+        pausedUntil,
+        timeZone: OWNER_TZ,
+        steerable: true,
+      }),
+      { markdown: false },
+    ).catch(() => {});
+  }
+  return run;
+}
+
+/**
+ * WHICH TRANSPORT one background job runs on, and then run it.
+ *
+ * The single entry point for a handed-off Codex job, so the drop-box path, the
+ * `codex:` prefix and the rate-limit fallback cannot end up on different
+ * transports for the same reason. `review` and a broken app-server both land on
+ * `codex exec`, which is the fallback and not the past.
+ */
+// eslint-disable-next-line max-len -- one line on purpose: bg-codex-wiring.test.mjs extracts this function by source and stops at the first unindented line, which a wrapped signature's `) {` would be.
+function startCodexJob(rawText, { mode = 'edit', cwd = null, reason = null, pausedUntil = null, announce = true, prompt = null, network = false, carriesHandoff = false } = {}) {
+  const transport = bgCodexTransport({ mode, fallback: codexAppServerState().fallback });
+  if (transport === 'appserver') {
+    return runCodexAppServerJob(rawText, { mode, cwd, reason, pausedUntil, announce, prompt, network, carriesHandoff });
+  }
+  return runCodex(rawText, { mode, cwd, reason, pausedUntil, announce, prompt, network });
+}
+
+/**
+ * Resume every background app-server job the previous daemon left running.
+ *
+ * Its CHILD died with that daemon (it was on its stdio pipes), but its THREAD is
+ * on OpenAI's side and resumes into a fresh one, so the job is continued rather
+ * than buried. Called from the boot loop BEFORE the reaper, which would
+ * otherwise find a dead pid and announce a job that is about to carry on.
+ *
+ * A record still in the registry is by definition a job that never reported:
+ * finish() clears it as its first act. That is the invariant that stops a
+ * finished job being re-run or handed back twice.
+ */
+function recoverCodexAppServerJob(id, rec) {
+  try {
+    inflight.clear(id); // the old pid is gone; the resumed job registers its own
+  } catch (e) {
+    console.error('[bridge] could not clear the resumed job record:', e.message);
+  }
+  const { startedAt } = parseRunId(id);
+  if (!rec?.threadId) {
+    // No thread to resume: the job died before `thread/start` came back, so
+    // there is nothing on OpenAI's side to continue. Reported as a dead worker
+    // rather than silently dropped.
+    const outcome = codexAppServerDeathOutcome({ reason: 'the daemon restarted before the Codex thread was created' });
+    if (startedAt) finalizeCodexMeta(startedAt, outcome);
+    reportCodexOutcome(rec?.task || '(a Codex job)', outcome, codexRunId(startedAt || Date.now()), {
+      mode: rec?.mode || 'edit',
+      cwd: rec?.cwd || null,
+    });
+    return null;
+  }
+  const run = runCodexAppServerJob(rec.task || '', {
+    mode: rec.mode || 'edit',
+    cwd: rec.cwd || null,
+    announce: false, // the resume line below is this run's announcement
+    resume: { threadId: rec.threadId, startedAt },
+  });
+  if (run) {
+    // PUSHED, not reassigned: start() is already in flight and its registry row
+    // holds this exact array, so replacing it would leave the mirror writing
+    // into an object nothing reads.
+    for (const st of Array.isArray(rec.steers) ? rec.steers : []) run.steers.push(st);
+    send(codexResumedLine({ lane: CODEX_LANE, title: briefTitle(stripLaneRules(rec.task || '')) }), {
+      markdown: false,
+    }).catch(() => {});
+  }
+  return run;
+}
+
 // A Codex run that outlived the daemon: keep what its report will need, and
 // re-arm its deadline. The kill timer lives in the process that spawned it, so a
 // restart silently removed the only bound on a billed run.
@@ -4949,6 +5646,18 @@ function stopCodexRuns() {
   }
   const runs = [...codexRuns.values()];
   for (const r of runs) {
+    // AN APP-SERVER JOB IS INTERRUPTED, NOT KILLED. The model acknowledges it,
+    // the turn completes with status `interrupted`, and whatever it produced
+    // still reaches the report. A SIGTERM at the child would take the answer
+    // with it and leave a half-written file behind in edit mode.
+    if (r.transport === 'appserver' && r.interrupt) {
+      try {
+        r.interrupt('a /stop from Telegram');
+      } catch (e) {
+        console.error('[bridge] codex job interrupt failed:', e.message);
+      }
+      continue;
+    }
     r.killed = true;
     r.killReason = 'a /stop from Telegram';
     try {
@@ -5083,7 +5792,7 @@ function noteCodexAppServerDeath() {
 }
 
 /**
- * Spawn `codex app-server` and complete the handshake.
+ * Spawn `codex app-server` and complete the handshake. ONE child, no globals.
  *
  * Resolves to a small client: `call(build)` sends one request built by one of
  * the pure builders and resolves with its result (or rejects with the JSON-RPC
@@ -5092,14 +5801,33 @@ function noteCodexAppServerDeath() {
  * Rejects rather than resolving a half-working client: a binary that cannot
  * answer `initialize` inside the deadline is an older CLI, and the caller falls
  * back to `codex exec` for good rather than paying the deadline once per turn.
+ *
+ * `onDeath` is the ONE thing that differs between the two callers, which is why
+ * this is generic. The chat lane shares a single server across every chat turn
+ * and counts its deaths globally; a background job owns its OWN child (so one
+ * job's server dying cannot take another job's turn with it) and counts its
+ * deaths on the job. Both need the same spawn, the same handshake and the same
+ * deadline on every call, and two copies of that would drift.
  */
-function startCodexAppServer() {
+function startAppServerChild({ onDeath = () => {}, latchInitFailure = false } = {}) {
+  // THE LATCH IS THE CHAT LANE'S, AND IT IS PERMANENT, so only the caller whose
+  // failure really is evidence about the BINARY may set it. A background job's
+  // child failing to hand shake is evidence about that spawn: five of them
+  // racing one 5s deadline while the machine is loaded is a slow spawn, not an
+  // older CLI, and latching there would silently drop the chat lane and every
+  // later job onto one-shot exec for the rest of the daemon's life while
+  // telling the owner "this codex build has no app-server", which is false. A
+  // job's death still reaches codexAppServerDeaths through onDeath, which is
+  // the shared, self-clearing signal that two deaths in a window is a fallback.
+  const latch = () => {
+    if (latchInitFailure) codexAppServerInitFailed = true;
+  };
   return new Promise((resolve, reject) => {
     let child;
     try {
       child = spawnProcess(CODEX_BIN, [...APP_SERVER_ARGS], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env } });
     } catch (e) {
-      codexAppServerInitFailed = true;
+      latch();
       reject(new Error(`codex app-server failed to start: ${e.message}`));
       return;
     }
@@ -5208,14 +5936,18 @@ function startCodexAppServer() {
         clearTimeout(timer);
         reject(dead);
       }
-      noteCodexAppServerDeath();
+      try {
+        onDeath();
+      } catch (e) {
+        console.error('[bridge] codex app-server death not reported:', e.message);
+      }
     };
     child.on('error', (e) => fail(`codex app-server: ${e.message}`));
     child.on('close', () => fail('the codex app-server exited'));
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      codexAppServerInitFailed = true;
+      latch();
       client.kill();
       reject(new Error('codex app-server did not answer initialize'));
     }, APP_SERVER_INIT_TIMEOUT_MS);
@@ -5227,18 +5959,25 @@ function startCodexAppServer() {
         settled = true;
         clearTimeout(timer);
         client.notify(initializedNotification());
-        codexAppServerClient = client;
-        console.log(`[bridge] codex app-server up (pid ${child.pid})`);
         resolve(client);
       })
       .catch((e) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        codexAppServerInitFailed = true;
+        latch();
         client.kill();
         reject(e);
       });
+  });
+}
+
+/** The CHAT lane's server: the generic child, plus the globals it is tracked by. */
+function startCodexAppServer() {
+  return startAppServerChild({ onDeath: noteCodexAppServerDeath, latchInitFailure: true }).then((client) => {
+    codexAppServerClient = client;
+    console.log(`[bridge] codex app-server up (pid ${client.child?.pid})`);
+    return client;
   });
 }
 
@@ -6206,7 +6945,7 @@ function drainBgHandoff() {
       // DISPATCH FIRST, then decorate: the queue file was already claimed above,
       // so anything that throws before the spawn destroys the brief with no
       // record of it anywhere.
-      const run = runCodex(text, {
+      const run = startCodexJob(text, {
         mode: 'edit', // a handed-off job is work, not a question
         announce: false, // the handoff notice below IS this run's announcement
         cwd: codexCwd,
@@ -6233,14 +6972,27 @@ function drainBgHandoff() {
             queued,
             engine: 'codex',
             engineNote: codexReasonText(decision.reason, decision.pausedUntil, { timeZone: OWNER_TZ }),
+            // Read off the RUN, never assumed: the same job dispatches onto
+            // `codex exec` whenever the app-server is in its fallback window,
+            // and a card offering a steer that run cannot take is a message
+            // that gets acked as delivered and goes nowhere.
+            steerable: run?.transport === 'appserver',
             // WHAT THIS RUN IS ON, resolved the same way the run itself
             // resolves it. "Codex" alone does not answer "why is this one
             // thinking harder than that one".
             ...codexCardSettings(),
           },
-          // A background Codex job has no in-process step stream, so its line
-          // carries the clock and nothing it would have to invent.
-          () => (codexRuns.has(run?.runId) ? { elapsedSec: Math.round((Date.now() - (run?.startedAt || Date.now())) / 1000) } : null),
+          // AN APP-SERVER JOB STREAMS ITS ITEMS TO US, so its line carries the
+          // same step count and last action a Claude worker's does, through the
+          // same renderer, and its ending carries the step total. A one-shot
+          // exec run has no in-process stream: it carries the clock and nothing
+          // it would have to invent.
+          () => {
+            if (!codexRuns.has(run?.runId)) return null;
+            const elapsedSec = Math.round((Date.now() - (run?.startedAt || Date.now())) / 1000);
+            if (run?.transport !== 'appserver') return { elapsedSec };
+            return { elapsedSec, steps: run.steps || 0, lastAct: run.lastAct || null };
+          },
           lint.length
             ? `\n⚠️ This brief names ${lint.length} thing${lint.length === 1 ? '' : 's'} Codex does not have:\n${lint.map((l) => `  • ${l}`).join('\n')}`
             : '',
@@ -7018,7 +7770,13 @@ async function handleCommand(text, msg = null) {
           // The last step out of its own log: a background Codex job has no
           // bubble, so this is the only place its activity is visible at all.
           lastAct: w.lastAct || null,
-          steerable: false,
+          // OFF THE DESCRIPTOR, never hardcoded. An app-server job takes a steer
+          // and streams its steps, and /status is the surface people are pointed
+          // at for "what is running": saying "not steerable · 0 steps" over the
+          // same job whose card offers `/steer` is two answers to one question.
+          steps: w.steps || 0,
+          steerable: Boolean(w.steerable),
+          steers: w.steers || 0,
           note: [w.mode || 'ask', w.cwd ? String(w.cwd).replace(HOME, '~') : null].filter(Boolean).join(' · '),
         });
       const win = modelWindow(st.lastModel || st.model || DEFAULT_MODEL);
@@ -7992,7 +8750,7 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
     // rawText = what you typed, so the start notice, /status and the bg-results
     // row are titled by the job. `prompt` = the same thing with the quote in
     // front, which is the only part Codex reads.
-    runCodex(text, {
+    startCodexJob(text, {
       prompt: sent,
       mode: 'edit',
       // Same repo resolution as the bg.mjs drop-box path: workspace-write is
@@ -8565,7 +9323,13 @@ async function main() {
     // here is what stops a restart leaving a question ticking on the phone
     // forever, which is rule 8's whole point.
     resolveBtwAfterRestart(id, rec);
-    if (rec?.engine === 'codex') adoptCodexSurvivor(id, rec);
+    // A CODEX JOB ON THE APP-SERVER IS RESUMED, NOT ADOPTED. Its child was on
+    // this daemon's stdio pipes and died with the last one, so there is no pid
+    // to re-arm a deadline against; its THREAD is on OpenAI's side and picks up
+    // where it left off. Done here, before the reaper, or a job that is about to
+    // carry on gets announced as dead.
+    if (rec?.engine === 'codex' && rec?.transport === 'appserver') recoverCodexAppServerJob(id, rec);
+    else if (rec?.engine === 'codex') adoptCodexSurvivor(id, rec);
   }
   const survivors = reattachLiveWorkers();
   if (survivors) console.log(`[bridge] ${survivors} background worker(s) survived the restart — re-attached`);

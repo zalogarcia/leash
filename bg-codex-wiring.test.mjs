@@ -25,7 +25,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { codexReviewScope, codexReviewTask, isCodexImage } from './bg-codex.mjs';
-import { execFallbackLine } from './codex-appserver.mjs';
+import { RESTART_CONTINUATION, execFallbackLine, lastActFromExecLog } from './codex-appserver.mjs';
 // The real parser and the real phrase list, so section 8b asserts the chat
 // lane marks the reset the MESSAGE carried rather than a number of its own.
 import { isLimitSignal as isLimitSignalReal, parseResetTime as parseResetTimeReal } from './accounts.mjs';
@@ -647,6 +647,10 @@ const saveState = () => { SAVES.push(1); };
 const runClaude = (text, lane, opts = {}) => { CLAUDE.push({ text, lane: lane.name, ...opts }); return Promise.resolve(); };
 const runCodexChatFallback = (text, decision) => { CHAT_FALLBACK.push({ text, decision }); };
 const runCodex = (text, opts) => { CODEX.push({ text, ...opts }); return { runId: 'codex-1' }; };
+// The transport router. Which TRANSPORT a job lands on is section 12's subject;
+// what the dispatch path has to get right is which jobs reach Codex at all, so
+// here the router is the one recorder both transports share.
+const startCodexJob = (text, opts) => runCodex(text, opts);
 export let rotationPausedUntil = 0;
 let codexFallbackValue = true;
 export const setWall = (until, fallback = true) => { rotationPausedUntil = until; codexFallbackValue = fallback; };
@@ -1476,6 +1480,10 @@ export const CODEX = [];
 export const CLAUDE = [];
 const send = (t) => { SENT.push(t); return Promise.resolve({ message_id: ++msgSeq }); };
 const runCodex = (text, opts) => { CODEX.push({ text, ...opts }); return { runId: 'codex-1' }; };
+// The transport router. Which TRANSPORT a job lands on is section 12's subject;
+// what the dispatch path has to get right is which jobs reach Codex at all, so
+// here the router is the one recorder both transports share.
+const startCodexJob = (text, opts) => runCodex(text, opts);
 const dispatchPrompt = (text, lane) => { CLAUDE.push({ text, lane: lane?.name }); };
 export const RECORDED = [];
 const recordBgResult = (task, record) => { RECORDED.push({ task, record }); };
@@ -3634,6 +3642,10 @@ export const initFailed = () => codexAppServerInitFailed;
         grab('codexAppServerState', 'const'),
         grab('codexAppServerUsable', 'const'),
         grab('noteCodexAppServerDeath'),
+        // The generic child. startCodexAppServer is now the chat lane's wrapper
+        // around it (a background job owns its own child and counts its own
+        // deaths), so the harness needs both or every spawn ReferenceErrors.
+        grab('startAppServerChild'),
         grab('startCodexAppServer'),
         grab('getCodexAppServer'),
         grab('killCodexAppServer'),
@@ -4119,6 +4131,1587 @@ await t('a full queue says so, and offers the two things he can do', () => {
   const full = P.SENT.find((t) => t.startsWith('⏳'));
   eq(full, '⏳ main queue is full (5)\nWait, or /stop main to clear it.');
 });
+
+// ---------------------------------------------------------------------------
+console.log(
+  "\n21. A BACKGROUND JOB ON `codex app-server` (the real runCodexAppServerJob)",
+);
+// ---------------------------------------------------------------------------
+//
+// The exec sections above prove a one-shot run. This proves the thing exec
+// structurally cannot do: a job that is still reachable while it works.
+//
+// The fake app-server below is a real process speaking the real JSON-RPC
+// framing, so what is exercised is the daemon's own protocol handling: the
+// requests it builds, the notifications it maps, the turn ids it guards on and
+// the child it owns. What it is NOT is a model, which is why
+// scripts/probes/codex-bg-appserver-probe.mjs exists beside it and has been run
+// against the live binary (a BTW-ANSWER #1 arrived mid-turn, a steer created a
+// file the brief never mentioned, and turn/interrupt reported `interrupted`).
+// ---------------------------------------------------------------------------
+
+const BGAS_DIR = mkdtempSync(path.join(tmpdir(), "bg-codex-appserver-"));
+const BGAS_RUNS = path.join(BGAS_DIR, "runs");
+const BGAS_CALLS = path.join(BGAS_DIR, "calls.jsonl"); // every request the fake received
+const FAKE_BGAS = path.join(BGAS_DIR, "fake-app-server.mjs");
+
+// The fake, as a node script. Env knobs:
+//   FAKE_TURN_MS       how long a turn runs before it completes (default 120)
+//   FAKE_DIE_AFTER_MS  exit(1) this long after the first turn/start
+//   FAKE_RESUME_FAIL   thread/resume answers a JSON-RPC error
+//   FAKE_NO_THREAD     thread/start answers with no thread id
+//   FAKE_INIT_REFUSE   initialize answers a JSON-RPC error (an old CLI's shape)
+//   FAKE_DIE_AT_SPAWN  the child exits before answering anything at all
+//   FAKE_REFUSE_STEER  turn/steer answers a JSON-RPC error even mid-turn
+//   FAKE_DIE_ON_RESUME the child exits DURING thread/resume, answering nothing
+//   FAKE_SILENT_INTERRUPT  turn/interrupt is accepted and the turn never completes
+writeFileSync(
+  FAKE_BGAS,
+  `import { appendFileSync } from 'node:fs';
+const CALLS = ${JSON.stringify(BGAS_CALLS)};
+const TURN_MS = Number(process.env.FAKE_TURN_MS || 120);
+// A child that dies before it can answer anything: the close-during-handshake
+// path, which rejects the spawn promise AND fires onDeath.
+if (process.env.FAKE_DIE_AT_SPAWN) process.exit(1);
+const out = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+const note = (method, params) => out({ jsonrpc: '2.0', method, params });
+const log = (o) => { try { appendFileSync(CALLS, JSON.stringify(o) + '\\n'); } catch {} };
+let threadId = null;
+let turnSeq = 0;
+let live = null; // { id, timer, items }
+const complete = (status) => {
+  if (!live) return;
+  const { id, items } = live;
+  clearTimeout(live.timer);
+  live = null;
+  note('thread/tokenUsage/updated', { threadId, turnId: id, tokenUsage: { last: { inputTokens: 11, outputTokens: 4 }, modelContextWindow: 400000 } });
+  note('turn/completed', { threadId, turn: { id, status, items } });
+};
+let buf = '';
+process.stdin.on('data', (d) => {
+  buf += d;
+  const lines = buf.split('\\n');
+  buf = lines.pop() ?? '';
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let msg; try { msg = JSON.parse(line); } catch { continue; }
+    log({ method: msg.method, params: msg.params });
+    const p = msg.params || {};
+    if (msg.method === 'initialize') {
+      if (process.env.FAKE_INIT_REFUSE) { out({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'unknown method initialize' } }); continue; }
+      out({ jsonrpc: '2.0', id: msg.id, result: { userAgent: 'fake' } }); continue;
+    }
+    if (msg.method === 'initialized') continue;
+    if (msg.method === 'thread/start') {
+      if (process.env.FAKE_NO_THREAD) { out({ jsonrpc: '2.0', id: msg.id, result: {} }); continue; }
+      threadId = 'th-fake-1';
+      out({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: threadId } } });
+      note('thread/started', { thread: { id: threadId } });
+      continue;
+    }
+    if (msg.method === 'thread/resume') {
+      // DIES WITH THE CALL STILL PENDING. Distinct from FAKE_RESUME_FAIL, which
+      // answers: here the daemon's await is rejected BY the death, so the death
+      // handler and the awaiting start() both learn about the same event.
+      if (process.env.FAKE_DIE_ON_RESUME) { process.exit(1); }
+      if (process.env.FAKE_RESUME_FAIL) { out({ jsonrpc: '2.0', id: msg.id, error: { code: -32600, message: 'no rollout found for thread id ' + p.threadId } }); continue; }
+      threadId = p.threadId;
+      out({ jsonrpc: '2.0', id: msg.id, result: {} });
+      continue;
+    }
+    if (msg.method === 'turn/start') {
+      const id = 'turn-' + ++turnSeq;
+      const text = (p.input || []).filter((i) => i.type === 'text').map((i) => i.text).join(' ');
+      live = { id, items: [{ type: 'agentMessage', text: 'ANSWER for: ' + text.slice(0, 60) }] };
+      out({ jsonrpc: '2.0', id: msg.id, result: { turn: { id, status: 'inProgress' } } });
+      note('turn/started', { threadId, turn: { id } });
+      note('item/started', { threadId, turnId: id, item: { id: 'i1', type: 'commandExecution', command: "/bin/zsh -lc 'ls -la'" } });
+      if (process.env.FAKE_DIE_AFTER_MS) { setTimeout(() => process.exit(1), Number(process.env.FAKE_DIE_AFTER_MS)); continue; }
+      live.timer = setTimeout(() => {
+        const last = live.items[live.items.length - 1];
+        note('item/completed', { threadId, turnId: id, item: { id: 'm1', type: 'agentMessage', text: last.text } });
+        complete('completed');
+      }, TURN_MS);
+      continue;
+    }
+    if (msg.method === 'turn/steer') {
+      // A turn that is running but cannot take a mid-turn write: the live
+      // binary's shape while a thread is compacting.
+      if (process.env.FAKE_REFUSE_STEER) { out({ jsonrpc: '2.0', id: msg.id, error: { code: -32600, message: 'turn is not steerable right now' } }); continue; }
+      if (!live) { out({ jsonrpc: '2.0', id: msg.id, error: { code: -32600, message: 'no active turn to steer' } }); continue; }
+      if (p.expectedTurnId !== live.id) { out({ jsonrpc: '2.0', id: msg.id, error: { code: -32600, message: 'expected active turn id \\\`' + p.expectedTurnId + '\\\` but found \\\`' + live.id + '\\\`' } }); continue; }
+      out({ jsonrpc: '2.0', id: msg.id, result: { turnId: live.id } });
+      const text = (p.input || []).map((i) => i.text || '').join(' ');
+      const btw = /\\[BTW #(\\d+) from the orchestrator/.exec(text);
+      if (btw && process.env.FAKE_NO_BTW_ANSWER) { continue; }
+      if (btw) {
+        // A model that obeys the framing: one message, the marker first, then
+        // back to work. Emitted as its own agent message exactly as the live
+        // binary emitted it (probe, 2026-09-09).
+        setTimeout(() => note('item/completed', { threadId, turnId: live && live.id, item: { id: 'b' + btw[1], type: 'agentMessage', text: 'BTW-ANSWER #' + btw[1] + ': it is b.txt' } }), 10);
+      } else {
+        live.items.push({ type: 'agentMessage', text: 'ANSWER after steer: ' + text.slice(-40) });
+      }
+      continue;
+    }
+    if (msg.method === 'turn/interrupt') {
+      out({ jsonrpc: '2.0', id: msg.id, result: {} });
+      // ACCEPTED, NEVER COMPLETED. The turn keeps running and the daemon is left
+      // holding a run it has already told the owner it stopped.
+      if (process.env.FAKE_SILENT_INTERRUPT) { continue; }
+      complete('interrupted');
+      continue;
+    }
+    out({ jsonrpc: '2.0', id: msg.id, result: {} });
+  }
+});
+`,
+);
+// `codex` is a binary in production, so the fake is one too: a shell wrapper
+// that ignores the `app-server` argument the daemon passes.
+const FAKE_BGAS_BIN = path.join(BGAS_DIR, "fake-codex-as");
+writeFileSync(
+  FAKE_BGAS_BIN,
+  `#!/bin/bash\nexec node ${JSON.stringify(FAKE_BGAS)}\n`,
+);
+chmodSync(FAKE_BGAS_BIN, 0o755);
+
+const BGAS_HARNESS = `
+import fs from 'node:fs';
+import { spawn as spawnProcess } from 'node:child_process';
+import {
+  APP_SERVER_ARGS, APP_SERVER_DEATH_WINDOW_MS, APP_SERVER_INIT_TIMEOUT_MS, APP_SERVER_MAX_DEATHS,
+  RESTART_CONTINUATION, answerFromTurn, appServerLogLine, bgCodexTransport, classifyAppServerError,
+  createJsonLineReader, execEventForLog, frameMessage, initializeRequest, initializedNotification,
+  lastActFromExecLog, mapNotification, shouldFallBackToExec, steerRefusalNote, threadResumeRequest,
+  threadStartRequest, turnInterruptRequest, turnStartRequest, turnSteerRequest,
+} from ${url("codex-appserver.mjs")};
+import {
+  CODEX_LANE, codexAppServerDeathOutcome, codexAppServerOutcome, codexPaths, codexRunId,
+  codexStartNotice, freeCodexStart,
+} from ${url("bg-codex.mjs")};
+import { BTW_RECORD_MAX, btwFraming, createBtwTracker, isBtwFramed, parseBtwAnswer } from ${url("bg-btw.mjs")};
+import { STEER_RECORD_MAX, steerFraming } from ${url("bg-steer.mjs")};
+import { briefTitle, stripLaneRules, parseRunId } from ${url("bg-notify.mjs")};
+import { clip, oneLine, renderEntry } from ${url("progress-render.mjs")};
+import { codexResumedLine, codexSteerLostLine } from ${url("system-messages.mjs")};
+const { existsSync, mkdirSync, writeFileSync, readFileSync, appendFileSync } = fs;
+export const SENT = [];
+export const REPORTED = [];
+export const LOGS = [];
+export const BTW_NOTICES = [];
+const send = (t) => { SENT.push(t); return Promise.resolve(); };
+const __realLog = console.log;
+console.log = (...a) => { LOGS.push(a.join(' ')); __realLog(...a); };
+export const codexRuns = new Map();
+export const registry = new Map();
+const inflight = {
+  add: (id, rec) => registry.set(id, rec),
+  clear: (id) => registry.delete(id),
+  read: () => Object.fromEntries(registry),
+};
+const reportCodexOutcome = (task, outcome, runId, meta) => { REPORTED.push({ task, outcome, runId, meta }); };
+export const WALL = [];
+const noteCodexWall = () => { WALL.push('set'); return Date.now() + 3600000; };
+const clearCodexWall = () => { WALL.push('clear'); };
+// The ⏳ lifecycle, recorded rather than sent: startBtwNotice is bridge.mjs's
+// own and is proven in bg-btw.test.mjs. What matters here is that every question
+// this job takes REACHES one of the five terminal states.
+const startBtwNotice = async (record, lane) => { record.resolve = (state, extra) => BTW_NOTICES.push({ id: record.id, lane, state, answer: extra?.answer ?? null, why: extra?.why ?? null }); };
+export let RUNS_DIR = '';
+export let CODEX_BIN = '';
+export let CODEX_TIMEOUT_MS = 0;
+// bridge.mjs's own value is 30s. Shortened here so the escalation can be proven
+// well INSIDE the fake's turn length: a test that waited the real 30s out could
+// not tell the backstop from the turn simply ending on its own.
+export let CODEX_INTERRUPT_GRACE_MS = 30_000;
+export const configure = (o) => {
+  if (o.runsDir !== undefined) RUNS_DIR = o.runsDir;
+  if (o.bin !== undefined) CODEX_BIN = o.bin;
+  if (o.timeoutMs !== undefined) CODEX_TIMEOUT_MS = o.timeoutMs;
+  if (o.interruptGraceMs !== undefined) CODEX_INTERRUPT_GRACE_MS = o.interruptGraceMs;
+};
+const CODEX_MODEL = 'gpt-6-astra';
+const codexSettingsNow = () => ({ model: null, effort: 'high' });
+const DEFAULT_CWD = ${JSON.stringify(BGAS_DIR)};
+const HOME = ${JSON.stringify(BGAS_DIR)};
+const OWNER_TZ = 'America/New_York';
+let codexAppServerInitFailed = false;
+// Read by the test: the latch is PERMANENT, so which caller may set it is the
+// whole question. A background job's child must never reach it.
+export const initFailed = () => codexAppServerInitFailed;
+export const codexAppServerDeaths = [];
+// The chat lane's own fallback verdict, which the ROUTER consults. Forced in a
+// test rather than reached through two real deaths of a shared server.
+export let FORCE_FALLBACK = false;
+export const setFallback = (v) => { FORCE_FALLBACK = v; };
+const codexAppServerState = () => (FORCE_FALLBACK ? { fallback: true, reason: 'child_died_twice' } : shouldFallBackToExec({ deaths: codexAppServerDeaths, initFailed: codexAppServerInitFailed }));
+// bgWorkerDescriptors' other two populations, empty here: the Claude lanes and
+// the survivors of a previous daemon are proven in bg-steer.test.mjs. What this
+// section is about is the third one.
+const bgLanes = [];
+const watchdog = { reattachedIds: new Set() };
+const readTailIf = () => '';
+export const EXEC_RUNS = [];
+const runCodex = (text, opts) => { EXEC_RUNS.push({ text, ...opts }); return { runId: 'codex-exec-1' }; };
+export const reset = () => {
+  SENT.length = 0; REPORTED.length = 0; LOGS.length = 0; BTW_NOTICES.length = 0;
+  EXEC_RUNS.length = 0; WALL.length = 0; codexRuns.clear(); registry.clear();
+  codexAppServerDeaths.length = 0; FORCE_FALLBACK = false; codexAppServerInitFailed = false;
+};
+`;
+
+const BGJ = await import(
+  "data:text/javascript," +
+    encodeURIComponent(
+      [
+        BGAS_HARNESS,
+        grab("APP_SERVER_CALL_TIMEOUT_MS", "const"),
+        grab("startAppServerChild"),
+        grab("writeCodexMeta"),
+        grab("finalizeCodexMeta"),
+        grab("btwRecordForDisk"),
+        grab("drainBtw"),
+        grab("runCodexAppServerJob"),
+        grab("startCodexJob"),
+        grab("recoverCodexAppServerJob"),
+        grab("bgWorkerDescriptors"),
+        "export { runCodexAppServerJob, startCodexJob, recoverCodexAppServerJob, startAppServerChild, bgWorkerDescriptors };",
+      ].join("\n"),
+    )
+);
+BGJ.configure({ runsDir: BGAS_RUNS, bin: FAKE_BGAS_BIN, timeoutMs: 0 });
+
+const asReported = (ms = 20000) =>
+  new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const tick = () => {
+      if (BGJ.REPORTED.length) return resolve(BGJ.REPORTED[BGJ.REPORTED.length - 1]);
+      if (Date.now() - t0 > ms)
+        return reject(new Error("the app-server job never reported"));
+      setTimeout(tick, 25);
+    };
+    tick();
+  });
+const asWait = (cond, what, ms = 20000) =>
+  new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const tick = () => {
+      if (cond()) return resolve(true);
+      if (Date.now() - t0 > ms)
+        return reject(new Error(`timed out waiting for ${what}`));
+      setTimeout(tick, 25);
+    };
+    tick();
+  });
+const calls = () =>
+  (existsSync(BGAS_CALLS) ? readFileSync(BGAS_CALLS, "utf8") : "")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+const clearCalls = () => writeFileSync(BGAS_CALLS, "");
+
+// ---------------------------------------------------------------------------
+console.log("\n21a. thread/start, and what the first turn is given");
+// ---------------------------------------------------------------------------
+
+BGJ.reset();
+clearCalls();
+process.env.FAKE_TURN_MS = "400";
+const jobA = BGJ.runCodexAppServerJob("ship the bridge change", {
+  mode: "edit",
+  cwd: BGAS_DIR,
+  reason: "explicit",
+});
+const outA = await asReported();
+const callsA = calls();
+
+await t(
+  "★ thread/start carries the cwd the brief resolved to, and the write sandbox",
+  () => {
+    const start = callsA.find((c) => c.method === "thread/start");
+    ok(start, "no thread/start was sent");
+    eq(
+      start.params.cwd,
+      BGAS_DIR,
+      "workspace-write is rooted at ONE directory; the wrong one edits the wrong tree",
+    );
+    eq(
+      start.params.sandbox,
+      "workspace-write",
+      "an edit job may write inside its cwd",
+    );
+    eq(
+      start.params.approvalPolicy,
+      "never",
+      "nothing may prompt a background job",
+    );
+  },
+);
+
+await t(
+  "★ the turn runs with the network OFF and the brief as its input",
+  () => {
+    const turn = callsA.find((c) => c.method === "turn/start");
+    ok(turn, "no turn/start was sent");
+    eq(turn.params.sandboxPolicy.type, "workspaceWrite");
+    eq(
+      turn.params.sandboxPolicy.networkAccess,
+      false,
+      "the same network rule the exec path runs under",
+    );
+    eq(turn.params.input[0].text, "ship the bridge change");
+    eq(turn.params.cwd, BGAS_DIR);
+  },
+);
+
+await t(
+  "an ask job cannot write, and says so in its sandbox rather than in prose",
+  () => {
+    BGJ.reset();
+    clearCalls();
+    BGJ.runCodexAppServerJob("what does bg.mjs do", { mode: "ask", cwd: BGAS_DIR });
+    return asReported().then(() => {
+      const turn = calls().find((c) => c.method === "turn/start");
+      eq(turn.params.sandboxPolicy.type, "readOnly");
+      eq(
+        calls().find((c) => c.method === "thread/start").params.sandbox,
+        "read-only",
+      );
+    });
+  },
+);
+
+await t(
+  "★ a turn carrying an engine handoff keeps the network off even if asked for",
+  () => {
+    BGJ.reset();
+    clearCalls();
+    BGJ.runCodexAppServerJob("continue the migration", {
+      mode: "edit",
+      cwd: BGAS_DIR,
+      network: true,
+      carriesHandoff: true,
+    });
+    return asReported().then(() => {
+      eq(
+        calls().find((c) => c.method === "turn/start").params.sandboxPolicy
+          .networkAccess,
+        false,
+      );
+    });
+  },
+);
+
+await t(
+  "the job reports through the same path an exec run does, with the same fields",
+  () => {
+    eq(outA.outcome.status, "finished");
+    ok(
+      outA.outcome.answer.startsWith("ANSWER for: ship the bridge change"),
+      outA.outcome.answer,
+    );
+    eq(outA.meta.mode, "edit");
+    eq(outA.meta.cwd, BGAS_DIR);
+    eq(
+      outA.outcome.tokens.input_tokens,
+      11,
+      "the token usage survives into the handback",
+    );
+    ok(
+      Array.isArray(outA.meta.steers),
+      "the handback carries what was steered in, exactly as the Claude path does",
+    );
+  },
+);
+
+await t(
+  "it is registered as background work, tagged app-server, and cleared when it reports",
+  () => {
+    eq(
+      BGJ.registry.size,
+      0,
+      "a reported job left in the registry gets announced as dead",
+    );
+    eq(BGJ.codexRuns.size, 0, "the live map must not leak finished jobs");
+  },
+);
+
+await t("★ the log it left is readable by the exec-stream readers", () => {
+  const log = readFileSync(jobA.logPath, "utf8");
+  ok(
+    log.includes('"thread.started"'),
+    "the thread id must be recoverable from disk",
+  );
+  ok(log.includes('"item.started"'), log.slice(0, 200));
+  const entry = lastActFromExecLog(log);
+  ok(
+    entry,
+    "lastActFromExecLog could not read the log an app-server job wrote",
+  );
+  eq(entry.name, "Bash", "this is what /status prints for a running job");
+  ok(
+    /"usage"/.test(log),
+    "the cost has to be on disk for a salvage to find it",
+  );
+});
+
+await t("the brief is written beside the log, and the answer too", () => {
+  const base = path.join(BGAS_RUNS, `codex-${jobA.startedAt}`);
+  eq(readFileSync(`${base}.prompt.md`, "utf8"), "ship the bridge change");
+  ok(
+    readFileSync(`${base}.last.md`, "utf8").startsWith("ANSWER for:"),
+    "a salvage reads the answer here",
+  );
+  const meta = JSON.parse(readFileSync(`${base}.meta.json`, "utf8"));
+  eq(meta.transport, "appserver", "the sidecar says which transport ran it");
+  eq(meta.status, "finished");
+});
+
+await t(
+  "★ no credential reaches the log, the registry or a lifecycle line",
+  () => {
+    const all = [
+      readFileSync(jobA.logPath, "utf8"),
+      JSON.stringify([...BGJ.registry]),
+      BGJ.LOGS.join("\n"),
+    ].join("\n");
+    ok(
+      !/sk-[A-Za-z0-9]{8}/.test(all),
+      "a credential reached a durable surface",
+    );
+    ok(!/eyJ[\w-]{6,}/.test(all), "a JWT reached a durable surface");
+  },
+);
+
+await t(
+  "the lifecycle log names each step with the run id and the thread id, and no brief",
+  () => {
+    const lines = BGJ.LOGS.filter((l) =>
+      /bg_codex_appserver_started|turn_started|handback/.test(l),
+    );
+    ok(lines.length >= 2, BGJ.LOGS.join("\n"));
+    ok(
+      !BGJ.LOGS.some((l) => l.includes("ship the bridge change")),
+      "a brief reached the daemon log",
+    );
+  },
+);
+
+// ---------------------------------------------------------------------------
+console.log("\n21b. a steer into a running turn");
+// ---------------------------------------------------------------------------
+
+BGJ.reset();
+clearCalls();
+process.env.FAKE_TURN_MS = "1500";
+const jobB = BGJ.runCodexAppServerJob("write the report", {
+  mode: "edit",
+  cwd: BGAS_DIR,
+});
+await asWait(
+  () => calls().some((c) => c.method === "turn/start"),
+  "the turn to start",
+);
+await new Promise((r) => setTimeout(r, 60));
+
+await t(
+  "★ a steer is delivered as turn/steer against the RUNNING turn id",
+  () => {
+    eq(
+      jobB.steer("also run the linter", { frame: true }),
+      true,
+      "the steer was refused",
+    );
+    return asWait(
+      () => calls().some((c) => c.method === "turn/steer"),
+      "the steer to land",
+    ).then(() => {
+      const steer = calls().find((c) => c.method === "turn/steer");
+      const turn = calls().find((c) => c.method === "turn/start");
+      eq(steer.params.expectedTurnId, "turn-1");
+      eq(steer.params.threadId, "th-fake-1");
+      ok(
+        steer.params.input[0].text.includes("also run the linter"),
+        steer.params.input[0].text,
+      );
+      ok(
+        steer.params.input[0].text.startsWith("[STEER from the orchestrator"),
+        "a steer must arrive framed or the job re-plans",
+      );
+      ok(turn, "sanity: the turn existed");
+    });
+  },
+);
+
+const outB = await asReported();
+
+await t(
+  "what was steered in reaches the report, through the same block a worker uses",
+  () => {
+    eq(outB.meta.steers.length, 1);
+    eq(outB.meta.steers[0].text, "also run the linter");
+    ok(outB.outcome.answer.includes("after steer"), outB.outcome.answer);
+  },
+);
+
+await t(
+  "a steer at a job that has finished is refused, not written into nothing",
+  () => {
+    eq(jobB.steer("too late", { frame: true }), false);
+  },
+);
+
+// ---------------------------------------------------------------------------
+console.log(
+  "\n21c. ★ a steer that arrives BETWEEN turns queues and rides the next one",
+);
+// ---------------------------------------------------------------------------
+
+BGJ.reset();
+clearCalls();
+process.env.FAKE_TURN_MS = "300";
+const jobC = BGJ.runCodexAppServerJob("the between-turns case", {
+  mode: "edit",
+  cwd: BGAS_DIR,
+});
+// Synchronously, before the spawn has even handshaked: there is no turn to put
+// this in, and refusing it would be wrong (the job is alive and it is for it).
+const tookEarly = jobC.steer("and also the docs", { frame: true });
+const outC = await asReported();
+
+await t("the early steer is accepted rather than refused", () => {
+  eq(
+    tookEarly,
+    true,
+    "the job is alive; a refusal here would send him to re-fire a running job",
+  );
+});
+
+await t("and it is delivered on the next turn/start, not dropped", () => {
+  const steer = calls().find((c) => c.method === "turn/steer");
+  ok(
+    steer,
+    `no turn/steer was ever sent: ${JSON.stringify(calls().map((c) => c.method))}`,
+  );
+  eq(
+    steer.params.expectedTurnId,
+    "turn-1",
+    "it lands in the turn that started after it",
+  );
+  ok(
+    steer.params.input[0].text.includes("and also the docs"),
+    steer.params.input[0].text,
+  );
+  eq(
+    outC.meta.steers.length,
+    1,
+    "and it is recorded on the report only once it really landed",
+  );
+});
+
+// ---------------------------------------------------------------------------
+console.log(
+  "\n21d. a side question, answered mid-run and lifted out of the report",
+);
+// ---------------------------------------------------------------------------
+
+BGJ.reset();
+clearCalls();
+process.env.FAKE_TURN_MS = "1200";
+const jobD = BGJ.runCodexAppServerJob("the btw case", {
+  mode: "edit",
+  cwd: BGAS_DIR,
+});
+await asWait(
+  () => calls().some((c) => c.method === "turn/start"),
+  "the turn to start",
+);
+await new Promise((r) => setTimeout(r, 60));
+const btwRec = jobD.btwAsk("which file did you just write?", {
+  question: "which file did you just write?",
+});
+// startBtwNotice is btwInto's job in production, and bg-btw.test.mjs owns the ⏳
+// lifecycle. Here the resolver is installed the same way btwInto installs it, so
+// what this section asserts is the ROUTING rather than the message.
+btwRec.resolve = (state, extra) =>
+  BGJ.BTW_NOTICES.push({ id: btwRec.id, lane: "codex", state, answer: extra?.answer ?? null });
+
+await t(
+  "a btw is minted, framed and delivered down the same pipe as a steer",
+  () => {
+    ok(btwRec, "btwAsk returned nothing");
+    eq(btwRec.id, 1);
+    return asWait(
+      () => calls().some((c) => c.method === "turn/steer"),
+      "the btw to land",
+    ).then(() => {
+      const sent = calls().find((c) => c.method === "turn/steer").params
+        .input[0].text;
+      ok(sent.startsWith("[BTW #1 from the orchestrator"), sent.slice(0, 80));
+      ok(
+        /NOT an instruction for your task/.test(sent),
+        "the framing is what stops the job re-planning",
+      );
+    });
+  },
+);
+
+await t(
+  "★ an unframed btw is refused rather than reaching the job as an instruction",
+  () => {
+    eq(jobD.steer("which repo are you in?", { kind: "btw" }), false);
+  },
+);
+
+const outD = await asReported();
+
+await t(
+  "★ the BTW-ANSWER block is routed to the asker and never becomes the report",
+  () => {
+    const routed = BGJ.BTW_NOTICES.find((n) => n.state === "answered");
+    ok(
+      routed,
+      `the answer never reached the ⏳: ${JSON.stringify(BGJ.BTW_NOTICES)}`,
+    );
+    eq(routed.id, 1);
+    eq(routed.answer, "it is b.txt");
+    ok(
+      !outD.outcome.answer.includes("BTW-ANSWER"),
+      `a private answer reached the handback: ${outD.outcome.answer}`,
+    );
+    ok(!outD.outcome.answer.includes("it is b.txt"), outD.outcome.answer);
+    ok(outD.outcome.answer.startsWith("ANSWER for:"), outD.outcome.answer);
+  },
+);
+
+await t(
+  "a btw is NOT counted as a steer: it changed nothing and the report must not claim it did",
+  () => {
+    eq(outD.meta.steers.length, 0);
+  },
+);
+
+await t(
+  "★ a question the job never answers still reaches a terminal state",
+  () => {
+    BGJ.reset();
+    clearCalls();
+    process.env.FAKE_TURN_MS = "400";
+    process.env.FAKE_NO_BTW_ANSWER = "1";
+    const jobE = BGJ.runCodexAppServerJob("the unanswered btw case", {
+      mode: "ask",
+      cwd: BGAS_DIR,
+    });
+    // The model takes the question and finishes without answering it, which on
+    // a phone is the difference between a line that resolves and one that ticks
+    // forever. All five endings are wired on this transport too.
+    const rec = jobE.btwAsk("will you make it?", {
+      question: "will you make it?",
+    });
+    rec.resolve = (state) => BGJ.BTW_NOTICES.push({ id: rec.id, state });
+    return asReported().then(() => {
+      delete process.env.FAKE_NO_BTW_ANSWER;
+      const ended = BGJ.BTW_NOTICES.find((n) => n.state === "ended");
+      ok(
+        ended,
+        `the pending question was stranded: ${JSON.stringify(BGJ.BTW_NOTICES)}`,
+      );
+    });
+  },
+);
+
+// ---------------------------------------------------------------------------
+console.log("\n21e. /stop is an interrupt the model acknowledges");
+// ---------------------------------------------------------------------------
+
+BGJ.reset();
+clearCalls();
+process.env.FAKE_TURN_MS = "5000";
+const jobF = BGJ.runCodexAppServerJob("the stop case", {
+  mode: "edit",
+  cwd: BGAS_DIR,
+});
+await asWait(
+  () => calls().some((c) => c.method === "turn/start"),
+  "the turn to start",
+);
+await new Promise((r) => setTimeout(r, 60));
+jobF.interrupt("a /stop from Telegram");
+const outF = await asReported();
+
+await t("★ /stop sends turn/interrupt, not a signal at the child", () => {
+  const int = calls().find((c) => c.method === "turn/interrupt");
+  ok(
+    int,
+    `no turn/interrupt was sent: ${JSON.stringify(calls().map((c) => c.method))}`,
+  );
+  eq(int.params.turnId, "turn-1");
+  eq(int.params.threadId, "th-fake-1");
+});
+
+await t("★ the outcome is STOPPED, never finished", () => {
+  eq(outF.outcome.status, "stopped");
+  ok(
+    !BGJ.WALL.includes("clear"),
+    "a stopped turn is not proof the ChatGPT window is open",
+  );
+});
+
+await t("and the report still goes out, so nothing it produced is lost", () => {
+  ok(outF.outcome.record, "a stopped job with no row is a silent loss");
+  ok(
+    existsSync(path.join(BGAS_RUNS, `codex-${jobF.startedAt}.last.md`)),
+    "bg-reports still gets what it produced",
+  );
+});
+
+// ---------------------------------------------------------------------------
+console.log("\n21f. the app-server dies mid-turn");
+// ---------------------------------------------------------------------------
+
+BGJ.reset();
+clearCalls();
+process.env.FAKE_TURN_MS = "200";
+process.env.FAKE_DIE_AFTER_MS = "80";
+const jobG = BGJ.runCodexAppServerJob("the death case", {
+  mode: "edit",
+  cwd: BGAS_DIR,
+});
+await asWait(() => jobG.deaths.length >= 1, "the first death");
+
+await t("★ the first death is retried, and the SAME thread is resumed", () => {
+  return asWait(
+    () => calls().filter((c) => c.method === "thread/resume").length >= 1,
+    "the resume",
+  ).then(() => {
+    const resume = calls().find((c) => c.method === "thread/resume");
+    eq(
+      resume.params.threadId,
+      "th-fake-1",
+      "a retry that started a new thread would start the work over",
+    );
+    eq(resume.params.cwd, BGAS_DIR);
+  });
+});
+
+await t(
+  "the continuation turn tells it to continue rather than re-sending the brief",
+  async () => {
+    // WAITED FOR, not assumed present. `thread/resume` returning is not the
+    // second turn having started: the turn/start is one round trip behind it,
+    // and reading the call log in that gap made this the one test in the file
+    // that failed under load while the code was correct. A bounded wait costs
+    // nothing when it is already there and removes a false red.
+    await asWait(
+      () => calls().filter((c) => c.method === "turn/start").length >= 2,
+      "the continuation turn to start",
+    );
+    const turns = calls().filter((c) => c.method === "turn/start");
+    const text = turns[1].params.input[0].text;
+    eq(text, RESTART_CONTINUATION);
+    ok(
+      !text.includes("the death case"),
+      "re-sending the brief is how a resumed job starts over",
+    );
+  },
+);
+
+const outG = await asReported(30000);
+
+await t(
+  "★ a second death inside the window gives up and hands back a dead-worker report",
+  () => {
+    eq(outG.outcome.status, "failed");
+    ok(
+      /bg-salvage\.py/.test(outG.outcome.answer),
+      "a dead worker is not an empty worker",
+    );
+    ok(/app-server died/.test(outG.outcome.answer), outG.outcome.answer);
+    eq(
+      BGJ.registry.size,
+      0,
+      "the registry entry must not outlive the report, or the reaper announces it twice",
+    );
+    eq(BGJ.codexRuns.size, 0);
+  },
+);
+
+await t("★ never two app-server children for one job", () => {
+  // One child at a time, always: a second while the first is alive would be two
+  // processes with write access to the same repo. Every spawn here REPLACES a
+  // dead one, so the count can never exceed the deaths plus the original, and
+  // one death inside the window buys exactly one retry.
+  const starts = calls().filter((c) => c.method === "initialize").length;
+  const deaths = jobG.deaths.length;
+  ok(
+    starts <= deaths + 1,
+    `spawned ${starts} children for ${deaths} deaths: a spawn with no death before it is a second live child`,
+  );
+  eq(
+    calls().filter((c) => c.method === "thread/resume").length,
+    1,
+    "one death inside the window buys exactly one retry",
+  );
+});
+
+await t(
+  "the deaths also reach the global list, so the NEXT job dispatches on exec",
+  () => {
+    ok(
+      BGJ.codexAppServerDeaths.length >= 2,
+      "two deaths in a minute means this machine has no working app-server",
+    );
+  },
+);
+
+delete process.env.FAKE_DIE_AFTER_MS;
+
+// ---------------------------------------------------------------------------
+console.log("\n21g. a daemon restart: the thread survives, the job is resumed");
+// ---------------------------------------------------------------------------
+
+BGJ.reset();
+clearCalls();
+process.env.FAKE_TURN_MS = "250";
+const RESTART_REC = {
+  pid: 999999,
+  task: "finish the migration",
+  lane: "codex",
+  startedAt: Date.now() - 60_000,
+  engine: "codex",
+  transport: "appserver",
+  threadId: "th-fake-1",
+  mode: "edit",
+  cwd: BGAS_DIR,
+  steers: [{ ts: "2026-09-09T18:00:00.000Z", text: "and the docs too" }],
+};
+BGJ.registry.set(`codex-${RESTART_REC.startedAt}-999999`, RESTART_REC);
+const resumed = BGJ.recoverCodexAppServerJob(
+  `codex-${RESTART_REC.startedAt}-999999`,
+  RESTART_REC,
+);
+const outH = await asReported();
+
+await t(
+  "★ the dead row is cleared before anything else, so the reaper cannot bury a live job",
+  () => {
+    ok(
+      !BGJ.registry.has(`codex-${RESTART_REC.startedAt}-999999`),
+      "the previous daemon row survived",
+    );
+  },
+);
+
+await t("★ it RESUMES the thread rather than starting a fresh one", () => {
+  const resume = calls().find((c) => c.method === "thread/resume");
+  ok(
+    resume,
+    `no thread/resume: ${JSON.stringify(calls().map((c) => c.method))}`,
+  );
+  eq(resume.params.threadId, "th-fake-1");
+  ok(
+    !calls().some((c) => c.method === "thread/start"),
+    "a fresh thread would throw away everything it had done",
+  );
+});
+
+await t(
+  "★ and its first turn is the continuation, never the brief again",
+  () => {
+    const turn = calls().find((c) => c.method === "turn/start");
+    eq(turn.params.input[0].text, RESTART_CONTINUATION);
+  },
+);
+
+await t(
+  "the resumed job keeps its own run id, so its report is the one it started",
+  () => {
+    eq(resumed.runId, `codex-${RESTART_REC.startedAt}`);
+    eq(outH.runId, `codex-${RESTART_REC.startedAt}`);
+  },
+);
+
+await t("what the previous daemon steered in still reaches the report", () => {
+  eq(outH.meta.steers.length, 1);
+  eq(outH.meta.steers[0].text, "and the docs too");
+});
+
+await t(
+  "it is steerable again: that is the whole point of resuming rather than reaping",
+  () => {
+    ok(
+      BGJ.SENT.some((s) => s.includes("Resumed")),
+      `no resume line was sent: ${JSON.stringify(BGJ.SENT)}`,
+    );
+  },
+);
+
+await t(
+  "★ a job whose thread never existed is handed back, not silently dropped",
+  () => {
+    BGJ.reset();
+    clearCalls();
+    const id = `codex-${Date.now() - 5000}-424242`;
+    BGJ.registry.set(id, {
+      pid: 424242,
+      task: "died early",
+      engine: "codex",
+      transport: "appserver",
+      mode: "edit",
+      cwd: BGAS_DIR,
+    });
+    const none = BGJ.recoverCodexAppServerJob(id, BGJ.registry.get(id));
+    eq(none, null);
+    return asReported().then((rep) => {
+      eq(rep.outcome.status, "failed");
+      ok(/bg-salvage\.py/.test(rep.outcome.answer), rep.outcome.answer);
+      eq(BGJ.registry.size, 0);
+    });
+  },
+);
+
+await t(
+  "★ a FINISHED job is never resumed, because its row is gone the moment it reports",
+  () => {
+    // The invariant behind "the continuation cannot re-run a finished job": every
+    // terminal path clears the registry entry as its first act, so a row that is
+    // still there at boot is by definition a job that never reported.
+    BGJ.reset();
+    clearCalls();
+    process.env.FAKE_TURN_MS = "120";
+    BGJ.runCodexAppServerJob("a job that finishes cleanly", {
+      mode: "edit",
+      cwd: BGAS_DIR,
+    });
+    return asReported().then(() => {
+      eq(
+        BGJ.registry.size,
+        0,
+        "a finished job that left a row would be resumed at the next boot",
+      );
+    });
+  },
+);
+
+// ---------------------------------------------------------------------------
+console.log("\n21h. the router: which transport, and what stays on exec");
+// ---------------------------------------------------------------------------
+
+await t("★ a handed-off edit job goes to the app-server", () => {
+  BGJ.reset();
+  clearCalls();
+  process.env.FAKE_TURN_MS = "100";
+  const run = BGJ.startCodexJob("run the suite", { mode: "edit", cwd: BGAS_DIR });
+  eq(BGJ.EXEC_RUNS.length, 0, "it must not have gone one-shot");
+  eq(run.transport, "appserver");
+  return asReported();
+});
+
+await t(
+  "★ the rate-limit fallback dispatches onto the app-server too, and says why",
+  () => {
+    BGJ.reset();
+    clearCalls();
+    const until = Date.now() + 3600_000;
+    const run = BGJ.startCodexJob("the walled job", {
+      mode: "edit",
+      cwd: BGAS_DIR,
+      reason: "claude_limited",
+      pausedUntil: until,
+    });
+    eq(run.transport, "appserver");
+    eq(run.reason, "claude_limited");
+    ok(
+      BGJ.SENT.some((s) => s.includes("every Claude account is limited")),
+      BGJ.SENT.join("|"),
+    );
+    return asReported().then((rep) => eq(rep.meta.reason, "claude_limited"));
+  },
+);
+
+await t("★ a review stays on `codex exec`", () => {
+  BGJ.reset();
+  const run = BGJ.startCodexJob("codex review: bridge", {
+    mode: "review",
+    cwd: BGAS_DIR,
+  });
+  eq(BGJ.EXEC_RUNS.length, 1, "a review must not be moved to the app-server");
+  eq(BGJ.EXEC_RUNS[0].mode, "review");
+  eq(run.runId, "codex-exec-1");
+});
+
+await t(
+  "★ a broken app-server puts the next job back on exec, which is what the fallback is",
+  () => {
+    BGJ.reset();
+    BGJ.setFallback(true);
+    const run = BGJ.startCodexJob("run the suite", { mode: "edit", cwd: BGAS_DIR });
+    eq(
+      BGJ.EXEC_RUNS.length,
+      1,
+      "with no working app-server the job must still run",
+    );
+    eq(run.runId, "codex-exec-1");
+    BGJ.setFallback(false);
+  },
+);
+
+await t("the start notice on an app-server job says it CAN be steered", () => {
+  BGJ.reset();
+  clearCalls();
+  process.env.FAKE_TURN_MS = "100";
+  BGJ.startCodexJob("the notice case", { mode: "edit", cwd: BGAS_DIR });
+  ok(
+    BGJ.SENT.some((s) => /steerable \(bg\.mjs steer/.test(s)),
+    BGJ.SENT.join("|"),
+  );
+  ok(
+    !BGJ.SENT.some((s) => /not steerable/.test(s)),
+    "the old sentence must not survive on a job that takes a steer",
+  );
+  return asReported();
+});
+
+// ---------------------------------------------------------------------------
+console.log("\n21i. `bg.mjs ps`: the STEER column");
+// ---------------------------------------------------------------------------
+
+BGJ.reset();
+clearCalls();
+process.env.FAKE_TURN_MS = "2000";
+const psJob = BGJ.runCodexAppServerJob("the ps case", {
+  mode: "edit",
+  cwd: BGAS_DIR,
+});
+await asWait(
+  () => calls().some((c) => c.method === "turn/start"),
+  "the turn to start",
+);
+// AND FOR THE FIRST ITEM TO BE PROCESSED, not merely for the turn to exist. The
+// step count and the last action come off notifications that arrive after the
+// turn/start response, so reading the descriptors in that gap made this the
+// second test in the file that went red under load while the code was correct.
+await asWait(() => psJob.steps >= 1, "the first streamed step");
+const psRows = BGJ.bgWorkerDescriptors();
+
+await t(
+  "★ an app-server job reports STEER yes, and carries the handle that makes it true",
+  () => {
+    const row = psRows.find((w) => w.runId === psJob.runId);
+    ok(
+      row,
+      `the job is missing from ps: ${JSON.stringify(psRows.map((w) => w.runId))}`,
+    );
+    eq(row.steerable, true);
+    eq(row.engine, "codex");
+    eq(row.transport, "appserver");
+    ok(row.run?.steer, "STEER yes with no handle is a refusal one call later");
+    ok(row.run?.btwAsk, "a btw is resolved by the same handle");
+    eq(row.isBg, true);
+  },
+);
+
+await t(
+  "and it shows what it is doing, from its own stream rather than a log walk",
+  () => {
+    const row = psRows.find((w) => w.runId === psJob.runId);
+    ok(
+      row.lastAct,
+      'a running job that shows nothing is the "always says running" bug',
+    );
+    ok(row.steps >= 1, `no steps counted: ${row.steps}`);
+  },
+);
+
+psJob.interrupt("the test is over");
+await asReported();
+
+await t("★ a one-shot exec run still reports STEER no, by name", () => {
+  BGJ.reset();
+  BGJ.codexRuns.set("codex-999", {
+    runId: "codex-999",
+    watchdogId: "codex-999-1",
+    startedAt: Date.now(),
+    child: { pid: 4242 },
+    mode: "edit",
+    cwd: BGAS_DIR,
+    prompt: "an exec run",
+    logPath: null,
+    done: false,
+    transport: "exec",
+  });
+  const rows = BGJ.bgWorkerDescriptors();
+  const row = rows.find((w) => w.runId === "codex-999");
+  eq(
+    row.steerable,
+    false,
+    "an exec run has no stdin to write into once its prompt is in",
+  );
+  eq(row.run, null);
+  eq(row.transport, "exec");
+  eq(
+    row.isBg,
+    true,
+    'it stays isBg so the resolver refuses by NAME rather than "nothing matches"',
+  );
+  BGJ.codexRuns.clear();
+});
+
+// ---------------------------------------------------------------------------
+console.log("\n21k. what the QA pass found");
+// ---------------------------------------------------------------------------
+//
+// Five defects, none of which any test above could see, because each lives on a
+// path that only opens once a background job owns an app-server child: a refusal
+// one round trip after the ack, a permanent global set by a job, a deadline
+// re-armed by a restart, a reaper landing inside a retry, and a restart script
+// that reads the job's child as idle.
+
+await t("★ a refused steer is taken back OUT of the report and corrected on the phone", async () => {
+  // A background job runs ONE turn. The chat lane can requeue a refused message
+  // onto the next one; here there is no next one, so queueing it silently
+  // dropped an instruction the owner had already been told was delivered, and
+  // the handback still listed it under STEERED IN.
+  BGJ.reset();
+  clearCalls();
+  process.env.FAKE_TURN_MS = "1500";
+  // SET BEFORE THE SPAWN: the fake inherits the environment when it starts, so a
+  // flag flipped afterwards never reaches it. The turn is running either way,
+  // which is the case being proven: refused while live, not refused because dead.
+  process.env.FAKE_REFUSE_STEER = "1";
+  const job = BGJ.runCodexAppServerJob("the refused steer case", { mode: "edit", cwd: BGAS_DIR });
+  await asWait(() => calls().some((c) => c.method === "turn/start"), "the turn to start");
+  await new Promise((r) => setTimeout(r, 60));
+  eq(job.steer("also run the linter", { frame: true }), true, "the ack still says delivered: the refusal is one round trip away");
+  await asWait(() => BGJ.SENT.some((s) => s.startsWith("❌ Not steered")), "the correction");
+  const rep = await asReported();
+  delete process.env.FAKE_REFUSE_STEER;
+  const note = BGJ.SENT.find((s) => s.startsWith("❌ Not steered"));
+  ok(/not steerable|cannot take a mid-turn message/.test(note), note);
+  ok(note.includes(`/steer ${job.runId}`), "★ it has to name the run, because re-sending is done by run id");
+  eq(rep.meta.steers.length, 0, "★ a steer that never landed must not be reported as one");
+});
+
+await t("★ a refused question resolves its own ⏳ instead of ticking until the job ends", async () => {
+  BGJ.reset();
+  clearCalls();
+  process.env.FAKE_TURN_MS = "1200";
+  process.env.FAKE_REFUSE_STEER = "1"; // before the spawn: the fake inherits env once
+  const job = BGJ.runCodexAppServerJob("the refused btw case", { mode: "edit", cwd: BGAS_DIR });
+  await asWait(() => calls().some((c) => c.method === "turn/start"), "the turn to start");
+  await new Promise((r) => setTimeout(r, 60));
+  const rec = job.btwAsk("which file did you just write?", { question: "which file?" });
+  rec.resolve = (state, extra) => BGJ.BTW_NOTICES.push({ id: rec.id, state, why: extra?.why ?? null });
+  await asWait(() => BGJ.BTW_NOTICES.length > 0, "the ⏳ to resolve");
+  delete process.env.FAKE_REFUSE_STEER;
+  const ending = BGJ.BTW_NOTICES[0];
+  eq(ending.state, "refused", `"ended" would claim the job's report may still carry it: ${JSON.stringify(BGJ.BTW_NOTICES)}`);
+  ok(ending.why, "the line has to say WHY, or he cannot tell it from a worker that ignored him");
+  ok(!BGJ.SENT.some((s) => s.startsWith("❌ Not steered")), "a question resolves its own line and must not also get a steer correction");
+  await asReported();
+  eq(BGJ.BTW_NOTICES.filter((n) => n.id === ending.id).length, 1, "★ and it is not resolved a SECOND time when the job ends");
+});
+
+await t("★ a job whose child cannot handshake does not disable the app-server for the whole daemon", async () => {
+  // codexAppServerInitFailed is permanent. Latching it from a background job's
+  // child means one slow spawn under load drops the CHAT lane and every later
+  // job onto one-shot exec for the rest of the daemon's life, while telling the
+  // owner "this codex build has no app-server", which is false.
+  BGJ.reset();
+  clearCalls();
+  process.env.FAKE_INIT_REFUSE = "1";
+  BGJ.runCodexAppServerJob("the bad handshake case", { mode: "edit", cwd: BGAS_DIR });
+  const rep = await asReported();
+  delete process.env.FAKE_INIT_REFUSE;
+  eq(rep.outcome.status, "failed", "the job itself must still be reported, never dropped");
+  ok(/bg-salvage\.py/.test(rep.outcome.answer), rep.outcome.answer);
+  eq(BGJ.initFailed(), false, "★ a job's spawn is evidence about that spawn, never about the binary");
+  ok(BGJ.codexAppServerDeaths.length >= 1, "it still feeds the shared death list, which is the signal that DOES fall back");
+});
+
+await t("★ one failed spawn counts as ONE death, however it failed", async () => {
+  // Two deaths inside the window means "this machine has no working
+  // app-server", and acting on it drops the chat lane to one-shot and every job
+  // dispatched in that minute onto exec for its whole life. A child that CLOSES
+  // during the handshake is seen by BOTH paths (it rejects the spawn promise
+  // AND fires onDeath), so counting it in each one made a single transient
+  // reach that threshold on its own.
+  BGJ.reset();
+  clearCalls();
+  process.env.FAKE_DIE_AT_SPAWN = "1";
+  BGJ.runCodexAppServerJob("the child that never came up", { mode: "edit", cwd: BGAS_DIR });
+  const rep = await asReported();
+  delete process.env.FAKE_DIE_AT_SPAWN;
+  eq(rep.outcome.status, "failed", "the job is still reported, never dropped");
+  eq(BGJ.codexAppServerDeaths.length, 1, "★ one spawn, one death: two is the threshold, not the tally of paths that noticed");
+  const died = BGJ.LOGS.filter((l) => l.includes("[bridge] died"));
+  ok(!died.some((l) => /giveUp=false/.test(l)), `a job that gave up must not log a retry it never made: ${died.join("|")}`);
+});
+
+await t("★ a resumed job whose child dies at the handshake does not log a retry it never makes", async () => {
+  // The one case where the two differ: a RESUMED job knows its thread, so the
+  // retry branch looks available. It is not: start() is still inside its own
+  // await, so the re-entrant call returns at the `spawning` guard and the catch
+  // one await away reports the job. Logging giveUp=false there is a line that
+  // says a retry happened over a job that gave up, which is the whole reason
+  // the lifecycle log exists.
+  BGJ.reset();
+  clearCalls();
+  process.env.FAKE_DIE_AT_SPAWN = "1";
+  const startedAt = Date.now() - 30_000;
+  const id = `codex-${startedAt}-999997`;
+  const rec = { pid: 999997, task: "the resumed one", lane: "codex", startedAt, engine: "codex", transport: "appserver", threadId: "th-fake-1", mode: "edit", cwd: BGAS_DIR };
+  BGJ.registry.set(id, rec);
+  BGJ.recoverCodexAppServerJob(id, rec);
+  const rep = await asReported();
+  delete process.env.FAKE_DIE_AT_SPAWN;
+  eq(rep.outcome.status, "failed");
+  const died = BGJ.LOGS.filter((l) => l.includes("[bridge] died"));
+  ok(died.length >= 1, "the death still has to be logged");
+  ok(!died.some((l) => /giveUp=false/.test(l)), `it gave up, so the log must say so: ${died.join("|")}`);
+  eq(BGJ.codexAppServerDeaths.length, 1, "and it is still one death, not two");
+});
+
+await t("★ a resumed job continues the original deadline rather than re-arming a full one", async () => {
+  // The only bound on a BILLED run. This daemon restarts after every bridge
+  // edit, so a full window per restart is how 30 minutes becomes unbounded in
+  // 30 minute increments. adoptCodexSurvivor does this arithmetic on the exec
+  // path under a comment that says exactly that.
+  BGJ.reset();
+  clearCalls();
+  BGJ.configure({ timeoutMs: 60_000 });
+  process.env.FAKE_TURN_MS = "20000"; // long enough that only the deadline can end it
+  const startedAt = Date.now() - 120_000; // two minutes into a one minute budget
+  const id = `codex-${startedAt}-999999`;
+  const rec = { pid: 999999, task: "the long one", lane: "codex", startedAt, engine: "codex", transport: "appserver", threadId: "th-fake-1", mode: "edit", cwd: BGAS_DIR };
+  BGJ.registry.set(id, rec);
+  BGJ.recoverCodexAppServerJob(id, rec);
+  const rep = await asReported(15000);
+  BGJ.configure({ timeoutMs: 0 });
+  eq(rep.outcome.status, "stopped", "a job past its deadline is interrupted, not given another full window");
+  eq(BGJ.registry.size, 0, "and it still reports and clears, exactly as any other ending does");
+});
+
+await t("★ registered_pids, run for real, keeps a job's child and drops the chat lane's", () => {
+  // The shell function itself, extracted by source and executed against a
+  // fixture registry. The script's own loop is never run: it ends in
+  // `launchctl kickstart`, and a test that restarts the owner's daemon to prove
+  // a filter is worse than no test at all.
+  const sh = readFileSync(path.join(DIR, "safe-restart.sh"), "utf8");
+  const fn = sh.slice(sh.indexOf("registered_pids() {"), sh.indexOf("\n}", sh.indexOf("registered_pids() {")) + 2);
+  // ★ $INFLIGHT, not a hardcoded bg-inflight.json beside the script. This build
+  // lets an install move the registry (config.json inflightFile, or
+  // BRIDGE_INFLIGHT_FILE), and a filter reading the wrong path would find no
+  // registered pids at all: every app-server child would read as the chat
+  // lane's, and the restart would go straight over a job mid-write.
+  ok(fn.includes("$INFLIGHT"), "the function was not extracted, or it stopped reading the configured registry");
+  const home = mkdtempSync(path.join(tmpdir(), "safe-restart-"));
+  const reg = path.join(home, "somewhere-else.json");
+  // 4242 is a background job's app-server child; 777 is the chat lane's, which
+  // is never registered. 999 is a Claude worker, registered like any other.
+  writeFileSync(
+    reg,
+    JSON.stringify({ "codex-1788999999999-4242": { pid: 4242, engine: "codex", transport: "appserver" }, "bg-1788999999998": { pid: 999 } }),
+  );
+  const kept = execFileSync("/bin/bash", ["-c", `INFLIGHT=${JSON.stringify(reg)}\n${fn}\nregistered_pids 4242 777 999`], { encoding: "utf8" })
+    .split("\n")
+    .filter(Boolean);
+  eq(JSON.stringify(kept), JSON.stringify(["4242", "999"]), "★ a registered app-server child is a JOB and must hold the restart");
+  eq(
+    execFileSync("/bin/bash", ["-c", `INFLIGHT=${JSON.stringify(reg)}\n${fn}\nregistered_pids 777`], { encoding: "utf8" }).trim(),
+    "",
+    "the chat lane's server is workless and must never hold one",
+  );
+  eq(
+    execFileSync("/bin/bash", ["-c", `INFLIGHT=/nowhere-at-all/bg-inflight.json\n${fn}\nregistered_pids 4242; echo rc=$?`], { encoding: "utf8" }).trim(),
+    "rc=0",
+    "an unreadable registry prints nothing and does not abort the restart script",
+  );
+  rmSync(home, { recursive: true, force: true });
+});
+
+await t("a resumed job INSIDE its budget is left alone", async () => {
+  BGJ.reset();
+  clearCalls();
+  BGJ.configure({ timeoutMs: 600_000 });
+  process.env.FAKE_TURN_MS = "150";
+  const startedAt = Date.now() - 5_000;
+  const id = `codex-${startedAt}-999998`;
+  const rec = { pid: 999998, task: "the short one", lane: "codex", startedAt, engine: "codex", transport: "appserver", threadId: "th-fake-1", mode: "edit", cwd: BGAS_DIR };
+  BGJ.registry.set(id, rec);
+  BGJ.recoverCodexAppServerJob(id, rec);
+  const rep = await asReported();
+  BGJ.configure({ timeoutMs: 0 });
+  eq(rep.outcome.status, "finished", "five seconds into ten minutes is not a deadline");
+});
+
+// ---------------------------------------------------------------------------
+console.log("\n21j. wired, not merely written");
+// ---------------------------------------------------------------------------
+//
+// Existence is not implementation. Each of these is a one-line call site inside
+// a function no test can extract, and each is a SILENT failure when missing: a
+// resumed job never resumed, a /stop that kills a child mid-write, a handed-off
+// job that quietly went one-shot. The mutation runs for the first two passed
+// with these in place and failed without them.
+
+const BRIDGE_SRC = SRC.join("\n");
+
+await t("★ the boot sweep resumes an app-server job, BEFORE the reaper could bury it", () => {
+  ok(
+    /if \(rec\?\.engine === 'codex' && rec\?\.transport === 'appserver'\) recoverCodexAppServerJob\(id, rec\);/.test(BRIDGE_SRC),
+    "the boot sweep never calls the recovery, so a restart loses every running Codex job",
+  );
+  const sweep = BRIDGE_SRC.slice(BRIDGE_SRC.indexOf("for (const [id, rec] of Object.entries(inflight.read()))"));
+  ok(
+    sweep.indexOf("recoverCodexAppServerJob") < sweep.indexOf("reapDeadWorkers("),
+    "a job that is about to carry on must not first be announced as dead",
+  );
+  ok(
+    /else if \(rec\?\.engine === 'codex'\) adoptCodexSurvivor\(id, rec\);/.test(BRIDGE_SRC),
+    "and a one-shot exec survivor keeps its old adoption path",
+  );
+});
+
+await t("★ /stop interrupts an app-server job rather than signalling its child", () => {
+  const stop = BRIDGE_SRC.slice(BRIDGE_SRC.indexOf("function stopCodexRuns("), BRIDGE_SRC.indexOf("THE CHAT-LANE FALLBACK"));
+  ok(/r\.transport === 'appserver' && r\.interrupt/.test(stop), "the app-server arm");
+  ok(
+    stop.indexOf("r.interrupt('a /stop from Telegram')") < stop.indexOf("r.child?.kill('SIGTERM')"),
+    "★ the interrupt arm must come first, or a job gets SIGTERMed mid-write in workspace-write",
+  );
+});
+
+await t("★ both handed-off dispatch paths go through the router, not straight to exec", () => {
+  // The drop-box path (bg.mjs --engine codex and the rate-limit fallback) and
+  // the typed `bg:` / `codex:` path. Either one calling runCodex directly would
+  // silently keep half the jobs one-shot.
+  eq((BRIDGE_SRC.match(/startCodexJob\(text, \{/g) || []).length, 2, "both background dispatch sites");
+  const drop = BRIDGE_SRC.slice(BRIDGE_SRC.indexOf("const fallbackSlashCommand"), BRIDGE_SRC.indexOf("const lint = lintCodexBrief"));
+  ok(/const run = startCodexJob\(text, \{/.test(drop), "the drop-box path still calls runCodex directly");
+});
+
+await t("★ the live card reads the transport off the run, for both facts it changes", () => {
+  // The dispatch card and the bubble under it. Both were written for a one-shot
+  // run and both are SILENT when wrong: a card that says "not steerable" over a
+  // job that takes a steer costs him the reach, and a bubble with no steps sits
+  // at "⏳ 18m" over a job doing work, which is the silence the live-message
+  // pass existed to remove. bg-notify.test.mjs owns what the line then renders.
+  const notice = BRIDGE_SRC.slice(
+    BRIDGE_SRC.indexOf("const lint = lintCodexBrief"),
+    BRIDGE_SRC.indexOf("} catch (e) {", BRIDGE_SRC.indexOf("const lint = lintCodexBrief")),
+  );
+  ok(/steerable: run\?\.transport === 'appserver',/.test(notice), "the card never learns the job can be steered");
+  ok(
+    /if \(run\?\.transport !== 'appserver'\) return \{ elapsedSec \};/.test(notice),
+    "an exec run must keep the clock alone: it has no in-process stream to read a step count off",
+  );
+  ok(
+    /return \{ elapsedSec, steps: run\.steps \|\| 0, lastAct: run\.lastAct \|\| null \};/.test(notice),
+    "★ an app-server job streams its items to us, so its bubble carries the same steps a Claude worker's does",
+  );
+});
+
+await t("★ the reaper is told a job mid-retry is not a corpse", () => {
+  // Its child really did die and its registry row really does hold a dead pid,
+  // for the few hundred ms until the replacement registers. The 60s reaper
+  // landing in that window sends the owner a dead-worker alert, dispatches the
+  // assistant to salvage, and stamps the sidecar `failed` on a job that then
+  // finishes and reports normally, twice. The daemon's own map knows better.
+  const fn = BRIDGE_SRC.slice(BRIDGE_SRC.indexOf("function onDeadWorkers("), BRIDGE_SRC.indexOf("\nfunction ", BRIDGE_SRC.indexOf("function onDeadWorkers(") + 1));
+  ok(/const run = startedAt \? codexRuns\.get\(codexRunId\(startedAt\)\) : null;/.test(fn), "it must ask the live map, not the row");
+  ok(/return Boolean\(run && !run\.done\);/.test(fn), "and `!run.done` is the whole test: a finished run is not in the map at all");
+  // BOTH INDICES CHECKED FOR PRESENCE FIRST. `indexOf` returns -1 for a line
+  // that is GONE, and -1 is less than everything, so an ordering assertion on
+  // its own passes loudest exactly when the thing it guards has been deleted.
+  // Caught by mutation: removing the filter left this test green.
+  const at = fn.indexOf("dead = dead.filter((d) => !stillDriven(d));");
+  const stamp = fn.indexOf("finalizeCodexMeta");
+  ok(at >= 0, "the filter is not called at all, so every mid-retry job is reported dead");
+  ok(stamp >= 0, "sanity: the sidecar stamp is what the ordering is about");
+  ok(at < stamp, "★ the filter must come before the sidecar stamp, or a running job is marked failed");
+  ok(/if \(!dead\.length\) return;/.test(fn), "and an emptied list must return rather than send an alert about nobody");
+});
+
+await t("★ safe-restart.sh counts a background Codex job's child as work in flight", () => {
+  // The one finding that lives OUTSIDE the diff, and the most expensive: the
+  // documented restart step reads a running Codex job as idle and kickstarts
+  // over it, killing a turn that may be mid-write in workspace-write.
+  const sh = readFileSync(path.join(DIR, "safe-restart.sh"), "utf8");
+  ok(
+    /\$0 ~ \/codex app-server\/ \{print \$2\}/.test(sh),
+    "the app-server children have to be collected before they can be sorted",
+  );
+  ok(
+    /registered_pids \$as_pids/.test(sh),
+    "★ and sorted by the REGISTRY: `ps` cannot tell the chat lane's server from a job's",
+  );
+  ok(
+    !/child_pids=\$\(ps -axo ppid=,pid=,command= \| awk -v p="\$DPID" '\$1 == p && \$0 !~ \/codex app-server\/ \{print \$2\}'\)\n  kids=/.test(sh),
+    "the unconditional exclusion must not survive: it is what made a live job read as idle",
+  );
+});
+
+await t("the report a job hands back carries the steers, on the same path an exec run uses", () => {
+  ok(
+    /handBackToChat\(task, outcome\.answer, outcome\.status, id, steers, \{/.test(BRIDGE_SRC),
+    "an exec run passes an empty list here; a steerable job must pass its own",
+  );
+});
+
+await t("★ /status reads steerability and steps off the descriptor, never hardcoded", () => {
+  // The card, `bg.mjs ps` and /steer all read `steerable` off the descriptor;
+  // /status is the fourth reader and the one the README points people at for
+  // "what is running". Hardcoding it there is two answers to one question, on
+  // the same job, at the same second.
+  const at = BRIDGE_SRC.indexOf("const codexBlock = (w) =>");
+  ok(at > 0, "codexBlock was not found, did it get renamed?");
+  // The end anchor is searched FROM the start anchor: `const win = modelWindow(`
+  // appears three times in this file and the first one is thousands of lines
+  // above codexBlock, which would slice an empty string and pass everything.
+  const fn = BRIDGE_SRC.slice(at, BRIDGE_SRC.indexOf("const win = modelWindow(", at));
+  ok(fn.length > 100, "codexBlock was not extracted, did it get renamed?");
+  ok(/steerable: Boolean\(w\.steerable\)/.test(fn), "★ a hardcoded false tells the owner a steerable job cannot be steered");
+  ok(/steps: w\.steps \|\| 0/.test(fn), "an app-server job streams its steps, so /status must not print zero over them");
+  ok(!/steerable: false/.test(fn), "the old hardcode must not survive alongside the new line");
+});
+
+// ---------------------------------------------------------------------------
+console.log("\n21l. what the SECOND QA pass found");
+// ---------------------------------------------------------------------------
+
+await t("★ a child that dies DURING thread/resume is retried, not reported dead on one death", async () => {
+  // THE RACE. `fail()` rejects the pending call and THEN calls onDeath, so the
+  // death handler runs synchronously (and starts the retry) while the awaiting
+  // start() is still one microtask behind it. Without the stale-attempt guard
+  // that await's catch then finishes the very run the retry just claimed: the
+  // job is handed back dead after ONE death, under a log line that already said
+  // giveUp=false, and the fresh child is killed on its way up.
+  BGJ.reset();
+  clearCalls();
+  BGJ.configure({ timeoutMs: 0 });
+  process.env.FAKE_TURN_MS = "120";
+  process.env.FAKE_DIE_ON_RESUME = "1";
+  const startedAt = Date.now() - 3_000;
+  const id = `codex-${startedAt}-424242`;
+  BGJ.registry.set(id, { pid: 424242, task: "the resume race", lane: "codex", startedAt, engine: "codex", transport: "appserver", threadId: "th-fake-1", mode: "edit", cwd: BGAS_DIR });
+  const run = BGJ.recoverCodexAppServerJob(id, BGJ.registry.get(id));
+  await asWait(() => run.deaths.length >= 1, "the first death");
+  // THE DISCRIMINATOR, and it is this wait rather than a count read after it: a
+  // second spawn that gets as far as its OWN thread/resume can only happen if
+  // the run was still alive to be retried. With the stale await finishing the
+  // run instead, the retry's child is killed by start()'s own `if (run.done)`
+  // before it resumes anything, and this wait times out.
+  await asWait(() => calls().filter((c) => c.method === "thread/resume").length >= 2, "the retry's own resume");
+  // Two deaths in the window IS the give-up signal, and it still fires.
+  const out = await asReported(30000);
+  delete process.env.FAKE_DIE_ON_RESUME;
+  eq(run.deaths.length, 2, "★ it took TWO deaths to give up, not one");
+  eq(BGJ.REPORTED.length, 1, "and the job is handed back exactly once");
+  eq(out.outcome.status, "failed");
+  ok(/bg-salvage\.py/.test(out.outcome.answer), "a dead worker is not an empty worker");
+  ok(BGJ.LOGS.some((l) => /died .*giveUp=false/.test(l)), "the first death is logged as a retry");
+  ok(BGJ.LOGS.some((l) => /died .*giveUp=true/.test(l)), "and only the last one as a give-up");
+  eq(BGJ.registry.size, 0, "the row is cleared by the ending that reported");
+});
+
+await t("★ a steer queued between turns is CORRECTED when the job ends before its next turn", async () => {
+  // Acked as delivered, then dropped in silence, is the one thing every refusal
+  // path in this file exists to avoid. A steer with no turn to land in is
+  // queued (correct: the job is alive), but if the job then ends without ever
+  // starting one, nothing was ever sent, the report's STEERED IN block does not
+  // carry it, and without this drain the owner is never told.
+  BGJ.reset();
+  clearCalls();
+  process.env.FAKE_NO_THREAD = "1"; // thread/start answers with no id, so the job ends before turn 1
+  const run = BGJ.runCodexAppServerJob("the queued steer case", { mode: "edit", cwd: BGAS_DIR });
+  // Synchronous, so there is provably no client and no turn yet: this is the
+  // exact window the queue exists for.
+  eq(run.steer("also touch z.txt"), true, "the run is alive, so the steer is accepted and queued");
+  const out = await asReported(20000);
+  delete process.env.FAKE_NO_THREAD;
+  eq(out.outcome.status, "failed", "sanity: this job cannot start a turn at all");
+  eq(calls().filter((c) => c.method === "turn/steer").length, 0, "there was never a turn to steer");
+  ok(
+    BGJ.SENT.some((m) => /Not steered/.test(m) && /the queued steer case|codex/.test(m)),
+    `the owner must be told the acked steer never landed:\n${BGJ.SENT.join("\n---\n")}`,
+  );
+  eq(JSON.stringify(out.meta.steers), "[]", "and it must not be claimed in the report as written into the job");
+});
+
+await t("★ an interrupt the server accepts and never completes still ends the run", async () => {
+  // `turn/interrupt` being ACCEPTED is not the ending; `turn/completed` is. A
+  // server that answers one and never sends the other leaves the run in
+  // codexRuns forever, reported as stopped on the phone while its child keeps
+  // writing in workspace-write. The exec path escalates SIGTERM to SIGKILL for
+  // exactly this; the grace window is the same escalation.
+  BGJ.reset();
+  clearCalls();
+  BGJ.configure({ interruptGraceMs: 400 });
+  process.env.FAKE_TURN_MS = "60000"; // the turn itself must NOT be what ends this
+  process.env.FAKE_SILENT_INTERRUPT = "1";
+  let out;
+  let took;
+  try {
+    const run = BGJ.runCodexAppServerJob("the silent interrupt case", { mode: "edit", cwd: BGAS_DIR });
+    await asWait(() => calls().some((c) => c.method === "turn/start"), "the turn to start");
+    run.interrupt("a /stop from Telegram");
+    await asWait(() => calls().some((c) => c.method === "turn/interrupt"), "the interrupt to be accepted");
+    const t0 = Date.now();
+    out = await asReported(20000);
+    took = Date.now() - t0;
+    eq(run.done, true);
+  } finally {
+    // IN A finally, because this test can fail by TIMING OUT and the knobs it
+    // sets live in process.env, which the fake reads: leaving a silent-interrupt
+    // fake behind turns the next test red for a reason that is not its own.
+    BGJ.configure({ interruptGraceMs: 30_000 });
+    delete process.env.FAKE_SILENT_INTERRUPT;
+    process.env.FAKE_TURN_MS = "120";
+  }
+  eq(out.outcome.status, "stopped", "a run the owner was told was stopped must actually end");
+  // ★ THE DISCRIMINATOR. Without the escalation this run still ends eventually,
+  // when the fake's own 60s turn completes and `run.killed` colours it stopped,
+  // so the STATUS alone cannot tell the two apart. What proves the backstop is
+  // that it ended inside its own grace window and nowhere near the turn.
+  ok(took < 10_000, `★ the escalation never fired: the run ended after ${took}ms, on the turn rather than on the stop`);
+  eq(BGJ.registry.size, 0, "and its row goes with it, or the reaper announces it later");
+});
+
+await t("the grace window is a backstop, not the normal path: a completing interrupt is unaffected", async () => {
+  // The same /stop against a server that behaves: the ending arrives on
+  // turn/completed, well inside the window, and the escalation never fires.
+  BGJ.reset();
+  clearCalls();
+  process.env.FAKE_TURN_MS = "60000";
+  const run = BGJ.runCodexAppServerJob("the ordinary stop case", { mode: "edit", cwd: BGAS_DIR });
+  await asWait(() => calls().some((c) => c.method === "turn/start"), "the turn to start");
+  const t0 = Date.now();
+  run.interrupt("a /stop from Telegram");
+  const out = await asReported(20000);
+  process.env.FAKE_TURN_MS = "120";
+  eq(out.outcome.status, "stopped");
+  ok(Date.now() - t0 < 5_000, `the escalation fired instead of the completion (${Date.now() - t0}ms)`);
+});
+
+await t("★ a question pending across a restart is not told to give up on a job that is RESUMED", () => {
+  // btwLostLine's wording is deliberate for a Claude survivor: it is re-attached
+  // by its log with no stdin, so "ask again" would name a retry the next command
+  // refuses. An app-server job is the opposite case: recoverCodexAppServerJob
+  // brings it back alive and steerable two lines later, so the same sentence is
+  // contradicted by the Resumed message that lands under it.
+  const fn = BRIDGE_SRC.slice(BRIDGE_SRC.indexOf("function resolveBtwAfterRestart("), BRIDGE_SRC.indexOf("\nfunction handleSteerRequest("));
+  ok(fn.length > 100, "resolveBtwAfterRestart was not extracted, did it get renamed?");
+  ok(
+    /rec\?\.transport === 'appserver'/.test(fn) && /Boolean\(rec\?\.threadId\)/.test(fn),
+    "★ only a record that will actually be resumed may take the resumable wording",
+  );
+  ok(/btwLostLine\(\{ lane: [^)]*resumable \}\)/.test(fn), "and the flag has to reach the builder");
+});
+
+
+rmSync(BGAS_DIR, { recursive: true, force: true });
 
 rmSync(TMP, { recursive: true, force: true });
 

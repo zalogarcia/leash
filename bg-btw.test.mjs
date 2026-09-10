@@ -38,6 +38,7 @@ import {
   isBtwFramed,
   parseBtwAnswer,
 } from './bg-btw.mjs';
+import { mapNotification } from './codex-appserver.mjs';
 import {
   REASONS,
   STEER_HEADER,
@@ -488,6 +489,18 @@ t('ack: a delivered steer is byte-identical to what it always printed', () => {
 // ---------------------------------------------------------------------------
 
 const BRIDGE = readFileSync(path.join(DIR, 'bridge.mjs'), 'utf8');
+// TWO TRANSPORTS NOW, and each has to satisfy these guards on its own. Counting
+// over the whole file would let one of them lose its detector while the other's
+// kept the total right, which is exactly the silent failure this section exists
+// to catch. Sliced by the function that owns each.
+const region = (from, to) => {
+  const a = BRIDGE.indexOf(from);
+  const b = BRIDGE.indexOf(to, a + 1);
+  if (a === -1 || b === -1) throw new Error(`could not slice bridge.mjs between ${from} and ${to}`);
+  return BRIDGE.slice(a, b);
+};
+const CLAUDE_WORKER = region('function runClaude(', '\nfunction ');
+const CODEX_JOB = region('function runCodexAppServerJob(', '\nfunction startCodexJob(');
 
 t('★ the detector is wired into both places an answer can appear, each its own way', () => {
   ok(
@@ -498,11 +511,30 @@ t('★ the detector is wired into both places an answer can appear, each its own
     /ev\.result\.trim\(\) && !run\.btwDelivered\(ev\.result\.trim\(\)\)/.test(BRIDGE),
     '★ the result event only SUPPRESSES an exact duplicate: without this the answer is captured into the report and bg-results.jsonl',
   );
-  eq((BRIDGE.match(/run\.btwTake\(/g) || []).length, 1, 'exactly one router, on the assistant block');
+  eq((CLAUDE_WORKER.match(/run\.btwTake\(/g) || []).length, 1, 'exactly one router, on the assistant block');
   ok(
     !/run\.btwTake\(ev\.result/.test(BRIDGE),
     '★ routing from the result event would swallow a report that FOLLOWS an answer in the same turn, and could resolve a second pending question',
   );
+});
+
+t('★ the CODEX job has its own detector, on the agent message item and nowhere else', () => {
+  // Same rule, other transport. A Codex answer arrives as an app-server
+  // agentMessage item; routing from turn/completed's item list instead would
+  // resolve the question twice, and routing from neither would put a private
+  // answer in the handback.
+  eq((CODEX_JOB.match(/run\.btwTake\(/g) || []).length, 1, 'exactly one router on the Codex job');
+  ok(/case 'message': \{[\s\S]{0,400}?if \(run\.btwTake\(text\)\) break;/.test(CODEX_JOB), 'it is on the streamed agent message');
+  ok(
+    /isBtwAnswer\(it\.text\)/.test(CODEX_JOB),
+    "★ and turn/completed's final items are FILTERED rather than routed: without this the last thing said becomes the report even when it was a private answer",
+  );
+});
+
+t('★ a btw cannot be written into a worker unframed, on either transport', () => {
+  const codexSteer = CODEX_JOB.slice(CODEX_JOB.indexOf('run.steer = ('), CODEX_JOB.indexOf('run.btwAsk = ('));
+  ok(/if \(kind === 'btw' && !isBtwFramed\(text\)\) \{/.test(codexSteer), 'the Codex guard');
+  ok(codexSteer.indexOf('isBtwFramed(text)') < codexSteer.indexOf('client'), '★ and it is before anything reaches the server');
 });
 
 t('★ a btw cannot be written into a worker unframed', () => {
@@ -523,7 +555,12 @@ t('★ the pending line does not tick when there is no message to edit', () => {
 t('★ both exit handlers drain, and /stop keeps its own glyph', () => {
   ok(/drainBtw\(run, 'ended'\);/.test(BRIDGE), "the spawn-failure path, where 'close' never fires");
   ok(/drainBtw\(run, wasStopped \? 'stopped' : 'ended'\);/.test(BRIDGE), 'the close handler, split by whether the run was stopped');
-  eq((BRIDGE.match(/drainBtw\(run,/g) || []).length, 3, 'the definition plus exactly two call sites: the two ways a run ends');
+  eq((CLAUDE_WORKER.match(/drainBtw\(run,/g) || []).length, 2, 'exactly two call sites on a Claude worker: the two ways a run ends');
+  // A Codex job has ONE terminal path (finish), which is the whole reason it can
+  // be one line: every ending, including the interrupt and the dead app-server,
+  // goes through it.
+  eq((CODEX_JOB.match(/drainBtw\(run,/g) || []).length, 1, 'the Codex job drains on its one terminal path');
+  ok(/drainBtw\(run, outcome\.status === 'stopped' \? 'stopped' : 'ended'\);/.test(CODEX_JOB), 'and /stop keeps its own glyph there too');
 });
 
 t('★ the drain happens AFTER the final log pump, not before it', () => {
@@ -608,7 +645,14 @@ t('the boot path resolves what the previous daemon left pending', () => {
 
 t('the pending questions are mirrored to disk, which is what makes that possible', () => {
   ok(/btwPending: run\.btw\.list\(\)\.map\(btwRecordForDisk\)/.test(BRIDGE), 'one writer for the mirror');
-  eq((BRIDGE.match(/run\.btwMirror\(\);/g) || []).length, 2, 'written on ask and re-written on answer');
+  eq((CLAUDE_WORKER.match(/run\.btwMirror\(\);/g) || []).length, 2, 'written on ask and re-written on answer');
+  // THREE on the Codex job, not two: written on ask, re-written on answer, and
+  // re-written again when the server REFUSES the question. That third one is
+  // load bearing for the same reason the first two are. A refused question is
+  // resolved in this daemon, so leaving it on disk would have the next daemon
+  // resolve the same ⏳ a second time, as "lost", after the owner already read
+  // why it was not delivered.
+  eq((CODEX_JOB.match(/run\.btwMirror\(\);/g) || []).length, 3, 'ask, answer, and the refusal that resolves the line early');
   ok(/record\.mirror = \(\) => w\.run\?\.btwMirror\?\.\(\);/.test(BRIDGE), '★ and again once the message id lands, which is the field a restart needs');
   ok(/record\.mirror\?\.\(\);/.test(BRIDGE), 'called from the notice, after the send returns');
 });
@@ -822,6 +866,57 @@ await at('with no daemon listening the CLI says so and exits 2', async () => {
   eq(r.code, 2, 'exit 2 is "the daemon is not reachable", distinct from a refusal');
   ok(/not reachable/.test(r.stderr), r.stderr);
   rmSync(cold, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n8. the detector over a CODEX agent message item');
+// ---------------------------------------------------------------------------
+//
+// A Claude worker's answer arrives as a stream-json assistant text block; a
+// Codex job's arrives as an app-server `item/completed` carrying an agentMessage.
+// Different transports, ONE detector, and these are the exact shapes the live
+// binary produced against this framing (probe, 2026-09-09).
+
+const codexMsg = (text) => mapNotification({ method: 'item/completed', params: { threadId: 't1', turnId: 'turn-1', item: { id: 'm1', type: 'agentMessage', text } } });
+
+t('★ an agentMessage item carrying the marker is routed, and its text lifted out', () => {
+  const tracker = createBtwTracker();
+  const rec = tracker.add({ lane: 'codex' });
+  const ev = codexMsg(`${BTW_ANSWER_PREFIX} #${rec.id}: it is b.txt`);
+  eq(ev.kind, 'message', 'the app-server item did not map to a message at all');
+  const res = tracker.take(ev.text);
+  eq(res.status, 'routed');
+  eq(res.entry, rec, 'a Codex answer must resolve the question it was asked');
+  eq(res.answer, 'it is b.txt');
+});
+
+t('★ the model\'s NARRATION before the answer is left completely alone', () => {
+  // Measured on the live binary: the first agent message after a btw was
+  // "I will create the files in alphabetical order...", and the real
+  // BTW-ANSWER arrived 27 seconds later. Swallowing the narration would have
+  // deleted the job\'s own output and sent a progress note as the answer.
+  const tracker = createBtwTracker();
+  tracker.add({ lane: 'codex' });
+  const ev = codexMsg('I will create the files in alphabetical order, with a pause between each.');
+  eq(tracker.take(ev.text).status, 'none');
+  eq(tracker.size, 1, 'the question is still outstanding');
+});
+
+t('a job that mentions the marker mid-sentence is not mistaken for an answer', () => {
+  const tracker = createBtwTracker();
+  tracker.add({ lane: 'codex' });
+  const ev = codexMsg(`I will emit ${BTW_ANSWER_PREFIX} #1 once the build finishes.`);
+  eq(tracker.take(ev.text).status, 'none', 'the marker must be the HEAD of the first line');
+});
+
+t('the final report the model writes under a Side questions heading is not an answer either', () => {
+  // The live probe\'s last message ended "### Side questions #1: ...", which is
+  // the framing working as intended. It is the report, and it must reach the
+  // handback intact.
+  const tracker = createBtwTracker();
+  tracker.add({ lane: 'codex' });
+  const ev = codexMsg('Created a.txt through j.txt and z.txt.\n\n### Side questions\n#1: b.txt at the time.');
+  eq(tracker.take(ev.text).status, 'none');
 });
 
 stub.close();

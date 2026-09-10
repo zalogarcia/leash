@@ -495,6 +495,35 @@ t('workerLine: a Codex job says what it is on instead of offering a steer it can
   ok(!s.includes('/steer'), 'offering a steer would be a lie that gets acked as delivered');
 });
 
+t('★ workerLine: a Codex job on the app-server offers the steer, on the same one line', () => {
+  // Steerability is a property of the TRANSPORT, not of the engine, and the
+  // card is three lines on a phone: the engine, the reason and the reach share
+  // a line rather than growing a fourth.
+  const s = workerLine({ ...JOB, phase: 'dispatch', engine: 'codex', engineNote: 'requested', running: 1, runId: 'codex-1788453512237', steerable: true });
+  ok(s.includes('🧠 codex · requested · /steer codex-1788453512237 <instruction>'), s);
+  ok(!s.includes('not steerable'), s);
+  eq(s.split('\n').filter((l) => l.startsWith('🧠 codex')).length, 1, 'one line, not two');
+});
+
+t('workerLine: a steerable Codex job with no run id names the lane rather than a placeholder', () => {
+  const s = workerLine({ lane: 'codex', brief: 'x', phase: 'dispatch', engine: 'codex', steerable: true });
+  ok(s.includes('🧠 codex · /steer codex <instruction>'), s);
+});
+
+t('★ workerLine: a Codex job that streams its steps renders them exactly as a Claude worker does', () => {
+  // The app-server hands us item notifications, so the bubble carries the same
+  // step count and last action, through the same renderer, and the ending
+  // carries the total. An exec run passes neither and keeps the clock alone.
+  eq(
+    workerLine({ lane: 'codex', title: 'ship the bridge change', engine: 'codex', phase: 'running', elapsedSec: 72, steps: 14, lastAct: '💻 Bash npm test' }),
+    ['🧠 codex', 'ship the bridge change', '⏳ 1m 12s · 14 steps · 💻 Bash npm test'].join('\n'),
+  );
+  eq(
+    workerLine({ lane: 'codex', title: 'ship the bridge change', engine: 'codex', phase: 'done', status: 'finished', elapsedSec: 1080, steps: 214 }),
+    ['✅ codex', 'ship the bridge change', 'Done · 18m · 214 steps'].join('\n'),
+  );
+});
+
 t('workerLine: a scheduled job keeps ⏰ and names the schedule, not a repo it did not choose', () => {
   eq(
     workerLine({ scheduleId: 3, scheduleWhen: 'daily 08:00', title: "Summarize yesterday's commits", phase: 'running', elapsedSec: 72, steps: 14, lastAct: '💻 Bash git log' }),
@@ -758,7 +787,7 @@ export const chatState = () => ({ cwd: '/Users/owner/dev/claude-telegram-bridge'
 export const bgLanes = [];
 let bgSeq = 0;
 const BG_TASK_TIMEOUT_MS = 1;
-export const reset = (ls = []) => { SENT.length = 0; DISPATCHED.length = 0; EDITS.length = 0; LIVE.clear(); workerNotices.clear(); msgSeq = 0; CODEX_STARTED.length = 0; rotationPausedUntil = 0; codexFallbackValue = true; ENGINE_CFG = {}; CHAT_ENGINE_STATE = {}; bgLanes.length = 0; bgSeq = 0; SAVED.length = 0; SCHED_LANDS_ON_CLAUDE = true; SCHEDULES = { nextId: 1, items: [] }; for (const l of ls) { bgSeq++; bgLanes.push({ name: bgSeq === 1 ? 'bg' : 'bg' + bgSeq, isBg: true, n: bgSeq, current: null, queue: [], ...l }); } };
+export const reset = (ls = []) => { SENT.length = 0; DISPATCHED.length = 0; EDITS.length = 0; LIVE.clear(); workerNotices.clear(); msgSeq = 0; CODEX_STARTED.length = 0; rotationPausedUntil = 0; codexFallbackValue = true; codexTransport = 'appserver'; ENGINE_CFG = {}; CHAT_ENGINE_STATE = {}; bgLanes.length = 0; bgSeq = 0; SAVED.length = 0; SCHED_LANDS_ON_CLAUDE = true; SCHEDULES = { nextId: 1, items: [] }; for (const l of ls) { bgSeq++; bgLanes.push({ name: bgSeq === 1 ? 'bg' : 'bg' + bgSeq, isBg: true, n: bgSeq, current: null, queue: [], ...l }); } };
 let queueContent = '[]';
 export const setQueue = (v) => { queueContent = JSON.stringify(v); };
 const readFileSync = () => queueContent;
@@ -799,6 +828,16 @@ export const setLimitWall = (until, fallback = true) => { rotationPausedUntil = 
 const codexFallbackOn = () => codexFallbackValue;
 const codexRuns = new Map();
 const runCodex = (text, opts) => { const runId = 'codex-' + (++clock); CODEX_STARTED.push({ text, runId, ...opts }); return { runId }; };
+// The transport router. Production picks app-server or exec here; what the drain
+// has to get right is WHICH JOBS reach Codex at all, so the stub records the
+// same shape and the transport choice is proven in bg-codex-wiring.test.mjs.
+//
+// It returns the transport for one reason: the CARD reads it. A stub that left
+// the field off would let the drain quietly go back to telling the owner a
+// steerable job cannot be steered, and every assertion here would still pass.
+let codexTransport = 'appserver';
+export const setCodexTransport = (t) => { codexTransport = t; };
+const startCodexJob = (text, opts) => ({ ...runCodex(text, opts), transport: codexTransport });
 const DEFAULT_CWD = '/Users/owner/dev';
 const existsSync = (p) => p === '/Users/owner/dev/ops-dash';
 const OWNER_TZ = 'Europe/Berlin';
@@ -1022,9 +1061,25 @@ t('an --engine codex item goes to Codex and NEVER to a Claude lane', () => {
   eq(B.CODEX_STARTED[0].cwd, '/Users/owner/dev/ops-dash', 'the brief names the repo, so the run is confined to it');
   const notice = B.SENT[0];
   ok(notice.startsWith('🧠 codex'), notice);
-  ok(notice.includes('🧠 codex · requested · not steerable'), notice);
   ok(notice.includes('Review the auth diff'), notice);
-  ok(!notice.includes('bg.mjs steer') && !notice.includes('/steer'), 'a Codex run cannot be steered');
+  // A handed-off job runs on the app-server, so the card offers the reach that
+  // buys: the RUN id, never the lane, because lane names are recycled.
+  ok(notice.includes(`🧠 codex · requested · /steer ${B.CODEX_STARTED[0].runId} <instruction>`), notice);
+  ok(!notice.includes('not steerable'), 'the old sentence must not survive on a job that takes a steer');
+});
+
+t('★ and the card says "not steerable" again the moment the job falls back to exec', () => {
+  // Not cosmetic: `/steer` at a one-shot run is refused, and a card that
+  // offered it sent the owner to type a message that goes nowhere. The card
+  // reads the transport off the run rather than assuming the engine.
+  B.reset([{}]);
+  B.setCodexTransport('exec');
+  B.setQueue([{ text: '# Review the auth diff\n\nRepo: ops-dash', engine: 'codex' }]);
+  B.drainBgHandoff();
+  const notice = B.SENT[0];
+  ok(notice.includes('🧠 codex · requested · not steerable'), notice);
+  ok(!notice.includes('/steer'), 'offering a steer would be a lie that gets acked as delivered');
+  B.setCodexTransport('appserver');
 });
 
 t('a codex: prefix routes the same way and is stripped from the brief', () => {
