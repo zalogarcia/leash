@@ -68,9 +68,11 @@ export function parseRunId(id) {
  */
 export function handoffNotice({ lane, runId, repo, brief, running, queued = 0, engine = 'claude', engineNote = null } = {}) {
   // A run on the second engine must be identifiable as one from the first
-  // glyph: Codex has none of this bridge's context, is billed separately, and
-  // cannot be steered, so reading its notice as a normal worker's would be
-  // wrong on all three counts.
+  // glyph: Codex has none of this bridge's context and is billed separately, so
+  // reading its notice as a normal worker's would be wrong on both counts. It
+  // IS steerable now: a background Codex job runs on app-server, and both a
+  // steer and a side question reach it mid turn (live, 2026-09-10). Only the
+  // exec runs, which are review and the exec fallback, still refuse one.
   const isCodex = String(engine).toLowerCase() === 'codex';
   const head = `${isCodex ? '🧠' : '🌙'} ${lane || 'background'}${repo ? ` · ${repo}` : ''}`;
   const title = briefTitle(stripLaneRules(brief));
