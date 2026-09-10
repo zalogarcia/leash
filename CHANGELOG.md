@@ -79,6 +79,13 @@ its process.**
 - **A question pending across a restart told you the worker could not be asked again, on a job that
   was about to be resumed.** True for a re-attached Claude survivor, which has no stdin left; false
   for the one worker the restart brings back, and contradicted by the `Resumed` line under it.
+- **`safe-restart.sh` looked for the run registry where the daemon does not always keep it.** It read
+  only `BRIDGE_INFLIGHT_FILE`, while the daemon also honours `inflightFile` in `config.json`, so an
+  install that moved the registry through the file layer left the restart finding no registered pids
+  at all: every `codex app-server` child read as the chat lane's, and the restart went over a job
+  mid-write. Both halves resolve it through the same three layers now. In the same pass, a background
+  Codex job's `/btw` introduces the daemon by its configured `name`, as the Claude worker's already
+  did, so a renamed install no longer answers to two names inside one feature.
 
 ## 1.7.0 (2026-09-09)
 
