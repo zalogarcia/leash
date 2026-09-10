@@ -40,6 +40,9 @@ SHARED_MODULES=(
   rich-format.mjs
   rich-format.test.mjs
   schedule.mjs
+  schedule-due.mjs
+  schedule-due.test.mjs
+  schedule-cli.test.mjs
   detached-workers.mjs
   detached-workers.test.mjs
   watchdog.test.mjs

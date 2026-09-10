@@ -797,6 +797,10 @@ function grabConst(name) {
 const NOTIFY_URL = pathToFileURL(path.join(DIR, 'bg-notify.mjs')).href;
 const CODEX_URL = pathToFileURL(path.join(DIR, 'bg-codex.mjs')).href;
 const ENGINE_URL = pathToFileURL(path.join(DIR, 'engine-state.mjs')).href;
+// The real due-logic, not a mirror: checkSchedules' cadence gate is the whole
+// point of the `every N days` shape, and a stub of it here would keep agreeing
+// with itself after schedule-due.mjs changed.
+const SCHEDULE_DUE_URL = pathToFileURL(path.join(DIR, 'schedule-due.mjs')).href;
 // The lane ALLOCATOR is extracted too, not mirrored. The worker count leans on
 // an invariant of the real getBgLane — it only ever hands back a lane that is
 // idle, so the job being handed off is always the +1 and never a double count —
@@ -806,6 +810,7 @@ const ENGINE_URL = pathToFileURL(path.join(DIR, 'engine-state.mjs')).href;
 const HARNESS = `
 import path from 'node:path';
 import { handoffNotice, completionNotice, parseRunId, briefRepo, briefTitle, stripLaneRules, workerLine, WORKER_TICK_MS, WORKER_IDLE_MS } from ${JSON.stringify(NOTIFY_URL)};
+import { describeWhen, isDailyDue } from ${JSON.stringify(SCHEDULE_DUE_URL)};
 export const SENT = [];
 export const DISPATCHED = [];
 export const EDITS = [];
@@ -1000,6 +1005,25 @@ t('★ a scheduled run that did NOT land on the Claude lane names no model at al
   eq(B.DISPATCHED.length, 1, 'the job still runs; only the card is quieter');
   eq(B.SENT[0].split('\n')[0], '⏰ #25 · daily 08:30');
   ok(!/opus|xhigh/.test(B.SENT[0]), B.SENT[0]);
+});
+
+t('★ an every-N-days run names its cadence on the card, and only fires on its day', () => {
+  // The harness clock is 2026-09-05 08:30. Anchored on the 3rd, an every-3d
+  // item is not due; anchored on the 2nd it is, and the card says "every 3d"
+  // rather than "daily", which is the one word telling him why it is quiet on
+  // the days in between.
+  B.reset([{}]);
+  B.setSchedules([{ id: 26, kind: 'daily', every: 3, at: '08:30', run: true, lastFired: '2026-09-03', text: 'BU ads check' }]);
+  B.checkSchedules();
+  eq(B.DISPATCHED.length, 0, 'fired a day early');
+  eq(B.SENT.length, 0);
+
+  B.reset([{}]);
+  B.setSchedules([{ id: 26, kind: 'daily', every: 3, at: '08:30', run: true, lastFired: '2026-09-02', text: 'BU ads check' }]);
+  B.checkSchedules();
+  eq(B.DISPATCHED.length, 1);
+  eq(B.SENT[0].split('\n')[0], '⏰ #26 · every 3d 08:30 · opus · xhigh');
+  eq(B.SAVED.at(-1).items[0].lastFired, '2026-09-05', 'the fire must move the anchor forward');
 });
 
 t('a plain reminder is still a reminder, with no card and no model', () => {

@@ -185,13 +185,16 @@ left to be guessed. The ack and the run bubble both say a quote went with the me
 | `/stop [bg\|codex\|all]` | Kill the running task and clear that lane's queue. A Claude run gets SIGTERM then SIGKILL; a Codex turn, chat or background, gets a `turn/interrupt` the model acknowledges, so whatever it produced still reaches the report. `codex` also reaches a one-shot Codex run, which belongs to no lane |
 | `/restart` | Restart the daemon remotely |
 | `/logs` | Tail the daemon log |
-| `/remind …` | `daily HH:MM <text>` · `once [YYYY-MM-DD] HH:MM <text>` · `in 90m <text>` |
+| `/remind …` | `daily HH:MM <text>` · `every <N>d HH:MM <text>` (every N days, N 2 to 365) · `once [YYYY-MM-DD] HH:MM <text>` · `in 90m <text>` |
 | `/schedules` · `/unschedule <id>` | List / remove scheduled entries |
 | `/yolo on\|off` | Permission bypass (see [Security](#security)) |
 | `/help` | All of the above, in Telegram |
 
 Prefix `run:` on a reminder (or `--run` in the CLI) to make it **execute** as a
-Claude task instead of just pinging you. Messages sent while a lane is busy are
+Claude task instead of just pinging you. An `every N days` entry is a daily
+carrying an `every` field, and its `lastFired` is the anchor the cadence counts
+from, so `schedule.mjs update <id> --anchor YYYY-MM-DD` is how you choose which
+day it lands on (`list` prints the next one). Messages sent while a lane is busy are
 steered into the running task; anything that can't be steered queues (max 5) and
 runs in order.
 

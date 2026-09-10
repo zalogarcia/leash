@@ -256,6 +256,7 @@ import {
 } from './codex-appserver.mjs';
 import { codexAccountBlock, createCodexAccount, fetchCodexRateLimits, readCodexRuns } from './codex-account.mjs';
 import { normalizeDashes } from './dash-normalize.mjs';
+import { describeWhen, isDailyDue } from './schedule-due.mjs';
 import {
   CODEX_EFFORTS,
   canProduceHandoff,
@@ -7165,8 +7166,7 @@ const localToday = () => {
 const localHHMM = () => new Date().toTimeString().slice(0, 5);
 
 function fmtSchedule(s) {
-  const when = s.kind === 'daily' ? `daily ${s.at}` : new Date(s.at).toLocaleString();
-  return `#${s.id} · ${when} · ${s.run ? '🤖 run' : '⏰ remind'} · ${clip(oneLine(s.text), 80)}`;
+  return `#${s.id} · ${describeWhen(s)} · ${s.run ? '🤖 run' : '⏰ remind'} · ${clip(oneLine(s.text), 80)}`;
 }
 
 // Called from the poll loop (≤~90s granularity). Sleep-tolerant: a time that
@@ -7180,7 +7180,10 @@ function checkSchedules() {
   for (const s of [...store.items]) {
     let due = false;
     if (s.kind === 'daily') {
-      if (s.lastFired !== today && hhmm >= s.at) {
+      // isDailyDue covers both cadences: a plain daily and an `every N days`
+      // one, which is the same item carrying `every`. The CLI reads the same
+      // helper, so the two can never disagree about when a schedule fires.
+      if (isDailyDue(s, today, hhmm)) {
         s.lastFired = today;
         due = true;
       }
@@ -7220,7 +7223,7 @@ function checkSchedules() {
             runId: schedRunId,
             brief: s.text,
             scheduleId: s.id,
-            scheduleWhen: s.kind === 'daily' ? `daily ${s.at}` : null,
+            scheduleWhen: s.kind === 'daily' ? describeWhen(s) : null,
             running: bgLanes.filter((l) => l.current || l.queue.length || l.finishing).length,
             // A scheduled job that DID land on a bg lane runs on the pool's pin
             // like every other worker, so it carries it too.
@@ -7433,7 +7436,7 @@ const BOT_COMMANDS = [
   { command: 'stop', description: 'Kill current task + discard queue' },
   { command: 'restart', description: 'Restart the Leash daemon' },
   { command: 'logs', description: 'Tail the Leash daemon log' },
-  { command: 'remind', description: 'Schedule a reminder or task (daily/once/in)' },
+  { command: 'remind', description: 'Schedule a reminder or task (daily/every/once/in)' },
   { command: 'schedules', description: 'List scheduled reminders & tasks' },
   { command: 'unschedule', description: 'Remove a schedule by id' },
   { command: 'yolo', description: 'Permission bypass on/off' },
@@ -7474,7 +7477,7 @@ Commands:
 /stop [bg|all] · kill the running task (chat lane by default)
 /restart · restart the daemon (if something feels stuck)
 /logs · last lines of the daemon log
-/remind daily HH:MM <text> · once [date] HH:MM <text> · in 2h <text> · prefix it with "run:" to run it as a Claude task
+/remind daily HH:MM <text> · every 3d HH:MM <text> · once [date] HH:MM · in 2h · prefix "run:" to run it as a Claude task
 /schedules · list them · /unschedule <id> removes one
 /yolo on|off · permission bypass (default: ON, as you run CC)
 /help · this message
@@ -8367,6 +8370,7 @@ async function handleCommand(text, msg = null) {
       const usage = [
         'Usage:',
         '/remind daily HH:MM <text>',
+        '/remind every <N>d HH:MM <text>  (every N days, N 2 to 365)',
         '/remind once [YYYY-MM-DD] HH:MM <text>  (no date = today, or tomorrow if past)',
         '/remind in <N>m|h|d <text>',
         '',
@@ -8379,6 +8383,16 @@ async function handleCommand(text, msg = null) {
       if (mode === 'daily' && parts.length > 2) {
         const tm = parts[1].match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
         if (tm) sched = { kind: 'daily', at: pad(tm[1], tm[2]), text: parts.slice(2).join(' ') };
+      } else if (mode === 'every' && parts.length > 3) {
+        // `every 3d 12:00 …` is a daily carrying a cadence: same kind, so no
+        // reader of the store breaks on it. A daemon older than this feature
+        // does not crash on `every`, it IGNORES it and fires the item daily, so
+        // an every-N item is only safe to add once the daemon has restarted.
+        const nd = (parts[1] || '').match(/^(\d+)d$/i);
+        const tm = (parts[2] || '').match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+        const n = nd ? Number(nd[1]) : 0;
+        if (nd && tm && n >= 2 && n <= 365)
+          sched = { kind: 'daily', every: n, at: pad(tm[1], tm[2]), text: parts.slice(3).join(' ') };
       } else if (mode === 'once') {
         let idx = 1;
         let dateStr = null;
