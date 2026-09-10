@@ -587,8 +587,25 @@ t('★ the daemon hands its CONFIGURED name to the framing', () => {
   // to the project name, and only this call site knows what this install is
   // actually called. Passing nothing would introduce a worker to a daemon that
   // does not answer to that name here.
-  ok(/btwFraming\(record\.id, question, \{ name: BRIDGE_NAME \}\)/.test(BRIDGE), 'the ask site passes config.name');
+  // BOTH ask sites: the Claude worker's and the background Codex job's. One of
+  // them left unnamed is a daemon that introduces itself under two names inside
+  // one feature, which is the thing this change exists to stop.
+  eq((BRIDGE.match(/btwFraming\(record\.id, question, \{ name: BRIDGE_NAME \}\)/g) || []).length, 2, 'both ask sites pass config.name');
+  eq((BRIDGE.match(/btwFraming\(record\.id, question\)/g) || []).length, 0, '★ an unnamed ask site would fall back to the built-in name');
   ok(/const BRIDGE_NAME = conf\('name'/.test(BRIDGE), 'and BRIDGE_NAME is the config value, not a literal');
+});
+
+t('★ the /btw state list in bridge.mjs names every ending, like the one in system-messages', () => {
+  // Two enumerations of the same six states, in the two files that own the
+  // halves. They are the checklist a new pending line is held against, so one
+  // that has fallen behind sends the next reader looking for five endings when
+  // there are six. btwRefusedLine was added without either being updated.
+  const at = BRIDGE.indexOf('//   answered  the stream detector routes the block');
+  ok(at > 0, 'the state list was not found, did the header get rewritten?');
+  const list = BRIDGE.slice(at, BRIDGE.indexOf('// ------', at));
+  for (const name of ['btwAnsweredLine', 'btwEndedLine', 'btwStoppedLine', 'btwLostLine', 'btwRefusedLine', 'btwWaitingLine']) {
+    ok(list.includes(name), `★ ${name} is wired but the state list does not mention it`);
+  }
 });
 
 t('the socket routes op btw to its own resolver, not to steerInto', () => {

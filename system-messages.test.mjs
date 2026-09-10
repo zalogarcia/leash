@@ -684,6 +684,20 @@ t('btw: every state renders with no arguments at all', () => {
   }
 });
 
+t('btw: ★ the state list at the head of the section names every builder that exists', () => {
+  // That comment is the checklist a NEW ending gets held against ("does this ⏳
+  // have a terminal builder?"), so a builder missing from it is a builder the
+  // next reader will not know to look for. btwRefusedLine was added as the
+  // sixth ending, and its twin list in bridge.mjs had fallen behind the same way.
+  const src = readFileSync(new URL('./system-messages.mjs', import.meta.url), 'utf8');
+  const at = src.indexOf('//   btwPendingLine');
+  ok(at > 0, 'the state list was not found, did the header get rewritten?');
+  const list = src.slice(at, src.indexOf('// ------', at));
+  for (const name of ['btwPendingLine', 'btwAnsweredLine', 'btwEndedLine', 'btwStoppedLine', 'btwLostLine', 'btwRefusedLine', 'btwWaitingLine']) {
+    ok(list.includes(name), `★ ${name} exists but the state list does not mention it`);
+  }
+});
+
 t('btw: ★ every pending state here has a terminal glyph another builder produces', () => {
   // Rule 8, mechanically. The pending line is the only ⏳, and each of the four
   // endings is a different builder, so a state that lost its path would show up

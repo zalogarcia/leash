@@ -2525,7 +2525,7 @@ function steerInto(target, text) {
 // the answer instead of waiting for the report.
 //
 // The whole design rests on one rule: EVERY ⏳ THIS PUTS UP REACHES A TERMINAL
-// STATE. There are five ways a question ends and all five are wired, because a
+// STATE. There are six ways a question ends and all six are wired, because a
 // pending line with an unreachable ending is exactly the defect the live-message
 // pass existed to remove:
 //
@@ -2533,6 +2533,8 @@ function steerInto(target, text) {
 //   ended     the run's close handler drains         (btwEndedLine)
 //   stopped   /stop, same drain, different glyph     (btwStoppedLine)
 //   lost      the next daemon resolves it at boot    (btwLostLine)
+//   refused   a Codex job's server took no mid-turn
+//             write, so nothing was ever delivered   (btwRefusedLine)
 //   waiting   15 minutes with no answer, and the listener stays on
 //             because a worker in a long tool call is busy, not gone
 //                                                    (btwWaitingLine)
@@ -5264,7 +5266,7 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
       run.btwMirror();
       record.resolve?.('refused', { why });
     };
-    if (!run.steer(btwFraming(record.id, question), { frame: false, kind: 'btw', onRefused })) {
+    if (!run.steer(btwFraming(record.id, question, { name: BRIDGE_NAME }), { frame: false, kind: 'btw', onRefused })) {
       run.btw.remove(record);
       return null;
     }

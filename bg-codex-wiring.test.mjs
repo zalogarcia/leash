@@ -4332,6 +4332,11 @@ export const configure = (o) => {
   if (o.interruptGraceMs !== undefined) CODEX_INTERRUPT_GRACE_MS = o.interruptGraceMs;
 };
 const CODEX_MODEL = 'gpt-6-astra';
+// The daemon's configured name, which the job's btw framing introduces to the
+// worker. A harness missing it makes every question throw ReferenceError, which
+// is production's own failure mode for a binding the real file has and the
+// harness does not.
+const BRIDGE_NAME = 'Leash';
 const codexSettingsNow = () => ({ model: null, effort: 'high' });
 const DEFAULT_CWD = ${JSON.stringify(BGAS_DIR)};
 const HOME = ${JSON.stringify(BGAS_DIR)};
