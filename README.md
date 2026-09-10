@@ -282,8 +282,9 @@ bg2-1788453999999  bg2   41190  4m       9      no     0     claude  Rebuild the
 
 **`STEER: no` is the honest answer, not a bug.** A worker that outlived a daemon
 restart is still running, but the new daemon only tails its log and holds no
-pipe to it; and a run whose result is already in has nothing left to steer. Both
-report `no` rather than accepting a write that would go nowhere.
+pipe to it; a run whose result is already in has nothing left to steer; and a
+one-shot `codex exec` run has no stdin to write into at all. All three report
+`no` rather than accepting a write that would go nowhere.
 
 The text arrives framed, so the worker knows it is a mid-run instruction and not
 a replacement brief. Without that framing the observed failure is a worker that
@@ -454,9 +455,9 @@ and finds its own auth in `~/.codex/auth.json`.
 Configuration, all optional, in `config.json`: `codexBin` (default `codex`),
 `codexTimeoutMs` (default 30 minutes; `0` disarms the deadline), `codexModel` and
 `codexEffort` (default: whatever the CLI itself uses), `codexAppServer` (default
-`true`: run the Codex CHAT lane on `codex app-server` so it can be steered,
-streams its tool steps and takes a real `/stop`; `false` pins it to one-shot
-`codex exec`), and `codexHandoffNetwork` (default `false`: the first Codex turn
+`true`: run BOTH Codex lanes on `codex app-server`, the chat lane and handed-over
+jobs alike, so they can be steered, stream their tool steps and take a real
+`/stop`; `false` pins them to one-shot `codex exec`), and `codexHandoffNetwork` (default `false`: the first Codex turn
 carrying a handoff from the other engine runs with network access off).
 
 ## Codex-first: running this bridge with no Claude at all

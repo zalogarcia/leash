@@ -111,6 +111,12 @@ its process.**
   on the transport, so only the words were wrong: it reads `not steerable (one-shot exec run)`, the
   same reason the dispatch notice gives, so the two cannot disagree about why one job takes no
   message.
+- **The README still described a Codex job as unreachable mid-run in two places.** The `STEER: no`
+  explanation named two causes when there are three, and the `codexAppServer` switch was described as
+  pinning the chat lane alone when it pins handed-over jobs too. Both now say the same thing the rest
+  of the page does: an edit or ask job on the app-server takes `/steer`, `/btw` and a real `/stop`,
+  and a one-shot `codex exec` run (a review, or a job dispatched inside the fallback window) refuses
+  and names the escape hatch.
 
 ## 1.7.0 (2026-09-09)
 
