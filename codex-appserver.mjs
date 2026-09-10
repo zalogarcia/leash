@@ -14,9 +14,10 @@
 // item/started and item/completed notifications are the tool steps, and
 // `turn/interrupt` is a stop that the model acknowledges instead of a SIGTERM.
 //
-// So the CHAT lane moves here. The BACKGROUND lane stays on `codex exec`: a
-// background job is one-shot by nature, its log is its transcript, and it must
-// outlive this daemon, which a child on our stdio pipes cannot.
+// So the CHAT lane moved here first, and the BACKGROUND lane followed on
+// 2026-09-09: see "BACKGROUND JOBS ON THE APP-SERVER" at the foot of this file
+// for how a job survives a daemon restart now that its process no longer does.
+// `codex exec review` stays one-shot, and exec stays the fallback.
 //
 // ---------------------------------------------------------------------------
 // MEASURED, 2026-09-04, codex-cli 0.153.0, against the real binary. Every claim
@@ -559,4 +560,153 @@ export function execFallbackLine(reason) {
           ? 'the app-server is switched off in config.json'
           : 'the Codex app-server is unavailable';
   return `⚠️ ${EXEC_FALLBACK_NOTE}: ${why}. This turn runs one-shot; a message sent mid-turn queues instead of steering.`;
+}
+
+// ---------------------------------------------------------------------------
+// BACKGROUND JOBS ON THE APP-SERVER (2026-09-09)
+//
+// The comment at the top of this file used to end "the BACKGROUND lane stays on
+// `codex exec`", and the reason given was that a background job "must outlive
+// this daemon, which a child on our stdio pipes cannot". That reason was real
+// and it is now paid for differently: the THREAD outlives the daemon, on
+// OpenAI's side, and `thread/resume` picks it up in a fresh child (measured, and
+// the thing the chat lane already relies on). So a background job survives a
+// restart by being RESUMED rather than by its process surviving, and in exchange
+// it gets the three things a one-shot run structurally cannot have: a steer, a
+// side question answered mid-run, and an interrupt the model acknowledges.
+//
+// What stays on `codex exec`: `codex exec review` (read-only, one-shot, it reads
+// the diff itself and there is nothing to steer into), and every job at all when
+// the app-server has failed its death window, which is what makes exec the
+// fallback rather than the past.
+// ---------------------------------------------------------------------------
+
+/** The background modes that run on the app-server. `review` is deliberately absent. */
+export const BG_APP_SERVER_MODES = Object.freeze(['ask', 'edit']);
+
+/**
+ * Which transport one background job runs on. Pure, so the decision is one
+ * tested function rather than an if-chain around two spawns.
+ *
+ * `fallback` is the app-server's own verdict on itself (shouldFallBackToExec):
+ * an older CLI with no app-server, a child that died twice inside the window, or
+ * the switch turned off in config.json.
+ */
+export function bgCodexTransport({ mode = 'edit', fallback = false } = {}) {
+  if (!BG_APP_SERVER_MODES.includes(String(mode))) return 'exec';
+  if (fallback) return 'exec';
+  return 'appserver';
+}
+
+/**
+ * What a resumed job is told, verbatim, as the input of its continuation turn.
+ *
+ * Two clauses carry the whole message: the files are intact (so it does not
+ * re-derive what it already wrote) and it must not start over (the observed
+ * failure mode of a bare "continue" is a model that re-reads the repo and
+ * re-does the first step it can remember).
+ */
+export const RESTART_CONTINUATION =
+  'The daemon restarted while you were mid-task. Your thread and any files you wrote are intact. ' +
+  'Continue from your last step and finish the brief; do not start over.';
+
+// ---------------------------------------------------------------------------
+// THE LOG FILE, IN `codex exec --json` SHAPE
+//
+// A background job leaves a log because three readers that are not this process
+// need one: /status (lastActFromExecLog), the salvage script, and codexOutcome
+// rebuilding a run from disk. All three already parse the `codex exec --json`
+// event stream, so an app-server job writes its notifications out in THAT shape
+// rather than teaching three readers a second protocol.
+// ---------------------------------------------------------------------------
+
+const CODEX_TO_EXEC_ITEM = Object.freeze(
+  Object.fromEntries(Object.entries(EXEC_ITEM_TYPES).map(([execName, codexName]) => [codexName, execName])),
+);
+
+/** One app-server item, in the snake_case shape the exec stream uses. */
+export function execItemFromCodexItem(item) {
+  if (!item || typeof item !== 'object') return null;
+  const out = { ...item, type: CODEX_TO_EXEC_ITEM[item.type] || item.type };
+  if (out.exitCode !== undefined) {
+    out.exit_code = out.exitCode;
+    delete out.exitCode;
+  }
+  if (out.savedPath !== undefined) {
+    out.saved_path = out.savedPath;
+    delete out.savedPath;
+  }
+  return out;
+}
+
+/**
+ * One server message, as the exec-stream event to append to the run log, or
+ * null when it is not worth a line.
+ *
+ * `usage` is passed in on the completion event because the app-server reports
+ * token counts on their own `thread/tokenUsage/updated` notification and the
+ * exec stream carries them on `turn.completed`. Writing them where the exec
+ * stream writes them is what lets parseCodexEvents read this log unchanged.
+ */
+export function execEventForLog(msg, { usage = null } = {}) {
+  if (!msg || typeof msg !== 'object' || !msg.method) return null;
+  const p = msg.params || {};
+  switch (msg.method) {
+    case 'thread/started':
+      return { type: 'thread.started', thread_id: p.thread?.id || null };
+    case 'turn/started':
+      return { type: 'turn.started', turn_id: p.turn?.id || null };
+    case 'item/started':
+      return { type: 'item.started', item: execItemFromCodexItem(p.item) };
+    case 'item/completed':
+      return { type: 'item.completed', item: execItemFromCodexItem(p.item) };
+    case 'turn/completed': {
+      const ev = { type: 'turn.completed', status: p.turn?.status || 'completed' };
+      if (usage) {
+        ev.usage = {
+          input_tokens: Number(usage.input_tokens) || 0,
+          output_tokens: Number(usage.output_tokens) || 0,
+        };
+      }
+      return ev;
+    }
+    case 'error':
+      return { type: 'error', message: String(p.error?.message || 'the Codex turn failed') };
+    default:
+      return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// THE LIFECYCLE LOG
+//
+// One line per step, so a job that went wrong can be reconstructed from the
+// daemon log without the brief, the answer or a credential ever being in it.
+// ---------------------------------------------------------------------------
+
+export const BG_APP_SERVER_EVENTS = Object.freeze([
+  'bg_codex_appserver_started',
+  'turn_started',
+  'steered',
+  'btw_routed',
+  'interrupted',
+  'resumed_after_restart',
+  'died',
+  'handback',
+]);
+
+// A value that may appear in a log line: an id, a count, a class name, a flag.
+// Anything else is REPLACED rather than clipped, which is the mechanism behind
+// "never the brief text": a caller that hands this a whole brief gets
+// [omitted], not the first forty characters of it.
+const LOG_VALUE_RE = /^[\w.:@/+-]{1,64}$/;
+
+export function appServerLogLine(event, fields = {}) {
+  const bits = [`[bridge] ${String(event)}`];
+  for (const [key, value] of Object.entries(fields || {})) {
+    if (value === null || value === undefined || value === '') continue;
+    const s = typeof value === 'boolean' || typeof value === 'number' ? String(value) : String(value);
+    bits.push(`${key}=${LOG_VALUE_RE.test(s) ? s : '[omitted]'}`);
+  }
+  return bits.join(' ');
 }

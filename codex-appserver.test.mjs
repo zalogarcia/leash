@@ -15,7 +15,13 @@ import { fileURLToPath } from 'node:url';
 import {
   APP_SERVER_ARGS,
   APP_SERVER_DEATH_WINDOW_MS,
+  BG_APP_SERVER_EVENTS,
   EXEC_FALLBACK_NOTE,
+  RESTART_CONTINUATION,
+  appServerLogLine,
+  bgCodexTransport,
+  execEventForLog,
+  execItemFromCodexItem,
   answerFromTurn,
   classifyAppServerError,
   codexItemEntry,
@@ -534,6 +540,139 @@ t('the fixture file itself carries no credential shape', () => {
   const raw = readFileSync(path.join(DIR, 'scripts', 'probes', 'fixtures', 'app-server-capture.json'), 'utf8');
   ok(!/eyJ[\w-]{6,}/.test(raw), 'a JWT is in the checked-in capture');
   ok(!/\bsk-[A-Za-z0-9_-]{8,}/.test(raw), 'an API key is in the checked-in capture');
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n8. background jobs on the app-server');
+// ---------------------------------------------------------------------------
+
+t('an edit job and an ask job both run on the app-server', () => {
+  eq(bgCodexTransport({ mode: 'edit' }), 'appserver');
+  eq(bgCodexTransport({ mode: 'ask' }), 'appserver');
+});
+
+t('★ a review stays on `codex exec`, always', () => {
+  // It is read-only by construction, it reads the diff itself, and there is
+  // nothing to steer into. Routing it here would buy nothing and change a path
+  // that works.
+  eq(bgCodexTransport({ mode: 'review' }), 'exec');
+  eq(bgCodexTransport({ mode: 'review', fallback: false }), 'exec');
+});
+
+t('★ a failed death window puts the next job back on exec', () => {
+  eq(bgCodexTransport({ mode: 'edit', fallback: true }), 'exec');
+  // And the fallback verdict is the SAME function the chat lane uses, so the two
+  // cannot disagree about whether this machine has a working app-server.
+  const dead = [Date.now(), Date.now()];
+  eq(bgCodexTransport({ mode: 'edit', fallback: shouldFallBackToExec({ deaths: dead }).fallback }), 'exec');
+  eq(bgCodexTransport({ mode: 'edit', fallback: shouldFallBackToExec({ deaths: [Date.now()] }).fallback }), 'appserver');
+});
+
+t('an unknown mode is refused into exec rather than guessed at', () => {
+  eq(bgCodexTransport({ mode: 'chat' }), 'exec');
+  eq(bgCodexTransport({ mode: '' }), 'exec');
+  eq(bgCodexTransport({}), 'appserver', 'the default is a background edit job');
+});
+
+t('the restart continuation says the files are intact and forbids starting over', () => {
+  ok(/intact/i.test(RESTART_CONTINUATION), RESTART_CONTINUATION);
+  ok(/do not start over/i.test(RESTART_CONTINUATION), RESTART_CONTINUATION);
+  ok(!/[\u2013\u2014]/.test(RESTART_CONTINUATION), 'no em or en dashes reach a model prompt');
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n8b. the log an app-server job leaves, in `codex exec --json` shape');
+// ---------------------------------------------------------------------------
+
+t('★ a streamed item lands in the log in the shape lastActFromExecLog reads', () => {
+  // The whole point: three readers already parse the exec stream, so the
+  // app-server writes THAT and none of them learns a second protocol.
+  const ev = execEventForLog(CAP['item/started:commandExecution']);
+  eq(ev.type, 'item.started');
+  eq(ev.item.type, 'command_execution', 'snake_case, the way the exec stream names it');
+  const line = JSON.stringify(ev);
+  const entry = lastActFromExecLog(line);
+  ok(entry, 'the log line did not read back as a step');
+  eq(entry.name, 'Bash');
+  deep(entry, execItemEntry(ev.item), 'the same entry the exec path would produce');
+});
+
+t('an exit code and a saved path are renamed the way the exec stream names them', () => {
+  const item = execItemFromCodexItem({ type: 'commandExecution', command: 'ls', exitCode: 2 });
+  eq(item.exit_code, 2);
+  eq(item.exitCode, undefined, 'the camelCase copy must not survive, or both readers see it twice');
+  eq(execItemFromCodexItem({ type: 'imageGeneration', savedPath: '/a/b.png' }).saved_path, '/a/b.png');
+});
+
+t('an item the exec stream has no name for keeps its own, and still renders', () => {
+  const ev = execEventForLog({ method: 'item/started', params: { item: { type: 'plan', text: 'do the thing' } } });
+  eq(ev.item.type, 'plan');
+  ok(lastActFromExecLog(JSON.stringify(ev)), 'execItemEntry falls through to the camelCase mapper');
+});
+
+t('★ the token usage rides turn.completed, where parseCodexEvents looks for it', () => {
+  const ev = execEventForLog(CAP['turn/completed'] || { method: 'turn/completed', params: { turn: { status: 'completed' } } }, {
+    usage: { input_tokens: 12, output_tokens: 3 },
+  });
+  eq(ev.type, 'turn.completed');
+  eq(ev.usage.input_tokens, 12);
+  eq(ev.usage.output_tokens, 3);
+});
+
+t('a completion with no usage in hand writes no usage block, rather than zeroes', () => {
+  // All-zero usage reads as "this run was free", which is a lie about money.
+  const ev = execEventForLog({ method: 'turn/completed', params: { turn: { status: 'completed' } } });
+  eq(ev.usage, undefined);
+});
+
+t('a notification worth no line produces none', () => {
+  eq(execEventForLog({ method: 'thread/tokenUsage/updated', params: {} }), null);
+  eq(execEventForLog({ method: 'item/agentMessage/delta', params: { delta: 'x' } }), null);
+  eq(execEventForLog(null), null);
+  eq(execEventForLog({ id: 3, result: {} }), null, 'a response is not a notification');
+});
+
+t('an error notification lands where parseCodexEvents reads failures', () => {
+  const ev = execEventForLog({ method: 'error', params: { error: { message: 'rate limit exceeded' } } });
+  eq(ev.type, 'error');
+  eq(ev.message, 'rate limit exceeded');
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n8c. the lifecycle log');
+// ---------------------------------------------------------------------------
+
+t('every lifecycle step has a name, and the names are the ones the brief asked for', () => {
+  for (const e of ['bg_codex_appserver_started', 'turn_started', 'steered', 'btw_routed', 'interrupted', 'resumed_after_restart', 'died', 'handback']) {
+    ok(BG_APP_SERVER_EVENTS.includes(e), `${e} is not a named lifecycle event`);
+  }
+});
+
+t('a line carries the run id and the thread id and nothing that was not asked for', () => {
+  eq(
+    appServerLogLine('turn_started', { runId: 'codex-1788994536799', threadId: '01a08865-4a9f-7150', turnId: null, mode: 'edit' }),
+    '[bridge] turn_started runId=codex-1788994536799 threadId=01a08865-4a9f-7150 mode=edit',
+  );
+});
+
+t('★ a brief handed to the logger is OMITTED, not clipped', () => {
+  // The mechanism behind "never the brief text": a caller that passes prose gets
+  // [omitted] rather than its first forty characters, so a log line cannot leak
+  // half a brief by being written carelessly.
+  const line = appServerLogLine('steered', { runId: 'codex-1', brief: 'ship the thing to prod and tell the owner' });
+  ok(line.includes('brief=[omitted]'), line);
+  ok(!line.includes('ship the thing'), line);
+});
+
+t('★ nothing token-shaped survives a log line either', () => {
+  const line = appServerLogLine('died', { runId: 'codex-1', note: 'sk-abcdefghijklmnop is the key' });
+  ok(!/sk-abcdefgh/.test(line), line);
+});
+
+t('an absent field is absent, not "null"; a zero is a fact and stays', () => {
+  eq(appServerLogLine('died', { runId: 'codex-1', threadId: null, turnId: undefined }), '[bridge] died runId=codex-1');
+  eq(appServerLogLine('died', { runId: 'codex-1', deaths: 0 }), '[bridge] died runId=codex-1 deaths=0', 'a count of zero is a fact');
+  eq(appServerLogLine('handback', { status: false }), '[bridge] handback status=false', 'false is a value, not an absence');
 });
 
 // ---------------------------------------------------------------------------
