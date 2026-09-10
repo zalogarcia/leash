@@ -505,6 +505,7 @@ export function steerUsage(workers = []) {
 //   btwEndedLine       ❌  the run finished without answering
 //   btwStoppedLine     🛑  the worker was stopped first
 //   btwLostLine        ❌  the daemon restarted while it was pending
+//   btwRefusedLine     ❌  the job refused the mid-turn write (Codex only)
 //   btwWaitingLine     ❌  15 minutes, still nothing (the listener stays on)
 //
 // btwWaitingLine is the odd one and deliberately so: it is a terminal TEXT on a
@@ -522,6 +523,39 @@ export function btwUsage(workers = []) {
     'A side question · it changes nothing.',
     'The answer comes back here.',
     ...(list.length ? list.flatMap((w) => ['', workerStatusBlock(w)]) : ['', '⚪ No background workers running.']),
+  ].join('\n');
+}
+
+/**
+ * A steer that was acked as delivered and then refused by the server.
+ *
+ * A background job runs ONE turn, so unlike the chat lane there is no next turn
+ * to carry a refused message and nothing to queue it onto. The ack has already
+ * said "steered into codex"; this is the correction, and it has to name the run
+ * because re-sending is done by run id.
+ */
+export function codexSteerLostLine({ lane = '', runId = '', why = '' } = {}) {
+  const reason = clip(oneLine(why || 'Codex refused the mid-turn message'), 60);
+  return [
+    `❌ Not steered · ${clip(oneLine(lane || 'codex'), 20)}`,
+    `${reason}.`,
+    ...(runId ? [`Try again: /steer ${clip(oneLine(runId), 40)} <instruction>`] : []),
+  ].join('\n');
+}
+
+/**
+ * A background Codex job picked back up after a daemon restart.
+ *
+ * Its child died with the daemon; its thread did not, so the job continues from
+ * where it was rather than being reported dead and re-fired from zero. One line
+ * says that, because a job that goes quiet across a restart and then finishes
+ * twenty minutes later is otherwise unexplained.
+ */
+export function codexResumedLine({ lane = '', title = '' } = {}) {
+  return [
+    `🧠 Resumed · ${clip(oneLine(lane || 'codex'), 20)}`,
+    ...(title ? [clip(oneLine(title), 60)] : []),
+    'The daemon restarted · the thread survived',
   ].join('\n');
 }
 
@@ -561,6 +595,20 @@ export function btwStoppedLine({ lane = '' } = {}) {
 }
 
 /**
+ * The question never reached the job.
+ *
+ * The sixth ending, and the only one where the worker did nothing wrong: the
+ * app-server refused the mid-turn write, so unlike `ended` there is no report
+ * that might still carry the answer, and unlike `lost` nothing restarted. The
+ * distinction is the whole point of the line: it tells the owner to ask again
+ * NOW, against a job that is still running.
+ */
+export function btwRefusedLine({ lane = '', why = '' } = {}) {
+  const reason = clip(oneLine(why || 'Codex refused the mid-turn message'), 60);
+  return [btwHead('❌', lane, 'not delivered'), `${reason}.`, 'The job is still running. Ask again.'].join('\n');
+}
+
+/**
  * The daemon died under a pending question.
  *
  * It does NOT say "ask again", and that is the whole point of the wording: a
@@ -569,13 +617,18 @@ export function btwStoppedLine({ lane = '' } = {}) {
  * again is refused every time. A line that told you to retry something the next
  * command will refuse is a line that lies. The report is the real fallback, and
  * a survivor still writes one.
+ *
+ * `resumable` is the one case where the opposite is true and the same sentence
+ * would be the lie: a background Codex job on the app-server is RESUMED on the
+ * next boot, so it is alive and steerable seconds later, and this line is about
+ * to be contradicted by the `Resumed` message under it. The question is lost
+ * either way, because the turn carrying it died with the last daemon.
  */
-export function btwLostLine({ lane = '' } = {}) {
+export function btwLostLine({ lane = '', resumable = false } = {}) {
   return [
     btwHead('❌', lane, 'answer lost'),
     'The daemon restarted while it waited.',
-    'That worker cannot be asked again;',
-    'its report may still carry it.',
+    ...(resumable ? ['The job was resumed. Ask again.'] : ['That worker cannot be asked again;', 'its report may still carry it.']),
   ].join('\n');
 }
 

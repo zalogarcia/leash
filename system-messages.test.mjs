@@ -29,6 +29,8 @@ import {
   deadWorkerLine,
   chainPausedLine,
   codexCatchUpLine,
+  codexResumedLine,
+  codexSteerLostLine,
   errorMessage,
   classifyClaudeFailure,
   claudeFailureRemedy,
@@ -45,6 +47,7 @@ import {
   btwEndedLine,
   btwStoppedLine,
   btwLostLine,
+  btwRefusedLine,
   btwWaitingLine,
   queueAck,
   queueStarted,
@@ -294,6 +297,27 @@ t('codex catch-up: the cause of a bubble he did not ask for', () => {
   eq(codexCatchUpLine(3), '▶️ Claude is back\n🧠 Catching Leash up on 3 Codex answers');
   eq(codexCatchUpLine(1), '▶️ Claude is back\n🧠 Catching Leash up on 1 Codex answer');
   houseStyle(codexCatchUpLine(3), 'codexCatchUpLine');
+});
+
+t('★ a steer that was acked and then refused is corrected, naming the run', () => {
+  // The ack has already said "steered into codex". A background job has one
+  // turn, so unlike the chat lane there is nothing to queue it onto: this line
+  // is the whole correction, and re-sending is done by run id.
+  const line = codexSteerLostLine({ lane: 'codex', runId: 'codex-1788453512237', why: 'the Codex turn had already finished' });
+  ok(line.startsWith('❌ Not steered · codex'), line);
+  ok(line.includes('the Codex turn had already finished.'), line);
+  ok(line.includes('/steer codex-1788453512237 <instruction>'), line);
+  houseStyle(line, 'codexSteerLostLine');
+  houseStyle(codexSteerLostLine({}), 'codexSteerLostLine bare');
+  ok(!codexSteerLostLine({ lane: 'codex' }).includes('/steer'), 'no run id, no command: a placeholder is worse than nothing');
+});
+
+t('a resumed background Codex job says so in one line, in the house style', () => {
+  const line = codexResumedLine({ lane: 'codex', title: 'finish the migration' });
+  ok(line.startsWith('🧠 Resumed · codex'), line);
+  ok(line.includes('the thread survived'), line);
+  houseStyle(line, 'codexResumedLine');
+  houseStyle(codexResumedLine({}), 'codexResumedLine bare');
 });
 
 // ---------------------------------------------------------------------------
@@ -610,6 +634,28 @@ t('btw: ★ a daemon restart resolves what it can no longer hear', () => {
   ok(!/[Aa]sk again once/.test(btwLostLine({ lane: 'bg2' })), 'never name a retry the next command refuses');
 });
 
+t('btw: ★ and the opposite line for the one worker a restart brings BACK', () => {
+  // A background Codex job on the app-server is resumed on the next boot, so
+  // "that worker cannot be asked again" is exactly wrong for it: it is alive and
+  // steerable seconds later, and the Resumed message lands right under this one.
+  // The question is still lost either way, because the turn carrying it died.
+  const s = btwLostLine({ lane: 'codex', resumable: true });
+  ok(s.includes('The daemon restarted while it waited.'), s);
+  ok(s.includes('The job was resumed. Ask again.'), s);
+  ok(!/cannot be asked again/.test(s), '★ the survivor wording must not reach a job that is coming back');
+  ok(!/cannot be asked again/.test(s) && /cannot be asked again/.test(btwLostLine({ lane: 'bg2' })), 'and the default is unchanged');
+});
+
+t('btw: ★ a question the server never took is not the same as one the worker ignored', () => {
+  // The sixth ending, and the only one where the worker did nothing. `ended`
+  // would say "Its report may still carry it" over a job that never saw the
+  // question, and `lost` would blame a restart that did not happen. What the
+  // owner needs to know is that the job is still there and asking again works.
+  const s = btwRefusedLine({ lane: 'bg2', why: 'the Codex turn had already finished' });
+  eq(s, '❌ btw · bg2 · not delivered\nthe Codex turn had already finished.\nThe job is still running. Ask again.');
+  ok(!btwRefusedLine({ lane: 'bg2' }).includes('undefined'), 'it renders with no reason at all');
+});
+
 t('btw: ★ fifteen minutes is a sentence, not an ending', () => {
   const s = btwWaitingLine({ lane: 'bg2', elapsedSec: 900 });
   ok(s.includes('15m, no answer yet'), s);
@@ -630,6 +676,7 @@ t('btw: every state renders with no arguments at all', () => {
     ['btwEndedLine', btwEndedLine],
     ['btwStoppedLine', btwStoppedLine],
     ['btwLostLine', btwLostLine],
+    ['btwRefusedLine', btwRefusedLine],
     ['btwWaitingLine', btwWaitingLine],
   ]) {
     ok(fn().includes('btw'), `${name} must degrade rather than throw`);
@@ -642,8 +689,8 @@ t('btw: ★ every pending state here has a terminal glyph another builder produc
   // endings is a different builder, so a state that lost its path would show up
   // here as a glyph nothing produces.
   ok(btwPendingLine({ lane: 'bg' }).startsWith('⏳'), 'the wait glyph');
-  const endings = [btwAnsweredLine({ lane: 'bg', answer: 'y' }), btwEndedLine({ lane: 'bg' }), btwStoppedLine({ lane: 'bg' }), btwLostLine({ lane: 'bg' })];
-  eq(new Set(endings.map((s) => s.slice(0, 2).trim())).size, 3, 'answered ✅, stopped 🛑, and ❌ for the two losses');
+  const endings = [btwAnsweredLine({ lane: 'bg', answer: 'y' }), btwEndedLine({ lane: 'bg' }), btwStoppedLine({ lane: 'bg' }), btwLostLine({ lane: 'bg' }), btwRefusedLine({ lane: 'bg' })];
+  eq(new Set(endings.map((s) => s.slice(0, 2).trim())).size, 3, 'answered ✅, stopped 🛑, and ❌ for the three losses');
   for (const s of endings) ok(!s.startsWith('⏳'), `an ending that is still a wait is not an ending: ${s}`);
 });
 
@@ -666,6 +713,8 @@ t('btw: ★ every shape passes the house-style gates', () => {
     ['btwEndedLine', btwEndedLine({ lane: 'bg2' })],
     ['btwStoppedLine', btwStoppedLine({ lane: 'bg2' })],
     ['btwLostLine', btwLostLine({ lane: 'bg2' })],
+    ['btwRefusedLine', btwRefusedLine({ lane: 'bg2', why: 'the ChatGPT window is used up' })],
+    ['btwRefusedLine/noreason', btwRefusedLine({ lane: 'bg2' })],
     ['btwWaitingLine', btwWaitingLine({ lane: 'bg2', elapsedSec: 900 })],
     ['btwWaitingLine/noclock', btwWaitingLine({ lane: 'bg2' })],
   ]) {
@@ -684,6 +733,7 @@ t('btw: ★ the FRAME alone, with no worker text in it, passes unexempted', () =
     ['btwEndedLine', btwEndedLine({ lane: 'bg2' })],
     ['btwStoppedLine', btwStoppedLine({ lane: 'bg2' })],
     ['btwLostLine', btwLostLine({ lane: 'bg2' })],
+    ['btwRefusedLine', btwRefusedLine({ lane: 'bg2', why: 'the ChatGPT window is used up' })],
     ['btwWaitingLine', btwWaitingLine({ lane: 'bg2', elapsedSec: 900 })],
   ]) {
     houseStyle(s, where);
