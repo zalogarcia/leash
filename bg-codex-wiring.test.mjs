@@ -4248,7 +4248,16 @@ process.stdin.on('data', (d) => {
         // A model that obeys the framing: one message, the marker first, then
         // back to work. Emitted as its own agent message exactly as the live
         // binary emitted it (probe, 2026-09-09).
-        setTimeout(() => note('item/completed', { threadId, turnId: live && live.id, item: { id: 'b' + btw[1], type: 'agentMessage', text: 'BTW-ANSWER #' + btw[1] + ': it is b.txt' } }), 10);
+        //
+        // FAKE_BTW_WITH_REPORT is the 2026-09-10 shape instead: the task was
+        // already finished when the question landed, so the ONE message is the
+        // answer, a blank line, and the report. It is also the turn's final
+        // item, because that is where the job's report comes from.
+        const body = process.env.FAKE_BTW_WITH_REPORT
+          ? 'BTW-ANSWER #' + btw[1] + ': it is b.txt\\n\\nDone: wrote a.txt and b.txt.'
+          : 'BTW-ANSWER #' + btw[1] + ': it is b.txt';
+        if (process.env.FAKE_BTW_WITH_REPORT && live) live.items.push({ type: 'agentMessage', text: body });
+        setTimeout(() => note('item/completed', { threadId, turnId: live && live.id, item: { id: 'b' + btw[1], type: 'agentMessage', text: body } }), 10);
       } else {
         live.items.push({ type: 'agentMessage', text: 'ANSWER after steer: ' + text.slice(-40) });
       }
@@ -4794,6 +4803,62 @@ await t(
   "a btw is NOT counted as a steer: it changed nothing and the report must not claim it did",
   () => {
     eq(outD.meta.steers.length, 0);
+  },
+);
+
+await t(
+  "★ a question answered as the job FINISHES costs the answer, never the report under it",
+  () => {
+    // The 2026-09-10 round trip, end to end on this transport: the job's last
+    // message is the answer with its report beneath it, and that same block is
+    // the turn's final item. Taking it whole sent the report to the asker as
+    // part of a private answer and handed the orchestrator an empty run.
+    BGJ.reset();
+    clearCalls();
+    process.env.FAKE_TURN_MS = "1200";
+    process.env.FAKE_BTW_WITH_REPORT = "1";
+    const jobG = BGJ.runCodexAppServerJob("the btw at the end case", {
+      mode: "edit",
+      cwd: BGAS_DIR,
+    });
+    return asWait(
+      () => calls().some((c) => c.method === "turn/start"),
+      "the turn to start",
+    )
+      .then(() => new Promise((r) => setTimeout(r, 60)))
+      .then(() => {
+        const rec = jobG.btwAsk("which file did you just write?", {
+          question: "which file did you just write?",
+        });
+        rec.resolve = (state, extra) =>
+          BGJ.BTW_NOTICES.push({ id: rec.id, state, answer: extra?.answer ?? null });
+        return asReported();
+      })
+      .then((out) => {
+        delete process.env.FAKE_BTW_WITH_REPORT;
+        const routed = BGJ.BTW_NOTICES.find((n) => n.state === "answered");
+        ok(
+          routed,
+          `the answer never reached the asker: ${JSON.stringify(BGJ.BTW_NOTICES)}`,
+        );
+        eq(
+          routed.answer,
+          "it is b.txt",
+          "★ the asker gets the paragraph, and the report is not folded into it",
+        );
+        ok(
+          out.outcome.answer.includes("Done: wrote a.txt and b.txt."),
+          `★ the report was lost with the answer: ${JSON.stringify(out.outcome.answer)}`,
+        );
+        ok(
+          !out.outcome.answer.includes("BTW-ANSWER"),
+          `the marker leaked into the report: ${out.outcome.answer}`,
+        );
+        ok(
+          !out.outcome.answer.includes("it is b.txt"),
+          `the private answer leaked into the report: ${out.outcome.answer}`,
+        );
+      });
   },
 );
 

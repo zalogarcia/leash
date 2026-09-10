@@ -336,14 +336,17 @@ node bg.mjs btw bg2 --file ./question.md
 ```
 
 The worker is told this is a side question, NOT an instruction, not a new task and not approval of anything;
-it answers immediately in one message whose first line is `BTW-ANSWER #N:` and then continues exactly where it
-was, plan unchanged. Lane rule 5 (prepended to every brief by `bg.mjs`) teaches the shape before the first
-question ever arrives, so a worker does not have to work it out from the framing alone. The daemon introduces
+it answers immediately in one message whose first line is `BTW-ANSWER #N:`, in one paragraph, and then
+continues exactly where it was, plan unchanged. If its task is already finished when the question lands it puts
+the answer first, leaves one blank line, and writes its report below it: the daemon ends the answer at that
+blank line and keeps everything under it as the report. Lane rule 5 (prepended to every brief by `bg.mjs`)
+teaches the shape before the first question ever arrives, so a worker does not have to work it out from the
+framing alone. The daemon introduces
 itself by the `name` in `config.json`, so the worker is told who is asking by the name this install answers to.
 
-The daemon watches that worker's own output stream for the marker line, lifts the block out of the progress
-bubble AND out of the report capture (so the answer is delivered once, not three times), and edits it into the
-⏳ message you already have on screen. One message per question, from ⏳ to one of four endings:
+The daemon watches that worker's own output stream for the marker line, lifts the ANSWER out of the progress
+bubble AND out of the report capture (so the answer is delivered once, not three times), leaves anything written
+under it where it was, and edits the answer into the ⏳ message you already have on screen. One message per question, from ⏳ to one of four endings:
 
 | | |
 | --- | --- |
@@ -552,8 +555,9 @@ already had:
   exactly as it is for a Claude worker. `bg.mjs ps` says `STEER yes`. A steer that arrives between
   turns is queued and delivered by the next `turn/start` rather than refused.
 * **`/btw` is answered mid-run.** The daemon watches the thread's agent messages for the
-  `BTW-ANSWER #N:` marker, routes it by id back to the chat that asked, and lifts the block out of
-  both the bubble and the report, exactly as on a Claude worker.
+  `BTW-ANSWER #N:` marker, routes it by id back to the chat that asked, and lifts the answer out of
+  both the bubble and the report, exactly as on a Claude worker. Anything the job wrote under the
+  answer is its own output and stays in both.
 * **`/stop` is a `turn/interrupt`** the model acknowledges, not a SIGTERM at a child that may be
   mid-write in `workspace-write`. The turn ends `interrupted`, the handback says stopped, and
   whatever it produced still reaches `bg-reports/`.

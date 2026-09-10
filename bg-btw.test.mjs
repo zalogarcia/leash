@@ -34,11 +34,16 @@ import {
   BTW_TICK_MS,
   BTW_TIMEOUT_MS,
   btwFraming,
+  btwOnlyOutputNote,
   createBtwTracker,
   isBtwFramed,
   parseBtwAnswer,
 } from './bg-btw.mjs';
 import { mapNotification } from './codex-appserver.mjs';
+// The end of the chain: what an empty report capture is turned into. Imported
+// so the reason line is asserted where it actually lands, not just where it is
+// built.
+import { bgOutcome } from './detached-workers.mjs';
 import {
   REASONS,
   STEER_HEADER,
@@ -145,6 +150,32 @@ t('★ isBtwFramed recognises what btwFraming writes, and nothing else', () => {
   ok(!isBtwFramed('here is what I did: [BTW #1 from the orchestrator ...]'), 'the head of the text, not anywhere in it');
 });
 
+t('★ framing: it says where the answer ENDS, because a finished task answers in the same message as its report', () => {
+  // The clause the 2026-09-10 round trip was missing. A worker whose task is
+  // done has nowhere to put its report except under the answer, and without a
+  // stated boundary the daemon either swallows the report or delivers it as
+  // part of a private answer. It did the first.
+  const f = btwFraming(1, 'q');
+  ok(/in ONE paragraph/.test(f), 'the shape of the answer itself');
+  ok(/If your task is already finished when the question arrives/.test(f), 'the case that has to be named');
+  ok(/leave one blank line/.test(f), '★ the boundary the parser splits on');
+  ok(/write your report below it/.test(f), 'and what belongs under it');
+});
+
+t('★ framing and parser agree: a worker that obeys the framing is split exactly where it was told to split', () => {
+  // The two halves that can drift apart in silence: the sentence a worker reads
+  // and the rule the daemon applies. This writes the message the sentence
+  // describes and asserts the split lands where the sentence promised.
+  const f = btwFraming(2, 'what number are you on?');
+  ok(f.includes('put the answer first, leave one blank line, and write your report below it'), 'the instruction this message is written from');
+  const msg = `${BTW_ANSWER_PREFIX} #2: the count is already finished, it reached 12.\n\n## Report\n\nWrote /tmp/count.txt with 1 to 12.`;
+  const parsed = parseBtwAnswer(msg);
+  eq(parsed.id, 2);
+  eq(parsed.answer, 'the count is already finished, it reached 12.', 'the asker gets the paragraph, and only the paragraph');
+  eq(parsed.remainder, '## Report\n\nWrote /tmp/count.txt with 1 to 12.', '★ and the report survives: this is exactly what the live round trip lost');
+  ok(!parsed.remainder.includes(BTW_ANSWER_PREFIX), 'no fragment of the marker leaks into the report');
+});
+
 t('lane rule 5 teaches the shape, in bg.mjs, before any worker meets it', () => {
   const bg = readFileSync(path.join(DIR, 'bg.mjs'), 'utf8');
   const rule = /'5\. A message that starts with \[BTW #N from the orchestrator\][^']*'/.exec(bg)?.[0] ?? '';
@@ -153,6 +184,13 @@ t('lane rule 5 teaches the shape, in bg.mjs, before any worker meets it', () => 
   ok(/NOT an instruction|not an instruction/.test(rule), 'the rule must say what it is not');
   ok(rule.includes('Side questions'), 'the report heading');
   ok(/OPPOSITE of a steer/.test(rule), 'rule 4 is right above it; the contrast is the teaching');
+  // THE THREE PLACES THE SHAPE IS STATED MUST STATE THE SAME SHAPE. bg.mjs
+  // imports nothing (it is a standalone CLI), so the budget is a literal here
+  // and only a test can hold it to the constant.
+  ok(rule.includes('in ONE paragraph'), 'the rule must ask for the same one paragraph the framing does');
+  ok(rule.includes('leave one blank line'), '★ and for the same boundary, or a worker taught by the rule would be parsed by a different one');
+  ok(rule.includes('write your report below it'), 'and say what goes under it');
+  ok(rule.includes(String(BTW_ANSWER_MAX)), 'the same character budget as the framing, written out');
 });
 
 // ---------------------------------------------------------------------------
@@ -215,6 +253,46 @@ t('parse: ordinary output, empty strings and nullish all parse to null', () => {
 t('parse: the prefix constant is what the regex looks for', () => {
   eq(BTW_ANSWER_PREFIX, 'BTW-ANSWER');
   eq(parseBtwAnswer(`${BTW_ANSWER_PREFIX} #9: fine`).id, 9);
+});
+
+t('★ parse: an answer with nothing under it has no remainder, which is the ordinary mid task case', () => {
+  const r = parseBtwAnswer('BTW-ANSWER #1: delta-agents, on main');
+  eq(r.remainder, '', 'nothing to keep, so nothing changes anywhere downstream');
+  eq(r.answerRaw, 'BTW-ANSWER #1: delta-agents, on main', 'the whole block was the answer');
+});
+
+t('★ parse: a blank line ends the answer and everything under it is the report', () => {
+  const r = parseBtwAnswer('BTW-ANSWER #1: the count reached 12\n\nHere is the report.\n\nWith two paragraphs.');
+  eq(r.answer, 'the count reached 12');
+  eq(r.remainder, 'Here is the report.\n\nWith two paragraphs.', '★ later blank lines belong to the report, only the FIRST one splits');
+  eq(r.answerRaw, 'BTW-ANSWER #1: the count reached 12', 'a verbatim leading slice, which is what strip() takes off');
+});
+
+t('parse: an answer written under the marker line still ends at the blank line', () => {
+  const r = parseBtwAnswer('BTW-ANSWER #2:\nthe migration applied at 17:04\n\n## Report\n\nAll green.');
+  eq(r.answer, 'the migration applied at 17:04');
+  eq(r.remainder, '## Report\n\nAll green.');
+});
+
+t('★ parse: an answer that never blank-lines is bounded by the budget, and the rest stays', () => {
+  // A worker that runs on gets its answer cut at a LINE, never mid sentence: a
+  // truncated answer reads like a whole one, while a long one is only long.
+  const line = 'x'.repeat(200);
+  const lines = Array.from({ length: 20 }, () => line); // 20 * 201 > BTW_ANSWER_MAX
+  const r = parseBtwAnswer(`BTW-ANSWER #1: head\n${lines.join('\n')}`);
+  ok(r.answer.length <= BTW_ANSWER_MAX, `the routed answer must respect the budget, got ${r.answer.length}`);
+  ok(r.answer.startsWith('head'), 'and it is the head of what the worker wrote, not a middle slice');
+  ok(r.remainder.length > 0, '★ the rest is kept rather than deleted');
+  ok(r.answer.split('\n').every((l) => l === 'head' || l === line), 'no line is cut in half');
+  eq(`${r.answerRaw}\n${r.remainder}`, `BTW-ANSWER #1: head\n${lines.join('\n')}`, 'the two halves are the whole block');
+});
+
+t('parse: a blank line before any answer text is still an answer, with an empty one', () => {
+  // Degenerate, but it must not throw or swallow: the marker line alone, then
+  // the report. The empty answer is what the asker gets, which is honest.
+  const r = parseBtwAnswer('BTW-ANSWER #1:\n\nThe report.');
+  eq(r.answer, '');
+  eq(r.remainder, 'The report.');
 });
 
 // ---------------------------------------------------------------------------
@@ -334,21 +412,148 @@ t('tracker: seq survives a drain, so a post-drain answer matches nothing', () =>
   eq(tr.take('BTW-ANSWER #1: late').status, 'duplicate', 'the run is over; the answer is stripped, not routed');
 });
 
-t('★ tracker: delivered() is exact identity, which is what the result event needs', () => {
-  // The result-event half of duplicate suppression. It cannot be `take`: a btw
-  // injected at a tool-step boundary joins the SAME turn, so the result can be
-  // the answer followed by the worker's real report, and matching on the first
-  // line would swallow the report with it.
+t('★ tracker: strip() subtracts a delivered answer and hands back what was under it', () => {
+  // The result-event half of duplicate suppression. It cannot be `take` (a
+  // second route could resolve a DIFFERENT pending question with this text),
+  // and it cannot be a bare identity check either: a btw injected at a tool-step
+  // boundary joins the SAME turn, so the result can be the answer followed by
+  // the worker's real report, and dropping the whole event drops the report.
   const tr = createBtwTracker();
   tr.add({});
   const answer = 'BTW-ANSWER #1: yes, at 17:04';
-  eq(tr.delivered(answer), false, 'nothing has been delivered yet');
+  eq(tr.strip(answer), answer, 'nothing has been delivered yet, so nothing is subtracted');
   tr.take(answer);
-  eq(tr.delivered(answer), true, 'the byte-identical copy is the duplicate to drop');
-  eq(tr.delivered(`${answer}\n\nAnd here is the report the run actually produced.`), false, '★ a result that CONTAINS the answer is not the answer');
-  eq(tr.delivered('BTW-ANSWER #1: yes, at 17:05'), false, 'a different text is different');
-  eq(tr.delivered(''), false);
-  eq(tr.delivered(null), false);
+  eq(tr.strip(answer), '', 'the byte-identical copy is the duplicate to drop, exactly as before');
+  eq(
+    tr.strip(`${answer}\n\nAnd here is the report the run actually produced.`),
+    'And here is the report the run actually produced.',
+    '★ a result that CONTAINS the answer keeps everything that was not the answer',
+  );
+  eq(tr.strip('BTW-ANSWER #1: yes, at 17:05'), 'BTW-ANSWER #1: yes, at 17:05', 'a different text is different, and is left alone');
+  eq(tr.strip('Ran the suite, 214 passed'), 'Ran the suite, 214 passed', 'ordinary output passes straight through');
+  eq(tr.strip(''), '');
+  eq(tr.strip(null), '');
+});
+
+t('★ tracker: strip() takes the LONGEST delivered answer, not the first that matches', () => {
+  // Two answers on one worker can share a leading line. Subtracting the shorter
+  // would leave the tail of a private answer sitting in the report.
+  const tr = createBtwTracker();
+  tr.add({});
+  tr.add({});
+  tr.take('BTW-ANSWER #1: yes');
+  tr.take('BTW-ANSWER #2: yes\nand the migration applied at 17:04');
+  eq(tr.strip('BTW-ANSWER #2: yes\nand the migration applied at 17:04'), '', 'the longer answer is fully subtracted');
+});
+
+t('★ tracker: an answer with a report under it routes the answer and keeps the report', () => {
+  // The 2026-09-10 shape, at the tracker: the worker finished its task as the
+  // question arrived, so its ONE message was the answer and then the report.
+  const tr = createBtwTracker();
+  const one = tr.add({ tag: 'one' });
+  const block = 'BTW-ANSWER #1: the count is already finished, it reached 12.\n\n## Report\n\nWrote /tmp/count.txt with 1 to 12.';
+  const r = tr.take(block);
+  eq(r.status, 'routed');
+  eq(r.entry, one);
+  eq(r.answer, 'the count is already finished, it reached 12.', 'the asker gets the answer alone');
+  eq(r.remainder, '## Report\n\nWrote /tmp/count.txt with 1 to 12.', '★ and the caller is handed the report');
+  ok(!r.remainder.includes(BTW_ANSWER_PREFIX), 'the marker does not leak into the report');
+  eq(tr.strip(block), r.remainder, '★ and the result event carrying the same block yields the same report, once');
+});
+
+t('★ tracker: a duplicate answer with a report under it still keeps the report', () => {
+  // The route already happened; the copy must cost the answer and nothing else.
+  const tr = createBtwTracker();
+  tr.add({});
+  tr.take('BTW-ANSWER #1: yes');
+  const again = tr.take('BTW-ANSWER #1: yes\n\nThe report, restated in the same message.');
+  eq(again.status, 'duplicate', 'the answer is not routed a second time');
+  eq(again.remainder, 'The report, restated in the same message.', 'but its report is not thrown away with it');
+});
+
+t('★ tracker: an answer nobody is waiting for is stripped, and its report is not', () => {
+  const tr = createBtwTracker();
+  tr.add({ tag: 'one' });
+  const r = tr.take('BTW-ANSWER #7: text about a different question\n\nThe report.');
+  eq(r.status, 'duplicate');
+  eq(r.remainder, 'The report.');
+  eq(tr.size, 1, 'and the live question is untouched');
+});
+
+t('★ tracker: TWO questions answered in one message route both, and neither reaches the report', () => {
+  // The framing asks for ONE message, and two questions injected at the same
+  // step boundary get one message for both. Routing only the first left the
+  // second sitting in the bubble, the handback and bg-results.jsonl while its
+  // own asker was told the run ended without answering (QA, 2026-09-10).
+  const tr = createBtwTracker();
+  const one = tr.add({ tag: 'one' });
+  const two = tr.add({ tag: 'two' });
+  const block = 'BTW-ANSWER #1: repo is delta-agents, on main\n\nBTW-ANSWER #2: the migration applied at 17:04\n\nThe report.';
+  const { routed, remainder } = tr.route(block);
+  eq(routed.length, 2, '★ both answers must be routed, not one');
+  eq(routed[0].entry, one);
+  eq(routed[1].entry, two);
+  eq(routed[0].answer, 'repo is delta-agents, on main');
+  eq(routed[1].answer, 'the migration applied at 17:04');
+  eq(remainder, 'The report.', '★ and only the text that was nobody\'s answer is left');
+  eq(tr.size, 0, 'no question is left waiting for an answer it already got');
+  eq(tr.strip(block), 'The report.', '★ the result-event copy subtracts BOTH, not just the first');
+});
+
+t('★ tracker: route drains answers with nothing under them without looping forever', () => {
+  const tr = createBtwTracker();
+  tr.add({});
+  tr.add({});
+  const { routed, remainder } = tr.route('BTW-ANSWER #1: yes\n\nBTW-ANSWER #2: no');
+  eq(routed.length, 2);
+  eq(remainder, '', 'a block that was nothing but answers leaves nothing behind');
+});
+
+t('tracker: route on ordinary output routes nothing and hands the text straight back', () => {
+  const tr = createBtwTracker();
+  tr.add({});
+  const { routed, remainder } = tr.route('Ran the suite, 214 passed');
+  eq(routed.length, 0);
+  eq(remainder, 'Ran the suite, 214 passed');
+  eq(tr.size, 1, 'and the question is still outstanding');
+});
+
+t('tracker: answered names the ids whose answers reached an asker, in order', () => {
+  const tr = createBtwTracker();
+  tr.add({});
+  tr.add({});
+  eq(tr.answered.length, 0);
+  tr.take('BTW-ANSWER #2: second');
+  tr.take('BTW-ANSWER #1: first');
+  eq(JSON.stringify(tr.answered), '[2,1]', 'answer order, not ask order');
+  tr.take('BTW-ANSWER #2: second');
+  eq(JSON.stringify(tr.answered), '[2,1]', 'a duplicate is not a second answer');
+  tr.answered.push(99);
+  eq(tr.answered.length, 2, 'a snapshot, so a caller cannot corrupt the ledger');
+});
+
+t('★ an empty capture with an answer behind it gets its reason, not "ended with no output"', () => {
+  // The last hole: the answer took the run's final message with it, so the
+  // report capture is legitimately empty. "The worker ended with no output"
+  // over that reads as a dead worker and gets the job re-fired.
+  eq(btwOnlyOutputNote([]), null, 'a run that answered nothing is left completely alone');
+  eq(btwOnlyOutputNote(), null, 'and undefined does not throw');
+  const note = btwOnlyOutputNote([1]);
+  ok(/side question #1/.test(note), note);
+  ok(/routed to the asker/.test(note), 'it says where the output went, which is the actionable half');
+  ok(/#1, #2/.test(btwOnlyOutputNote([1, 2])), 'two answers, both named');
+  ok(!/[–—]/.test(note), 'the daemon must not write the punctuation it bans');
+});
+
+t('★ the reason line becomes the handback and the recorded row, through the one outcome function', () => {
+  const silent = bgOutcome([], null, 0, '');
+  eq(silent.answer, 'The worker ended with no output.', 'the line this replaces');
+  eq(silent.record, null, 'which records nothing at all');
+  const note = btwOnlyOutputNote([1]);
+  const withNote = bgOutcome([note], null, 0, '');
+  eq(withNote.status, 'finished');
+  eq(withNote.answer, note, '★ the handback says why the capture was empty');
+  eq(withNote.record, note, 'and bg-results.jsonl carries the same reason');
 });
 
 t('★ tracker: an id-less answer cannot be routed twice under any text', () => {
@@ -504,17 +709,37 @@ const CODEX_JOB = region('function runCodexAppServerJob(', '\nfunction startCode
 
 t('★ the detector is wired into both places an answer can appear, each its own way', () => {
   ok(
-    /if \(!isSubagent && !run\.btwTake\(block\.text\.trim\(\)\)\) \{/.test(BRIDGE),
+    /const kept = run\.btwTake\(block\.text\.trim\(\)\);/.test(CLAUDE_WORKER),
     'the assistant text block ROUTES: without this the answer stays in the progress bubble',
   );
   ok(
-    /ev\.result\.trim\(\) && !run\.btwDelivered\(ev\.result\.trim\(\)\)/.test(BRIDGE),
-    '★ the result event only SUPPRESSES an exact duplicate: without this the answer is captured into the report and bg-results.jsonl',
+    /const \{ routed, remainder \} = run\.btw\.route\(text\);/.test(CLAUDE_WORKER),
+    '★ and it DRAINS: routing only the first answer left a second one in the report (QA, 2026-09-10)',
   );
+  ok(
+    /if \(kept\) progress\.push\(\{ kind: 'text', text: kept \}\);/.test(CLAUDE_WORKER),
+    "★ and what is LEFT of the block is still shown: a report written under an answer is the worker's own output",
+  );
+  ok(
+    /const kept = run\.btwLeftover\(ev\.result\.trim\(\)\);/.test(CLAUDE_WORKER),
+    '★ the result event SUBTRACTS the delivered answer instead of dropping the whole event: dropping it handed a finished job back as "ended with no output" (live, 2026-09-10)',
+  );
+  ok(/if \(kept\) resultTexts\.push\(kept\);/.test(CLAUDE_WORKER), 'and what is left is the report, which is what the capture is for');
   eq((CLAUDE_WORKER.match(/run\.btwTake\(/g) || []).length, 1, 'exactly one router, on the assistant block');
   ok(
     !/run\.btwTake\(ev\.result/.test(BRIDGE),
-    '★ routing from the result event would swallow a report that FOLLOWS an answer in the same turn, and could resolve a second pending question',
+    '★ routing from the result event could resolve a SECOND pending question with this text (QA, 2026-09-09); subtracting cannot',
+  );
+});
+
+t('★ an empty capture with an answer behind it is not reported as a silent worker', () => {
+  ok(/const note = btwOnlyOutputNote\(run\.btw\.answered\);/.test(CLAUDE_WORKER), 'the reason is built from the ids actually answered, never assumed');
+  ok(/bgOutcome\(bgTexts, resultEvent, code, stderrTail\)/.test(CLAUDE_WORKER), 'and it reaches the ONE function that decides what a background run reports');
+  const arm = CLAUDE_WORKER.slice(CLAUDE_WORKER.indexOf('const bgTexts = resultTexts.slice();'), CLAUDE_WORKER.indexOf('reportBgOutcome('));
+  ok(arm, 'the fallback was not found in the background arm');
+  ok(
+    /!bgTexts\.length && !resultEvent\?\.is_error && code === 0/.test(arm),
+    '★ only over a CLEAN empty capture: a failed worker keeps its own words, or a death would be reported as a side answer',
   );
 });
 
@@ -524,11 +749,13 @@ t('★ the CODEX job has its own detector, on the agent message item and nowhere
   // resolve the question twice, and routing from neither would put a private
   // answer in the handback.
   eq((CODEX_JOB.match(/run\.btwTake\(/g) || []).length, 1, 'exactly one router on the Codex job');
-  ok(/case 'message': \{[\s\S]{0,400}?if \(run\.btwTake\(text\)\) break;/.test(CODEX_JOB), 'it is on the streamed agent message');
+  ok(/case 'message': \{[\s\S]{0,600}?const kept = run\.btwTake\(text\);/.test(CODEX_JOB), 'it is on the streamed agent message');
   ok(
-    /isBtwAnswer\(it\.text\)/.test(CODEX_JOB),
-    "★ and turn/completed's final items are FILTERED rather than routed: without this the last thing said becomes the report even when it was a private answer",
+    /const kept = btwLeftover\(it\.text\);/.test(CODEX_JOB),
+    "★ and turn/completed's final items are SUBTRACTED rather than routed: routing would resolve the question twice, and dropping them whole would lose a report written under an answer",
   );
+  ok(/if \(kept\) answer = kept;/.test(CODEX_JOB), 'the streamed half keeps what was not the answer, as the running report');
+  ok(/const \{ routed, remainder \} = run\.btw\.route\(text\);/.test(CODEX_JOB), 'and this transport drains a multi-answer message too');
 });
 
 t('★ a btw cannot be written into a worker unframed, on either transport', () => {

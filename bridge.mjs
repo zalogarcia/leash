@@ -167,6 +167,7 @@ import {
   BTW_TICK_MS,
   BTW_TIMEOUT_MS,
   btwFraming,
+  btwOnlyOutputNote,
   createBtwTracker,
   isBtwFramed,
   parseBtwAnswer,
@@ -1577,25 +1578,31 @@ function runClaude(
     };
 
     /**
-     * Offer one block of the worker's own output to the side-question router.
+     * Offer one block of the worker's own output to the side-question router,
+     * and get back WHAT IS LEFT OF IT.
      *
-     * Returns true when the block WAS an answer, which is the caller's signal to
-     * drop it: an answer is already going to the chat as its own message, and
-     * leaving it in the progress bubble and in the report capture would deliver
-     * it twice and put a fragment of a private exchange into a handback.
+     * The answer itself is subtracted: it is already going to the asker as its
+     * own message, and leaving it in the progress bubble and in the report
+     * capture would deliver it twice and put a fragment of a private exchange
+     * into a handback. Everything under it is the worker's own output and comes
+     * straight back, because a question that lands as the task finishes is
+     * answered in the SAME message as the report (live, 2026-09-10: taking the
+     * block whole handed a finished job back as "ended with no output").
+     *
+     * EVERY answer in the block is routed, not just the first: the framing asks
+     * for ONE message, so a worker holding two questions answers both in one
+     * (QA, 2026-09-10). Returns the block unchanged when it carried no answer at
+     * all, and '' when it was nothing but answers.
      */
     run.btwTake = (text) => {
-      const res = run.btw.take(text);
-      if (res.status === 'none') return false;
-      if (res.status === 'routed') {
-        res.entry.resolve?.('answered', { answer: res.answer });
-        run.btwMirror();
-      }
-      return true; // 'routed' and 'duplicate' are both "not the worker's output"
+      const { routed, remainder } = run.btw.route(text);
+      for (const r of routed) r.entry?.resolve?.('answered', { answer: r.answer });
+      if (routed.length) run.btwMirror();
+      return remainder;
     };
 
-    /** Was this exact text already delivered as an answer? The result-event half. */
-    run.btwDelivered = (text) => run.btw.delivered(text);
+    /** The same subtraction for a copy of a block already routed. The result-event half. */
+    run.btwLeftover = (text) => run.btw.strip(text);
 
     // Per-lane: chat dies at 30m, a background worker gets hours (see the
     // constants). A lane without an explicit timeoutMs falls back to the chat
@@ -1699,11 +1706,15 @@ function runClaude(
             // person who asked, it is already on its way to them as an edit to
             // the pending message they have on screen, and leaving it here
             // would show it a second time in the bubble. Subagent prose is
-            // never offered: the question went to the worker, not to something
-            // it spawned.
-            if (!isSubagent && !run.btwTake(block.text.trim())) {
-              progress.push({ kind: 'text', text: block.text.trim() }); // subagent prose is noise; their tool calls tell the story
-            }
+            // never offered and never shown: the question went to the worker,
+            // not to something it spawned, and their tool calls tell the story.
+            //
+            // What comes back is the block MINUS the answer, so a worker that
+            // answered and then wrote its report in the one message keeps the
+            // report.
+            if (isSubagent) continue;
+            const kept = run.btwTake(block.text.trim());
+            if (kept) progress.push({ kind: 'text', text: kept });
           } else if (block.type === 'tool_use') {
             const entry = toolEntry(block, isSubagent, HOME);
             progress.push(entry);
@@ -1734,18 +1745,19 @@ function runClaude(
         // copy is what keeps a private answer out of the handback and out of
         // bg-results.jsonl.
         //
-        // ASKED AS "was this already sent", NOT offered to the router. Across
-        // 60 real run logs every result event carrying text was byte-identical
-        // to the last assistant text block of its turn (55 of 55, no
-        // concatenations), so identity is sufficient here. Routing would be
-        // wider than that evidence: it matches on the FIRST line, so a result
-        // that merely BEGAN with an answer would be swallowed whole and handed
-        // back as "ended with no output", and a second route could resolve a
-        // DIFFERENT pending question with this text (QA, 2026-09-09). The
-        // pending line is already resolved from the assistant block by the time
-        // this is asked.
-        if (typeof ev.result === 'string' && ev.result.trim() && !run.btwDelivered(ev.result.trim())) {
-          resultTexts.push(ev.result);
+        // THE ANSWER IS SUBTRACTED, THE EVENT IS NOT DROPPED, and it is never
+        // offered to the router: routing here could resolve a DIFFERENT pending
+        // question with this text (QA, 2026-09-09), while dropping the whole
+        // event throws away anything the worker wrote under the answer. The
+        // usual case is unchanged, because across 60 real run logs every result
+        // event carrying text was byte-identical to the last assistant text
+        // block of its turn (55 of 55, no concatenations): the subtraction
+        // leaves nothing and nothing is pushed. The case that is NOT usual is
+        // the one that fired live on 2026-09-10, a task that finished as the
+        // question arrived, and it is the whole report.
+        if (typeof ev.result === 'string' && ev.result.trim()) {
+          const kept = run.btwLeftover(ev.result.trim());
+          if (kept) resultTexts.push(kept);
         }
         // Streaming-input mode keeps the process alive waiting for more stdin —
         // closing it here is what ends the run, on EVERY lane now that a
@@ -1980,9 +1992,22 @@ function runClaude(
         // The run id is the log's basename (<lane>-<startedAt>), the same key
         // the inflight registry and the re-attach path use, so a worker reports
         // under one name whichever path ends up reporting it.
+        //
+        // AN EMPTY CAPTURE WITH AN ANSWER BEHIND IT IS NOT A SILENT WORKER. A
+        // question answered at the very end of a task takes the run's last
+        // message with it, legitimately: the answer went to the asker and there
+        // was nothing else to say. "The worker ended with no output" over that
+        // reads as a dead worker and gets the job re-fired, so the empty capture
+        // is given its reason instead. Only when the run ended CLEANLY: a real
+        // failure keeps its own words.
+        const bgTexts = resultTexts.slice();
+        if (!bgTexts.length && !resultEvent?.is_error && code === 0) {
+          const note = btwOnlyOutputNote(run.btw.answered);
+          if (note) bgTexts.push(note);
+        }
         reportBgOutcome(
           rawText,
-          bgOutcome(resultTexts, resultEvent, code, stderrTail),
+          bgOutcome(bgTexts, resultEvent, code, stderrTail),
           logPath ? path.basename(logPath, '.jsonl') : null,
           { steers: run.steers },
         );
@@ -5121,11 +5146,27 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
   // deliver a private exchange as the job's result. Asked in TWO places (the
   // streamed item and the authoritative turn items) because either one alone
   // could carry it.
-  const isBtwAnswer = (text) => {
-    const s = String(text ?? '').trim();
-    if (!s) return false;
-    if (run.btw.delivered(s)) return true;
-    return run.btw.seq > 0 && Boolean(parseBtwAnswer(s));
+  //
+  // SUBTRACTED, never dropped whole: a job that finishes as the question lands
+  // answers it in the same message as its report, and the report is the job's
+  // output. Returns what is left, which is the text itself when it carried no
+  // answer at all.
+  const btwLeftover = (text) => {
+    let rest = String(text ?? '').trim();
+    // Drained rather than subtracted once: two questions answered in one message
+    // put two answers at the front of the same item (QA, 2026-09-10).
+    for (;;) {
+      if (!rest) return '';
+      const stripped = run.btw.strip(rest);
+      if (stripped !== rest) {
+        rest = stripped; // it began with answers already routed
+        continue;
+      }
+      if (run.btw.seq === 0) return rest; // nobody asked this job anything
+      const parsed = parseBtwAnswer(rest);
+      if (!parsed) return rest;
+      rest = parsed.remainder;
+    }
   };
 
   const onNotification = (msg) => {
@@ -5147,10 +5188,11 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
         break;
       case 'message': {
         const text = String(ev.text || '').trim();
-        // Routed and swallowed, or kept as the running answer. Codex narrates
-        // before it acts, so the LAST non-answer message is the report.
-        if (run.btwTake(text)) break;
-        if (text) answer = text;
+        // Routed and subtracted, or kept as the running answer. Codex narrates
+        // before it acts, so the LAST non-answer message is the report, and a
+        // message that was an answer plus a report keeps the report half.
+        const kept = run.btwTake(text);
+        if (kept) answer = kept;
         break;
       }
       case 'usage':
@@ -5165,9 +5207,12 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
         // answer: the streamed one can be cut short, this cannot. The side
         // answers are filtered out of it for the same reason they are filtered
         // out of the stream.
-        const items = (Array.isArray(ev.items) ? ev.items : []).filter(
-          (it) => !(it?.type === 'agentMessage' && isBtwAnswer(it.text)),
-        );
+        const items = (Array.isArray(ev.items) ? ev.items : []).flatMap((it) => {
+          if (it?.type !== 'agentMessage') return [it];
+          const kept = btwLeftover(it.text);
+          if (kept === String(it.text ?? '').trim()) return [it]; // carried no answer
+          return kept ? [{ ...it, text: kept }] : [];
+        });
         const finalAnswer = answerFromTurn({ items });
         if (finalAnswer) answer = finalAnswer;
         if (ev.status === 'failed' && !failure) {
@@ -5273,14 +5318,13 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
     run.btwMirror();
     return record;
   };
+  // Same contract as the Claude worker's: the block MINUS every answer in it, so
+  // an answer written above a report costs the answer and not the report.
   run.btwTake = (text) => {
-    const res = run.btw.take(text);
-    if (res.status === 'none') return false;
-    if (res.status === 'routed') {
-      res.entry.resolve?.('answered', { answer: res.answer });
-      run.btwMirror();
-    }
-    return true;
+    const { routed, remainder } = run.btw.route(text);
+    for (const r of routed) r.entry?.resolve?.('answered', { answer: r.answer });
+    if (routed.length) run.btwMirror();
+    return remainder;
   };
   run.handle = { steer: run.steer, btwAsk: run.btwAsk, btwMirror: run.btwMirror };
 

@@ -86,6 +86,18 @@ its process.**
   mid-write. Both halves resolve it through the same three layers now. In the same pass, a background
   Codex job's `/btw` introduces the daemon by its configured `name`, as the Claude worker's already
   did, so a renamed install no longer answers to two names inside one feature.
+- **A question answered at the very END of a task swallowed the worker's report.** A worker whose
+  task had already finished answered in ONE message carrying the answer AND its report, and the whole
+  block was taken as the answer: the asker got the report folded into a private answer, and the
+  handback said "the worker ended with no output" over a finished job. The answer now ends at the
+  first blank line (or the stated character budget, broken at a line rather than mid sentence) and
+  everything under it stays in the bubble and in the report, on both transports. Every answer in the
+  block is routed, not just the first, because the framing asks for ONE message and a worker holding
+  two questions answers both in it. The framing, lane rule 5 and the README now tell a worker exactly
+  that shape: one paragraph, and if the task is already done, the answer first, one blank line, then
+  the report. And a clean run whose capture is empty because its only final message WAS an answer
+  reports that reason instead of "ended with no output", which reads as a dead worker and gets the
+  job re-fired.
 
 ## 1.7.0 (2026-09-09)
 
