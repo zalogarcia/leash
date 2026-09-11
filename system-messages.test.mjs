@@ -80,6 +80,10 @@ import {
   WALL_TICK_MS,
   limitWallLine,
   limitWallResolved,
+  accountLedgerRow,
+  accountLedgerBlock,
+  LEDGER_NAME_MAX,
+  holdFullLine,
   swapFailedLine,
   chatRotatedLine,
   chatWalledRetryLine,
@@ -1010,6 +1014,145 @@ t('wall: the back line names WHICH engine is about to run the parked work', () =
 
 t('wall: five minutes, because it needs a clock that is not wrong, not a live one', () => {
   eq(WALL_TICK_MS, 5 * 60 * 1000);
+});
+
+// ---------------------------------------------------------------------------
+// The account health ledger (2026-09-11)
+// ---------------------------------------------------------------------------
+
+const LNOW = Date.UTC(2026, 8, 11, 16, 46, 0); // 12:46 ET, the incident
+const LTZ = 'America/New_York';
+const lrow = (name, o = {}) => ({ name, walled: false, until: null, captured: true, ...o });
+const secsFrom = (h) => Math.floor((LNOW + h * 3600_000) / 1000);
+
+t('ledger: ★ a walled row leads with ⛔ and carries the clock, not the word', () => {
+  // "⛔ name · walled to Sat 1:00am" is 47 characters on a 44 character line,
+  // and the glyph already says "blocked": the value is the time.
+  eq(
+    accountLedgerRow(lrow('gjgkabche@gmail.com', { walled: true, until: secsFrom(12) }), { timeZone: LTZ, now: LNOW }),
+    '⛔ gjgkabche@gmail.com · Sat 12:46am',
+  );
+  eq(accountLedgerRow(lrow('zalo@blackumbrella.app'), { timeZone: LTZ, now: LNOW }), '✅ zalo@blackumbrella.app · ok');
+  eq(accountLedgerRow(lrow('a@b.com', { live: true }), { timeZone: LTZ, now: LNOW }), '▶︎ a@b.com · ok', 'the live one is a glyph, not a suffix');
+  eq(accountLedgerRow(lrow('c@d.com', { captured: false }), { timeZone: LTZ, now: LNOW }), '⚠️ c@d.com · no login');
+});
+
+t('ledger: ★ limitedUntil is epoch SECONDS, and reading it as ms prints 1970', () => {
+  // accounts.mjs's ledger unit. fmtResetClock takes ISO or epoch MILLISECONDS,
+  // so handing it seconds puts a time in the past on the one row where being
+  // wrong about the clock is the whole point of the row.
+  const r = accountLedgerRow(lrow('a@b.com', { walled: true, until: secsFrom(2) }), { timeZone: LTZ, now: LNOW });
+  eq(r, '⛔ a@b.com · 2:46pm');
+  ok(!/1969|1970/.test(r), r);
+});
+
+t('ledger: a wall with no clock says walled rather than inventing a time', () => {
+  eq(accountLedgerRow(lrow('a@b.com', { walled: true, until: null }), { timeZone: LTZ, now: LNOW }), '⛔ a@b.com · walled');
+  ok(!accountLedgerRow(lrow('a@b.com', { walled: true }), { timeZone: LTZ }).includes('undefined'));
+});
+
+t('ledger: a long name is clipped, never wrapped', () => {
+  const r = accountLedgerRow(lrow('a'.repeat(90) + '@example.com'), { timeZone: LTZ, now: LNOW });
+  ok(r.length <= LEDGER_NAME_MAX + 10, `${r.length}: ${r}`);
+  eq(LEDGER_NAME_MAX, 24);
+});
+
+t('ledger: ★ the head row answers "is there anywhere to go", not "what exists"', () => {
+  const b = accountLedgerBlock(
+    [
+      lrow('hello@blackumbrella.app', { walled: true, until: secsFrom(2), live: true }),
+      lrow('gjgkabche@gmail.com', { walled: true, until: secsFrom(12) }),
+      lrow('zalo@blackumbrella.app'),
+    ],
+    { timeZone: LTZ, now: LNOW },
+  );
+  eq(b.split('\n')[0], '🗂 Accounts · 1 free of 3');
+  // Live first (where am I), then what can take work (who is next), then the
+  // walled ones soonest first (how long until everything is back).
+  eq(b.split('\n')[1], '   ⛔ hello@blackumbrella.app · 2:46pm');
+  eq(b.split('\n')[2], '   ✅ zalo@blackumbrella.app · ok');
+  eq(b.split('\n')[3], '   ⛔ gjgkabche@gmail.com · Sat 12:46am');
+});
+
+t('ledger: an uncaptured slot is not counted as free', () => {
+  const b = accountLedgerBlock([lrow('a@b.com'), lrow('c@d.com', { captured: false })], { timeZone: LTZ, now: LNOW });
+  ok(b.startsWith('🗂 Accounts · 1 free of 2'), b);
+});
+
+t('ledger: ★ no accounts enrolled renders NOTHING, not a line about it', () => {
+  // Same rule as peersBlock: a Codex-first install has no Claude accounts and
+  // does not need a line saying so on every /status forever.
+  eq(accountLedgerBlock([]), '');
+  eq(accountLedgerBlock(null), '');
+  eq(accountLedgerBlock([{}, null]), '', 'a row with no name is not a row');
+});
+
+t('wall: ★ the notice names every account and its reset, soonest first', () => {
+  // The old notice carried the earliest reset and nothing else, which answers
+  // "when can I work again" and not "which of my three subscriptions is
+  // down". On 2026-09-11 the second was the complaint: the rotation had hopped
+  // onto an account out of usage credits since the night before and nothing he
+  // could read said so.
+  const s = limitWallLine({
+    resetClock: '2:20pm',
+    leftText: '1h 34m',
+    accounts: [
+      lrow('gjgkabche@gmail.com', { walled: true, until: secsFrom(12) }),
+      lrow('hello@blackumbrella.app', { walled: true, until: secsFrom(2) }),
+    ],
+    timeZone: LTZ,
+    now: LNOW,
+  });
+  const lines = s.split('\n');
+  eq(lines[0], '⛔ Every Claude account is limited');
+  eq(lines[1], '⏳ Resets 2:20pm · in 1h 34m');
+  eq(lines[2], '   hello@blackumbrella.app · 2:46pm', 'the soonest row IS the ⏳ clock above it');
+  eq(lines[3], '   gjgkabche@gmail.com · Sat 12:46am');
+});
+
+t('wall: ★ what is HELD is counted on the message already on screen', () => {
+  // A handed-off job that waits for a reset is otherwise indistinguishable
+  // from one that was dropped. One live line, so a second held job edits this
+  // number instead of sending a second bubble.
+  ok(limitWallLine({ heldCount: 1 }).includes('📥 1 held · it runs at the reset'));
+  ok(limitWallLine({ heldCount: 4 }).includes('📥 4 held · they run at the reset'));
+  ok(!limitWallLine({ heldCount: 0 }).includes('held'), 'nothing held, no line');
+  ok(!limitWallLine({}).includes('held'));
+});
+
+t('wall: ★ the ⏳ hold has a ✅ that says what it released', () => {
+  eq(limitWallResolved({ clock: '2:21pm', resumed: 2 }), '✅ Claude is back · 2:21pm\n▶️ Started 2 held jobs');
+  eq(limitWallResolved({ clock: '2:21pm', resumed: 1 }).split('\n')[1], '▶️ Started 1 held job');
+  ok(!limitWallResolved({ clock: '2:21pm', resumed: 0 }).includes('held'), 'nothing was held, no line');
+  eq(
+    limitWallResolved({ clock: '2:21pm', codexAnswered: 3, resumed: 2 }).split('\n').length,
+    3,
+    'both facts fit, one per line',
+  );
+});
+
+t('wall: ★ the hold being full is said out loud, and not with /stop', () => {
+  // Past the bound the message used to vanish: no park, no answer, no bubble,
+  // on exactly the afternoon he keeps re-asking because nothing is happening.
+  // Deliberately not queueFull, whose second line offers `/stop <lane>`:
+  // nothing is running, so there is nothing to stop.
+  eq(holdFullLine({ max: 5 }), '📥 Holding 5 behind the wall\nThis one was not queued · re-send it');
+  ok(!holdFullLine({ max: 5 }).includes('/stop'), 'there is nothing running to stop');
+  ok(!holdFullLine({}).includes('undefined'));
+});
+
+t('ledger: ★ every ledger and wall-row shape passes the house-style gates', () => {
+  const long = 'x'.repeat(24) + '@example.com';
+  for (const [s, where] of [
+    [accountLedgerBlock([lrow('hello@blackumbrella.app', { walled: true, until: secsFrom(2), live: true }), lrow('zalo@blackumbrella.app'), lrow('gjgkabche@gmail.com', { walled: true, until: secsFrom(140) })], { timeZone: LTZ, now: LNOW }), 'accountLedgerBlock'],
+    [accountLedgerBlock([lrow(long, { walled: true, until: secsFrom(140) }), lrow(long, { captured: false })], { timeZone: LTZ, now: LNOW }), 'accountLedgerBlock/long names'],
+    [accountLedgerRow(lrow(long, { walled: true, until: secsFrom(12) }), { timeZone: LTZ, now: LNOW }), 'accountLedgerRow/worst case'],
+    [limitWallLine({ resetClock: '2:20pm', leftText: '1h 34m', heldCount: 12, accounts: [lrow(long, { walled: true, until: secsFrom(140) }), lrow('a@b.com', { walled: true, until: secsFrom(2) })], timeZone: LTZ, now: LNOW }), 'limitWallLine/rows'],
+    [limitWallResolved({ clock: '2:21pm', codexAnswered: 3, resumed: 12 }), 'limitWallResolved/resumed'],
+    [holdFullLine({ max: 5 }), 'holdFullLine'],
+  ]) {
+    houseStyle(s, where);
+  }
 });
 
 t('wall: ★ every wall shape passes the house-style gates', () => {

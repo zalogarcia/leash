@@ -6,6 +6,7 @@ accounts.unclaimed.json
 state.json
 schedules.json
 bg-queue.json
+bg-held.json
 bg-results.jsonl
 chat-ring.jsonl
 bg-reports/

@@ -733,13 +733,30 @@ export function createAccountStore({
     return { ok: true, account: list[i] };
   }
 
-  function markLimited(name, resetsAt) {
+  // THE HEALTH LEDGER, one row per account, and the reason it is persisted
+  // rather than held in memory: a wall outlives the daemon. `limitedUntil` is
+  // epoch SECONDS and is the whole gate nextAvailable() reads.
+  //
+  // `source` and `verifiedAt` are for the reader, not the gate. A wall learned
+  // from a probe of a healthy-looking account (account-selector.mjs) and a wall
+  // learned by dying on it are worth different amounts when the question is
+  // "why is this account down", and a mark with no timestamp cannot answer
+  // "how old is that belief". Optional, so the two-argument call sites that
+  // predate them keep working unchanged.
+  function markLimited(name, resetsAt, { source = null, verifiedAt = null } = {}) {
     const list = read();
     const i = list.findIndex((a) => a.name === name);
     if (i === -1) return { ok: false, error: `no account slot named "${name}"` };
-    list[i] = { ...list[i], limitedUntil: Number(resetsAt) || null };
+    list[i] = {
+      ...list[i],
+      limitedUntil: Number(resetsAt) || null,
+      limitedSource: source || list[i].limitedSource || null,
+      limitedVerifiedAt: verifiedAt || new Date().toISOString(),
+    };
     write(list);
-    log(`marked "${name}" limited until ${new Date(Number(resetsAt) * 1000).toISOString()}`);
+    log(
+      `marked "${name}" limited until ${new Date(Number(resetsAt) * 1000).toISOString()}${source ? ` (${source})` : ''}`,
+    );
     return { ok: true, account: list[i] };
   }
 
@@ -747,7 +764,9 @@ export function createAccountStore({
     const list = read();
     const i = list.findIndex((a) => a.name === name);
     if (i === -1) return { ok: false, error: `no account slot named "${name}"` };
-    list[i] = { ...list[i], limitedUntil: null };
+    // The reason goes with the wall. A cleared limit whose source and timestamp
+    // survived would describe a wall that is no longer there.
+    list[i] = { ...list[i], limitedUntil: null, limitedSource: null, limitedVerifiedAt: null };
     write(list);
     return { ok: true, account: list[i] };
   }
@@ -817,6 +836,11 @@ export function createAccountStore({
       lastActiveAt: a.lastActiveAt || null,
       limitedUntil: a.limitedUntil || null,
       limited: isLimited(a, now),
+      // The ledger's provenance, for the /status rows. Never load bearing:
+      // `limited` above is the gate, these two only say where the belief came
+      // from and how old it is.
+      limitedSource: a.limitedSource || null,
+      limitedVerifiedAt: a.limitedVerifiedAt || null,
     }));
   }
 

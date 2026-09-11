@@ -839,13 +839,57 @@ export const chatState = () => ({ cwd: '/Users/owner/dev/claude-telegram-bridge'
 export const bgLanes = [];
 let bgSeq = 0;
 const BG_TASK_TIMEOUT_MS = 1;
-export const reset = (ls = []) => { SENT.length = 0; DISPATCHED.length = 0; EDITS.length = 0; LIVE.clear(); workerNotices.clear(); msgSeq = 0; CODEX_STARTED.length = 0; rotationPausedUntil = 0; codexFallbackValue = true; codexTransport = 'appserver'; ENGINE_CFG = {}; CHAT_ENGINE_STATE = {}; bgLanes.length = 0; bgSeq = 0; SAVED.length = 0; SCHED_LANDS_ON_CLAUDE = true; SCHEDULES = { nextId: 1, items: [] }; for (const l of ls) { bgSeq++; bgLanes.push({ name: bgSeq === 1 ? 'bg' : 'bg' + bgSeq, isBg: true, n: bgSeq, current: null, queue: [], ...l }); } };
+export const reset = (ls = []) => { SENT.length = 0; DISPATCHED.length = 0; EDITS.length = 0; LIVE.clear(); workerNotices.clear(); msgSeq = 0; CODEX_STARTED.length = 0; rotationPausedUntil = 0; codexFallbackValue = true; codexTransport = 'appserver'; ENGINE_CFG = {}; CHAT_ENGINE_STATE = {}; bgLanes.length = 0; bgSeq = 0; SAVED.length = 0; SCHED_LANDS_ON_CLAUDE = true; SCHEDULES = { nextId: 1, items: [] }; heldContent = '[]'; pendingWrite = null; writeFails = false; WALLS_RAISED.length = 0; RESUMES.length = 0; DECISIONS.length = 0; WRITES.length = 0; pendingWrite = null; for (const l of ls) { bgSeq++; bgLanes.push({ name: bgSeq === 1 ? 'bg' : 'bg' + bgSeq, isBg: true, n: bgSeq, current: null, queue: [], ...l }); } };
 let queueContent = '[]';
 export const setQueue = (v) => { queueContent = JSON.stringify(v); };
-const readFileSync = () => queueContent;
-const writeFileSync = () => {};
-const renameSync = () => {};
+export const readQueue = () => JSON.parse(queueContent);
+// A REAL, PATH-AWARE ROUND TRIP over two files: the drop-box the drain claims,
+// and the on-disk HOLD the wall writes. Stubs that swallowed the writes would
+// let the hold lose a claimed brief and every assertion here would still pass,
+// which is exactly the bug the on-disk hold exists to remove. Modelled the way
+// production does it, write to a temp path then rename, so content only
+// becomes visible at the rename and a failed write changes nothing.
 const BG_QUEUE_FILE = '/tmp/never-written-bg-queue.json';
+const BG_HELD_FILE = '/tmp/never-written-bg-held.json';
+export let heldContent = '[]';
+export const readHeld = () => JSON.parse(heldContent);
+export const setHeld = (v) => { heldContent = JSON.stringify(v); };
+// A DAEMON RESTART, modelled: the files survive, every variable does not.
+export const restartDaemon = () => { pendingWrite = null; };
+const fileFor = (p) => (String(p).startsWith(BG_HELD_FILE) ? 'held' : 'queue');
+const readFileSync = (p) => (fileFor(p) === 'held' ? heldContent : queueContent);
+let pendingWrite = null;
+export const WRITES = [];
+// Which FILE's writes fail: 'held', 'queue', or false for none. Per file
+// rather than global, because the drain claims the drop-box with a write of
+// its own and failing that one never reaches the hold at all.
+export let writeFails = false;
+export const setWriteFails = (v) => { writeFails = v === true ? 'queue' : v; };
+const writeFileSync = (p, text) => {
+  WRITES.push({ path: String(p), text: String(text) });
+  if (writeFails && writeFails === fileFor(p)) throw new Error('disk full');
+  pendingWrite = { which: fileFor(p), text: String(text) };
+};
+const renameSync = () => {
+  if (!pendingWrite) return;
+  if (pendingWrite.which === 'held') heldContent = pendingWrite.text;
+  else queueContent = pendingWrite.text;
+  pendingWrite = null;
+};
+// THE WALL HOLD. The drain parks a job resolveEngine left on a walled Claude,
+// and the flush writes it back here. The notice and the resume timer are
+// stubbed (bg-codex-wiring.test.mjs owns the notice shape, and a real timer in
+// a unit suite is a test that waits an hour); the HOLD and the RE-QUEUE are the
+// real functions, because losing a claimed brief is the failure that matters.
+const CLAUDE_AVAILABLE = true;
+export const WALLS_RAISED = [];
+const raiseClaudeWall = async () => { WALLS_RAISED.push(Date.now()); return null; };
+export const RESUMES = [];
+const armWallResume = (at) => { RESUMES.push(at); return null; };
+export const DECISIONS = [];
+const logAccountDecision = (d) => { DECISIONS.push(d); };
+const pendWallResolution = () => true;
+const settleWall = () => {};
 // The second engine. Same rule as chatState above: the extracted drain reads
 // these as MODULE bindings, so the harness has to provide them by the same
 // names production does, and the routing decision itself comes from the REAL
@@ -933,10 +977,16 @@ const B = await import(
         grabConst('workerNotices'),
         grabFn('startWorkerNotice'),
         grabFn('editWorkerNotice'),
+        grabConst('PARKED_WALLED_JOBS_MAX'),
+        grabConst('claudeRateWalled'),
+        grabFn('readHeldBgJobs'),
+        grabFn('writeHeldBgJobs'),
+        grabFn('holdBgJob'),
         grabFn('drainBgHandoff'),
+        grabFn('flushParkedWalledJobs'),
         grabFn('notifyOwnerBgFinished'),
         grabFn('checkSchedules'),
-        'export { drainBgHandoff, notifyOwnerBgFinished, getBgLane, startWorkerNotice, editWorkerNotice, workerNotices, checkSchedules };',
+        'export { drainBgHandoff, flushParkedWalledJobs, readHeldBgJobs, holdBgJob, PARKED_WALLED_JOBS_MAX, notifyOwnerBgFinished, getBgLane, startWorkerNotice, editWorkerNotice, workerNotices, checkSchedules };',
       ].join('\n'),
     )
 );
@@ -1203,14 +1253,130 @@ t('★ with every Claude account walled, an ordinary job runs on Codex instead o
   ok(/🧠 codex · every Claude account is limited/.test(B.SENT[0]), B.SENT[0]);
 });
 
-t('/codex off means the wall is waited out, exactly as before', () => {
+t('★ /codex off means the wall is HELD OUT, not spawned into', () => {
   B.reset([{}]);
   B.setLimitWall(Date.now() + HOUR, false);
   B.setQueue([{ text: '# Build the report' }]);
   B.drainBgHandoff();
   eq(B.CODEX_STARTED.length, 0, 'the setting is the whole point of the setting');
-  eq(B.DISPATCHED.length, 1);
-  ok(B.SENT[0].startsWith('🌙 '), B.SENT[0]);
+  // IT USED TO DISPATCH HERE, onto a Claude lane with no account that could
+  // answer: a limit death, a 90 second salvage and a handback per job. Two of
+  // those reached him on 2026-09-11. "Waited out" is now literal.
+  eq(B.DISPATCHED.length, 0, 'spawning into the wall is a death, not a wait');
+  eq(B.readHeldBgJobs().length, 1, 'held as the queue item it arrived as');
+  eq(B.WALLS_RAISED.length, 1, 'ONE notice for the wall, not a bubble per job');
+  eq(B.SENT.length, 0, 'the wall notice is the message; no worker card for a job that has not started');
+  ok(B.DECISIONS.some((d) => d.decision === 'all_accounts_walled_until'), JSON.stringify(B.DECISIONS));
+});
+
+t('★ a held job is written back to the queue at the reset and then runs', () => {
+  B.reset([{}]);
+  B.setLimitWall(Date.now() + HOUR, false);
+  B.setQueue([{ text: '# Build the report' }]);
+  B.drainBgHandoff();
+  eq(B.readHeldBgJobs().length, 1);
+  // The wall lifts.
+  B.setLimitWall(0, false);
+  B.flushParkedWalledJobs();
+  eq(B.readHeldBgJobs().length, 0, 'released');
+  eq(B.DISPATCHED.length, 1, 'and it actually ran, through the ordinary drain');
+  ok(B.SENT[0].startsWith('🌙 '), `it gets its normal worker card: ${B.SENT[0]}`);
+  ok(B.DECISIONS.some((d) => d.decision === 'resume_after_reset'), JSON.stringify(B.DECISIONS));
+});
+
+t('a held job stays held while the wall is still up', () => {
+  B.reset([{}]);
+  B.setLimitWall(Date.now() + HOUR, false);
+  B.setQueue([{ text: '# Build the report' }]);
+  B.drainBgHandoff();
+  B.flushParkedWalledJobs();
+  eq(B.readHeldBgJobs().length, 1, 'releasing it into the wall is the death this avoids');
+  eq(B.DISPATCHED.length, 0);
+});
+
+t('★ the held brief is never lost: it goes back in FRONT of newer work', () => {
+  B.reset([{}, {}]);
+  B.setLimitWall(Date.now() + HOUR, false);
+  B.setQueue([{ text: '# The job that waited' }]);
+  B.drainBgHandoff();
+  // A new job lands in the queue file while the wall is up.
+  B.setQueue([{ text: '# A job that just arrived' }]);
+  B.setLimitWall(0, false);
+  B.flushParkedWalledJobs();
+  // Both ran, and the one that had already waited out a wall was not put
+  // behind the one that had not.
+  eq(B.DISPATCHED.length, 2, JSON.stringify(B.DISPATCHED));
+  ok(String(B.DISPATCHED[0].prompt || B.DISPATCHED[0].text || B.DISPATCHED[0]).includes('The job that waited'), JSON.stringify(B.DISPATCHED[0]));
+});
+
+t('★ the hold is ON DISK, so a daemon restart does not destroy the brief', () => {
+  // drainBgHandoff claims bg-queue.json BEFORE it decides anything, so a
+  // claimed brief exists in exactly one place. An in-memory hold made that
+  // place a variable in a process restarted after every edit to bridge.mjs,
+  // during a wall that lasts hours: the job was neither dispatched, nor in
+  // bg-results.jsonl, nor visible to bg-salvage.py. The behaviour it replaced
+  // lost nothing, because it spawned into the wall and produced a handback.
+  B.reset([{}]);
+  B.setLimitWall(Date.now() + HOUR, false);
+  B.setQueue([{ text: '# The brief that must survive' }]);
+  B.drainBgHandoff();
+  eq(B.readHeld().length, 1, 'on disk, not in a variable');
+  ok(String(B.readHeld()[0].text).includes('The brief that must survive'), JSON.stringify(B.readHeld()));
+  // The daemon dies and comes back. Nothing in memory survives; the file does.
+  B.restartDaemon();
+  B.setLimitWall(0, false);
+  B.flushParkedWalledJobs();
+  eq(B.DISPATCHED.length, 1, 'the brief ran after the restart');
+  eq(B.readHeld().length, 0, 'and the hold is cleared');
+});
+
+t('★ a drop-box write that fails leaves the job HELD, never dropped', () => {
+  B.reset([{}]);
+  B.setLimitWall(Date.now() + HOUR, false);
+  B.setQueue([{ text: '# Build the report' }]);
+  B.drainBgHandoff();
+  eq(B.readHeld().length, 1);
+  B.setLimitWall(0, false);
+  B.setWriteFails('queue');
+  B.flushParkedWalledJobs();
+  eq(B.readHeld().length, 1, 'still held: the next flush tries again');
+  eq(B.DISPATCHED.length, 0);
+  B.setWriteFails(false);
+  B.flushParkedWalledJobs();
+  eq(B.DISPATCHED.length, 1, 'and it runs once the write lands');
+  eq(B.readHeld().length, 0);
+});
+
+t('★ a hold write that fails STARTS the job rather than losing it', () => {
+  // The soft fence: dying on a wall is recoverable (handback plus a durable
+  // row), being silently eaten is not.
+  B.reset([{}]);
+  B.setLimitWall(Date.now() + HOUR, false);
+  B.setQueue([{ text: '# Build the report' }]);
+  B.setWriteFails('held');
+  B.drainBgHandoff();
+  eq(B.readHeld().length, 0, 'nothing could be held');
+  eq(B.DISPATCHED.length, 1, 'so it ran, which at least produces a handback');
+});
+
+t('past the hold bound a job is started, not dropped', () => {
+  B.reset([{}]);
+  B.setLimitWall(Date.now() + HOUR, false);
+  B.setHeld(Array.from({ length: B.PARKED_WALLED_JOBS_MAX }, (_, i) => ({ text: `# held ${i}` })));
+  B.setQueue([{ text: '# one job too many' }]);
+  B.drainBgHandoff();
+  eq(B.readHeld().length, B.PARKED_WALLED_JOBS_MAX, 'the hold did not grow');
+  eq(B.DISPATCHED.length, 1, 'and the brief was not destroyed to keep the bound');
+});
+
+t('a job pinned to Claude by name waits too, rather than dying on the wall', () => {
+  B.reset([{}]);
+  B.setLimitWall(Date.now() + HOUR, true); // the fallback is ON, but this job named Claude
+  B.setQueue([{ text: 'claude: # Build the report' }]);
+  B.drainBgHandoff();
+  eq(B.CODEX_STARTED.length, 0, 'it asked for Claude by name');
+  eq(B.DISPATCHED.length, 0);
+  eq(B.readHeldBgJobs().length, 1);
 });
 
 t('a healthy bridge routes nothing to Codex on its own', () => {

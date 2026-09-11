@@ -630,6 +630,27 @@ export function createAccountUsage({
       return { active, rows };
     },
 
+    // ONE named slot, for the rotation's pre-swap probe (account-selector.mjs).
+    //
+    // Not all(): a wall is the one moment latency is against us, and reading
+    // three accounts to decide about the one we are about to swap onto spends
+    // two round trips on a question nobody asked. The selector asks about
+    // candidates in rotation order and usually stops at the first.
+    //
+    // `fresh` defaults TRUE and that is the whole point of the call. The TTL
+    // cache can hold a row read a minute before the account ran out, and a
+    // reading taken while it still had headroom is a reading that says it has
+    // headroom: exactly the false clean bill of health this probe exists to
+    // stop. The same reason usageResetFor invalidates before it reads.
+    async one(name, { fresh = true } = {}) {
+      if (!name) return null;
+      if (fresh) invalidateUsageCache(name);
+      const active = await resolveActive();
+      const acct = store.listAccounts().find((a) => a.name === name);
+      if (!acct) return null;
+      return readOne(acct, active);
+    },
+
     // Just the live one, for /status's single compact line.
     async activeOnly() {
       const active = await resolveActive();

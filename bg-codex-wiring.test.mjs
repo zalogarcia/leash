@@ -565,7 +565,7 @@ const P = await import(
         `
 import { codexCwdForBrief, fmtUntil, parseEnginePrefix, shouldRouteToCodex } from ${url('bg-codex.mjs')};
 import { briefRepo, briefTitle, stripLaneRules } from ${url('bg-notify.mjs')};
-import { queueAck, queueStarted, queueDropped, queueRunningNow, queueFull, steeredInAck, WALL_TICK_MS, bothWalledLine, enginesBackLine, limitWallLine, limitWallResolved, chatRotatedLine, chatWalledRetryLine } from ${url('system-messages.mjs')};
+import { queueAck, queueStarted, queueDropped, queueRunningNow, queueFull, holdFullLine, steeredInAck, WALL_TICK_MS, bothWalledLine, enginesBackLine, limitWallLine, limitWallResolved, chatRotatedLine, chatWalledRetryLine } from ${url('system-messages.mjs')};
 import { composeWithQuote } from ${url('reply-quote.mjs')};
 import { workerLine, WORKER_TICK_MS, WORKER_IDLE_MS } from ${url('bg-notify.mjs')};
 import { claudeMissingLine, resolveEngine } from ${url('engine-state.mjs')};
@@ -665,11 +665,13 @@ const OWNER_TZ = 'UTC';
 export let rotationCooldownUntil = 0;
 export const setCooldownUntil = (v) => { rotationCooldownUntil = v; };
 const ROTATION_COOLDOWN_MS = 90000;
-export const ACC = { active: null, free: [], swapOk: true, swapError: 'locked', earliest: 0, swapDelayMs: 0, marked: [], swapped: [], cacheKills: 0 };
+export const ACC = { active: null, free: [], swapOk: true, swapError: 'locked', earliest: 0, swapDelayMs: 0, marked: [], swapped: [], cacheKills: 0, ledger: [], probes: [] };
 export const setAccounts = (o) => { Object.assign(ACC, o); };
 const accounts = {
   activeAccount: async () => (ACC.active ? { account: { name: ACC.active } } : {}),
   markLimited: (name, resetsAt) => { ACC.marked.push({ name, resetsAt }); },
+  // The wall notice's rows. One per account, straight off the ledger.
+  describe: () => ACC.ledger,
   nextAvailable: ({ activeName }) => {
     const n = ACC.free.find((x) => x !== activeName);
     return n ? { name: n } : null;
@@ -695,10 +697,33 @@ const invalidateUsageCache = () => { ACC.cacheKills++; };
 export const USAGE_RESET = { calls: 0, value: null };
 const usageResetFor = async (name) => { USAGE_RESET.calls++; return USAGE_RESET.value; };
 export const parkedCodexChats = [];
+// STUBBED for the same reason usageResetFor is: this suite is about what the
+// CHAT LANE does with a rotation, and account-selector.test.mjs plus
+// limit-rotation.test.mjs own the probing rule against the real functions. It
+// records what it was asked, so a test here can still assert that the rotation
+// asked for a VERIFIED account rather than the first ledger-free one.
+const pickHealthyAccount = async ({ activeName = null, lines = [] } = {}) => {
+  ACC.probes.push(activeName);
+  const n = ACC.free.find((x) => x !== activeName) || null;
+  return { outcome: n ? 'selected' : 'all_walled', name: n, account: n ? { name: n } : null, walls: [], earliest: ACC.earliest || null, probed: [] };
+};
+export const DECISIONS = [];
+const logAccountDecision = (d) => { DECISIONS.push(d); };
+// The JOB hold lives in drainBgHandoff, which this suite does not extract:
+// bg-notify.test.mjs owns the drain and the real flush.
+export const JOB_FLUSHES = [];
+const flushParkedWalledJobs = () => { JOB_FLUSHES.push(Date.now()); };
+let wallResumeTimer = null;
 const swapFailedLine = ({ error, account }) => 'swap failed ' + error + ' ' + account;
 const CLAUDE_AVAILABLE_FN = () => CLAUDE_AVAILABLE;
 export const parkedWalledChats = [];
-export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wallNotices.clear(); workerNotices.clear(); sentSeq = 0; CLAUDE.length = 0; CHAT_FALLBACK.length = 0; CODEX.length = 0; CODEX_CHAT.length = 0; bgLanes.length = 0; bgSeq = 0; rotationPausedUntil = 0; codexPausedUntil = 0; parkedWalledChats.length = 0; codexFallbackValue = true; CHAT_CWD = ${JSON.stringify(TMP)}; ENGINE_CFG = {}; CHAT_ENGINE_STATE = {}; CLAUDE_AVAILABLE = true; CODEX_AVAILABLE = true; LANES.main.current = null; LANES.main.queue.length = 0; HANDOFF.pending = false; HANDOFF.block = ''; rotationCooldownUntil = 0; ACC.active = null; ACC.free = []; ACC.swapOk = true; ACC.swapError = 'locked'; ACC.earliest = 0; ACC.swapDelayMs = 0; ACC.marked.length = 0; ACC.swapped.length = 0; ACC.cacheKills = 0; USAGE_RESET.calls = 0; USAGE_RESET.value = null; parkedCodexChats.length = 0; SAVES.length = 0; delete CHAT_STATE.handoffPending; };
+// The wall notice counts what is held on DISK (bg-held.json). The hold itself
+// belongs to the drain, which bg-notify.test.mjs owns; here it only has to
+// return a number the notice can print.
+export let HELD_JOBS = 0;
+export const setHeldJobs = (n) => { HELD_JOBS = n; };
+const readHeldBgJobs = () => Array.from({ length: HELD_JOBS }, (_, i) => ({ text: 'held ' + i }));
+export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wallNotices.clear(); workerNotices.clear(); sentSeq = 0; CLAUDE.length = 0; CHAT_FALLBACK.length = 0; CODEX.length = 0; CODEX_CHAT.length = 0; bgLanes.length = 0; bgSeq = 0; rotationPausedUntil = 0; codexPausedUntil = 0; parkedWalledChats.length = 0; codexFallbackValue = true; CHAT_CWD = ${JSON.stringify(TMP)}; ENGINE_CFG = {}; CHAT_ENGINE_STATE = {}; CLAUDE_AVAILABLE = true; CODEX_AVAILABLE = true; LANES.main.current = null; LANES.main.queue.length = 0; HANDOFF.pending = false; HANDOFF.block = ''; rotationCooldownUntil = 0; ACC.active = null; ACC.free = []; ACC.swapOk = true; ACC.swapError = 'locked'; ACC.earliest = 0; ACC.swapDelayMs = 0; ACC.marked.length = 0; ACC.swapped.length = 0; ACC.cacheKills = 0; USAGE_RESET.calls = 0; USAGE_RESET.value = null; parkedCodexChats.length = 0; SAVES.length = 0; HELD_JOBS = 0; ACC.ledger = []; ACC.probes.length = 0; DECISIONS.length = 0; JOB_FLUSHES.length = 0; if (wallResumeTimer) clearTimeout(wallResumeTimer); wallResumeTimer = null; delete CHAT_STATE.handoffPending; };
 `,
         grab('BG_COMMAND_RE', 'const'),
         grab('unchosenCodex', 'const'),
@@ -709,6 +734,7 @@ export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wa
         grab('pickLane'),
         grab('codexWalled', 'const'),
         grab('claudeWalled', 'const'),
+        grab('claudeRateWalled', 'const'),
         grab('wallNotices', 'const'),
         grab('raiseWall'),
         grab('settleWall'),
@@ -717,6 +743,14 @@ export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wa
         grab('startWorkerNotice'),
         grab('editWorkerNotice'),
         grab('bothEnginesWalledLine'),
+        // The Claude wall's own notice, the REAL function: its rows are what
+        // name each account and its reset, which is the half the old notice
+        // left out.
+        grab('claudeWallFacts'),
+        grab('raiseClaudeWall'),
+        grab('armWallResume'),
+        grab('canRunHeldItem'),
+        grab('noEngineForChat', 'const'),
         grab('flushParkedWalledChats'),
         grab('queueItem'),
         grab('asQueueItem', 'const'),
@@ -736,7 +770,7 @@ export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wa
         grab('codexTakingChat', 'const'),
         grab('chatLimitRetryPlan'),
         grab('handleChatLimitFailure'),
-        'export { dispatchPrompt, drainQueue, startResolvedRun, flushParkedWalledChats, bothEnginesWalledLine, trackQueueAck, resolveQueueAck, QUEUE_MAX, PARKED_WALLED_MAX, raiseWall, settleWall, wallNotices, rotateOffLimitedAccount, chatLimitRetryPlan, handleChatLimitFailure, codexCanTakeChat, codexTakingChat, chatRunFailure, resultEventErrored };',
+        'export { dispatchPrompt, drainQueue, startResolvedRun, flushParkedWalledChats, bothEnginesWalledLine, raiseClaudeWall, claudeWallFacts, noEngineForChat, canRunHeldItem, trackQueueAck, resolveQueueAck, QUEUE_MAX, PARKED_WALLED_MAX, raiseWall, settleWall, wallNotices, rotateOffLimitedAccount, chatLimitRetryPlan, handleChatLimitFailure, codexCanTakeChat, codexTakingChat, chatRunFailure, resultEventErrored };',
       ].join('\n'),
     )
 );
@@ -768,11 +802,16 @@ P.reset();
 P.setWall(WALL);
 P.dispatchPrompt('/autopilot ship the thing', undefined, { allowCodexFallback: true });
 
-await t('★ a Claude SLASH COMMAND is never routed to Codex', () => {
+await t('★ a Claude SLASH COMMAND is never routed to Codex, and now it really waits', () => {
   // /autopilot is a Claude Code command. Codex has no idea what it is, so
   // routing one there buys confident nonsense instead of a wait.
   eq(P.CODEX.length, 0, 'Codex cannot run a Claude slash command');
-  eq(P.CLAUDE.length, 1);
+  // AND IT IS NOT SPAWNED INTO THE WALL EITHER, which is what used to happen:
+  // the fallback that rescues an ordinary message does not apply to a slash
+  // command, so the command went to Claude and died, while the handoff notice
+  // said in writing that it would "wait for the reset". It waits now.
+  eq(P.CLAUDE.length, 0, 'spawning it here is a guaranteed limit death and a 90s salvage');
+  eq(P.parkedWalledChats.length, 1, 'held, and re-dispatched by itself at the reset');
 });
 
 P.reset();
@@ -792,10 +831,47 @@ P.reset();
 P.setWall(WALL, false); // /codex off
 P.dispatchPrompt('is the deploy green', undefined, { allowCodexFallback: true });
 
-await t('/codex off leaves every message on Claude', () => {
-  eq(P.CHAT_FALLBACK.length, 0);
+await t('★ /codex off holds the message instead of spawning it into the wall', () => {
+  // 2026-09-11: with the fallback off (or no codex on the machine at all)
+  // `codexWalled()` is false, so the old park condition did not fire and a
+  // walled chat message went to Claude, died, and reached the phone as a raw
+  // "You're out of usage credits" card. The park condition is the negation of
+  // "Codex is actually going to answer this", so there is no gap left for it.
+  eq(P.CHAT_FALLBACK.length, 0, 'the setting is the whole point of the setting');
   eq(P.CODEX.length, 0);
-  eq(P.CLAUDE.length, 1);
+  eq(P.CLAUDE.length, 0, 'a red bubble is not an answer');
+  eq(P.parkedWalledChats.length, 1, 'held, and it runs by itself at the reset');
+});
+
+await t('the held message raises the Claude wall notice, naming every account', () => {
+  // ONE notice, and it is the Claude one rather than the both-engines line: a
+  // machine with the fallback off has no Codex wall to report, and saying
+  // "Both engines are out" about an engine that was never asked is a lie in a
+  // message whose whole job is to be trusted for hours.
+  ok(P.wallNotices.has('claude'), 'the wall he is waiting on has a live message');
+  ok(!P.wallNotices.has('both'), 'nothing is walled on the Codex side');
+  ok(P.SENT.some((t) => String(t).includes('Every Claude account is limited')), P.SENT.join(' | '));
+});
+
+// The rows come off the ledger, so the notice answers "which of my three
+// subscriptions is down" and not only "when can I work again".
+P.reset();
+P.setWall(WALL, false);
+P.setAccounts({
+  ledger: [
+    { name: 'hello@example.com', limited: true, limitedUntil: Math.floor(WALL / 1000), captured: true },
+    { name: 'gjg@example.com', limited: true, limitedUntil: Math.floor(WALL / 1000) + 7200, captured: true },
+  ],
+});
+P.dispatchPrompt('is the deploy green', undefined, { allowCodexFallback: true });
+
+await t('★ the wall notice names each account and holds a count of what is waiting', () => {
+  const notice = P.SENT.find((t) => String(t).includes('Every Claude account is limited')) || '';
+  ok(notice.includes('hello@example.com'), notice);
+  ok(notice.includes('gjg@example.com'), notice);
+  ok(/📥 1 held/.test(notice), notice);
+  // Soonest first, so the ⏳ clock above is visibly the first row.
+  ok(notice.indexOf('hello@example.com') < notice.indexOf('gjg@example.com'), notice);
 });
 
 P.reset();
@@ -1209,13 +1285,17 @@ P.setAccounts({ active: 'first@example.com', free: [], earliest: Math.floor((Dat
 P.setEngines({ codexAvailable: false });
 const noCodex = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx());
 
-await t('★ with no Codex to hand it to, the walled message is NOT re-dispatched', () => {
-  // resolveEngine hands a walled Claude lane back to Claude when Codex is
-  // missing, so re-dispatching here would fail, rotate, plan, re-dispatch,
-  // for as long as the wall lasts.
-  eq(noCodex.dispatch, null, 'the real failure plus the wall notice goes out instead');
-  eq(P.CLAUDE.length, 0);
-  eq(P.CHAT_FALLBACK.length, 0);
+await t('★ with no Codex to hand it to, the walled message is HELD, not failed', () => {
+  // It used to return dispatch:null here, and the raw CLI death went out with
+  // a wall notice under it: the "❌ You're out of usage credits" card of
+  // 2026-09-11. The loop this guarded against (fail, rotate, plan,
+  // re-dispatch, forever) is closed at the front door now instead, so the
+  // message can be re-dispatched and simply parks.
+  ok(noCodex.dispatch, 'the message gets a plan rather than a red bubble');
+  noCodex.dispatch();
+  eq(P.CLAUDE.length, 0, 'never spawned into the wall');
+  eq(P.CHAT_FALLBACK.length, 0, 'there is no Codex on this machine');
+  eq(P.parkedWalledChats.length, 1, 'held, and it runs by itself at the reset');
 });
 
 P.reset();
@@ -1223,9 +1303,105 @@ P.setAccounts({ active: 'first@example.com', free: [], earliest: Math.floor((Dat
 P.setWall(0, false); // /codex off
 const fallbackOff = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx());
 
-await t('/codex off closes the same loop', () => {
-  eq(fallbackOff.dispatch, null);
+await t('/codex off closes the same loop the same way', () => {
+  ok(fallbackOff.dispatch);
+  fallbackOff.dispatch();
   eq(P.CLAUDE.length, 0);
+  eq(P.parkedWalledChats.length, 1);
+});
+
+// AND THE LOOP REALLY IS CLOSED: a held message re-dispatched while the wall is
+// still up goes back into the hold rather than round again.
+P.reset();
+P.setWall(Date.now() + 3600_000, false);
+P.dispatchPrompt('is the deploy green', undefined, { allowCodexFallback: true });
+P.dispatchPrompt('is the deploy green', undefined, { allowCodexFallback: true });
+
+await t('★ re-dispatching under the same wall re-parks rather than spawning', () => {
+  eq(P.CLAUDE.length, 0);
+  eq(P.parkedWalledChats.length, 2, 'each one is held; neither reaches a lane that cannot answer');
+});
+
+// THE PARK AND THE RELEASE MUST BE EXACT COMPLEMENTS. A slash command is held
+// even when Codex is willing (Codex will not take one), and the release gate
+// used to lack that term: the flush freed it, sent "Codex is back · running 1
+// parked" about an engine that was never walled, and dispatchPrompt parked it
+// straight back. Once per poll cycle for the length of the wall.
+P.reset();
+P.setWall(Date.now() + 3600_000, true); // Claude walled, Codex WILLING
+P.dispatchPrompt('/goal ship the thing', undefined, { allowCodexFallback: true });
+const sentAtPark = P.SENT.length;
+P.flushParkedWalledChats();
+P.flushParkedWalledChats();
+P.flushParkedWalledChats();
+
+await t('★ a held slash command is not released while only Codex is free', () => {
+  eq(P.parkedWalledChats.length, 1, 'still held: Codex cannot run a Claude command at any price');
+  eq(P.CLAUDE.length, 0, 'and it was not re-spawned into the wall');
+  eq(P.SENT.length, sentAtPark, 'and NOT one false "an engine is back" per poll cycle');
+  ok(!P.SENT.join('\n').includes('is back'), P.SENT.join('\n'));
+});
+
+await t('canRunHeldItem is the complement of the park, per item', () => {
+  // Same wall, same instant: the ordinary message can go to Codex, the slash
+  // command cannot. One gate, two answers, which is why it takes the item.
+  eq(P.canRunHeldItem({ text: 'is the deploy green' }), true);
+  eq(P.canRunHeldItem({ text: '/goal ship the thing' }), false);
+  eq(P.canRunHeldItem({ text: 'bg: run the suite' }), true, 'a plain brief is not a slash command');
+});
+
+// A MIXED HOLD releases only what can run, and leaves the rest held.
+P.reset();
+P.setWall(Date.now() + 3600_000, false); // nothing can answer
+P.dispatchPrompt('is the deploy green', undefined, { allowCodexFallback: true });
+P.dispatchPrompt('/goal ship the thing', undefined, { allowCodexFallback: true });
+P.setWall(Date.now() + 3600_000, true); // Codex comes back, Claude still walled
+P.flushParkedWalledChats();
+
+await t('★ a mixed hold releases the ordinary message and keeps the command', () => {
+  eq(P.CHAT_FALLBACK.length, 1, 'the question gets its degraded answer');
+  eq(P.parkedWalledChats.length, 1, 'and the command waits for the reset it actually needs');
+  eq(P.parkedWalledChats[0].text, '/goal ship the thing');
+});
+
+// THE BOUND: past it, he is told, rather than the message vanishing.
+P.reset();
+P.setWall(Date.now() + 3600_000, false);
+for (let i = 0; i < P.PARKED_WALLED_MAX + 2; i++) {
+  P.dispatchPrompt(`question ${i}`, undefined, { allowCodexFallback: true });
+}
+
+await t('★ past the hold bound the message is refused OUT LOUD, not dropped', () => {
+  eq(P.parkedWalledChats.length, P.PARKED_WALLED_MAX);
+  eq(P.CLAUDE.length, 0);
+  const refusals = P.SENT.filter((x) => String(x).includes('was not queued'));
+  eq(refusals.length, 2, `one line per message that could not be held: ${P.SENT.join(' | ')}`);
+});
+
+// A `bg:` MESSAGE GOES BACK TO A BG LANE. dispatchPrompt strips the prefix
+// before it builds the item, so re-dispatching with no lane sends a long job
+// through pickLane onto the CHAT lane, blocking the one lane he talks to.
+P.reset();
+P.setWall(Date.now() + 3600_000, false);
+P.dispatchPrompt('bg: write the long report', undefined, { allowCodexFallback: true });
+P.setWall(0, false);
+P.flushParkedWalledChats();
+
+await t('★ a held bg: job is released onto a BACKGROUND lane, not the chat lane', () => {
+  eq(P.CLAUDE.length, 1);
+  // The stub records lane.name, and a bg lane is named bg / bg2 / bg3.
+  ok(/^bg\d*$/.test(String(P.CLAUDE[0].lane)), `released onto ${P.CLAUDE[0].lane}`);
+});
+
+// THE MISSING BINARY IS NOT A WALL. Parking for a reset that will never come is
+// a message dropped in silence, so this case keeps its refusal.
+P.reset();
+P.setEngines({ claudeAvailable: false, codexAvailable: false });
+P.dispatchPrompt('is the deploy green', undefined, { allowCodexFallback: true });
+
+await t('★ with NO claude on the machine the message is refused, not held forever', () => {
+  eq(P.parkedWalledChats.length, 0, 'no reset is coming, so holding it is dropping it');
+  ok(P.SENT.length > 0, 'he is told');
 });
 
 // --- the swap could not be written -----------------------------------------
@@ -1251,7 +1427,14 @@ await t('chatLimitRetryPlan: every outcome maps to exactly one behaviour', () =>
   eq(P.chatLimitRetryPlan({ ...P0, outcome: 'paused' }, opts).retry.allowCodexFallback, true);
   eq(P.chatLimitRetryPlan({ ...P0, outcome: 'swapped' }, { ...opts, retried: true }), null, 'the cap');
   eq(P.chatLimitRetryPlan({ ...P0, outcome: 'swapped' }, { ...opts, priority: true }), null, 'internal traffic');
-  eq(P.chatLimitRetryPlan({ ...P0, outcome: 'exhausted' }, { ...opts, codexCanTake: false }), null, 'the loop guard');
+  // THE LOOP GUARD MOVED. It used to bail here and hand him the raw failure;
+  // dispatchPrompt parks the re-dispatch instead, so the plan is the same on
+  // both sides of it and the message survives the wall.
+  eq(
+    P.chatLimitRetryPlan({ ...P0, outcome: 'exhausted' }, { ...opts, codexCanTake: false }).retry.allowCodexFallback,
+    true,
+    'the wall path always re-dispatches now; the front door decides where it lands',
+  );
 });
 
 // --- the close handler, which is too big to extract ------------------------
@@ -2271,9 +2454,14 @@ P.reset();
 P.setWall(WALL);
 P.dispatchPrompt('bg: /autopilot ship it', undefined, { allowCodexFallback: true });
 
-await t('and during a WALL the same command waits, as it always did', () => {
+await t('★ and during a WALL the same command waits for real, not on a dead lane', () => {
   eq(P.CODEX.length, 0);
-  eq(P.CLAUDE.length, 1, 'it waits on the Claude lane');
+  // It used to be spawned on the Claude lane, which is a guaranteed limit
+  // death and a 90 second salvage, while the handoff notice said in writing
+  // that it would wait for the reset. Codex will not take a Claude slash
+  // command at any price, so the wall is the only thing it can wait for.
+  eq(P.CLAUDE.length, 0, 'spawning it is a death, not a wait');
+  eq(P.parkedWalledChats.length, 1, 'held until the reset, then re-dispatched to a bg lane');
 });
 
 P.reset();

@@ -252,6 +252,23 @@ least-recently-used account that still has headroom, and retries a chat
 message once on it. Workers already running are
 never killed by a swap — only new ones pick up the new account.
 
+**A candidate is verified before it is used.** "Still has headroom" is not the same as "nothing has
+walled it yet", and the difference cost a real afternoon: a wall rotated onto an account that had been
+out of usage credits since the night before, the retry died on it, and the raw error reached the phone.
+So each candidate now gets one usage-API call (5 second deadline) before the swap, and one the API
+says is spent is recorded in the ledger and skipped rather than tried, until an account with real
+headroom is found or every account has been asked exactly once. Every window counts, including the
+per-model weekly ones: on the account that produced that wall the five hour window was empty and the
+weekly window had room, and the wall was a per-model weekly cap at 100%. A probe that cannot be read
+is never read as a wall, so an unreachable API costs the verification and not the rotation.
+
+**With every account walled, work waits instead of failing.** A typed message and a handed-off
+background job are held and re-run by themselves at the earliest reset. Held briefs go to
+`bg-held.json` (gitignored) rather than to memory, so a restart during a wall cannot destroy one. One
+live notice covers the wall: each account with its reset clock, the earliest one, a count of what is
+held, and a "Claude is back" ending when the first window returns. `/status` shows the same ledger,
+one row per account.
+
 **Credentials never leave your machine.** Enrolled accounts live in
 `accounts.json` next to `bridge.mjs` (chmod 600, gitignored — see
 [accounts.example.json](accounts.example.json) for the shape); the live login

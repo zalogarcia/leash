@@ -741,6 +741,7 @@ export function statusHeader({
   autoCompact = null,
   wakeUp = null,
   usageBlock = null,
+  ledger = null,
 } = {}) {
   const lines = [`📍 ${name}${host ? ` on ${host}` : ''}`];
   if (cwd) lines.push(`📁 ${cwd}`);
@@ -756,6 +757,10 @@ export function statusHeader({
   // by itself, and both answer "when did it last happen".
   if (wakeUp) lines.push(wakeUp);
   if (usageBlock) lines.push(usageBlock);
+  // UNDER the live account's headroom, because it answers the next question:
+  // that block says how much is left here, this one says whether there is
+  // anywhere to go when it runs out.
+  if (ledger) lines.push(ledger);
   return lines.join('\n');
 }
 
@@ -879,12 +884,121 @@ export const WALL_TICK_MS = 5 * 60 * 1000;
  * blocked for background work only", which are very different afternoons. It
  * appears only when Codex is actually reachable and actually taking chat.
  */
-export function limitWallLine({ resetClock = null, leftText = null, codexTaking = false } = {}) {
+export function limitWallLine({ resetClock = null, leftText = null, codexTaking = false, accounts = [], heldCount = 0, timeZone = undefined, now = Date.now() } = {}) {
   const lines = ['⛔ Every Claude account is limited'];
   const bits = [resetClock ? `Resets ${resetClock}` : null, leftText ? `in ${leftText}` : null].filter(Boolean);
   lines.push(bits.length ? `⏳ ${bits.join(' · ')}` : '⏳ No reset time is known');
+  // ONE ROW PER ACCOUNT, soonest first, so the ⏳ clock above is visibly the
+  // first row rather than a number he has to trust. Before this the notice said
+  // only the earliest reset, which answers "when can I work again" and not
+  // "which of my three subscriptions is actually down". On 2026-09-11 the
+  // answer to the second was the whole complaint: the rotation had hopped onto
+  // an account that had been out of usage credits since the night before, and
+  // nothing he could read said so.
+  for (const r of sortLedger(accounts, now)) {
+    const clock = ledgerClock(r, { timeZone, now });
+    lines.push(`${STATUS_INDENT}${clip(oneLine(r.name || '?'), LEDGER_NAME_MAX)}${clock ? ` · ${clock}` : ''}`);
+  }
+  // WHAT THE WALL IS HOLDING. A handed-off job that waits for a reset is
+  // otherwise indistinguishable from one that was dropped, and the whole point
+  // of holding it rather than spawning it into the wall is that it is still
+  // going to run. One line on the message already on screen, counted live, so
+  // a second held job edits this number instead of sending a second bubble.
+  const held = Number(heldCount) || 0;
+  if (held > 0) lines.push(`📥 ${held} held · ${held === 1 ? 'it runs' : 'they run'} at the reset`);
   lines.push(codexTaking ? '🧠 Codex is taking chat messages' : 'Background work is paused until then.');
   return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// THE ACCOUNT HEALTH LEDGER, as /status shows it
+// ---------------------------------------------------------------------------
+//
+// /status carries one usage line for the LIVE account, which answers "how much
+// headroom have I got right now" and says nothing about whether the daemon can
+// move when that runs out. That was the invisible half of the 2026-09-11
+// incident: two of three accounts were walled and the only way to find out was
+// to watch a run die on one.
+//
+// So one row per account, and the row says the one thing that decides whether
+// it can take the next job: ok, or walled until a clock. Names are clipped
+// rather than wrapped, because a wrapped account name reads as two accounts.
+
+/** The row name ceiling. An address longer than this is cut, never wrapped. */
+export const LEDGER_NAME_MAX = 24;
+
+/**
+ * The reset clock for one ledger row, or null.
+ *
+ * `until` is epoch SECONDS, which is accounts.mjs's ledger unit, and
+ * fmtResetClock takes ISO strings or epoch MILLISECONDS. Handing it seconds
+ * reads as 1970 and prints a time in the past on the one row where being wrong
+ * about the clock is the whole point of the row.
+ */
+function ledgerClock(r, { timeZone, now }) {
+  const secs = Number(r?.until);
+  if (!Number.isFinite(secs) || secs <= 0) return null;
+  return fmtResetClock(secs * 1000, { timeZone, now, compact: true });
+}
+
+/**
+ * Live first, then whatever can take work, then the walled ones soonest first.
+ *
+ * Deterministic on purpose: the order is what a test asserts, and it is also
+ * the reading order the two questions want. "Where am I" is answered by the
+ * top row, "who is next" by the row under it, and "how long until I have
+ * everything back" by the last.
+ */
+function sortLedger(rows = [], now = Date.now()) {
+  return [...(rows || []).filter((r) => r && r.name)].sort((a, b) => {
+    if (!!a.live !== !!b.live) return a.live ? -1 : 1;
+    if (!!a.walled !== !!b.walled) return a.walled ? 1 : -1;
+    const ua = Number(a.until) || Infinity;
+    const ub = Number(b.until) || Infinity;
+    return ua - ub;
+  });
+}
+
+/**
+ * One row: `⛔ gjgkabche@gmail.com · Sat 1:00am`.
+ *
+ * Takes the accounts.mjs describe() shape plus a `live` flag:
+ * { name, walled, until, captured, live }.
+ *
+ * THE GLYPH CARRIES THE STATE and the value is the clock, which is what keeps
+ * this inside the bubble: "⛔ name · walled to Sat 1:00am" is 47 characters on
+ * a 44 character line, and ⛔ followed by a time already reads as "blocked
+ * until then". Same reason live-ness is a glyph rather than a suffix, and why a
+ * walled row does not carry it at all: /status names the live account on the
+ * usage line directly above this block, so a second marker there would spend
+ * the row's last characters repeating it.
+ */
+export function accountLedgerRow(r = {}, { timeZone = undefined, now = Date.now() } = {}) {
+  const clock = ledgerClock(r, { timeZone, now });
+  const state = r.walled ? clock || 'walled' : r.captured === false ? 'no login' : 'ok';
+  const glyph = r.walled ? '⛔' : r.captured === false ? '⚠️' : r.live ? '▶︎' : '✅';
+  return `${glyph} ${clip(oneLine(r.name || '?'), LEDGER_NAME_MAX)} · ${state}`;
+}
+
+/**
+ * The whole block, or '' when no account is enrolled.
+ *
+ * '' rather than a "no accounts" line for the same reason peersBlock returns
+ * it: a Codex-first install has no Claude accounts and does not need a line
+ * about it on every /status for the rest of the daemon's life.
+ *
+ * The head row carries the count because that is the fact he actually wants
+ * from this block: not which accounts exist, but whether the daemon has
+ * anywhere to go when the live one walls.
+ */
+export function accountLedgerBlock(rows = [], { timeZone = undefined, now = Date.now() } = {}) {
+  const list = (rows || []).filter((r) => r && r.name);
+  if (!list.length) return '';
+  const free = list.filter((r) => !r.walled && r.captured !== false).length;
+  return [
+    `🗂 Accounts · ${free} free of ${list.length}`,
+    ...sortLedger(list, now).map((r) => `${STATUS_INDENT}${accountLedgerRow(r, { timeZone, now })}`),
+  ].join('\n');
 }
 
 /**
@@ -893,14 +1007,32 @@ export function limitWallLine({ resetClock = null, leftText = null, codexTaking 
  * A ⏳ that stops ticking and never resolves is worse than a static line: it
  * teaches the reader that the live lines lie. This is the ✅ it becomes.
  */
-export function limitWallResolved({ clock = null, codexAnswered = 0 } = {}) {
+export function limitWallResolved({ clock = null, codexAnswered = 0, resumed = 0 } = {}) {
   const lines = [`✅ Claude is back${clock ? ` · ${clock}` : ''}`];
   const n = Number(codexAnswered) || 0;
   // Not "while it was out": the line above already said Claude is back, so the
   // clause is the third one of a sentence nobody finishes reading, and it is
   // what pushed this onto a second phone line.
   if (n > 0) lines.push(`🧠 Codex answered ${n} message${n === 1 ? '' : 's'}`);
+  // WHAT THE WALL WAS HOLDING, now running. A job held behind a wall draws its
+  // own worker card a moment after this, so the count belongs in this ending
+  // rather than in a message of its own.
+  const held = Number(resumed) || 0;
+  if (held > 0) lines.push(`▶️ Started ${held} held job${held === 1 ? '' : 's'}`);
   return lines.join('\n');
+}
+
+/**
+ * THE WALL HOLD IS FULL, so this message was not taken (ACC-04).
+ *
+ * It used to be silence: past the bound the message was neither parked nor
+ * answered nor acknowledged, on exactly the afternoon he keeps re-asking
+ * because nothing is happening. Deliberately NOT queueFull, whose second line
+ * offers `/stop <lane>`: nothing is running, so there is nothing to stop, and
+ * the only thing that helps is sending it again once the wall lifts.
+ */
+export function holdFullLine({ max = 5 } = {}) {
+  return [`📥 Holding ${Number(max) || 0} behind the wall`, 'This one was not queued · re-send it'].join('\n');
 }
 
 /**

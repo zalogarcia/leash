@@ -21,6 +21,10 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+// The probe deadline is a CONTRACT the rotation depends on (a slow API must
+// cost the verification, not the rotation), so it is asserted here against the
+// module that owns it rather than restated.
+import { PROBE_TIMEOUT_MS } from './account-selector.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -70,7 +74,10 @@ const WALL =
   "You're out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.";
 
 const HARNESS = `
-import { parseResetTime } from ${url('accounts.mjs')};
+import { parseResetTime, isLimited, earliestReset as earliestResetReal } from ${url('accounts.mjs')};
+// THE REAL SELECTION RULE. The whole point of this block is that a candidate is
+// verified before it is swapped onto, so a stub of it here would prove nothing.
+import { selectAccount, PROBE_TIMEOUT_MS } from ${url('account-selector.mjs')};
 import { resetsAtToMs, invalidateUsageCache } from ${url('account-usage.mjs')};
 import { fmtLeft } from ${url('usage-limits.mjs')};
 
@@ -95,21 +102,51 @@ export const setUsageThrows = (v) => { usageThrows = v; };
 export let usageHangs = false;
 export const setUsageHangs = (v) => { usageHangs = v; };
 export const reset = () => {
-  CALLS.length = 0; LOGS.length = 0; marked.length = 0;
+  CALLS.length = 0; LOGS.length = 0; marked.length = 0; probeCalls.length = 0;
   rotationPausedUntil = 0; rotationCooldownUntil = 0;
   USAGE_ROW = null; usageThrows = false; usageHangs = false; NEXT = { name: 'free-slot' }; swapOk = true;
+  LIST = []; PROBES = {}; ACTIVE = 'gjgkabche@gmail.com'; probeThrows = false; probeHangs = false;
+  if (wallResumeTimer) clearTimeout(wallResumeTimer);
+  wallResumeTimer = null;
 };
 export let NEXT = { name: 'free-slot' };
 export const setNext = (v) => { NEXT = v; };
 export let swapOk = true;
 export const setSwapOk = (v) => { swapOk = v; };
+export const pausedUntil = () => rotationPausedUntil;
 
+// THE STORE, as a list this test can shape. The selection rule under test is
+// the REAL one (account-selector.mjs, imported below), so the ledger it filters
+// and the probes it makes have to be real data rather than a mirror of the
+// answer.
+export let LIST = [];
+export const setList = (v) => { LIST = v; };
+// What the usage API says about each slot, by name. Absent = the probe comes
+// back unreadable, which is NOT a wall.
+export let PROBES = {};
+export const setProbes = (v) => { PROBES = v; };
+export const probeCalls = [];
 const accounts = {
-  activeAccount: async () => ({ account: { name: 'gjgkabche@gmail.com' } }),
-  markLimited: (name, resetsAt) => { marked.push({ name, resetsAt }); return { ok: true }; },
+  activeAccount: async () => ({ account: { name: ACTIVE } }),
+  listAccounts: () => LIST,
+  describe: (now = Date.now()) =>
+    LIST.map((a) => ({
+      name: a.name,
+      captured: !!a.claudeAiOauth?.accessToken,
+      limitedUntil: a.limitedUntil || null,
+      limited: isLimited(a, now),
+    })),
+  markLimited: (name, resetsAt, opts) => {
+    marked.push({ name, resetsAt, source: opts?.source || null });
+    // Written through, so the selector's next pass and earliestReset see it,
+    // exactly as the real store does.
+    const i = LIST.findIndex((a) => a.name === name);
+    if (i >= 0) LIST[i] = { ...LIST[i], limitedUntil: Number(resetsAt) || null };
+    return { ok: true };
+  },
   nextAvailable: () => NEXT,
   swapTo: async (name) => { CALLS.push({ swapTo: name }); return swapOk ? { ok: true } : { ok: false, error: 'keychain said no' }; },
-  earliestReset: () => Math.floor((NOW + 2 * ${HOUR}) / 1000),
+  earliestReset: () => earliestResetReal(LIST, Date.now()),
 };
 const accountUsage = {
   activeOnly: async () => {
@@ -118,7 +155,27 @@ const accountUsage = {
     if (usageHangs) return new Promise(() => {});
     return { active: {}, row: USAGE_ROW };
   },
+  one: async (name) => {
+    probeCalls.push(name);
+    if (probeThrows) throw new Error('usage API unreachable');
+    if (probeHangs) return new Promise(() => {});
+    return PROBES[name] ?? null;
+  },
 };
+export let ACTIVE = 'gjgkabche@gmail.com';
+export const setActive = (v) => { ACTIVE = v; };
+export let probeThrows = false;
+export const setProbeThrows = (v) => { probeThrows = v; };
+export let probeHangs = false;
+export const setProbeHangs = (v) => { probeHangs = v; };
+// What armWallResume would wake, stubbed: the hold and the release belong to
+// bg-notify.test.mjs and bg-codex-wiring.test.mjs, which own the drain and the
+// chat lane. Here they only have to exist.
+const parkedWalledChats = [];
+const parkedWalledJobs = [];
+const flushParkedWalledChats = () => {};
+const flushParkedWalledJobs = () => {};
+let wallResumeTimer = null;
 // The REAL body (the .catch matters: it is what makes a rejecting API resolve
 // to the fallback rather than throw), with a short fuse so the hang case does
 // not hold the suite up for six seconds.
@@ -140,14 +197,31 @@ const B = await import(
       [
         HARNESS,
         grab('usageResetFor'),
+        grab('logAccountDecision'),
+        grab('pickHealthyAccount'),
+        grab('claudeWallFacts'),
+        grab('raiseClaudeWall'),
+        grab('armWallResume'),
         grab('rotateOffLimitedAccount'),
-        'export { usageResetFor, rotateOffLimitedAccount };',
+        'export { usageResetFor, pickHealthyAccount, rotateOffLimitedAccount, claudeWallFacts };',
       ].join('\n'),
     )
 );
 
 const win = (percent, resetsAt) => ({ percent, resetsAt, severity: null, locked: null });
 const row = (usage, name = 'gjgkabche@gmail.com') => ({ name, state: 'ok', usage });
+// A slot as accounts.json holds one. `limitedUntil` is epoch SECONDS.
+const slot = (name, extra = {}) => ({ name, claudeAiOauth: { accessToken: 'a', refreshToken: 'r' }, ...extra });
+// The real store on 2026-09-11 12:46 ET: the account that walled, the one that
+// had been out of usage credits since the night before with NOTHING in the
+// ledger saying so, and a healthy one.
+const THREE = () => [
+  slot('gjgkabche@gmail.com'),
+  slot('zalo@blackumbrella.app'),
+  slot('hello@blackumbrella.app'),
+];
+// The probe reading of an account with headroom.
+const HEALTHY = (name) => row({ fiveHour: win(13, iso(4 * HOUR)), sevenDay: win(18, iso(100 * HOUR)), scoped: [], extraUsage: null }, name);
 
 // ---------------------------------------------------------------------------
 console.log('\n1. usageResetFor: which window is the wall');
@@ -260,6 +334,8 @@ console.log('\n2. rotateOffLimitedAccount: the clockless wall end to end');
 // ---------------------------------------------------------------------------
 
 B.reset();
+B.setList(THREE());
+B.setProbes({ 'zalo@blackumbrella.app': HEALTHY('zalo@blackumbrella.app'), 'hello@blackumbrella.app': HEALTHY('hello@blackumbrella.app') });
 B.setUsageRow(row({ fiveHour: win(100, iso(6 * HOUR)), sevenDay: win(100, iso(40 * HOUR)), scoped: [], extraUsage: null }));
 let rot = await B.rotateOffLimitedAccount(WALL);
 await t('★ the wall with no clock marks the account until the API window, not one hour out', () => {
@@ -280,6 +356,8 @@ await t('★ the wall with no clock marks the account until the API window, not 
 });
 
 B.reset();
+B.setList(THREE());
+B.setProbes({ 'zalo@blackumbrella.app': HEALTHY('zalo@blackumbrella.app'), 'hello@blackumbrella.app': HEALTHY('hello@blackumbrella.app') });
 B.setUsageRow(row({ fiveHour: win(20, iso(HOUR)), sevenDay: win(30, iso(HOUR)), scoped: [], extraUsage: null }));
 rot = await B.rotateOffLimitedAccount(WALL);
 await t('when the API cannot better it, the guess still marks and still swaps', () => {
@@ -289,6 +367,8 @@ await t('when the API cannot better it, the guess still marks and still swaps', 
 });
 
 B.reset();
+B.setList(THREE());
+B.setProbes({ 'zalo@blackumbrella.app': HEALTHY('zalo@blackumbrella.app'), 'hello@blackumbrella.app': HEALTHY('hello@blackumbrella.app') });
 B.setUsageRow(row({ fiveHour: win(100, iso(6 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }));
 rot = await B.rotateOffLimitedAccount("You've hit your session limit · resets 6:30pm (America/Caracas)");
 await t('★ a wall that DOES carry a clock never asks the usage API', () => {
@@ -298,13 +378,172 @@ await t('★ a wall that DOES carry a clock never asks the usage API', () => {
 });
 
 B.reset();
-B.setNext(null);
+// Every other slot already known limited in the ledger: nothing to move to,
+// and nothing to probe either.
+B.setList([
+  slot('gjgkabche@gmail.com'),
+  slot('zalo@blackumbrella.app', { limitedUntil: Math.floor((NOW + 3 * HOUR) / 1000) }),
+  slot('hello@blackumbrella.app', { limitedUntil: Math.floor((NOW + 9 * HOUR) / 1000) }),
+]);
 B.setUsageRow(row({ fiveHour: win(100, iso(6 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }));
 rot = await B.rotateOffLimitedAccount(WALL);
 await t('the enrichment still runs when nothing is free to swap to', () => {
   eq(rot.outcome, 'exhausted');
   eq(B.marked[0].resetsAt, Math.floor((NOW + 6 * HOUR) / 1000), 'the wall clock has to be right precisely then');
   ok(B.CALLS.some((c) => c.raiseWall === 'claude'), 'and the wall notice goes up');
+  eq(B.probeCalls.length, 0, 'an account the ledger already walled is never probed and never hopped onto');
+  // The wall waits for the EARLIEST reset in the ledger, not for the account
+  // that just died: it is the first moment anything can run again.
+  eq(B.pausedUntil(), NOW + 3 * HOUR, 'three hours out is the first account back');
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n3. THE 12:46 INCIDENT: the rotation asks before it hops');
+// ---------------------------------------------------------------------------
+// hello@ hit its session limit, the rotation swapped onto gjgkabche@ (out of
+// usage credits since the night before, and NOT walled in the ledger, because
+// nothing had died on it yet), the retry died, the chat lane showed the raw
+// "You're out of usage credits" card and two workers died the same way.
+//
+// The live probe of that account, taken the same afternoon, is the fixture
+// below: the five hour window EMPTY, the weekly window at 97%, and the wall
+// hiding in the per-model weekly scoped row at 100%.
+
+const OUT_OF_CREDITS = (name) =>
+  row(
+    {
+      fiveHour: { percent: 0, resetsAt: null, severity: 'normal', locked: null },
+      sevenDay: win(97, iso(12 * HOUR)),
+      scoped: [{ label: 'Fable', percent: 100, resetsAt: iso(12 * HOUR) }],
+      extraUsage: { enabled: false, percent: 0, usedCredits: 0, monthlyLimit: 50000 },
+    },
+    name,
+  );
+
+B.reset();
+B.setActive('hello@blackumbrella.app');
+B.setList(THREE());
+B.setProbes({
+  // rotation order is least-recently-active, and nothing here has ever run, so
+  // gjgkabche@ is asked first: exactly the account the old code hopped onto.
+  'gjgkabche@gmail.com': OUT_OF_CREDITS('gjgkabche@gmail.com'),
+  'zalo@blackumbrella.app': HEALTHY('zalo@blackumbrella.app'),
+});
+B.setUsageRow(row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: win(54, iso(100 * HOUR)), scoped: [], extraUsage: null }, 'hello@blackumbrella.app'));
+rot = await B.rotateOffLimitedAccount(WALL);
+
+await t('★ the out-of-credits account is SKIPPED, not swapped onto', () => {
+  eq(rot.outcome, 'swapped');
+  eq(rot.nextName, 'zalo@blackumbrella.app', 'it kept going until it found one with headroom');
+  eq(B.CALLS.filter((c) => c.swapTo).length, 1, 'and only swapped once');
+  eq(B.CALLS.find((c) => c.swapTo).swapTo, 'zalo@blackumbrella.app');
+});
+
+await t('★ the skip is because of the SCOPED window, which the obvious rule misses', () => {
+  // fiveHour 0% and sevenDay 97%: a check of "5h or weekly at 100" calls this
+  // account healthy and reproduces the incident exactly.
+  ok(B.probeCalls.includes('gjgkabche@gmail.com'), `it asked: ${B.probeCalls.join(', ')}`);
+  const m = B.marked.find((x) => x.name === 'gjgkabche@gmail.com');
+  ok(m, `the skipped account is walled in the ledger: ${JSON.stringify(B.marked)}`);
+  eq(m.resetsAt, Math.floor((NOW + 12 * HOUR) / 1000), 'until the window the API named');
+  eq(m.source, 'probe', 'and the ledger records that this wall was learned by asking, not by dying');
+});
+
+await t('the decision log names every step', () => {
+  const log = B.LOGS.join('\n');
+  ok(log.includes('account_walled'), log);
+  ok(log.includes('account_selected'), log);
+  ok(log.includes('account=zalo@blackumbrella.app'), log);
+});
+
+await t('the handback note tells M which account was skipped and why', () => {
+  const note = rot.lines.join('\n');
+  ok(note.includes('Skipped "gjgkabche@gmail.com"'), note);
+  ok(note.includes('weekly Fable window is spent'), note);
+});
+
+// An account the ledger ALREADY knows is walled costs no round trip at all.
+B.reset();
+B.setActive('hello@blackumbrella.app');
+B.setList([
+  slot('gjgkabche@gmail.com', { limitedUntil: Math.floor((NOW + 12 * HOUR) / 1000) }),
+  slot('zalo@blackumbrella.app'),
+  slot('hello@blackumbrella.app'),
+]);
+B.setProbes({ 'zalo@blackumbrella.app': HEALTHY('zalo@blackumbrella.app') });
+B.setUsageRow(null);
+rot = await B.rotateOffLimitedAccount(WALL);
+
+await t('★ a known-walled account is never probed and never hopped onto', () => {
+  eq(rot.nextName, 'zalo@blackumbrella.app');
+  ok(!B.probeCalls.includes('gjgkabche@gmail.com'), `no round trip for a known wall: ${B.probeCalls.join(', ')}`);
+  ok(B.LOGS.join('\n').includes('account_skipped_known_walled'), B.LOGS.join('\n'));
+});
+
+// EVERY ACCOUNT SPENT: the cycle ends, it does not loop, and the wall clock is
+// the earliest of the three.
+B.reset();
+B.setActive('hello@blackumbrella.app');
+B.setList(THREE());
+B.setProbes({
+  'gjgkabche@gmail.com': OUT_OF_CREDITS('gjgkabche@gmail.com'),
+  'zalo@blackumbrella.app': row({ fiveHour: win(100, iso(3 * HOUR)), sevenDay: win(40, iso(90 * HOUR)), scoped: [], extraUsage: null }, 'zalo@blackumbrella.app'),
+});
+B.setUsageRow(row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }, 'hello@blackumbrella.app'));
+rot = await B.rotateOffLimitedAccount(WALL);
+
+await t('★ with every account spent it cycles through all of them exactly once, then walls', () => {
+  eq(rot.outcome, 'exhausted');
+  eq(B.probeCalls.length, 2, `each candidate asked once, never twice: ${B.probeCalls.join(', ')}`);
+  eq(new Set(B.probeCalls).size, 2, 'and never the same one twice');
+  eq(B.CALLS.filter((c) => c.swapTo).length, 0, 'nothing was swapped onto');
+  eq(B.marked.length, 3, 'all three are in the ledger: the one that died and the two that were asked');
+  ok(B.LOGS.join('\n').includes('all_accounts_walled_until'), B.LOGS.join('\n'));
+  // The wall waits for the soonest of the three, which is the account that
+  // just died (two hours), not the twelve-hour weekly window.
+  eq(B.pausedUntil(), NOW + 2 * HOUR, 'the first moment anything can run again');
+});
+
+// A PROBE THAT CANNOT BE READ IS NOT A WALL. Walling every account on a network
+// blip would be worse than the behaviour this replaced.
+B.reset();
+B.setActive('hello@blackumbrella.app');
+B.setList(THREE());
+B.setProbeThrows(true);
+B.setUsageRow(null);
+rot = await B.rotateOffLimitedAccount(WALL);
+
+await t('★ an unreachable usage API takes the candidate anyway, and says so', () => {
+  eq(rot.outcome, 'swapped', 'a network blip must not wall a working subscription');
+  eq(B.marked.length, 1, 'only the account that actually died is marked');
+  ok(B.LOGS.join('\n').includes('account_probe_failed'), B.LOGS.join('\n'));
+  ok(rot.lines.join('\n').includes('trying it anyway'), rot.lines.join('\n'));
+});
+
+B.reset();
+B.setActive('hello@blackumbrella.app');
+B.setList(THREE());
+B.setProbeHangs(true);
+B.setUsageRow(null);
+rot = await B.rotateOffLimitedAccount(WALL);
+
+await t('a probe that never answers is deadlined, not waited on', () => {
+  eq(rot.outcome, 'swapped');
+  ok(PROBE_TIMEOUT_MS <= 5000, `the probe deadline stays at five seconds, not ${PROBE_TIMEOUT_MS}`);
+});
+
+// The wall notice's rows come off the ledger.
+B.reset();
+B.setList([
+  slot('gjgkabche@gmail.com', { limitedUntil: Math.floor((NOW + 12 * HOUR) / 1000) }),
+  slot('zalo@blackumbrella.app', { limitedUntil: Math.floor((NOW + 2 * HOUR) / 1000) }),
+  slot('hello@blackumbrella.app'),
+]);
+await t('claudeWallFacts reads the earliest reset and one row per account', () => {
+  const f = B.claudeWallFacts(NOW);
+  eq(f.rows.length, 3);
+  eq(f.earliest, Math.floor((NOW + 2 * HOUR) / 1000), 'the soonest wall, so the clock is the one he waits on');
+  eq(f.rows.filter((r) => r.walled).length, 2);
 });
 
 // ---------------------------------------------------------------------------

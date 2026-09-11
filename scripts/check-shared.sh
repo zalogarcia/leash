@@ -56,6 +56,8 @@ SHARED_MODULES=(
   accounts.test.mjs
   account-usage.mjs
   account-usage.test.mjs
+  account-selector.mjs
+  account-selector.test.mjs
   account-buttons.mjs
   account-buttons.test.mjs
   credential-store.mjs
