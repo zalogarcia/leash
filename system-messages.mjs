@@ -739,6 +739,7 @@ export function statusHeader({
   ctxPct = null,
   threadNote = '',
   autoCompact = null,
+  wakeUp = null,
   usageBlock = null,
 } = {}) {
   const lines = [`📍 ${name}${host ? ` on ${host}` : ''}`];
@@ -751,6 +752,9 @@ export function statusHeader({
   // The auto compact row sits under the chat line it describes: it is a fact
   // about THIS chat's context, so it reads next to the percentage.
   if (autoCompact) lines.push(autoCompact);
+  // The wake-up row sits under it: both are the daemon acting on this chat
+  // by itself, and both answer "when did it last happen".
+  if (wakeUp) lines.push(wakeUp);
   if (usageBlock) lines.push(usageBlock);
   return lines.join('\n');
 }
@@ -1098,6 +1102,117 @@ export function autoCompactStatusLine({ enabled = false, thresholdPercent = 60, 
   if (!enabled) return '📦 auto compact off';
   const last = Number.isFinite(lastAt) && lastAt > 0 ? `last ${fmtResetClock(lastAt, { timeZone, now, compact: true })}` : 'never yet';
   return `📦 auto compact on · ${thresholdPercent}% · ${last}`;
+}
+
+// ---------------------------------------------------------------------------
+// WAKE-UP: the turn the daemon writes when the chat may have unfinished work
+// ---------------------------------------------------------------------------
+//
+// 2026-09-11: the chat session was cut mid turn by a daemon restart with five
+// briefs written and not yet dispatched, and the next boot resumed the session
+// and waited. Fifty minutes later the owner noticed. wake-up.mjs holds the
+// decision; these are the two texts it can produce, and the /status row that
+// says when it last did. They are model-facing prompts, written in the house
+// style anyway: one fact per line, the icon first, no dashes, the quoted tails
+// on their own lines. The first line is the tag that marks the turn as daemon
+// authored in the transcript; it is the one line whose length follows the
+// owner's name.
+
+/** The bounded tail of a message, quoted on its own line. */
+function quotedTail(text, max) {
+  const s = clip(oneLine(String(text ?? '')), max);
+  return s ? `"${s}"` : null;
+}
+
+// The last assistant message rides in the ring at four hundred characters;
+// the prompt keeps three hundred of it. The cut turn's own prompt is shorter
+// still: it is there to name the turn, not to replay it.
+export const WAKE_UP_TAIL_MAX = 300;
+export const WAKE_UP_PROMPT_MAX = 160;
+
+/**
+ * The restart wake-up. `previous` is what the last daemon left behind:
+ * `{ state: 'cut', at, prompt }` for a turn that never reached its terminal
+ * state, or `{ state: 'ended', at }` for one that ended normally and whose
+ * last words made a commitment. `lastWords` is the ring's last assistant text,
+ * already redacted and clipped by the ring.
+ */
+export function restartWakeUpPrompt({
+  name = 'M',
+  ownerName = 'the owner',
+  restartedAt = null,
+  previous = null,
+  lastWords = '',
+  timeZone = undefined,
+  now = Date.now(),
+} = {}) {
+  const clock = (ms) => (Number.isFinite(ms) && ms > 0 ? fmtResetClock(ms, { timeZone, now, compact: true }) : null);
+  const lines = [`[Bridge wake-up, daemon authored, not ${ownerName}.]`];
+  const at = clock(restartedAt);
+  lines.push(`🔄 ${name} restarted${at ? ` at ${at}` : ''}`);
+  if (previous?.state === 'cut') {
+    lines.push('✂️ Last turn was cut mid turn');
+    const began = clock(previous.at);
+    const answering = quotedTail(previous.prompt, WAKE_UP_PROMPT_MAX);
+    if (began || answering) lines.push(`🕐 It began${began ? ` at ${began}` : ''}${answering ? ', answering:' : ''}`);
+    if (answering) lines.push(answering);
+  } else if (previous?.state === 'ended') {
+    const ended = clock(previous.at);
+    lines.push(`✅ Last turn ended normally${ended ? ` at ${ended}` : ''}`);
+  }
+  const tail = quotedTail(lastWords, WAKE_UP_TAIL_MAX);
+  if (tail) {
+    lines.push(`💬 Your last words to ${ownerName}:`);
+    lines.push(tail);
+  }
+  lines.push(
+    '🔍 Check for unfinished work now:',
+    '↳ pending dispatches',
+    '↳ promised deliveries',
+    '↳ workers to collect',
+    '↳ files written but not used',
+    'Finish it now, without waiting.',
+    'If nothing is pending, reply in one line.',
+  );
+  return lines.join('\n');
+}
+
+/**
+ * The header of the prime a compaction hands the fresh chat, in its two
+ * modes. `wait` is the prime every compaction used before this existed;
+ * `continue` is chosen when the summary's "Unfinished work" section is not
+ * empty (wake-up.mjs reads it), and it tells the fresh chat to carry on
+ * instead of standing still.
+ */
+export function compactPrimeHeader({ ownerName = 'the owner', mode = 'wait' } = {}) {
+  const lines = [
+    `[Session handoff, daemon authored, not ${ownerName}.]`,
+    '📦 The summary below is your context now',
+    `💬 Your last chat with ${ownerName}, compacted`,
+    '✅ Acknowledge in ONE short line first:',
+    '↳ what you are in the middle of',
+  ];
+  if (mode === 'continue') {
+    lines.push('⚠️ Its "Unfinished work" list is not empty', '▶️ Then continue that unfinished work now', 'Do not wait for the next message.');
+  } else {
+    lines.push(`⏸ Then wait for ${ownerName}'s next message`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * The /status row. One line: on or off (per half), and when the last wake-up
+ * went out and why. "never yet" rather than nothing, for the same reason the
+ * auto compact row says it.
+ */
+export function wakeUpStatusLine({ afterRestart = true, afterCompact = true, lastAt = null, reason = null, timeZone = undefined, now = Date.now() } = {}) {
+  if (!afterRestart && !afterCompact) return '⏰ wake-up off';
+  const on = afterRestart && afterCompact ? 'on' : afterRestart ? 'restart only' : 'compact only';
+  const last =
+    Number.isFinite(lastAt) && lastAt > 0
+      ? `last ${fmtResetClock(lastAt, { timeZone, now, compact: true })}${reason ? ` (${reason})` : ''}`
+      : 'never yet';
+  return `⏰ wake-up ${on} · ${last}`;
 }
 
 // ---------------------------------------------------------------------------

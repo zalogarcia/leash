@@ -30,6 +30,7 @@
   "style": { "noDashes": false },
   "progress": { "background": true },
   "autoCompact": { "enabled": false, "thresholdPercent": 60, "cooldownMinutes": 30 },
+  "wakeUp": { "afterRestart": true, "afterCompact": true },
 
   "logFile": "",
 
@@ -61,6 +62,7 @@
     "style": "{\"noDashes\": true} rewrites em and en dashes out of every outbound reply, on both engines, leaving code spans, fenced blocks and URLs alone. Default false: the model keeps its own voice.",
     "progress": "{\"background\": false} turns off the live 🌙 line a background worker keeps on screen from dispatch to done. Default true.",
     "autoCompact": "{\"enabled\": true} lets the daemon run the same compaction /compact runs, by itself, when a chat turn ends with the session at or past thresholdPercent of its context window and nothing is queued, steered or asked and unanswered. The live message says it was automatic. cooldownMinutes is the least time between two compactions, manual or automatic. Default off, 60, 30.",
+    "wakeUp": "afterRestart: true sends the chat ONE wake-up turn after a daemon restart when the last process was cut mid turn (a persisted turn-in-flight marker, not a guess from timestamps) or its last answer promised a next step, telling it to finish any unfinished work now: pending dispatches, promised deliveries, workers to collect, files written but not used. Skipped when you already sent a message after the restart, on a walled engine, on a Codex chat lane, and never twice for the same turn. afterCompact: true makes the fresh chat a compaction opens CONTINUE the summary's Unfinished work list instead of acknowledging and waiting. Both default true; a bare false turns both off.",
     "logFile": "Where the daemon writes its own log. Empty = the path the service manager already gives it (launchd / systemd).",
     "bgTailMs": "How often the daemon polls a detached worker's log file, in ms. This replaces the stdout pipe. Default 300.",
     "reattachPollMs": "How often to check whether a worker that outlived a daemon restart has exited, in ms. Default 5000.",

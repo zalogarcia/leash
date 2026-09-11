@@ -51,6 +51,15 @@ import {
 } from './progress-render.mjs';
 import { execJson, fmtTokens, readRateLimits, fmtLeft, fmtLimit, modelWindow } from './usage-limits.mjs';
 import { autoCompactConfig, autoCompactLogLine, contextPercent, decideAutoCompact } from './auto-compact.mjs';
+import {
+  wakeUpConfig,
+  decideRestartWakeUp,
+  restartWakeUpLogLine,
+  lastAnswerRecord,
+  compactPrimeMode,
+  compactWakeUpLogLine,
+  unfinishedWorkClause,
+} from './wake-up.mjs';
 import { createAccountStore, fingerprint, isLimitSignal, parseResetTime } from './accounts.mjs';
 import {
   createAccountUsage,
@@ -137,6 +146,10 @@ import {
   autoCompactDoneLine,
   autoCompactFailedLine,
   autoCompactStatusLine,
+  restartWakeUpPrompt,
+  compactPrimeHeader,
+  wakeUpStatusLine,
+  WAKE_UP_PROMPT_MAX,
   WALL_TICK_MS,
   limitWallLine,
   limitWallResolved,
@@ -213,6 +226,7 @@ import {
   codexThinkingLine,
   codexThreadStatus,
   isCodexImage,
+  redactTokens,
 } from './bg-codex.mjs';
 import {
   HANDOFF_CAPTURE_MS,
@@ -532,6 +546,19 @@ if (IS_ENTRYPOINT) mkdirSync(INBOX_DIR, { recursive: true });
 
 function saveState() {
   writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+/**
+ * Drop the chat lane's turn-in-flight marker, if it is this run's. Guarded by
+ * the run's own id so a late close from an earlier run can never clear the
+ * marker of the one now running.
+ */
+function clearTurnInFlight(run) {
+  if (!run?.markerId) return;
+  const st = chatState();
+  if (st.chatTurnInFlight?.runId !== run.markerId) return;
+  delete st.chatTurnInFlight;
+  saveState();
 }
 
 function chatState() {
@@ -1236,6 +1263,79 @@ async function maybeAutoCompact({ wasCompaction = false, stopped = false, pct = 
   if (!res.ok) console.log(`[bridge] auto_compact_skipped reason=${res.reason} pct=${decision.pct}`);
 }
 
+/**
+ * The restart wake-up, decided at the chat lane's first idle moment after the
+ * first poll of this process, and re-decided at every later idle moment while
+ * the decision is deferred (a worker report that happened to land first holds
+ * the lane for as long as it holds it). Every fact goes through the pure
+ * decision in wake-up.mjs and every outcome is one log line; a deferral logs
+ * once per reason, not once per poll.
+ *
+ * Called from two places, both cheap and both guarded by the slot: the poll
+ * loop after each batch of updates (so the owner's backlog is known before the
+ * first decision), and the chat lane's close handler (the next idle moment).
+ */
+function maybeRestartWakeUp() {
+  const w = restartWakeUp;
+  if (!w?.pending) return;
+  const st = chatState();
+  const decision = decideRestartWakeUp({
+    config: WAKE_UP,
+    inFlight: w.cut,
+    ring: readChatRing(),
+    lastAnswer: st.lastAnswer || null,
+    engine: chatLaneEngine(),
+    claudeAvailable: CLAUDE_AVAILABLE,
+    hasSession: Boolean(st.sessionId),
+    // /new, /resume or a compaction since boot: the cut turn was another
+    // chat's, and the fresh one was primed for whatever it needs to continue.
+    sessionChanged: Boolean(st.sessionId) && st.sessionId !== w.sessionAtBoot,
+    walled: claudeWalled(),
+    ownerMessage: ownerMessageSinceBoot,
+    laneBusy: Boolean(LANES.main.current),
+    queued: LANES.main.queue.length + (mediaGroup && !mediaGroup.done ? 1 : 0),
+    lastWakeUp: st.lastWakeUp || null,
+  });
+  if (decision.defer) {
+    if (w.deferred !== decision.reason) {
+      w.deferred = decision.reason;
+      console.log(restartWakeUpLogLine(decision));
+    }
+    return;
+  }
+  w.pending = false;
+  console.log(restartWakeUpLogLine(decision));
+  // The marker the last daemon left is consumed HERE, at the final decision,
+  // not at boot: a boot that died before this point would otherwise have
+  // eaten the marker and woken nobody. Guarded, because a run that started
+  // meanwhile (a worker report, the owner's message) owns the slot now.
+  if (w.cut && st.chatTurnInFlight?.runId === w.cut.runId) delete st.chatTurnInFlight;
+  if (!decision.wake) {
+    saveState();
+    return;
+  }
+  // Stamped BEFORE the dispatch. The key is the turn (or the answer) this
+  // wake-up is for, so a second boot that somehow reads the same facts skips.
+  // A restart that cuts the wake-up turn ITSELF is a new cut turn and wakes
+  // again, on purpose: the work it was sent to finish is still unfinished.
+  st.lastWakeUp = { at: Date.now(), reason: 'restart', key: decision.key };
+  saveState();
+  const prompt = restartWakeUpPrompt({
+    name: BRIDGE_NAME,
+    ownerName: OWNER_NAME,
+    restartedAt: BOOT_AT,
+    previous: decision.cut
+      ? { state: 'cut', at: decision.cut.at, prompt: decision.cut.prompt }
+      : { state: 'ended', at: decision.last?.ts ?? null },
+    lastWords: decision.last?.text || '',
+    timeZone: OWNER_TZ,
+  });
+  // A normal chat turn: its answer reaches the owner, and its prompt is
+  // recorded in the ring under the daemon's own tag. priority, so it is never
+  // dropped for queue limits and runs before anything queued behind it.
+  dispatchPrompt(prompt, LANES.main, { priority: true });
+}
+
 // ---------------------------------------------------------------------------
 // THE LIVE BACKGROUND WORKER LINE
 //
@@ -1272,6 +1372,23 @@ const BG_PROGRESS_ON = String(confObj('progress').background ?? 'true') !== 'fal
 // conf() rather than confObj(): the parser takes the env layer's JSON text and
 // a bare `true` itself, so one read serves config.json and the environment.
 const AUTO_COMPACT = autoCompactConfig(conf('autoCompact', {}));
+
+// WAKE-UP. After a restart, and after a compaction, the chat session may be
+// holding unfinished work it will never resume by itself: on 2026-09-11 a
+// restart cut a turn with five briefs written and not dispatched, and the
+// session sat on them for fifty minutes because nothing asked it to look. The
+// rule is wake-up.mjs; this is the block it reads, `wakeUp: { afterRestart,
+// afterCompact }` in config.json. Both default ON.
+const WAKE_UP = wakeUpConfig(conf('wakeUp', {}));
+// When THIS process came up, for the restart wake-up's "restarted at" line.
+const BOOT_AT = Date.now();
+// The restart wake-up's one slot: set at boot from the marker the previous
+// daemon left (or did not), decided at the first idle moment after the first
+// poll, and never more than once per process. See maybeRestartWakeUp.
+let restartWakeUp = null; // { pending, cut, deferred }
+// The owner typed something since this boot. The restart wake-up defers to
+// that: their message wins, whatever the last daemon left behind.
+let ownerMessageSinceBoot = false;
 
 // How long a worker line keeps ticking after its run vanished without a
 // terminal edit. Minutes, not seconds: the close handler clears lane.current
@@ -1537,6 +1654,27 @@ function runClaude(
     // conversation needs. It still gets one start line and one final edit.
     const liveProgress = !isBgLane;
     const logPath = isBgLane ? path.join(RUNS_DIR, `${lane.name || 'bg'}-${startedAt}.jsonl`) : null;
+    // THE TURN IN FLIGHT MARKER, chat lane only. Written to state.json before
+    // the spawn and cleared at every terminal state of this run (the close
+    // handler, the spawn-error handler), so a daemon that dies under the run
+    // leaves it on disk for the next boot to READ. That is what makes "was a
+    // turn cut by the restart" a fact rather than a guess from timestamps:
+    // on 2026-09-11 a restart cut a handback turn between a tool result and
+    // the model's next call, and nothing in the daemon knew. `kind` is what
+    // the next boot needs to decide: a cut compaction leaves the chat as it
+    // was and is not resumed, a cut handback or a cut owner message is.
+    // The prompt is clipped and redacted here, because this is the one new
+    // place a chat prompt lands on disk outside the ring.
+    if (lane === LANES.main) {
+      run.markerId = `main-${startedAt}`;
+      st.chatTurnInFlight = {
+        runId: run.markerId,
+        at: startedAt,
+        prompt: redactTokens(clip(oneLine(rawText), WAKE_UP_PROMPT_MAX)),
+        kind: rawText.startsWith(COMPACT_MARKER) ? 'compact' : priority ? 'internal' : 'owner',
+      };
+      saveState();
+    }
     const { child } = spawnWorker(CLAUDE_BIN, args, { cwd, env: { ...process.env }, logPath });
     run.child = child;
     run.logPath = logPath; // /status and any future salvage want to find the log
@@ -1949,6 +2087,7 @@ function runClaude(
         detail: e.message,
         remedy: claudeFailureRemedy(classifyClaudeFailure(e.message)),
       });
+      clearTurnInFlight(run); // a spawn failure is a terminal state too, once the owner has been told
       resolve();
       drainQueue(lane);
     });
@@ -1970,6 +2109,12 @@ function runClaude(
       // deregister it before any await, or a restart inside this handler's async
       // tail would make the watchdog announce a worker that actually reported.
       if (run.watchdogId) inflight.clear(run.watchdogId);
+      // NOT the chat lane's marker, not yet. From the owner's side the turn
+      // is over when its answer has reached the phone, and that is several
+      // awaits below; safe-restart.sh kickstarts the moment the child count
+      // hits zero, which is exactly this window. A restart in it loses the
+      // reply, and a marker still on disk is what makes the next boot ask the
+      // session to look (QA, 2026-09-11). Cleared after the delivery arms.
       const wasStopped = run.stopped;
       // The run is over, so nothing can answer a side question any more. AFTER
       // the final tail pump above, which is what gives an answer written
@@ -2223,8 +2368,16 @@ function runClaude(
         // stale number could re-arm the trigger on a chat that is nearly empty.
         delete st.lastContextTokens;
         st.gen_main = (st.gen_main || 0) + 1;
-        saveState();
         const archived = prev ? prev.slice(0, 8) : null;
+        // WHICH PRIME THE FRESH CHAT GETS. The summary was asked to end with an
+        // "Unfinished work" section; when it lists something, the fresh chat
+        // is told to continue it now rather than acknowledge and wait, which
+        // is the compaction half of the wake-up (wake-up.mjs). One decision,
+        // one log line, on the manual and the automatic path alike.
+        const prime = compactPrimeMode({ config: WAKE_UP, summary: resultTexts[0] });
+        console.log(compactWakeUpLogLine(prime));
+        if (prime.mode === 'continue') st.lastWakeUp = { at: Date.now(), reason: 'compact', key: `compact:${prev || Date.now()}` };
+        saveState();
         const wasAuto = Boolean(compactNotice?.auto);
         const fromPct = compactNotice?.pct ?? null;
         const doneMsgId = compactNotice?.msgId ?? null;
@@ -2244,7 +2397,7 @@ function runClaude(
           // resultTexts[0]: compact runs are steer-proof so there is only one
           // turn, but if anything ever slips through, the FIRST answer is the
           // summary — later ones would be replies to whatever slipped in.
-          `[Session handoff — the summary below is the compacted context of your previous chat with ${OWNER_NAME}. It is your starting context. Acknowledge in ONE short line (what you're in the middle of), then wait for the next message.]\n\n${resultTexts[0]}`,
+          `${compactPrimeHeader({ ownerName: OWNER_NAME, mode: prime.mode })}\n\n${resultTexts[0]}`,
           LANES.main,
           { priority: true },
         );
@@ -2252,6 +2405,11 @@ function runClaude(
         // One bubble per turn — a steer that became its own turn produced two
         // answers, and BOTH belong to the owner.
         recordChatTurn({ engine: 'claude', role: 'assistant', text: resultTexts.join('\n'), paths: touched });
+        // What the restart wake-up reads: the commitment phrase and the tail
+        // of the WHOLE answer, not the ring row's four hundred head characters
+        // (the next step is usually the last sentence). Redacted like the ring.
+        st.lastAnswer = lastAnswerRecord(resultTexts.join('\n'), { redact: redactTokens });
+        saveState();
         for (const t of resultTexts) await sendResult(t).catch(() => {});
       } else if (resultEvent?.is_error || code !== 0) {
         // A textless failure. `limitPlan` can never be set here (its own arm
@@ -2267,6 +2425,11 @@ function runClaude(
       } else {
         await send('⚠️ The run ended with no output.', { markdown: false }).catch(() => {});
       }
+      // The chat lane's marker, now: whatever this turn had to say has been
+      // sent (or re-dispatched, or reported as a failure), so a restart from
+      // here on cuts nothing. Guarded by the run id, so a re-dispatch above
+      // that already wrote its own marker keeps it.
+      clearTurnInFlight(run);
       finishing--;
       if (lane.finishing) lane.finishing--;
       // The assistant has finished with whatever reports it was handed, so the lines
@@ -2287,6 +2450,10 @@ function runClaude(
         );
       }
       drainQueue(lane);
+      // The chat lane's next idle moment, for a restart wake-up that was
+      // deferred behind this run. After drainQueue: a queued message that just
+      // claimed the lane defers it once more, as it should.
+      if (lane === LANES.main) maybeRestartWakeUp();
       gcBgLane(lane);
     });
   });
@@ -2332,7 +2499,10 @@ function matchArchive(archive, ref) {
 const COMPACT_MARKER = '[[BRIDGE-COMPACT]]';
 const COMPACT_PROMPT =
   COMPACT_MARKER +
-  ' Produce a compaction summary of this entire conversation for a successor session that will have NO other context. Include: who you are working with and standing instructions; every active project with its exact state and file paths; key decisions made (with the reasoning that still matters); open tasks and what happens next; anything you were asked to remember. Write it as dense prose + bullet lists. Output ONLY the summary — no preamble, no sign-off.';
+  ' Produce a compaction summary of this entire conversation for a successor session that will have NO other context. Include: who you are working with and standing instructions; every active project with its exact state and file paths; key decisions made (with the reasoning that still matters); open tasks and what happens next; anything you were asked to remember. Write it as dense prose + bullet lists. Output ONLY the summary, no preamble, no sign-off. ' +
+  // The section the prime reads back (wake-up.mjs): a fresh chat primed from
+  // a summary that lists pending work is told to continue it, not to wait.
+  unfinishedWorkClause();
 
 // ---------- commands ----------
 
@@ -8131,6 +8301,13 @@ async function handleCommand(text, msg = null) {
               lastAt: st.autoCompactedAt ?? null,
               timeZone: OWNER_TZ,
             }),
+            wakeUp: wakeUpStatusLine({
+              afterRestart: WAKE_UP.afterRestart,
+              afterCompact: WAKE_UP.afterCompact,
+              lastAt: st.lastWakeUp?.at ?? null,
+              reason: st.lastWakeUp?.reason ?? null,
+              timeZone: OWNER_TZ,
+            }),
             usageBlock: liveUsage ? usageLine(liveUsage.row, { timeZone: OWNER_TZ }) : null,
           }),
           '',
@@ -9471,8 +9648,10 @@ async function handleUpdate(update) {
     return;
   }
   if (!msg.text) {
-    if (pickMedia(msg)) await handleMedia(msg);
-    else await send('Send text, photos, videos, voice notes or files.', { markdown: false });
+    if (pickMedia(msg)) {
+      ownerMessageSinceBoot = true; // a file is a message too, for the wake-up
+      await handleMedia(msg);
+    } else await send('Send text, photos, videos, voice notes or files.', { markdown: false });
     return;
   }
   handbackStreak = 0; // a real message from the owner ends any worker-report chain
@@ -9506,6 +9685,9 @@ async function handleUpdate(update) {
     await handleCommand(msg.text, msg);
     return;
   }
+  // Past the daemon's own commands, this is a message for the chat: the
+  // restart wake-up yields to it (maybeRestartWakeUp), whatever it says.
+  ownerMessageSinceBoot = true;
   // Any other text — including /commands not reserved above — goes to Claude
   // Code; custom slash commands (/autopilot, /bug, /qa-loop, …) work headless.
   // Menu-picked commands arrive with underscores (Telegram forbids hyphens in
@@ -9529,6 +9711,10 @@ async function handleUpdate(update) {
 
 async function pollLoop() {
   console.log(`[${new Date().toISOString()}] [bridge] polling as owner chat ${CHAT_ID}, cwd default ${DEFAULT_CWD}`);
+  // The FIRST poll returns at once instead of holding for 50s: the restart
+  // wake-up is decided right after it, and a decision that waited out an
+  // empty long poll would be a minute late for no reason.
+  let firstPoll = true;
   for (;;) {
     try {
       writeFileSync(HEARTBEAT_FILE, String(Date.now())); // watchdog liveness signal
@@ -9551,7 +9737,7 @@ async function pollLoop() {
       }
       const updates = await tg('getUpdates', {
         offset: state.offset,
-        timeout: 50,
+        timeout: firstPoll ? 0 : 50,
         // callback_query is what makes the /account keyboard's buttons do
         // anything: without it Telegram RENDERS the buttons and silently drops
         // every tap, leaving a spinner on the button forever. Both kinds share
@@ -9570,6 +9756,10 @@ async function pollLoop() {
           console.error('[bridge] update handling error:', e.message);
         }
       }
+      firstPoll = false;
+      // After the batch, never before it: what the owner typed while the
+      // daemon was down has now been dispatched, and the decision can see it.
+      maybeRestartWakeUp();
     } catch (e) {
       if (e.code === 409) {
         console.error('[bridge] 409 conflict — another getUpdates consumer is running. Retrying in 30s.');
@@ -9632,6 +9822,18 @@ async function main() {
   // conversation. There is no adoption path and there should not be: rejoining
   // a turn whose notifications we missed would report a step list with a hole
   // in it.
+  // THE CLAUDE CHAT TURN THAT WAS RUNNING WHEN THE DAEMON WENT DOWN. Read and
+  // cleared here, decided later: the wake-up must not start before the first
+  // poll has delivered whatever the owner typed while we were down (their
+  // message wins), and must not start under a run. maybeRestartWakeUp owns
+  // the decision; this only hands it the marker the last process left behind.
+  const cutTurn = chatState().chatTurnInFlight || null;
+  if (cutTurn) {
+    console.log(
+      `[bridge] chat turn cut by the restart runId=${cutTurn.runId} kind=${cutTurn.kind} began=${new Date(cutTurn.at || 0).toISOString()}`,
+    );
+  }
+  restartWakeUp = { pending: true, cut: cutTurn, deferred: null, sessionAtBoot: chatState().sessionId || null };
   const inFlight = chatState().codexTurnInFlight;
   if (inFlight) {
     delete chatState().codexTurnInFlight;

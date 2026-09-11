@@ -207,6 +207,25 @@ queued, steered in or asked and unanswered, the summary turn starts on its own,
 under a live message that says it was automatic, and your next message queues
 behind it exactly as it would behind `/compact`. A cooldown (default 30 minutes)
 keeps two compactions apart; `/status` shows the setting and when it last fired.
+The summary ends with an "Unfinished work" list, and when that list is not
+empty the fresh chat is primed to continue it at once rather than acknowledge
+and wait for your next message (`wakeUp.afterCompact`, default on).
+
+**A restart wakes the chat if it may have unfinished work.** Leash persists a
+turn-in-flight marker when a chat turn starts and clears it when the turn
+reaches its terminal state, so the next boot can read, not guess, that a
+restart cut a turn short. If it did, or if the chat's last answer promised a
+next step ("then I dispatch the rest"), the daemon sends the chat one wake-up
+turn: when it restarted, what the cut turn was answering, the tail of the
+chat's last words, and the instruction to finish any pending dispatches,
+deliveries, worker collections or unused files now, or reply in one line if
+nothing is pending. The turn is tagged as daemon authored in the transcript
+and its answer reaches you like any other. It waits for the lane to be idle,
+never runs on a walled engine or a Codex chat lane, fires at most once per
+restart and never twice for the same turn, and is skipped outright when you
+already sent a message after the restart (`wakeUp.afterRestart`, default on).
+`/status` shows when the last wake-up went out and why; the daemon log has one
+`wake_up_sent` / `wake_up_skipped` line per decision.
 Leash's `/usage` goes further than the interactive screen: it reads live plan
 usage for every enrolled account, not just the one currently logged in.
 
@@ -850,7 +869,10 @@ both engines, leaving code, fences and URLs alone — default `false`, the model
 keeps its own voice), `progress` (`{"background": false}` turns off the live
 line a background worker keeps on screen from dispatch to done — default `true`)
 and `autoCompact` (`{"enabled": true, "thresholdPercent": 60, "cooldownMinutes": 30}`
-lets the daemon compact an idle chat by itself past the threshold, default off).
+lets the daemon compact an idle chat by itself past the threshold, default off),
+`wakeUp` (`{"afterRestart": true, "afterCompact": true}`: wake the chat after a
+restart that cut a turn or left a promise unfinished, and make a compaction's
+fresh chat continue the summary's unfinished work; both default on).
 
 Every key can be overridden with a `BRIDGE_<UPPER_SNAKE>` environment variable,
 including the object-valued ones: `BRIDGE_STYLE='{"noDashes":true}'`,

@@ -64,6 +64,8 @@ SHARED_MODULES=(
   steer-sock.test.mjs
   auto-compact.mjs
   auto-compact.test.mjs
+  wake-up.mjs
+  wake-up.test.mjs
 )
 
 # NOT LISTED, and why. These modules came from the private sibling and behave

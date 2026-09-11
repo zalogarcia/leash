@@ -1153,6 +1153,250 @@ for (const [state, glyph] of [['ended', '❌'], ['stopped', '🛑'], ['lost', '�
   });
 }
 
+// ---------------------------------------------------------------------------
+console.log('\n12. the restart wake-up: the real decision function, against a fake daemon');
+// ---------------------------------------------------------------------------
+//
+// 2026-09-11: a restart cut a chat turn with five briefs written and not yet
+// dispatched, and the next boot waited. wake-up.test.mjs proves the pure
+// decision; this proves bridge.mjs acts on it: one priority dispatch, tagged
+// as daemon authored, stamped once, deferred behind a busy lane rather than
+// lost, and yielding to the owner's own message.
+
+const WAKE_HARNESS = `
+import { decideRestartWakeUp, restartWakeUpLogLine } from ${url('wake-up.mjs')};
+import { restartWakeUpPrompt } from ${url('system-messages.mjs')};
+const WAKE_UP = { afterRestart: true, afterCompact: true };
+let restartWakeUp = null;
+export const setSlot = (v) => { restartWakeUp = v; };
+export const getSlot = () => restartWakeUp;
+const STATE = { chats: { '1': { sessionId: 'abc12345' } } };
+const chatState = () => STATE.chats['1'];
+export const st = chatState;
+export let SAVES = 0;
+const saveState = () => { SAVES++; };
+let RING = [];
+export const setRing = (r) => { RING = r; };
+const readChatRing = () => RING;
+let ENGINE = 'claude';
+export const setEngine = (e) => { ENGINE = e; };
+const chatLaneEngine = () => ENGINE;
+const CLAUDE_AVAILABLE = true;
+let WALLED = false;
+export const setWalled = (v) => { WALLED = v; };
+const claudeWalled = () => WALLED;
+let ownerMessageSinceBoot = false;
+export const setOwner = (v) => { ownerMessageSinceBoot = v; };
+const LANES = { main: { current: null, queue: [] } };
+export const lanes = LANES;
+let mediaGroup = null;
+const BRIDGE_NAME = 'M';
+const OWNER_NAME = 'Zalo';
+const BOOT_AT = Date.parse('2026-09-11T14:23:07Z');
+const OWNER_TZ = 'America/New_York';
+export const DISPATCHED = [];
+const dispatchPrompt = (prompt, lane, opts) => { DISPATCHED.push({ prompt, lane, opts }); };
+export const reset = () => { DISPATCHED.length = 0; RING = []; ENGINE = 'claude'; WALLED = false; ownerMessageSinceBoot = false; LANES.main.current = null; LANES.main.queue.length = 0; delete STATE.chats['1'].lastWakeUp; delete STATE.chats['1'].chatTurnInFlight; delete STATE.chats['1'].lastAnswer; STATE.chats['1'].sessionId = 'abc12345'; };
+`;
+const W = await import(
+  'data:text/javascript,' +
+    encodeURIComponent([WAKE_HARNESS, grab('maybeRestartWakeUp'), grab('clearTurnInFlight'), 'export { maybeRestartWakeUp, clearTurnInFlight };'].join('\n')),
+);
+const CUT = { runId: 'main-1789136127000', at: Date.parse('2026-09-11T14:15:27Z'), prompt: '[Report from your own background worker, it finished.', kind: 'internal' };
+const COMMIT_RING = [
+  { ts: 1789133232570, chat: '1', engine: 'claude', role: 'user', text: '[Session handoff…' },
+  { ts: 1789133239572, chat: '1', engine: 'claude', role: 'assistant', text: 'Picking back up: once the gate lands I dispatch wave 4.' },
+];
+const logs = [];
+const withLogs = (fn) => {
+  const orig = console.log;
+  logs.length = 0;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    fn();
+  } finally {
+    console.log = orig;
+  }
+};
+
+await t('★ a cut turn wakes the session: one priority dispatch, tagged, stamped once, marker consumed', () => {
+  W.reset();
+  W.st().chatTurnInFlight = { ...CUT }; // still on disk: boot reads it, the decision consumes it
+  W.setSlot({ pending: true, cut: CUT, deferred: null, sessionAtBoot: 'abc12345' });
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(W.DISPATCHED.length, 1);
+  ok(!W.st().chatTurnInFlight, 'the marker is consumed at the final decision');
+  const d = W.DISPATCHED[0];
+  eq(d.lane, W.lanes.main);
+  eq(d.opts.priority, true, 'never dropped, runs before anything queued');
+  ok(d.prompt.startsWith('[Bridge wake-up, daemon authored, not Zalo.]'), d.prompt.split('\n')[0]);
+  ok(d.prompt.includes('🔄 M restarted at 10:23am'), d.prompt);
+  ok(d.prompt.includes('✂️ Last turn was cut mid turn'), d.prompt);
+  ok(d.prompt.includes('🕐 It began at 10:15am, answering:'), d.prompt);
+  ok(d.prompt.includes('"[Report from your own background worker, it finished."'), d.prompt);
+  ok(d.prompt.includes('Finish it now, without waiting.'), d.prompt);
+  eq(W.getSlot().pending, false, 'decided once');
+  eq(W.st().lastWakeUp.key, 'cut:main-1789136127000');
+  eq(W.st().lastWakeUp.reason, 'restart');
+  eq(logs.length, 1);
+  eq(logs[0], '[bridge] wake_up_sent reason=restart kind=cut cut=main-1789136127000');
+});
+
+await t('★ and never a second time in the same process', () => {
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(W.DISPATCHED.length, 1);
+  eq(logs.length, 0, 'a decided slot logs nothing more');
+});
+
+await t('★ a second boot on the same cut turn skips: the stamp is on disk', () => {
+  W.DISPATCHED.length = 0;
+  W.setSlot({ pending: true, cut: CUT, deferred: null, sessionAtBoot: 'abc12345' });
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(W.DISPATCHED.length, 0);
+  eq(logs[0], '[bridge] wake_up_skipped reason=already_sent');
+  eq(W.getSlot().pending, false);
+});
+
+await t('★ the owner\'s message wins', () => {
+  W.reset();
+  W.setOwner(true);
+  W.setSlot({ pending: true, cut: CUT, deferred: null, sessionAtBoot: 'abc12345' });
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(W.DISPATCHED.length, 0);
+  eq(logs[0], '[bridge] wake_up_skipped reason=owner_message');
+  eq(W.getSlot().pending, false, 'final: the owner is talking, the slot is spent');
+  ok(!W.st().lastWakeUp, 'nothing stamped for a wake-up that did not go out');
+});
+
+await t('★ a skip consumes the marker only if it is still the cut turn\'s', () => {
+  W.reset();
+  W.setOwner(true);
+  W.st().chatTurnInFlight = { runId: 'main-NEW', at: 9, prompt: 'the owner\'s message', kind: 'owner' };
+  W.setSlot({ pending: true, cut: CUT, deferred: null, sessionAtBoot: 'abc12345' });
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(W.st().chatTurnInFlight.runId, 'main-NEW', 'the run now in flight owns the slot');
+});
+
+await t('★ a switched chat skips: the cut turn was another session\'s', () => {
+  W.reset();
+  W.st().sessionId = 'ffff0000';
+  W.setSlot({ pending: true, cut: CUT, deferred: null, sessionAtBoot: 'abc12345' });
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(W.DISPATCHED.length, 0);
+  eq(logs[0], '[bridge] wake_up_skipped reason=chat_switched');
+});
+
+await t('★ the persisted last answer beats the ring head, and its tail is what the prompt quotes', () => {
+  W.reset();
+  W.setRing([{ ts: 1, chat: '1', engine: 'claude', role: 'assistant', text: 'Both green. ' + 'x'.repeat(380) }]);
+  W.st().lastAnswer = { ts: 1789135524567, phrase: 'Then I dispatch', tail: '…xxxx Then I dispatch wave 4 and run SP1.' };
+  W.setSlot({ pending: true, cut: null, deferred: null, sessionAtBoot: 'abc12345' });
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(W.DISPATCHED.length, 1);
+  const p = W.DISPATCHED[0].prompt;
+  ok(p.includes('✅ Last turn ended normally at 10:05am'), p);
+  ok(p.includes('"…xxxx Then I dispatch wave 4 and run SP1."'), p);
+  eq(W.st().lastWakeUp.key, 'commitment:1789135524567');
+});
+
+await t('★ a busy lane defers, logs once, and the wake-up goes out at the next idle moment', () => {
+  W.reset();
+  W.setSlot({ pending: true, cut: CUT, deferred: null, sessionAtBoot: 'abc12345' });
+  W.lanes.main.current = { prompt: 'a worker report' };
+  W.st().chatTurnInFlight = { ...CUT };
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(W.DISPATCHED.length, 0);
+  eq(W.getSlot().pending, true, 'still pending');
+  ok(W.st().chatTurnInFlight, 'a deferral leaves the marker on disk: a boot that dies here must not eat it');
+  eq(logs.length, 1);
+  eq(logs[0], '[bridge] wake_up_deferred reason=lane_busy kind=cut');
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(logs.length, 0, 'the same deferral is not logged every poll');
+  W.lanes.main.current = null;
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(W.DISPATCHED.length, 1, 'the next idle moment sends it');
+  eq(W.getSlot().pending, false);
+});
+
+await t('a deferral that ends in the owner\'s message ends in a skip', () => {
+  W.reset();
+  W.setSlot({ pending: true, cut: CUT, deferred: null, sessionAtBoot: 'abc12345' });
+  W.lanes.main.current = { prompt: 'a worker report' };
+  withLogs(() => W.maybeRestartWakeUp());
+  W.setOwner(true);
+  W.lanes.main.current = null;
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(W.DISPATCHED.length, 0);
+  eq(logs[0], '[bridge] wake_up_skipped reason=owner_message');
+});
+
+await t('★ a restart between turns wakes on the ring\'s commitment, and says the turn ended normally', () => {
+  W.reset();
+  W.setRing(COMMIT_RING);
+  W.setSlot({ pending: true, cut: null, deferred: null, sessionAtBoot: 'abc12345' });
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(W.DISPATCHED.length, 1);
+  const p = W.DISPATCHED[0].prompt;
+  ok(p.includes('✅ Last turn ended normally at 9:27am'), p);
+  ok(p.includes('"Picking back up: once the gate lands I dispatch wave 4."'), p);
+  ok(!p.includes('cut'), p);
+  eq(W.st().lastWakeUp.key, 'commitment:1789133239572');
+  ok(logs[0].startsWith('[bridge] wake_up_sent reason=restart kind=commitment phrase="'), logs[0]);
+});
+
+await t('nothing cut, nothing promised: one skip line, no dispatch', () => {
+  W.reset();
+  W.setRing([{ ts: 1, chat: '1', engine: 'claude', role: 'assistant', text: 'Both repos are green.' }]);
+  W.setSlot({ pending: true, cut: null, deferred: null, sessionAtBoot: 'abc12345' });
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(W.DISPATCHED.length, 0);
+  eq(logs[0], '[bridge] wake_up_skipped reason=nothing_pending');
+});
+
+await t('walled and codex lanes skip, finally', () => {
+  W.reset();
+  W.setWalled(true);
+  W.setSlot({ pending: true, cut: CUT, deferred: null, sessionAtBoot: 'abc12345' });
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(logs[0], '[bridge] wake_up_skipped reason=walled');
+  eq(W.getSlot().pending, false);
+  W.reset();
+  W.setEngine('codex');
+  W.setSlot({ pending: true, cut: CUT, deferred: null, sessionAtBoot: 'abc12345' });
+  withLogs(() => W.maybeRestartWakeUp());
+  eq(logs[0], '[bridge] wake_up_skipped reason=codex_lane');
+  eq(W.DISPATCHED.length, 0);
+});
+
+await t('★ clearTurnInFlight drops the marker only for its own run', () => {
+  W.reset();
+  W.st().chatTurnInFlight = { runId: 'main-5', at: 5, prompt: 'x', kind: 'owner' };
+  W.clearTurnInFlight({ markerId: 'main-4' });
+  ok(W.st().chatTurnInFlight, 'a late close from an earlier run leaves the live marker alone');
+  W.clearTurnInFlight({ markerId: 'main-5' });
+  ok(!W.st().chatTurnInFlight, 'its own run clears it');
+  W.clearTurnInFlight(null);
+  W.clearTurnInFlight({});
+});
+
+await t('★ wired, not merely written: the marker, the clause and the prime are on the real paths', () => {
+  const src = SRC.join('\n');
+  ok(src.includes('st.chatTurnInFlight = {'), 'runClaude writes the marker');
+  eq((src.match(/\n\s+clearTurnInFlight\(run\);/g) || []).length, 2, 'cleared in the close handler and the spawn-error handler');
+  ok(src.includes("const cutTurn = chatState().chatTurnInFlight || null;"), 'main() reads it at boot');
+  ok(src.includes('restartWakeUp = { pending: true, cut: cutTurn, deferred: null, sessionAtBoot: chatState().sessionId || null };'), 'and arms the slot');
+  ok(!src.includes('    delete chatState().chatTurnInFlight;'), 'boot does NOT consume the marker; the decision does');
+  ok(src.includes("if (w.cut && st.chatTurnInFlight?.runId === w.cut.runId) delete st.chatTurnInFlight;"), 'consumed at the final decision, guarded');
+  ok(src.includes('st.lastAnswer = lastAnswerRecord(resultTexts.join'), 'the last answer record is written where the answer is recorded');
+  eq((src.match(/maybeRestartWakeUp\(\);/g) || []).length, 2, 'decided after each poll batch and at the chat lane close');
+  ok(src.includes('timeout: firstPoll ? 0 : 50'), 'the first poll returns at once');
+  ok(src.includes('unfinishedWorkClause()'), 'the compaction prompt asks for the section');
+  ok(src.includes('compactPrimeMode({ config: WAKE_UP, summary: resultTexts[0] })'), 'the prime reads it back');
+  ok(src.includes('compactPrimeHeader({ ownerName: OWNER_NAME, mode: prime.mode })'), 'and picks the header by it');
+  ok(src.includes('ownerMessageSinceBoot = true;'), 'the owner flag is set on the chat path');
+  ok(src.includes('wakeUp: wakeUpStatusLine({'), '/status has the row');
+});
+
 console.log(`\n${pass} passed, ${failures.length} failed\n`);
 if (failures.length) {
   for (const f of failures) console.error(`  ✗ ${f}\n`);
