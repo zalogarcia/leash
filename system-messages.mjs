@@ -28,6 +28,7 @@
 // testable without a token. See system-messages.test.mjs.
 
 import { clip, oneLine, fmtElapsed } from './progress-render.mjs';
+import { fmtResetClock } from './account-usage.mjs';
 
 // ---------------------------------------------------------------------------
 // THE PLAIN-TEXT FALLBACK
@@ -737,6 +738,7 @@ export function statusHeader({
   session = '',
   ctxPct = null,
   threadNote = '',
+  autoCompact = null,
   usageBlock = null,
 } = {}) {
   const lines = [`📍 ${name}${host ? ` on ${host}` : ''}`];
@@ -746,6 +748,9 @@ export function statusHeader({
   if (engineLine) lines.push(engineLine);
   const ctx = Number.isFinite(ctxPct) ? ` · ctx ${ctxPct}%` : '';
   lines.push(`💬 chat ${session || 'fresh'}${ctx}${threadNote ? ` · ${threadNote}` : ''}`);
+  // The auto compact row sits under the chat line it describes: it is a fact
+  // about THIS chat's context, so it reads next to the percentage.
+  if (autoCompact) lines.push(autoCompact);
   if (usageBlock) lines.push(usageBlock);
   return lines.join('\n');
 }
@@ -1039,6 +1044,60 @@ export function compactDoneLine({ elapsedSec = null, archived = null } = {}) {
 /** The other ending: /new or /resume landed while the summary was being written. */
 export function compactDiscardedLine() {
   return ['⚠️ Compaction discarded', 'The chat was switched while it ran.'].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// AUTO COMPACT: the same wait, started by the daemon instead of the owner
+// ---------------------------------------------------------------------------
+//
+// The daemon compacts the chat by itself once the context passes a threshold
+// and the lane is idle (auto-compact.mjs holds the rule). It is the SAME model
+// turn as /compact and lands on the same shaped message, so the four builders
+// here mirror the four above one for one; what differs is the label, because
+// a compaction he did not ask for has to say so, and the percentage, because
+// that is the reason it happened.
+
+/** The wait. Carries the percentage that triggered it, and a clock once there is one. */
+export function autoCompactLine({ pct = null, elapsedSec = 0 } = {}) {
+  const at = Number.isFinite(pct) ? ` at ${pct}%` : '';
+  const el = Number.isFinite(elapsedSec) && elapsedSec > 0 ? ` · ${fmtElapsed(Math.round(elapsedSec))}` : '';
+  return `📦 Auto compacting${at}…${el}`;
+}
+
+/**
+ * It worked. The percentage line grows a second number once the fresh chat
+ * has run its first turn and can be measured; until then it names only the
+ * depth the old chat reached, which is a fact, where a guess would not be.
+ */
+export function autoCompactDoneLine({ elapsedSec = null, archived = null, fromPct = null, toPct = null } = {}) {
+  const el = Number.isFinite(elapsedSec) && elapsedSec >= 0 ? ` · ${fmtElapsed(Math.round(elapsedSec))}` : '';
+  const lines = [`✅ Auto compacted${el}`];
+  if (Number.isFinite(fromPct)) {
+    lines.push(Number.isFinite(toPct) ? `📉 ctx ${fromPct}% to ${toPct}%` : `📉 ctx was ${fromPct}%`);
+  }
+  if (archived) lines.push(`💬 Old chat archived (${archived}) · /resume it`);
+  lines.push('🆕 Fresh chat primed with the summary');
+  return lines.join('\n');
+}
+
+/** The other ending: the summary turn died. The chat is exactly as it was. */
+export function autoCompactFailedLine({ reason = '' } = {}) {
+  const lines = ['❌ Auto compact failed'];
+  const r = oneLine(reason || '');
+  if (r) lines.push(clip(r, 120));
+  lines.push('The chat is unchanged · /compact retries');
+  return lines.join('\n');
+}
+
+/**
+ * The /status row. One line, three facts: on or off, the threshold, and when it
+ * last fired in the owner's zone. "never yet" rather than nothing, because an
+ * enabled feature that has not fired is a state worth reading.
+ */
+export function autoCompactStatusLine({ enabled = false, thresholdPercent = 60, lastAt = null, timeZone = undefined, now = Date.now() } = {}) {
+  if (!enabled) return '📦 auto compact off';
+  const last = Number.isFinite(lastAt) && lastAt > 0 ? `last ${fmtResetClock(lastAt, { timeZone, now, compact: true })}` : 'never yet';
+  return `📦 auto compact on · ${thresholdPercent}% · ${last}`;
 }
 
 // ---------------------------------------------------------------------------

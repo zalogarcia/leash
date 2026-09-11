@@ -29,6 +29,7 @@
 
   "style": { "noDashes": false },
   "progress": { "background": true },
+  "autoCompact": { "enabled": false, "thresholdPercent": 60, "cooldownMinutes": 30 },
 
   "logFile": "",
 
@@ -59,6 +60,7 @@
     "handoffCaptureTurn": "true lets the engine you are LEAVING spend one short turn writing the handoff (goal, decisions, files, open question) before the switch. false always builds it from the on-disk chat ring instead, which never needs a model to be up.",
     "style": "{\"noDashes\": true} rewrites em and en dashes out of every outbound reply, on both engines, leaving code spans, fenced blocks and URLs alone. Default false: the model keeps its own voice.",
     "progress": "{\"background\": false} turns off the live 🌙 line a background worker keeps on screen from dispatch to done. Default true.",
+    "autoCompact": "{\"enabled\": true} lets the daemon run the same compaction /compact runs, by itself, when a chat turn ends with the session at or past thresholdPercent of its context window and nothing is queued, steered or asked and unanswered. The live message says it was automatic. cooldownMinutes is the least time between two compactions, manual or automatic. Default off, 60, 30.",
     "logFile": "Where the daemon writes its own log. Empty = the path the service manager already gives it (launchd / systemd).",
     "bgTailMs": "How often the daemon polls a detached worker's log file, in ms. This replaces the stdout pipe. Default 300.",
     "reattachPollMs": "How often to check whether a worker that outlived a daemon restart has exited, in ms. Default 5000.",

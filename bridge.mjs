@@ -50,6 +50,7 @@ import {
   fmtAge,
 } from './progress-render.mjs';
 import { execJson, fmtTokens, readRateLimits, fmtLeft, fmtLimit, modelWindow } from './usage-limits.mjs';
+import { autoCompactConfig, autoCompactLogLine, contextPercent, decideAutoCompact } from './auto-compact.mjs';
 import { createAccountStore, fingerprint, isLimitSignal, parseResetTime } from './accounts.mjs';
 import {
   createAccountUsage,
@@ -132,6 +133,10 @@ import {
   compactQueuedLine,
   compactDoneLine,
   compactDiscardedLine,
+  autoCompactLine,
+  autoCompactDoneLine,
+  autoCompactFailedLine,
+  autoCompactStatusLine,
   WALL_TICK_MS,
   limitWallLine,
   limitWallResolved,
@@ -1054,13 +1059,17 @@ const COMPACT_TICK_MS = 3000;
 // degrade every other live line in the process.
 const COMPACT_MAX_MS = 15 * 60_000;
 
-async function startCompactNotice(queued) {
+// `auto`: the daemon started this one, not the owner, and the message says so
+// from its first frame (autoCompactLine) to its last (autoCompactDoneLine or
+// autoCompactFailedLine). `pct` is the depth that triggered it, carried on the
+// slot so the done line can name where the old chat was.
+async function startCompactNotice(queued, { auto = false, pct = null } = {}) {
   // A SECOND /compact ORPHANS THE FIRST unless the slot is cleared: there is
   // one slot, and the entry left in liveMessages has no terminal condition of
   // its own. Retire it before claiming.
   if (compactNotice) settleCompactNotice(compactDiscardedLine());
   const startedAt = Date.now();
-  const first = queued ? compactQueuedLine() : compactingLine();
+  const first = queued ? compactQueuedLine() : auto ? autoCompactLine({ pct }) : compactingLine();
   const m = await send(first, { markdown: false }).catch(() => null);
   if (!m?.message_id) return null;
   const entry = registerLive({
@@ -1081,13 +1090,14 @@ async function startCompactNotice(queued) {
       // on itself, so a ticking number would be measuring the wrong thing.
       if (queued || now < this.nextAt || now < editCooldownUntil) return;
       this.nextAt = now + COMPACT_TICK_MS;
-      const next = compactingLine(Math.round((now - startedAt) / 1000));
+      const elapsedSec = Math.round((now - startedAt) / 1000);
+      const next = auto ? autoCompactLine({ pct, elapsedSec }) : compactingLine(elapsedSec);
       if (next === this.last) return;
       this.last = next;
       editProgress(this.msgId, escHtml(next), () => next).catch(() => {});
     },
   });
-  compactNotice = { msgId: m.message_id, startedAt, entry };
+  compactNotice = { msgId: m.message_id, startedAt, entry, auto, pct };
   return compactNotice;
 }
 
@@ -1103,6 +1113,128 @@ function settleCompactNotice(text) {
 
 /** Elapsed since the notice went up, for the done line. */
 const compactElapsed = () => (compactNotice ? Math.round((Date.now() - compactNotice.startedAt) / 1000) : null);
+
+/**
+ * The three endings, chosen by who started the compaction. The close handler
+ * asks for an ending by kind and gets the manual or the automatic shape of it
+ * from the ONE slot, so the two paths cannot drift: an automatic compaction
+ * that ended under "✅ Compacted" would be a compaction the owner never asked
+ * for reported as one they did.
+ */
+function compactEnding(kind, { archived = null, reason = '' } = {}) {
+  const auto = Boolean(compactNotice?.auto);
+  const fromPct = compactNotice?.pct ?? null;
+  if (kind === 'done') {
+    const args = { elapsedSec: compactElapsed(), archived };
+    return auto ? autoCompactDoneLine({ ...args, fromPct }) : compactDoneLine(args);
+  }
+  if (kind === 'failed') {
+    return auto
+      ? autoCompactFailedLine({ reason })
+      : ['❌ Compaction failed', 'The chat is unchanged. Try again, or /new.'].join('\n');
+  }
+  return compactDiscardedLine();
+}
+
+/**
+ * ONE entry for both compactions, the /compact command and the automatic one,
+ * so the summary prompt, the priority path, the live message and the cooldown
+ * stamp are the same four things whoever asked. Returns the refusal reason on
+ * a Codex chat lane or a fresh chat; the command turns those into words, the
+ * automatic path never reaches them (its decision already checked both).
+ */
+async function startCompaction({ auto = false, pct = null } = {}) {
+  const st = chatState();
+  if (chatLaneEngine() === 'codex') return { ok: false, reason: 'codex' };
+  if (!st.sessionId) return { ok: false, reason: 'fresh' };
+  // Stamped at the START, not at the end: a compaction that fails must count
+  // for the cooldown too, or a walled account would re-fire it every turn.
+  // Per chat, in state.json, so the cooldown survives a daemon restart.
+  st.compactedAt = Date.now();
+  if (auto) st.autoCompactedAt = st.compactedAt;
+  saveState();
+  // The message that lives. Awaited so its id exists before the dispatch
+  // could possibly finish and try to edit it.
+  await startCompactNotice(Boolean(LANES.main.current), { auto, pct });
+  // priority: the queue path, NEVER the steer path. Steered into a running
+  // task, the summary would come back under that task's rawText and the
+  // COMPACT_MARKER check in the close handler would never fire.
+  dispatchPrompt(COMPACT_PROMPT, LANES.main, { priority: true });
+  return { ok: true };
+}
+
+/**
+ * An automatic compaction's done line is owed one more fact: the depth the
+ * FRESH chat starts at. That is only measurable once the primed handoff turn
+ * has run, so the done line goes up without it and is edited once more when
+ * the next chat-lane close can measure. One slot, cleared on that close
+ * whether or not it could: a line that waits forever for a number is the
+ * stranded ⏳ this file keeps finding.
+ */
+let autoCompactAwaitingPct = null; // { msgId, args }
+
+function settleAutoCompactPct(toPct) {
+  const a = autoCompactAwaitingPct;
+  autoCompactAwaitingPct = null;
+  if (!a) return;
+  if (!Number.isFinite(toPct)) {
+    console.log(`[bridge] auto_compact_done pct=unmeasured (was ${a.args.fromPct}%)`);
+    return;
+  }
+  console.log(`[bridge] auto_compact_done pct=${toPct} (was ${a.args.fromPct}%)`);
+  const text = autoCompactDoneLine({ ...a.args, toPct });
+  editProgress(a.msgId, escHtml(text), () => text).catch(() => {});
+}
+
+/**
+ * The trigger, at the close of every chat-lane run. Every fact goes through
+ * the pure decision in auto-compact.mjs and every decision is one log line,
+ * so "why did it not compact" is answered by the log and never by reading
+ * this function. Only a `compact: true` spends anything.
+ */
+async function maybeAutoCompact({ wasCompaction = false, stopped = false, pct = null, run = null } = {}) {
+  const st = chatState();
+  const decision = decideAutoCompact({
+    config: AUTO_COMPACT,
+    lane: 'main',
+    wasCompaction,
+    // /stop empties the queue, so without this every other clause passed and
+    // the correction typed next queued behind a summary of the aborted task.
+    stopped,
+    engine: chatLaneEngine(),
+    hasSession: Boolean(st.sessionId),
+    walled: claudeWalled(),
+    pct,
+    // A message that landed during this close handler's own awaits has
+    // already started a run: the lane is not idle, whatever the queue says.
+    laneBusy: Boolean(LANES.main.current),
+    // An album still gathering will dispatch itself within seconds; it is a
+    // queued message that has not reached the queue yet.
+    queued: LANES.main.queue.length + (mediaGroup && !mediaGroup.done ? 1 : 0),
+    // A steer is either folded into the running turn or runs as one more
+    // turn before exit, so at a close that produced a result every steer was
+    // acted on. A close with NO result event (killed, crashed, stopped before
+    // its first answer) acted on none of them: those are the pending ones,
+    // and the owner's next message will be the same instruction again.
+    steerPending: run && !run.gotResult ? run.steers.length : 0,
+    // Side questions still open on ANY live run. The closed run's own were
+    // drained above; a worker the owner is mid-question with will answer into
+    // this chat within seconds, and a summary turn should not start under it.
+    btwPending: [...allLanes().map((l) => l.current), ...codexRuns.values()].reduce(
+      (n, r) => n + (r?.btw?.list ? r.btw.list().length : 0),
+      0,
+    ),
+    lastCompactAt: st.compactedAt ?? null,
+    now: Date.now(),
+  });
+  // A disabled install logs nothing: there is no decision to diagnose on a
+  // feature that is off, and it is off by default.
+  if (decision.reason === 'disabled') return;
+  console.log(autoCompactLogLine(decision));
+  if (!decision.compact) return;
+  const res = await startCompaction({ auto: true, pct: decision.pct });
+  if (!res.ok) console.log(`[bridge] auto_compact_skipped reason=${res.reason} pct=${decision.pct}`);
+}
 
 // ---------------------------------------------------------------------------
 // THE LIVE BACKGROUND WORKER LINE
@@ -1131,6 +1263,15 @@ const compactElapsed = () => (compactNotice ? Math.round((Date.now() - compactNo
 // A Leash user on a busy chat, or with ten workers, can have the old static
 // notice back. Default on: the silence is the defect this fixes.
 const BG_PROGRESS_ON = String(confObj('progress').background ?? 'true') !== 'false';
+
+// AUTO COMPACT: the daemon compacts the chat by itself once its context passes
+// a threshold and the lane is idle. The rule itself is auto-compact.mjs; this
+// is only the block it reads, `autoCompact: { enabled, thresholdPercent,
+// cooldownMinutes }` in config.json (or BRIDGE_AUTO_COMPACT as JSON text).
+// Off unless configured.
+// conf() rather than confObj(): the parser takes the env layer's JSON text and
+// a bare `true` itself, so one read serves config.json and the environment.
+const AUTO_COMPACT = autoCompactConfig(conf('autoCompact', {}));
 
 // How long a worker line keeps ticking after its run vanished without a
 // terminal edit. Minutes, not seconds: the close handler clears lane.current
@@ -1296,6 +1437,7 @@ function runClaude(
     lane,
     steers: [],
     btw: createBtwTracker(),
+    gotResult: false, // set on the first result event; a steer written before it was acted on
   };
   lane.current = run;
   return new Promise(async (resolve) => {
@@ -1736,6 +1878,7 @@ function runClaude(
         }
       } else if (ev.type === 'result') {
         resultEvent = ev;
+        run.gotResult = true; // read by maybeAutoCompact: steers written before this were acted on
         // The CLI only injects a steer at a step boundary — during a no-tool
         // stretch it becomes its OWN turn with its own result event (probed
         // live: essay task + steered "what is 2+2" → 2 results). Collect every
@@ -1881,16 +2024,27 @@ function runClaude(
       const bucket = pct >= 90 ? 90 : pct >= 75 ? 75 : pct >= 60 ? 60 : 0;
       if (bucket !== (st[bucketKey] || 0)) {
         st[bucketKey] = bucket;
+        // The second line names the way out. With auto compact armed for this
+        // depth the way out is the daemon's, and saying "/new when convenient"
+        // in the same breath as "📦 Auto compacting" was two answers to one
+        // question (QA, 2026-09-11). The percentage line stays: the crossing
+        // is still worth a glance, and the compaction may be a few turns off.
+        const autoArmed = lane === LANES.main && AUTO_COMPACT.enabled && pct >= AUTO_COMPACT.thresholdPercent;
         if (bucket)
           await send(
             [
               `⚠️ ${lane.name === 'bg' ? 'Background' : 'Chat'} context ${pct}% of ${fmtTokens(win)}`,
-              `/new${lane.name === 'bg' ? ' bg' : ''} starts fresh when convenient`,
+              autoArmed ? 'auto compact runs when the chat is idle' : `/new${lane.name === 'bg' ? ' bg' : ''} starts fresh when convenient`,
             ].join('\n'),
             { markdown: false },
           ).catch(() => {});
       }
       } // end ctxKey gauge
+      // The depth this close measured, for the automatic compaction below and
+      // for the done line of the one before. Null when this close could not
+      // measure (a bg lane, or /new landed mid-run and the gauge was skipped).
+      const ctxPctNow = lane === LANES.main && genOk ? contextPercent(st.lastContextTokens, win) : null;
+      if (lane === LANES.main) settleAutoCompactPct(ctxPctNow);
       saveState();
 
       // A SESSION LIMIT ON THE CHAT LANE. Decided HERE, above the progress
@@ -1966,11 +2120,14 @@ function runClaude(
       // pass on this change; the guard on the two commit arms below is the
       // other half.
       if (isCompact && (!resultTexts.length || eventErrored)) {
-        settleCompactNotice(
-          wasStopped
-            ? compactDiscardedLine()
-            : ['❌ Compaction failed', 'The chat is unchanged. Try again, or /new.'].join('\n'),
+        // The reason, for the automatic ending: the CLI's own words when it
+        // died with some (a limit wall puts them in `result`), else stderr,
+        // else the exit. The manual ending stays the sentence it always was.
+        const failReason = firstMeaningfulLine(
+          (eventErrored && resultTexts[0]) || stderrTail.trim() || resultEvent?.subtype || (code !== 0 ? `exit code ${code}` : 'the run ended with no summary'),
         );
+        if (compactNotice?.auto) console.log(`[bridge] auto_compact_failed reason=${wasStopped ? 'stopped' : oneLine(failReason).slice(0, 160)}`);
+        settleCompactNotice(wasStopped ? compactEnding('discarded') : compactEnding('failed', { reason: failReason }));
       }
       if (wasStopped) {
         // A STOPPED WORKER STILL OWES ITS LINE AN ENDING. /stop takes the child
@@ -2044,7 +2201,8 @@ function runClaude(
         // just switched to, resurrect the one they cleared). Discard instead;
         // both chats stay in the archive. A dedicated arm, not && genOk on the
         // next one: falling through would dump the whole summary as a bubble.
-        if (!settleCompactNotice(compactDiscardedLine())) {
+        if (compactNotice?.auto) console.log('[bridge] auto_compact_failed reason=chat_switched');
+        if (!settleCompactNotice(compactEnding('discarded'))) {
           await send(compactDiscardedLine(), { markdown: false }).catch(() => {});
         }
       } else if (isCompact && resultTexts.length && !eventErrored) {
@@ -2059,14 +2217,29 @@ function runClaude(
         if (prev) st.archive = archiveUpsert(st.archive, prev, { at: Date.now() });
         delete st.sessionId;
         delete st.warnedBucket_main;
+        // As /new does. Left in place, a handoff turn that dies before its
+        // first assistant event would settle the automatic done line with the
+        // OLD chat's depth ("ctx 63% to 63%"), and with a zero cooldown that
+        // stale number could re-arm the trigger on a chat that is nearly empty.
+        delete st.lastContextTokens;
         st.gen_main = (st.gen_main || 0) + 1;
         saveState();
-        const doneLine = compactDoneLine({ elapsedSec: compactElapsed(), archived: prev ? prev.slice(0, 8) : null });
+        const archived = prev ? prev.slice(0, 8) : null;
+        const wasAuto = Boolean(compactNotice?.auto);
+        const fromPct = compactNotice?.pct ?? null;
+        const doneMsgId = compactNotice?.msgId ?? null;
+        const doneElapsed = compactElapsed();
+        const doneLine = compactEnding('done', { archived });
         if (!settleCompactNotice(doneLine)) {
           // No notice to edit (a failed send, or a daemon restart since): the
           // ending still has to arrive.
           await send(doneLine, { markdown: false }).catch(() => {});
+        } else if (wasAuto) {
+          // The fresh chat's depth is not known yet; the next chat-lane close
+          // that can measure it edits this same message once more.
+          autoCompactAwaitingPct = { msgId: doneMsgId, args: { elapsedSec: doneElapsed, archived, fromPct } };
         }
+        if (wasAuto) console.log(`[bridge] auto_compact_summary_ready from=${fromPct}% archived=${archived || 'none'}`);
         dispatchPrompt(
           // resultTexts[0]: compact runs are steer-proof so there is only one
           // turn, but if anything ever slips through, the FIRST answer is the
@@ -2101,6 +2274,18 @@ function runClaude(
       // only: a background worker's own close says nothing about the assistant's turn.
       if (lane === LANES.main) settleReadingNotices();
       resolve();
+      // AUTO COMPACT, decided here and nowhere else: the chat lane has just
+      // reached a terminal state, the queue has not been drained yet, and
+      // every fact the rule needs is in hand. Awaited so the compaction's own
+      // dispatch claims the lane before drainQueue looks at it; the decision
+      // already required an empty queue, so nothing is held up by the await.
+      // Caught, because this is an async 'close' callback: a throw here would
+      // be an unhandled rejection, and a compaction must never cost the daemon.
+      if (lane === LANES.main) {
+        await maybeAutoCompact({ wasCompaction: isCompact, stopped: wasStopped, pct: ctxPctNow, run }).catch((e) =>
+          console.error('[bridge] auto compact failed:', e.message),
+        );
+      }
       drainQueue(lane);
       gcBgLane(lane);
     });
@@ -7777,13 +7962,9 @@ async function handleCommand(text, msg = null) {
         await send('Nothing to compact · this chat is fresh.', { markdown: false });
         return;
       }
-      // The message that lives. Awaited so its id exists before the dispatch
-      // could possibly finish and try to edit it.
-      await startCompactNotice(Boolean(LANES.main.current));
-      // priority: the queue path, NEVER the steer path — steered into a running
-      // task, the summary would come back under that task's rawText and the
-      // COMPACT_MARKER check in the close handler would never fire.
-      dispatchPrompt(COMPACT_PROMPT, LANES.main, { priority: true });
+      // The same function the automatic compaction calls: one live message,
+      // one prompt, one priority path, one cooldown stamp.
+      await startCompaction();
       return;
     }
     case '/cd': {
@@ -7944,6 +8125,12 @@ async function handleCommand(text, msg = null) {
             ctxPct: st.lastContextTokens ? Math.min(100, Math.round((st.lastContextTokens / win) * 100)) : null,
             threadNote:
               chatLaneEngine() === 'codex' ? `codex thread ${codexThreadStatus(st.codexThreadAt)}` : '',
+            autoCompact: autoCompactStatusLine({
+              enabled: AUTO_COMPACT.enabled,
+              thresholdPercent: AUTO_COMPACT.thresholdPercent,
+              lastAt: st.autoCompactedAt ?? null,
+              timeZone: OWNER_TZ,
+            }),
             usageBlock: liveUsage ? usageLine(liveUsage.row, { timeZone: OWNER_TZ }) : null,
           }),
           '',

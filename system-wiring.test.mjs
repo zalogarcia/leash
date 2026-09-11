@@ -66,7 +66,7 @@ export const url = (f) => JSON.stringify(pathToFileURL(path.join(DIR, f)).href);
 // way the plain fallback is ever reached in production.
 // ---------------------------------------------------------------------------
 const HARNESS = `
-import { visibleOnly, fetchingLine, fetchFailedLine, errorMessage, WALL_TICK_MS, compactingLine, compactQueuedLine, compactDoneLine, compactDiscardedLine } from ${url('system-messages.mjs')};
+import { visibleOnly, fetchingLine, fetchFailedLine, errorMessage, WALL_TICK_MS, compactingLine, compactQueuedLine, compactDoneLine, compactDiscardedLine, autoCompactLine, autoCompactDoneLine, autoCompactFailedLine } from ${url('system-messages.mjs')};
 import { btwPendingLine, btwAnsweredLine, btwEndedLine, btwStoppedLine, btwLostLine, btwRefusedLine, btwWaitingLine } from ${url('system-messages.mjs')};
 import { BTW_RECORD_MAX, BTW_TICK_MS, BTW_TIMEOUT_MS } from ${url('bg-btw.mjs')};
 import { normalizeDashes } from ${url('dash-normalize.mjs')};
@@ -91,6 +91,10 @@ const CHAT_ID = '1';
 const TG_MSG_LIMIT = 4000;
 const QUOTE_TAGS_LEN = 37;
 let compactNotice = null;
+let autoCompactAwaitingPct = null;
+export const setAwaitingPct = (v) => { autoCompactAwaitingPct = v; };
+export const getAwaitingPct = () => autoCompactAwaitingPct;
+export const getCompactNotice = () => compactNotice;
 const COMPACT_TICK_MS = 3000;
 const COMPACT_MAX_MS = 900000;
 export let editCooldownUntil = 0;
@@ -140,11 +144,13 @@ const B = await import(
         grab('startCompactNotice'),
         grab('settleCompactNotice'),
         grab('compactElapsed', 'const'),
+        grab('compactEnding'),
+        grab('settleAutoCompactPct'),
         grab('btwRecordForDisk'),
         grab('drainBtw'),
         grab('startBtwNotice'),
         grab('resolveBtwAfterRestart'),
-        'export { sendHtml, editProgress, pendingMessage, registerLive, tickLiveMessages, liveMessages, sendError, sendSubView, tg, raiseWall, settleWall, pendWallResolution, wallNotices, startCompactNotice, settleCompactNotice, compactElapsed, btwRecordForDisk, drainBtw, startBtwNotice, resolveBtwAfterRestart };',
+        'export { sendHtml, editProgress, pendingMessage, registerLive, tickLiveMessages, liveMessages, sendError, sendSubView, tg, raiseWall, settleWall, pendWallResolution, wallNotices, startCompactNotice, settleCompactNotice, compactElapsed, compactEnding, settleAutoCompactPct, btwRecordForDisk, drainBtw, startBtwNotice, resolveBtwAfterRestart };',
       ].join('\n'),
     )
 );
@@ -693,6 +699,90 @@ await t('★ a 429 pauses its edits, but never its ability to retire', () => {
   eq(gatedCompact.done, true, 'a penalty in the wrong second stranded it permanently');
 });
 B.setCooldown(0);
+B.liveMessages.clear();
+
+// ---------------------------------------------------------------------------
+console.log('\n8b. auto compact: the same slot, the automatic shapes');
+// ---------------------------------------------------------------------------
+// The daemon compacts by itself past a threshold (auto-compact.mjs decides).
+// It is the SAME slot and the same function as /compact; what has to hold is
+// that every frame of the message says it was automatic, from the first send
+// to the ending the close handler picks, and that the ending grows the fresh
+// chat's percentage on the same message rather than as a second one.
+
+B.reset();
+B.liveMessages.clear();
+await B.startCompactNotice(false, { auto: true, pct: 63 });
+await t('the automatic wait goes up instantly, naming itself and the percentage', () => {
+  eq(B.CALLS.length, 1);
+  eq(B.CALLS[0].method, 'sendMessage');
+  eq(B.CALLS[0].payload.text, '📦 Auto compacting at 63%…');
+});
+
+const autoEntry = [...B.liveMessages][0];
+autoEntry.nextAt = Date.now() - 1;
+autoEntry.last = 'force a change';
+B.tickLiveMessages();
+await t('★ it ticks in place as the automatic line, never as the manual one', () => {
+  const edits = B.CALLS.filter((c) => c.method === 'editMessageText');
+  eq(edits.length, 1);
+  eq(edits[0].payload.message_id, 101);
+  ok(edits[0].payload.text.startsWith('📦 Auto compacting at 63%…'), edits[0].payload.text);
+  ok(!edits[0].payload.text.includes('Compacting…'), 'the manual frame leaked into an automatic wait');
+});
+
+await t('★ the endings come from the slot: automatic in, automatic out', () => {
+  ok(B.compactEnding('done', { archived: '7f4e3041' }).startsWith('✅ Auto compacted'), 'done');
+  ok(B.compactEnding('done', { archived: '7f4e3041' }).includes('📉 ctx was 63%'), 'the depth it left');
+  ok(B.compactEnding('failed', { reason: 'exit code 1' }).startsWith('❌ Auto compact failed'), 'failed');
+  ok(B.compactEnding('failed', { reason: 'exit code 1' }).includes('exit code 1'), 'the reason');
+  ok(B.compactEnding('discarded').startsWith('⚠️ Compaction discarded'), 'discarded is shared');
+});
+
+const autoDone = B.compactEnding('done', { archived: '7f4e3041' });
+B.settleCompactNotice(autoDone);
+await t('★ the ending lands on the same message', () => {
+  const last = B.CALLS[B.CALLS.length - 1];
+  eq(last.method, 'editMessageText');
+  eq(last.payload.message_id, 101);
+  eq(last.payload.text, autoDone);
+});
+
+const beforePct = B.CALLS.length;
+B.setAwaitingPct({ msgId: 101, args: { elapsedSec: 42, archived: '7f4e3041', fromPct: 63 } });
+B.settleAutoCompactPct(4);
+await t('★ the fresh chat percentage edits that same message once more, then the slot is empty', () => {
+  const last = B.CALLS[B.CALLS.length - 1];
+  eq(B.CALLS.length, beforePct + 1, 'exactly one more edit');
+  eq(last.method, 'editMessageText');
+  eq(last.payload.message_id, 101);
+  ok(last.payload.text.includes('📉 ctx 63% to 4%'), last.payload.text);
+  eq(B.getAwaitingPct(), null, 'cleared on settle');
+});
+
+B.setAwaitingPct({ msgId: 101, args: { elapsedSec: 42, archived: '7f4e3041', fromPct: 63 } });
+const beforeUnmeasured = B.CALLS.length;
+B.settleAutoCompactPct(null);
+await t('an unmeasurable fresh chat clears the slot and edits nothing: the line stays a fact', () => {
+  eq(B.CALLS.length, beforeUnmeasured, 'it wrote a guess');
+  eq(B.getAwaitingPct(), null, 'and it did not wait forever');
+});
+
+await t('a settle with nothing awaiting is a no-op, not a throw', () => {
+  const before = B.CALLS.length;
+  B.settleAutoCompactPct(4);
+  eq(B.CALLS.length, before);
+});
+
+B.reset();
+B.liveMessages.clear();
+await B.startCompactNotice(false);
+await t('★ a manual slot still gets the manual endings', () => {
+  ok(B.compactEnding('done', { archived: '7f4e3041' }).startsWith('✅ Compacted'), B.compactEnding('done', {}));
+  ok(B.compactEnding('failed', { reason: 'x' }).startsWith('❌ Compaction failed'), 'failed');
+  ok(!B.compactEnding('failed', { reason: 'x' }).includes('Auto'), 'the automatic frame leaked into a manual ending');
+});
+B.settleCompactNotice('done');
 B.liveMessages.clear();
 
 // ---------------------------------------------------------------------------

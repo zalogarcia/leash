@@ -68,6 +68,10 @@ import {
   compactQueuedLine,
   compactDoneLine,
   compactDiscardedLine,
+  autoCompactLine,
+  autoCompactDoneLine,
+  autoCompactFailedLine,
+  autoCompactStatusLine,
   WALL_TICK_MS,
   limitWallLine,
   limitWallResolved,
@@ -1123,6 +1127,81 @@ t('compact: ★ house style on every one of the four states', () => {
     [compactQueuedLine(), 'compactQueuedLine'],
     [compactDoneLine({ elapsedSec: 42, archived: '7f4e3041' }), 'compactDoneLine'],
     [compactDiscardedLine(), 'compactDiscardedLine'],
+  ]) {
+    houseStyle(s2, where);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// auto compact: the same wait, started by the daemon
+// ---------------------------------------------------------------------------
+
+t('auto compact: ★ the ⏳ says it was not asked for, and why it is happening', () => {
+  eq(autoCompactLine({ pct: 63 }), '📦 Auto compacting at 63%…');
+  ok(autoCompactLine({}).startsWith('📦 Auto compacting'), 'no percentage still names the actor');
+  ok(!autoCompactLine({}).includes('%'), 'an unknown percentage is omitted, never printed as NaN');
+});
+
+t('auto compact: the wait carries a clock once there is one worth showing', () => {
+  ok(!autoCompactLine({ pct: 63, elapsedSec: 0 }).includes('·'), autoCompactLine({ pct: 63, elapsedSec: 0 }));
+  eq(autoCompactLine({ pct: 63, elapsedSec: 42 }), '📦 Auto compacting at 63%… · 42s');
+});
+
+t('auto compact: ★ the done line, before and after the fresh chat can be measured', () => {
+  eq(
+    autoCompactDoneLine({ elapsedSec: 42, archived: '7f4e3041', fromPct: 63 }),
+    '✅ Auto compacted · 42s\n📉 ctx was 63%\n💬 Old chat archived (7f4e3041) · /resume it\n🆕 Fresh chat primed with the summary',
+  );
+  eq(
+    autoCompactDoneLine({ elapsedSec: 42, archived: '7f4e3041', fromPct: 63, toPct: 4 }),
+    '✅ Auto compacted · 42s\n📉 ctx 63% to 4%\n💬 Old chat archived (7f4e3041) · /resume it\n🆕 Fresh chat primed with the summary',
+  );
+});
+
+t('auto compact: unknown facts cost their line rather than printing a ?', () => {
+  const s2 = autoCompactDoneLine({ elapsedSec: 1 });
+  eq(s2.split('\n').length, 2, 'no percentage, no archive: two lines');
+  ok(!s2.includes('?') && !s2.includes('null') && !s2.includes('NaN'), s2);
+});
+
+t('auto compact: the failure names the reason and promises nothing changed', () => {
+  const s2 = autoCompactFailedLine({ reason: 'exit code 1' });
+  eq(s2, '❌ Auto compact failed\nexit code 1\nThe chat is unchanged · /compact retries');
+  eq(autoCompactFailedLine({}).split('\n').length, 2, 'no reason, no reason line');
+  ok(autoCompactFailedLine({ reason: 'x'.repeat(400) }).split('\n')[1].length <= 120, 'a stack trace is clipped');
+});
+
+t('auto compact: ★ the /status row, in its three states', () => {
+  eq(autoCompactStatusLine({ enabled: false }), '📦 auto compact off');
+  eq(autoCompactStatusLine({ enabled: true, thresholdPercent: 60 }), '📦 auto compact on · 60% · never yet');
+  const now = Date.parse('2026-09-11T13:05:00Z');
+  eq(
+    autoCompactStatusLine({ enabled: true, thresholdPercent: 60, lastAt: now - 60 * 60_000, timeZone: 'America/New_York', now }),
+    '📦 auto compact on · 60% · last 8:05am',
+  );
+  eq(
+    autoCompactStatusLine({ enabled: true, thresholdPercent: 60, lastAt: now - 3 * 86_400_000, timeZone: 'America/New_York', now }),
+    '📦 auto compact on · 60% · last Tue 9:05am',
+    'a fire on another day names the day',
+  );
+});
+
+t('auto compact: the row sits under the chat line in the header', () => {
+  const row = autoCompactStatusLine({ enabled: true, thresholdPercent: 60 });
+  const lines = statusHeader({ name: 'M', session: '7f4e3041', ctxPct: 63, autoCompact: row }).split('\n');
+  eq(lines[1], '💬 chat 7f4e3041 · ctx 63%');
+  eq(lines[2], row);
+  ok(!statusHeader({ name: 'M' }).includes('auto compact'), 'no row given, no row printed');
+});
+
+t('auto compact: ★ house style on every state, including the longest ones', () => {
+  const now = Date.parse('2026-09-11T13:05:00Z');
+  for (const [s2, where] of [
+    [autoCompactLine({ pct: 100, elapsedSec: 899 }), 'autoCompactLine'],
+    [autoCompactDoneLine({ elapsedSec: 899, archived: '7f4e3041', fromPct: 100, toPct: 100 }), 'autoCompactDoneLine'],
+    [autoCompactFailedLine({ reason: 'the run ended with no summary' }), 'autoCompactFailedLine'],
+    [autoCompactStatusLine({ enabled: true, thresholdPercent: 100, lastAt: now - 3 * 86_400_000, timeZone: 'America/New_York', now }), 'autoCompactStatusLine'],
+    [autoCompactStatusLine({ enabled: false }), 'autoCompactStatusLine off'],
   ]) {
     houseStyle(s2, where);
   }

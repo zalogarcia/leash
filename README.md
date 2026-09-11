@@ -200,9 +200,15 @@ runs in order.
 
 `/compact` is Leash's own implementation, not the interactive built-in: it
 asks the current session for a handoff summary, archives that session, and opens
-a fresh one primed with the summary. Leash's `/usage` goes further than the
-interactive screen: it reads live plan usage for every enrolled account, not just
-the one currently logged in.
+a fresh one primed with the summary. With `autoCompact` enabled in `config.json`
+Leash runs that same compaction by itself: when a chat turn ends with the session
+at or past the threshold (default 60% of the context window) and nothing is
+queued, steered in or asked and unanswered, the summary turn starts on its own,
+under a live message that says it was automatic, and your next message queues
+behind it exactly as it would behind `/compact`. A cooldown (default 30 minutes)
+keeps two compactions apart; `/status` shows the setting and when it last fired.
+Leash's `/usage` goes further than the interactive screen: it reads live plan
+usage for every enrolled account, not just the one currently logged in.
 
 ## Multiple Claude accounts
 
@@ -841,8 +847,10 @@ The engine and presentation keys: `name` (what the daemon calls itself in
 `false` always builds it from the on-disk chat ring instead), `style`
 (`{"noDashes": true}` rewrites em and en dashes out of every outbound reply on
 both engines, leaving code, fences and URLs alone — default `false`, the model
-keeps its own voice) and `progress` (`{"background": false}` turns off the live
-line a background worker keeps on screen from dispatch to done — default `true`).
+keeps its own voice), `progress` (`{"background": false}` turns off the live
+line a background worker keeps on screen from dispatch to done — default `true`)
+and `autoCompact` (`{"enabled": true, "thresholdPercent": 60, "cooldownMinutes": 30}`
+lets the daemon compact an idle chat by itself past the threshold, default off).
 
 Every key can be overridden with a `BRIDGE_<UPPER_SNAKE>` environment variable,
 including the object-valued ones: `BRIDGE_STYLE='{"noDashes":true}'`,
