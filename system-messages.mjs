@@ -253,7 +253,17 @@ export function classifyClaudeFailure(text) {
   if (/\b401\b|unauthorized|unauthenticated|invalid[ _-]?api[ _-]?key|authentication|not (?:logged|signed) in|oauth|token (?:has )?expired/i.test(s)) {
     return 'auth';
   }
-  if (/\b429\b|rate[ _-]?limit|usage limit|quota|too many requests|you've (?:hit|reached) your/i.test(s)) {
+  // "out of usage credits" is the 2026-09 wall and it is a LIMIT, not a billing
+  // state: it is what a Max account says when its window is spent, and the
+  // credit branch above would send them to a payment screen for it. The query
+  // parameter is the CLI's own stamp on its limit messages, kept here as the
+  // second anchor for the same reason accounts.mjs keeps it: the sentence is
+  // the CLI's to reword, the parameter is not prose.
+  if (
+    /\b429\b|rate[ _-]?limit|usage limit|quota|too many requests|you've (?:hit|reached) your|out of usage credits|from=cc_cli_limit_message/i.test(
+      s,
+    )
+  ) {
     return 'rate_limit';
   }
   if (/ENOENT|command not found|no such file or directory/i.test(s)) return 'missing';

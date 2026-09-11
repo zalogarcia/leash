@@ -333,6 +333,20 @@ t('errors: the four classes that have different answers', () => {
   eq(classifyClaudeFailure('exit code 1'), 'other');
 });
 
+t('errors: the "out of usage credits" wall is a limit, not a billing state', () => {
+  // A Max account whose window is spent says this. Classed as credit it would
+  // send them to a payment screen; classed as other it renders as a bare
+  // error, which is what it did on 2026-09-10 while two accounts sat free.
+  eq(
+    classifyClaudeFailure(
+      "You're out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.",
+    ),
+    'rate_limit',
+  );
+  eq(classifyClaudeFailure('claude.ai/settings/usage?from=cc_cli_limit_message'), 'rate_limit', 'the parameter alone');
+  eq(classifyClaudeFailure('API Error: 400 credit balance is too low'), 'credit', 'a real billing state is untouched');
+});
+
 t('errors: credit beats auth, or he is sent to the wrong screen', () => {
   // "credit balance is too low" arrives as an authentication-shaped API error.
   eq(classifyClaudeFailure('Authentication error: your credit balance is too low'), 'credit');

@@ -206,6 +206,29 @@ await t('limit phrases are recognised and bare "limit" is not', () => {
   ok(!isLimitSignal(''), 'empty text is not a limit');
 });
 
+// The wall that started saying something new. Both anchors are asserted
+// separately, because the point of having two is that either one alone still
+// rotates the account when the CLI rewords the other.
+await t('the "out of usage credits" wall is a limit, on either anchor', () => {
+  ok(
+    isLimitSignal(
+      "You're out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.",
+    ),
+    'the exact sentence observed on 2026-09-10 must rotate the account',
+  );
+  ok(isLimitSignal('out of usage credits'), 'the phrase alone is the first anchor');
+  ok(
+    isLimitSignal('see https://claude.ai/settings/usage?from=cc_cli_limit_message for details'),
+    'the query parameter alone is the second anchor, so a reworded sentence still trips it',
+  );
+  ok(!isLimitSignal('your credits are fine'), 'the word "credits" alone must not rotate accounts');
+  ok(!isLimitSignal('usage went up this week'), 'the word "usage" alone must not rotate accounts');
+  ok(
+    !isLimitSignal('manage usage credits at claude.ai/settings/usage'),
+    'the settings URL without the limit parameter is documentation, not a wall',
+  );
+});
+
 // ---------- selection ----------
 
 const iso = (msFromNow) => new Date(NOW + msFromNow).toISOString();

@@ -165,6 +165,20 @@ const LIMIT_PHRASES = [
   /session limit reached/i,
   /usage limit reached/i,
   /claude ai usage limit reached/i,
+  // THE 2026-09 WALL, which says neither "session limit" nor "usage limit":
+  // "You're out of usage credits. Switch to another model, or manage usage
+  // credits at claude.ai/settings/usage?from=cc_cli_limit_message, to
+  // continue." Every phrase above missed it, so the chat lane died on it twice
+  // in five seconds with two free accounts sitting in the store, marked
+  // nothing and swapped nothing, and printed "Error 5s" (2026-09-10 19:12 and
+  // 19:21 ET, rotated by hand at 19:24).
+  //
+  // TWO INDEPENDENT ANCHORS because the sentence is the CLI's to reword at any
+  // release, and being one release behind is how this bug happened. The query
+  // parameter is stamped on its limit messages and is not prose anyone writes
+  // by accident, so it survives a rewording of the sentence around it.
+  /out of usage credits/i,
+  /from=cc_cli_limit_message/i,
 ];
 export function isLimitSignal(text) {
   const s = String(text || '');

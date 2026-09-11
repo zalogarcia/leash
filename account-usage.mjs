@@ -139,7 +139,12 @@ export function usageBar(percent) {
 
 // Accepts an ISO string (what the API returns), an epoch-millisecond number, or
 // a Date. Epoch SECONDS are deliberately NOT accepted — see fmtResetLeft.
-function toMs(resetsAt) {
+// EXPORTED because rotateOffLimitedAccount reads the same resets_at fields off
+// a usage row and must not hand-roll a second reader for them: this API has
+// sent both ISO strings and epoch numbers, and a parser that knows only one of
+// those reads the other as far-future or as NaN. Named for the field it parses,
+// since at the call site it is 3,000 lines away from this one.
+export function resetsAtToMs(resetsAt) {
   if (resetsAt instanceof Date) return resetsAt.getTime();
   if (typeof resetsAt === 'number') return Number.isFinite(resetsAt) ? resetsAt : NaN;
   if (typeof resetsAt === 'string') return Date.parse(resetsAt);
@@ -170,7 +175,7 @@ function weekdayLabel(ms, timeZone) {
 // be tested by moving the wall clock. Both of those are exactly what the unit
 // contract comment on fmtLeft warns about, so this takes ISO/ms and takes `now`.
 export function fmtResetLeft(resetsAt, now = Date.now(), { timeZone = LOCAL_TZ, withDay = true, withLeft = true } = {}) {
-  const ms = toMs(resetsAt);
+  const ms = resetsAtToMs(resetsAt);
   if (!Number.isFinite(ms)) return 'unknown';
   const delta = ms - Number(now);
   if (!Number.isFinite(delta) || delta <= 0) return 'due now';
@@ -198,7 +203,7 @@ export function fmtResetLeft(resetsAt, now = Date.now(), { timeZone = LOCAL_TZ, 
 // already unambiguous and the two words buy back room on a phone line. /usage
 // keeps the date: it is the diagnostic view and a date is never wrong there.
 export function fmtResetClock(resetsAt, { timeZone = LOCAL_TZ, now = Date.now(), compact = false } = {}) {
-  const ms = toMs(resetsAt);
+  const ms = resetsAtToMs(resetsAt);
   if (!Number.isFinite(ms)) return 'unknown';
   const t = new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', minute: '2-digit', hour12: true })
     .format(new Date(ms))

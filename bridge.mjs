@@ -54,6 +54,7 @@ import { createAccountStore, fingerprint, isLimitSignal, parseResetTime } from '
 import {
   createAccountUsage,
   invalidateUsageCache,
+  resetsAtToMs,
   usageLine,
   renderAccountList,
   renderUsageReport,
@@ -3149,10 +3150,76 @@ function chatRunFailure(resultTexts, resultEvent, code, stderrTail = '') {
 //   'exhausted'   marked, nothing free, wall raised
 // `lines` is the worker-note prose, kept verbatim so the handback is unchanged.
 // ---------------------------------------------------------------------------
+/**
+ * THE RESET CLOCK A WALL DOES NOT CARRY.
+ *
+ * parseResetTime never returns null: a message with no parseable time degrades
+ * to now + 1h with guessed:true, which is the right default when nothing better
+ * exists. The 2026-09 wall ("You're out of usage credits ...") carries no clock
+ * at all, so a rotation off it would free the account an hour later, hand it the
+ * next message, die on it again and rotate everything else off in the process:
+ * an hour at a time until the real window happened to roll over.
+ *
+ * The usage API knows the real one. This reads it for the SLOT BEING MARKED and
+ * takes the LATEST resets_at among the windows that are genuinely exhausted:
+ * `locked` (the server's own reason string) or 100%. Latest, because a
+ * five-hour window back at 8pm is worth nothing while the weekly window is
+ * still full, and marking the account free at 8pm just buys another death.
+ *
+ * THE 95% TIER IS A DIFFERENT QUESTION AND TAKES THE SOONEST, not the latest.
+ * It exists only because the API and the CLI round differently and a wall at
+ * 99.6% can read as 99 here, so at that tier we do not KNOW which window is the
+ * wall. Taking the latest there turns a rounding allowance into a guess that a
+ * 96% weekly window is spent, and marks a healthy account down for days over a
+ * five-hour wall: worse than the one-hour guess this exists to replace, and
+ * nothing in the daemon clears a limitedUntil early. Soonest is the smallest
+ * claim the evidence supports, and being early costs one more rotation.
+ *
+ * Returns a parseResetTime-shaped object, or null when it cannot better the
+ * guess, which the caller then keeps: an unreachable API, a row belonging to a
+ * different slot (another account's numbers are never this account's window),
+ * no window near its ceiling, or a reset already in the past. That last one
+ * matters most: limitedUntil in the past is not a limit at all, so accepting it
+ * would hand the dead account straight back to the next message.
+ */
+async function usageResetFor(name) {
+  if (!name) return null;
+  try {
+    // The cached row can predate the wall by the whole TTL, and a reading taken
+    // before the account ran out is a reading that says it had headroom. This
+    // is the one moment the number has to be fresh.
+    invalidateUsageCache(name);
+    const snap = await withDeadline(accountUsage.activeOnly(), 6_000, null);
+    const row = snap?.row;
+    if (!row || row.name !== name || !row.usage) return null;
+    // A locked window counts even if its percent came back unreadable: the
+    // reason string is the stronger signal of the two.
+    const windows = [row.usage.fiveHour, row.usage.sevenDay, ...(row.usage.scoped || [])].filter(
+      (w) => w && w.resetsAt && (w.locked || Number.isFinite(Number(w.percent))),
+    );
+    const near95 = windows
+      .filter((w) => Number(w.percent) >= 95)
+      .map((w) => resetsAtToMs(w.resetsAt))
+      .filter((ms) => Number.isFinite(ms));
+    // `locked` is the server saying the window is spent, which beats any
+    // percent we might have to round.
+    const exhausted = windows
+      .filter((w) => w.locked || Number(w.percent) >= 100)
+      .map((w) => resetsAtToMs(w.resetsAt))
+      .filter((ms) => Number.isFinite(ms));
+    const ms = exhausted.length ? Math.max(...exhausted) : near95.length ? Math.min(...near95) : null;
+    if (ms === null || !(ms > Date.now())) return null;
+    return { resetsAt: Math.floor(ms / 1000), guessed: false, note: 'reset time read from the usage API' };
+  } catch (e) {
+    console.error('[bridge] usage lookup for the limited account failed:', e.message);
+    return null;
+  }
+}
+
 async function rotateOffLimitedAccount(detail) {
   const now = Date.now();
   const lines = [];
-  const reset = parseResetTime(String(detail || ''));
+  let reset = parseResetTime(String(detail || ''));
 
   // NO CLAUDE ON THIS MACHINE: there is no account to mark, none to swap to,
   // and pausing rotation would wall a Codex lane that never touched an
@@ -3190,10 +3257,32 @@ async function rotateOffLimitedAccount(detail) {
   const active = await accounts.activeAccount();
   const activeName = active?.account?.name || null;
   if (activeName) {
+    // A WALL WITH NO CLOCK ON IT still has to produce a real one, or the guess
+    // frees this account in an hour and the next message dies on it again. See
+    // usageResetFor; null means the API could not better the guess, and the
+    // guess is still better than nothing.
+    let source = reset.guessed ? 'guessed' : 'the wall message';
+    if (reset.guessed) {
+      const better = await usageResetFor(activeName);
+      if (better) {
+        reset = better;
+        source = 'the usage API';
+      }
+    }
     accounts.markLimited(activeName, reset.resetsAt);
-    lines.push(
-      `ACCOUNT ROTATION: "${activeName}" hit its limit, reset ${fmtLeft(reset.resetsAt)} out${reset.guessed ? ' (GUESSED: the message did not carry a parseable reset time)' : ''}.`,
+    // WHERE THE CLOCK CAME FROM, said out loud in both places. A guess and a
+    // reading are worth different amounts to whoever reads this afterwards,
+    // and the daemon log is where "why was it retried an hour early" is
+    // answered.
+    console.log(
+      `[bridge] "${activeName}" limited until ${new Date(reset.resetsAt * 1000).toISOString()}, reset time from ${source}`,
     );
+    const resetNote = {
+      guessed: ' (GUESSED: the message did not carry a parseable reset time)',
+      'the usage API': ' (read from the usage API: the wall message carried no clock)',
+      'the wall message': '',
+    }[source];
+    lines.push(`ACCOUNT ROTATION: "${activeName}" hit its limit, reset ${fmtLeft(reset.resetsAt)} out${resetNote}.`);
   } else {
     lines.push(
       `ACCOUNT ROTATION: a session limit was hit but the live credentials match no captured slot, so nothing could be marked limited. Run /account capture <name> to bank the current login.`,

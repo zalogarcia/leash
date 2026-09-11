@@ -685,11 +685,20 @@ const accounts = {
   earliestReset: () => ACC.earliest,
 };
 const invalidateUsageCache = () => { ACC.cacheKills++; };
+// STUBBED, not extracted: this suite is about what the CHAT LANE does with a
+// rotation, not about where the reset clock comes from (limit-rotation.test.mjs
+// owns that, against the real function). It has to exist all the same, because
+// rotateOffLimitedAccount calls it on any wall whose message carries no
+// parseable reset time, and the 2026-09 wall is exactly that shape: without
+// this stub, changing LIMIT_STDERR to the newer wording would fail every test
+// below with a bare ReferenceError.
+export const USAGE_RESET = { calls: 0, value: null };
+const usageResetFor = async (name) => { USAGE_RESET.calls++; return USAGE_RESET.value; };
 export const parkedCodexChats = [];
 const swapFailedLine = ({ error, account }) => 'swap failed ' + error + ' ' + account;
 const CLAUDE_AVAILABLE_FN = () => CLAUDE_AVAILABLE;
 export const parkedWalledChats = [];
-export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wallNotices.clear(); workerNotices.clear(); sentSeq = 0; CLAUDE.length = 0; CHAT_FALLBACK.length = 0; CODEX.length = 0; CODEX_CHAT.length = 0; bgLanes.length = 0; bgSeq = 0; rotationPausedUntil = 0; codexPausedUntil = 0; parkedWalledChats.length = 0; codexFallbackValue = true; CHAT_CWD = ${JSON.stringify(TMP)}; ENGINE_CFG = {}; CHAT_ENGINE_STATE = {}; CLAUDE_AVAILABLE = true; CODEX_AVAILABLE = true; LANES.main.current = null; LANES.main.queue.length = 0; HANDOFF.pending = false; HANDOFF.block = ''; rotationCooldownUntil = 0; ACC.active = null; ACC.free = []; ACC.swapOk = true; ACC.swapError = 'locked'; ACC.earliest = 0; ACC.swapDelayMs = 0; ACC.marked.length = 0; ACC.swapped.length = 0; ACC.cacheKills = 0; parkedCodexChats.length = 0; SAVES.length = 0; delete CHAT_STATE.handoffPending; };
+export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wallNotices.clear(); workerNotices.clear(); sentSeq = 0; CLAUDE.length = 0; CHAT_FALLBACK.length = 0; CODEX.length = 0; CODEX_CHAT.length = 0; bgLanes.length = 0; bgSeq = 0; rotationPausedUntil = 0; codexPausedUntil = 0; parkedWalledChats.length = 0; codexFallbackValue = true; CHAT_CWD = ${JSON.stringify(TMP)}; ENGINE_CFG = {}; CHAT_ENGINE_STATE = {}; CLAUDE_AVAILABLE = true; CODEX_AVAILABLE = true; LANES.main.current = null; LANES.main.queue.length = 0; HANDOFF.pending = false; HANDOFF.block = ''; rotationCooldownUntil = 0; ACC.active = null; ACC.free = []; ACC.swapOk = true; ACC.swapError = 'locked'; ACC.earliest = 0; ACC.swapDelayMs = 0; ACC.marked.length = 0; ACC.swapped.length = 0; ACC.cacheKills = 0; USAGE_RESET.calls = 0; USAGE_RESET.value = null; parkedCodexChats.length = 0; SAVES.length = 0; delete CHAT_STATE.handoffPending; };
 `,
         grab('BG_COMMAND_RE', 'const'),
         grab('unchosenCodex', 'const'),
@@ -862,6 +871,38 @@ await t('★ no "Claude run failed" bubble: the rotation line is the whole answe
 });
 
 await t('the rotation line passes the house-style gates', () => houseOk(swapPlan.line, 'chatRotatedLine'));
+
+// --- the 2026-09 wall, which carries no reset clock at all -----------------
+// The one that started this: the chat lane died twice in five seconds on it
+// with two accounts free, because no phrase matched. The phrase matches now,
+// and the clock it does not carry is asked of the usage API.
+const CREDITS_WALL =
+  "You're out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.";
+
+P.reset();
+P.setAccounts({ active: 'gjgkabche@gmail.com', free: ['hello@blackumbrella.app'] });
+P.USAGE_RESET.value = { resetsAt: Math.floor(Date.now() / 1000) + 7 * 3600, guessed: false, note: 'usage api' };
+const creditsPlan = await P.handleChatLimitFailure(CREDITS_WALL, chatCtx());
+creditsPlan?.dispatch();
+
+await t('★ the clockless wall rotates the chat lane and takes its reset from the usage API', () => {
+  eq(P.ACC.marked.length, 1, 'the wall that marked nothing on 2026-09-10 now marks');
+  eq(P.ACC.marked[0].name, 'gjgkabche@gmail.com');
+  eq(P.USAGE_RESET.calls, 1, 'the API is asked exactly once, only because the message carried no clock');
+  eq(P.ACC.marked[0].resetsAt, P.USAGE_RESET.value.resetsAt, 'and its answer is what gets banked');
+  eq(P.ACC.swapped[0], 'hello@blackumbrella.app', 'and the free account takes over');
+  eq(P.CLAUDE.length, 1, 'and the message that was waiting on it is retried');
+});
+
+P.reset();
+P.setAccounts({ active: 'zalo@blackumbrella.app', free: ['gjgkabche@gmail.com'] });
+await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx());
+await t('a wall that DOES carry a clock never asks the usage API', () => {
+  eq(P.USAGE_RESET.calls, 0, 'no network on the common path');
+});
+
+const swapPlan2 = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx());
+swapPlan2?.dispatch();
 
 // --- nothing free ----------------------------------------------------------
 P.reset();
