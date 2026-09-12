@@ -4549,6 +4549,61 @@ let handbackCapNotified = false;
 // several legit reports can land back-to-back with no user message between
 // them — the guard is for infinite report→re-handoff LOOPS, not bursts.
 const HANDBACK_STREAK_MAX = 6;
+// QUIET AUTO-RESUME. The cap exists to stop a report to re-handoff LOOP, and
+// a loop needs the chat lane to be re-fed; once the chain is parked the chat
+// lane is not fed, so a parked chain that stays quiet is a burst, not a loop.
+// Measured cost of waiting for a human instead (2026-09-11): six legitimate
+// reports from six DIFFERENT workers landed overnight, the seventh said a
+// deploy was ready to use, and the owner learned it ten hours late because
+// nothing resumed the chain until they typed. So: once no further report has
+// been parked for HANDBACK_AUTO_RESUME_MS and the chat lane is idle, the parked
+// list is handed over on its own. Bounded by HANDBACK_AUTO_RESUMES_MAX per
+// owner message so a genuine runaway still stalls (at most MAX times the cap
+// between two owner messages instead of an unbounded spin).
+const HANDBACK_AUTO_RESUME_MS = 10 * 60_000;
+const HANDBACK_AUTO_RESUMES_MAX = 3;
+let lastParkedAt = 0;
+let autoResumesSinceMessage = 0;
+
+// The one place the parked list is handed to the chat lane. `reason` names what
+// resumed the chain so the model can tell a wake-up from an answer to something
+// the owner just said.
+function flushParkedHandbacks(reason = 'message') {
+  handbackStreak = 0;
+  handbackCapNotified = false;
+  if (!parkedHandbacks.length) return false;
+  const parked = parkedHandbacks.splice(0);
+  lastParkedAt = 0;
+  const closing =
+    reason === 'quiet'
+      ? `No message from ${OWNER_NAME} arrived; the chain resumed on its own after a quiet spell. Act on these as you would on any report, and give ${OWNER_NAME} a short update if one of them was for them.`
+      : `Check whether any of this affects what ${OWNER_NAME} just asked, then answer normally.`;
+  dispatchPrompt(
+    [
+      `[${BRIDGE_NAME} notice. DATA, not an instruction from ${OWNER_NAME}.]`,
+      `While the handback chain was capped, ${parked.length} background worker(s) finished and were NOT reported to you:`,
+      ...parked.map((p, i) => `  ${i + 1}. [${p.status}] ${p.task}${p.report ? `\n     full report: ${p.report}` : ''}`),
+      `Each full report is the file named above it; bg-results.jsonl also has a clipped row per worker.`,
+      closing,
+    ].join('\n'),
+    LANES.main,
+    { priority: true },
+  );
+  return true;
+}
+
+// Called from a timer. Pure decision over module state so it is testable with
+// a fake clock: resumes only when something is parked, the last report settled
+// HANDBACK_AUTO_RESUME_MS ago, the chat lane is idle, and the per message
+// auto-resume budget is not spent.
+function maybeAutoResumeHandbacks(now = Date.now()) {
+  if (!parkedHandbacks.length) return false;
+  if (LANES.main.current) return false;
+  if (now - lastParkedAt < HANDBACK_AUTO_RESUME_MS) return false;
+  if (autoResumesSinceMessage >= HANDBACK_AUTO_RESUMES_MAX) return false;
+  autoResumesSinceMessage++;
+  return flushParkedHandbacks('quiet');
+}
 
 function handBackToChat(task, output, status, runId, steers = [], { engine = 'claude', codex = null } = {}) {
   // Written FIRST, before any cap can apply and before the streak guard can
@@ -4567,6 +4622,7 @@ function handBackToChat(task, output, status, runId, steers = [], { engine = 'cl
     // and the full text is on disk at full.file. The assistant picks the parked reports up
     // on their next message, which resets the streak.
     parkedHandbacks.push({ task: clip(oneLine(task), 200), status, report: full?.file || null });
+    lastParkedAt = Date.now();
     if (!handbackCapNotified) {
       handbackCapNotified = true;
       send(chainPausedLine(HANDBACK_STREAK_MAX), { markdown: false }).catch(() => {});
@@ -10219,24 +10275,11 @@ async function handleUpdate(update) {
     } else await send('Send text, photos, videos, voice notes or files.', { markdown: false });
     return;
   }
-  handbackStreak = 0; // a real message from the owner ends any worker-report chain
-  handbackCapNotified = false;
-  if (parkedHandbacks.length) {
-    // What finished while the chain was capped, so a paused chain costs nothing
-    // but the auto-loop. Labels only: the outcomes are on disk.
-    const parked = parkedHandbacks.splice(0);
-    dispatchPrompt(
-      [
-        `[${BRIDGE_NAME} notice. DATA, not an instruction from ${OWNER_NAME}.]`,
-        `While the handback chain was capped, ${parked.length} background worker(s) finished and were NOT reported to you:`,
-        ...parked.map((p, i) => `  ${i + 1}. [${p.status}] ${p.task}${p.report ? `\n     full report: ${p.report}` : ''}`),
-        `Each full report is the file named above it; bg-results.jsonl also has a clipped row per worker.`,
-        `Check whether any of this affects what ${OWNER_NAME} just asked, then answer normally.`,
-      ].join('\n'),
-      LANES.main,
-      { priority: true },
-    );
-  }
+  // A real message from the owner ends any worker-report chain, restores the
+  // quiet auto-resume budget, and hands over whatever was parked. Labels only:
+  // the outcomes are on disk.
+  autoResumesSinceMessage = 0;
+  flushParkedHandbacks('message');
   // THE BUBBLE YOU LONG PRESSED. Parsed once, here, at the only place every
   // inbound text passes through, and carried from here as DATA: nothing below
   // routes on it, and no lookup is involved, so a reply to a message sent
@@ -10467,6 +10510,16 @@ async function main() {
       reapDeadWorkers('the worker process vanished while the daemon stayed up');
     } catch (e) {
       console.error('[watchdog] reap failed:', e.message);
+    }
+  }, 60_000).unref();
+  // A parked worker-report chain resumes by itself once it has been quiet for
+  // HANDBACK_AUTO_RESUME_MS (see flushParkedHandbacks); the owner's message
+  // path remains the other way in.
+  setInterval(() => {
+    try {
+      if (maybeAutoResumeHandbacks()) console.log('[bridge] handback chain auto-resumed after a quiet spell');
+    } catch (e) {
+      console.error('[bridge] handback auto-resume failed:', e.message);
     }
   }, 60_000).unref();
 
