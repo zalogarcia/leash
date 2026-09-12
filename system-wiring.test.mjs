@@ -1208,14 +1208,22 @@ const COMMIT_RING = [
   { ts: 1789133239572, chat: '1', engine: 'claude', role: 'assistant', text: 'Picking back up: once the gate lands I dispatch wave 4.' },
 ];
 const logs = [];
+// The wake-up clock is day-aware (a time on another day gains its weekday), and
+// the harness pins BOOT_AT to a Friday, so the clock the daemon reads must be
+// pinned to that same day or the suite goes red the next morning (it did, on
+// Saturday 2026-09-12: "Fri 10:23am" against an expected "10:23am").
+const FIXED_NOW = Date.parse('2026-09-11T14:24:07Z');
 const withLogs = (fn) => {
   const orig = console.log;
+  const origNow = Date.now;
   logs.length = 0;
   console.log = (...a) => logs.push(a.join(' '));
+  Date.now = () => FIXED_NOW;
   try {
     fn();
   } finally {
     console.log = orig;
+    Date.now = origNow;
   }
 };
 
