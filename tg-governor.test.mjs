@@ -21,7 +21,7 @@ const failures = [];
 const tests = [];
 const t = (name, fn) => tests.push({ name, fn });
 
-const CHAT = '404408023';
+const CHAT = '1000000001';
 
 /** A governor on fresh files with a fake clock and a scripted transport. */
 function rig(overrides = {}) {
