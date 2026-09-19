@@ -340,6 +340,7 @@ const SEND = await import(
          box.calls.push({ method, payload });
        };
        ${src.match(/let richOk = .*/)[0]}
+       const gov = () => ({ coolingDown: () => false }); // the governor, quiet: these tests are about the rails
        ${grab('sendRich')}
        ${grab('sendResult')}
        export { sendResult };

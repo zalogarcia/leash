@@ -68,6 +68,8 @@ SHARED_MODULES=(
   auto-compact.test.mjs
   wake-up.mjs
   wake-up.test.mjs
+  tg-governor.mjs
+  tg-governor.test.mjs
 )
 
 # NOT LISTED, and why. These modules came from the private sibling and behave

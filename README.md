@@ -143,6 +143,54 @@ It either folds your message into the current turn or answers it right after.
 Only when steering isn't possible (nothing running yet, run already finishing)
 does the message queue instead.
 
+### Every write to your chat passes one governor
+
+Telegram rate-limits bots per chat, and when it says stop it can say so for a
+long time: a single `429` can carry a `retry_after` measured in hours. A bridge
+that treats that as an error loses whatever it was trying to send — and what it
+is usually trying to send is the answer you are waiting for.
+
+`tg-governor.mjs` sits in front of every write to your chat and owns four things
+with one clock and one set of files:
+
+- **A token bucket.** Telegram's own guidance is one message per second per
+  chat, with short bursts tolerated. The bucket refills at that rate, holds a
+  burst of three, and keeps one token in reserve that only a real message may
+  spend — so typing indicators and progress edits can never crowd out the
+  answer, no matter how many lanes are running.
+- **A shared cooldown.** Any `429`, from any method, writes a deadline to
+  `tg-throttle.json`. Every writer inside the daemon checks it before every
+  write, and anything *outside* the daemon that writes to the same chat can read
+  the same file. One penalty stops the whole fleet from spending into it, and a
+  later deadline written by another process is adopted rather than ignored.
+- **An outbox instead of a drop.** A message you are meant to read that arrives
+  during a cooldown is **held** in `tg-outbox.json`, not discarded. When the
+  deadline passes it is flushed oldest-first at just under one per second,
+  behind a single header line saying how long the chat was throttled. The file
+  survives a daemon restart, and so does the deadline. HTML that Telegram
+  refuses to parse falls back to plain text; a `4xx` is dropped with a log line;
+  network errors retry a few times before giving up.
+- **A ledger.** `tg-ledger.jsonl` records every write and its outcome — method
+  and result only, never message text — so the next long rate limit can be
+  traced back to what was sent in the minutes before it. `/status` shows a
+  summary of the last ten minutes.
+
+A short penalty (ten seconds or less) is still waited out in place, so the
+message lands in order. Anything longer is held. Chrome — typing pulses,
+progress edits, the placeholder bubble that gets edited into its own answer — is
+dropped rather than held, because a liveness frame delivered forty minutes late
+is a frame that lies.
+
+**What you see when a cooldown hits:** the bot goes quiet, because it is not
+allowed to write. If you send a message during the cooldown, it answers with one
+plain line telling you it is throttled and until when — at most once every
+fifteen minutes, so a silent bot is never mistaken for a dead one. When the
+penalty clears, everything that was held arrives in order behind one header
+line. Nothing you were owed is lost.
+
+The three state files (`tg-outbox.json`, `tg-throttle.json`, `tg-ledger.jsonl`)
+are gitignored and live next to `bridge.mjs`.
+
 ## Replying to a message
 
 Long press any bubble, pick Reply, and the message you were pointing at is quoted into the prompt: the engine
@@ -838,6 +886,7 @@ node accounts.test.mjs           # the account store and the rotation rules
 node account-usage.test.mjs      # live plan usage per account
 node account-buttons.test.mjs    # the one-tap swap keyboard
 node credential-store.test.mjs   # the keychain / file store behind a swap
+node tg-governor.test.mjs        # the write governor: bucket, cooldown, outbox, ledger
 
 # probes (no Telegram, no daemon, no model spend)
 node scripts/probes/steer-probe.mjs         # a steer, end to end, into a fake worker

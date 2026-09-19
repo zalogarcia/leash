@@ -24,3 +24,9 @@ node_modules/
 .DS_Store
 .vercel
 steer.sock.pid
+tg-outbox.json
+tg-outbox.json.tmp
+tg-throttle.json
+tg-throttle.json.tmp
+tg-ledger.jsonl
+tg-ledger.jsonl.tmp

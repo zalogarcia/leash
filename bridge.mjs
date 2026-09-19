@@ -36,6 +36,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import readline from 'node:readline';
 import { mdToRichBlocks, chunkBlocks, shouldUseRich, stripModeMarkers, detailsToHtml } from './rich-format.mjs';
 import { chunks, escHtml, stripHtml, mdToTelegramHtml } from './md-format.mjs';
+import { createGovernor } from './tg-governor.mjs';
 import {
   clip,
   oneLine,
@@ -602,10 +603,9 @@ function getOpenAIKey() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// retry429:false — for disposable calls (progress edits, typing indicators).
-// Retrying those is actively harmful: the frame is stale by the time the penalty
-// clears, and each retry extends the throttle window.
-async function tg(method, payload, attempt = 0, { retry429 = true } = {}) {
+// The raw call: one HTTP round trip and no policy. Throws {code, description,
+// retryAfter} on a Telegram error so the governor and the callers can route on it.
+async function tgRaw(method, payload) {
   const res = await fetch(`${API}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -614,24 +614,100 @@ async function tg(method, payload, attempt = 0, { retry429 = true } = {}) {
   });
   const data = await res.json().catch(() => ({}));
   if (!data.ok) {
-    const retryAfter = data.parameters?.retry_after || 0;
-    // Anything reaching here with retry429 still on is a message the user is
-    // meant to READ — an answer, an error, a handback. Waiting out even a long
-    // penalty beats dropping it, so honour retry_after up to 5 minutes.
-    // (Disposable calls opt out via retry429:false and back off instead; capping
-    // this wait low is what silently swallows a final reply.)
-    if (data.error_code === 429 && retry429 && attempt < 3 && retryAfter <= 300) {
-      if (retryAfter > 10) console.error(`[bridge] ${method} throttled — waiting ${retryAfter}s to deliver`);
-      await sleep((retryAfter || 3) * 1000);
-      return tg(method, payload, attempt + 1, { retry429 });
-    }
     const err = new Error(`${method}: ${data.error_code} ${data.description || 'unknown'}`);
     err.code = data.error_code;
     err.description = data.description || '';
-    err.retryAfter = retryAfter;
+    err.retryAfter = data.parameters?.retry_after || 0;
     throw err;
   }
   return data.result;
+}
+
+// EVERY WRITE TO THE CHAT PASSES THE GOVERNOR FIRST (tg-governor.mjs): a token
+// bucket under Telegram's one-message-per-second guidance, one shared cooldown
+// that every writer honours the moment any 429 lands (in this process through
+// this gate, outside it through tg-throttle.json), and a persistent outbox for
+// the messages the user must read. A 429 whose retry_after is measured in hours
+// used to make this function throw for every answer, and each one was logged as
+// RESULT NOT DELIVERED and lost; now they wait in the outbox and land behind one
+// header line when the penalty clears. Reads and non-chat writes pass straight
+// through. Built lazily: OWNER_TZ and friends are declared later in this file
+// and are only safe to read once the module has finished loading.
+let governorInstance = null;
+function gov() {
+  if (!governorInstance) {
+    governorInstance = createGovernor({
+      chatId: CHAT_ID,
+      name: () => BRIDGE_NAME,
+      deliver: tgRaw,
+      plainOf: stripHtml,
+      timeZone: OWNER_TZ,
+      outboxFile: path.join(SCRIPT_DIR, 'tg-outbox.json'),
+      throttleFile: path.join(SCRIPT_DIR, 'tg-throttle.json'),
+      ledgerFile: path.join(SCRIPT_DIR, 'tg-ledger.jsonl'),
+    });
+  }
+  return governorInstance;
+}
+
+// retry429:false marks a disposable call (a progress edit, a typing pulse):
+// never retried, never held, dropped outright while the chat is cooling down.
+// The frame is stale by the time a penalty clears, and each retry extends it.
+// disposable:true says the same of a sendMessage that is only chrome (the
+// placeholder bubble), so it can never be delivered forty minutes late.
+async function tg(method, payload, attempt = 0, { retry429 = true, disposable = false } = {}) {
+  const g = gov();
+  const isDisposable = disposable || retry429 === false;
+  const decision = g.gate(method, payload, { disposable: isDisposable });
+  if (decision.action === 'queue') return g.enqueue(method, payload);
+  if (decision.action === 'drop') {
+    g.record({ method, outcome: 'dropped', retryAfter: decision.retryAfter });
+    const err = new Error(`${method}: 429 held back, chat cooling down (${decision.retryAfter}s)`);
+    err.code = 429;
+    err.description = 'cooling down';
+    err.retryAfter = decision.retryAfter;
+    throw err;
+  }
+  if (decision.waitMs > 0) await sleep(decision.waitMs);
+  const started = Date.now();
+  try {
+    const result = await tgRaw(method, payload);
+    if (decision.governed) g.record({ method, outcome: 'sent', ms: Date.now() - started });
+    return result;
+  } catch (err) {
+    if (err.code !== 429) {
+      if (decision.governed) g.record({ method, outcome: 'error', code: err.code });
+      throw err;
+    }
+    const retryAfter = err.retryAfter || 0;
+    if (!decision.governed) {
+      // A 429 on something that is not a chat write (setMyCommands, getFile):
+      // the old behaviour, wait it out briefly, nothing to hold.
+      if (retry429 && attempt < 3 && retryAfter <= 300) {
+        await sleep((retryAfter || 3) * 1000);
+        return tg(method, payload, attempt + 1, { retry429, disposable });
+      }
+      throw err;
+    }
+    g.record({ method, outcome: 'throttled', code: 429, retryAfter });
+    g.throttle(retryAfter, method);
+    // A short penalty is waited out in place so this message lands in order.
+    // Anything longer goes to the outbox (a message they must read) or is
+    // dropped (chrome), and the cooldown it opened pauses every other writer
+    // meanwhile. The old rule waited up to 300s inline, which froze a lane for
+    // five minutes and then dropped the answer anyway when the penalty was
+    // longer. Both bounds matter: THIS response may say 5s while another lane's
+    // 429 or another process's file already pushed the shared deadline out by
+    // hours, and a lane asleep for hours holds an unpersisted answer a restart
+    // loses. (throttle() adds one second of slack to the deadline, hence the
+    // +1000 on the shared bound.)
+    if (!isDisposable && attempt < 3 && retryAfter * 1000 <= g.inlineWaitMaxMs && g.remainingMs() <= g.inlineWaitMaxMs + 1000) {
+      await sleep(g.remainingMs() + 100);
+      return tg(method, payload, attempt + 1, { retry429, disposable });
+    }
+    if (decision.queueable) return g.enqueue(method, payload);
+    throw err;
+  }
 }
 
 // Send text to the chat; tries HTML, falls back to plain on parse errors.
@@ -639,22 +715,29 @@ async function tg(method, payload, attempt = 0, { retry429 = true } = {}) {
 // for backward compatibility" — it can't express underline, strike, spoiler or
 // blockquote, and forbids nested entities. HTML is the same converter the final
 // answers already use, so both paths render identically.
-async function send(text, { markdown = true } = {}) {
+// disposable:true is for chrome (a "Reading…" line that will be edited into its
+// answer): dropped rather than held while the chat is cooling down.
+async function send(text, { markdown = true, disposable = false } = {}) {
   let last = null;
   for (const chunk of chunks(text, TG_MSG_LIMIT)) {
     if (markdown) {
       try {
-        last = await tg('sendMessage', {
-          chat_id: CHAT_ID,
-          text: mdToTelegramHtml(chunk),
-          parse_mode: 'HTML',
-        });
+        last = await tg(
+          'sendMessage',
+          {
+            chat_id: CHAT_ID,
+            text: mdToTelegramHtml(chunk),
+            parse_mode: 'HTML',
+          },
+          0,
+          { disposable },
+        );
         continue;
       } catch {
         /* fall through to plain */
       }
     }
-    last = await tg('sendMessage', { chat_id: CHAT_ID, text: chunk });
+    last = await tg('sendMessage', { chat_id: CHAT_ID, text: chunk }, 0, { disposable });
   }
   return last;
 }
@@ -914,7 +997,7 @@ function tickLiveMessages() {
  */
 async function pendingMessage(label, { tickMs = 3000 } = {}) {
   const startedAt = Date.now();
-  const m = await send(fetchingLine(label), { markdown: false }).catch(() => null);
+  const m = await send(fetchingLine(label), { markdown: false, disposable: true }).catch(() => null);
   const msgId = m?.message_id ?? null;
   let terminal = false;
   const timer =
@@ -1629,7 +1712,7 @@ function runClaude(
           text: `${lane.icon} ${thinkingWord(wordSeed, THINKING_WORDS)}…${
             attachmentFrameNote(kinds) ? ` · ${attachmentFrameNote(kinds)}` : ''
           }${replyQuoteFrameNote(replyQuote || {}) ? ` · ${replyQuoteFrameNote(replyQuote || {})}` : ''}`,
-        });
+        }, 0, { disposable: true });
         progressMsgId = m.message_id;
       } catch (e) {
         console.error('[bridge] failed to send progress message:', e.message);
@@ -7150,7 +7233,7 @@ function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = f
       const m = await tg('sendMessage', {
         chat_id: CHAT_ID,
         text: codexThinkingLine({ elapsedSec: 0, resumed, images: imgs.length }),
-      });
+      }, 0, { disposable: true });
       progressMsgId = m.message_id;
     } catch (e) {
       console.error('[bridge] failed to send codex progress message:', e.message);
@@ -7674,7 +7757,7 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
         text: `🧠 Codex · ${thinkingWord(wordSeed, THINKING_WORDS)}…${resumed ? ' · continuing this chat' : ''}${
           imgs.length ? ` · ${imgs.length} image${imgs.length === 1 ? '' : 's'}` : ''
         }`,
-      });
+      }, 0, { disposable: true });
       progressMsgId = m.message_id;
     } catch (e) {
       console.error('[bridge] failed to send codex progress message:', e.message);
@@ -8266,6 +8349,10 @@ let richOk = process.env.TG_RICH !== '0';
 
 async function sendRich(text) {
   if (!richOk) return false;
+  // While the chat is cooling down the answer will be HELD, and a held rich
+  // payload cannot degrade to plain text later the way HTML can. Take the HTML
+  // rail now so what waits in the outbox is recoverable.
+  if (gov().coolingDown()) return false;
   // Rich blocks cannot carry inline bold/code (Telegram drops parse_mode and
   // entities inside them), so they are used only for a real TABLE, which is the
   // one thing the HTML path genuinely cannot express.
@@ -8278,6 +8365,9 @@ async function sendRich(text) {
     }
     return true;
   } catch (e) {
+    // A penalty says nothing about the schema: the HTML rail takes over for
+    // this answer and rich stays available for the next one.
+    if (e.code === 429) return false;
     richOk = false;
     console.error(`[bridge] rich send failed, falling back to HTML for the rest of this run: ${e.message}`);
     return false;
@@ -8879,6 +8969,8 @@ async function handleCommand(text, msg = null) {
               { timeZone: OWNER_TZ },
             ),
           }),
+          '',
+          gov().statusLine(),
           '',
           laneBlock(LANES.main),
           ...activeBg.flatMap((l) => ['', laneBlock(l)]),
@@ -9504,7 +9596,9 @@ async function handleCommand(text, msg = null) {
       // to confirm the reboot was gated by a 10-minute cooldown stamped on the
       // PREVIOUS boot, so it was suppressed on exactly the restarts that were
       // asked for and the last thing on screen stayed "restarting", forever.
-      const m = await send(restartingLine(), { markdown: false }).catch(() => null);
+      // Chrome: a "Restarting…" line delivered from the outbox after a wall,
+      // with the daemon long since back, is a frame that lies.
+      const m = await send(restartingLine(), { markdown: false, disposable: true }).catch(() => null);
       state.restartMsg = m?.message_id ? { id: m.message_id, at: Date.now() } : null;
       state.lastAnnounce = 0; // force the 🟢 online announce on reboot as confirmation
       saveState();
@@ -10259,6 +10353,10 @@ async function handleUpdate(update) {
     console.log(`[bridge] ignoring message from unauthorized chat ${msg.chat?.id}`);
     return;
   }
+  // They wrote while Telegram is throttling the bot: one plain line about the
+  // hold, at most once a quarter hour, so a silent bot is never mistaken for a
+  // dead one and restarted in the hope of waking it.
+  if (gov().coolingDown()) gov().noticeOwner().catch(() => {});
   const ageSec = Date.now() / 1000 - (msg.date || 0);
   if (ageSec > STALE_SEC) {
     const what = msg.text || `<${pickMedia(msg)?.kind || 'media'}>`;
@@ -10552,6 +10650,7 @@ async function main() {
       console.error('[bridge] announce failed:', e.message),
     );
   }
+  gov().start(); // the outbox flusher: held answers go out when the cooldown clears
   await pollLoop();
 }
 
