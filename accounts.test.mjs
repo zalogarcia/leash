@@ -137,6 +137,32 @@ await t('the real message parses: 6:30pm in an explicit zone', () => {
   ok(r.note.includes('America/Caracas'), 'the zone should be reported');
 });
 
+// The WEEKLY wall, 2026-09-13 01:37 ET: a worker died on it, isLimitSignal read
+// false, nothing was marked and nothing rotated, and the account sat in the file
+// as available at 100 percent of its seven day window.
+await t('the weekly wall is a limit signal', () => {
+  ok(isLimitSignal("You've hit your weekly limit \u00b7 resets Sep 17 at 10am (America/Caracas)"), 'weekly message must be a limit signal');
+  ok(isLimitSignal('weekly limit reached'), 'the bare noun counts too');
+});
+
+await t('the weekly wall parses its DATE, not the next 10am', () => {
+  const r = parseResetTime("You've hit your weekly limit \u00b7 resets Sep 17 at 10am (America/Caracas)", { now: NOW });
+  eq(r.guessed, false);
+  eq(r.resetsAt, Math.floor(Date.UTC(2026, 8, 17, 14, 0, 0) / 1000), '10am Caracas on Sep 17 is 14:00Z that day');
+  ok(r.note.includes('dated'), 'the note should say it read a date');
+});
+
+await t('a dated reset already past this year rolls to next year', () => {
+  const r = parseResetTime('resets Jan 3 at 9am (America/Caracas)', { now: NOW });
+  eq(r.guessed, false);
+  eq(r.resetsAt, Math.floor(Date.UTC(2027, 0, 3, 13, 0, 0) / 1000), 'a January date quoted in August means next January');
+});
+
+await t('an unrecognised month word guesses rather than landing days early', () => {
+  const r = parseResetTime('resets Smarch 17 at 10am (America/Caracas)', { now: NOW });
+  eq(r.guessed, true, 'a month word we cannot read must not become today at 10am');
+});
+
 await t('a bare time with no zone reads as local', () => {
   const r = parseResetTime("You've hit your session limit, resets 1pm", { now: NOW, timeZone: 'America/Caracas' });
   eq(r.guessed, false);

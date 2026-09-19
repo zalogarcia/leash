@@ -48,6 +48,30 @@ const today = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
 
+// A local date N days from today, as YYYY-MM-DD. Plain calendar arithmetic
+// through Date.UTC, deliberately NOT schedule-due.mjs's addDays: these tests
+// assert what the CLI prints, and computing the expectation with the same
+// function the CLI uses would make an off-by-one agree with itself.
+//
+// WHY THE FIXTURES ARE RELATIVE AT ALL. They used to hard-code `lastFired:
+// '2026-09-10'` and assert `(next 2026-09-13)`, which is only true while today
+// is on or before the 13th. On 2026-09-13 the three cadence tests started
+// failing on a pristine tree and stayed failing, and the arithmetic they accuse
+// is right: with an anchor nine days back and a three day cadence, isDailyDue()
+// fires TODAY, and nextDaily() says so. (Property-checked over 468 anchor and
+// cadence pairs: the date nextDaily reports is always the first date isDailyDue
+// returns true on.) A fixture that expires is a fixture that teaches the next
+// reader to distrust a working gate.
+const daysFromToday = (n) => {
+  const [y, m, d] = today().split('-').map(Number);
+  const at = new Date(Date.UTC(y, m - 1, d + n));
+  return `${at.getUTCFullYear()}-${String(at.getUTCMonth() + 1).padStart(2, '0')}-${String(at.getUTCDate()).padStart(2, '0')}`;
+};
+// The anchor sits one day back, so anchor + 3 is always two days from now: in
+// the future on every day of the year, and never rounded up to today.
+const ANCHOR = () => daysFromToday(-1);
+const NEXT_AFTER_ANCHOR = () => daysFromToday(2);
+
 // ---------------------------------------------------------------------------
 console.log('\n1. add');
 
@@ -109,7 +133,7 @@ t('the other three forms still work', () => {
 // ---------------------------------------------------------------------------
 console.log('\n2. update: the cadence and its anchor');
 
-const CADENCE = { id: 1, kind: 'daily', every: 3, at: '12:00', lastFired: '2026-09-10', text: 'ads', run: true };
+const CADENCE = { id: 1, kind: 'daily', every: 3, at: '12:00', lastFired: ANCHOR(), text: 'ads', run: true };
 const PLAIN = { id: 1, kind: 'daily', at: '12:00', lastFired: '2026-09-01', text: 'ads' };
 
 t('--every N turns a daily into a cadence item, --every 1 turns it back', () => {
@@ -122,19 +146,19 @@ t('--every N turns a daily into a cadence item, --every 1 turns it back', () => 
 
 t('--anchor sets the last fire, so the next one is anchor plus N', () => {
   seed([{ ...CADENCE, lastFired: undefined }]);
-  const r = run('update', '1', '--anchor', '2026-09-10');
+  const r = run('update', '1', '--anchor', ANCHOR());
   eq(r.code, 0, r.err);
-  eq(read().items[0].lastFired, '2026-09-10');
-  ok(r.out.includes('(next 2026-09-13)'), r.out);
+  eq(read().items[0].lastFired, ANCHOR());
+  ok(r.out.includes(`(next ${NEXT_AFTER_ANCHOR()})`), r.out);
 });
 
 t('--every and --anchor in one call is the conversion, and it works', () => {
   seed([{ ...PLAIN }]);
-  const r = run('update', '1', '--every', '3', '--anchor', '2026-09-10');
+  const r = run('update', '1', '--every', '3', '--anchor', ANCHOR());
   eq(r.code, 0, r.err);
   eq(read().items[0].every, 3);
-  eq(read().items[0].lastFired, '2026-09-10');
-  ok(r.out.includes('every 3d 12:00 (next 2026-09-13)'), r.out);
+  eq(read().items[0].lastFired, ANCHOR());
+  ok(r.out.includes(`every 3d 12:00 (next ${NEXT_AFTER_ANCHOR()})`), r.out);
 });
 
 t('★ --at keeps a cadence item\'s anchor', () => {
@@ -143,7 +167,7 @@ t('★ --at keeps a cadence item\'s anchor', () => {
   seed([{ ...CADENCE }]);
   eq(run('update', '1', '--at', '23:59').code, 0);
   eq(read().items[0].at, '23:59');
-  eq(read().items[0].lastFired, '2026-09-10', 'the anchor was destroyed by a time change');
+  eq(read().items[0].lastFired, ANCHOR(), 'the anchor was destroyed by a time change');
 });
 
 t('--at on a plain daily still re-latches exactly as it did before', () => {
@@ -168,7 +192,7 @@ t('★ a date that only looks real is refused', () => {
     const r = run('update', '1', '--anchor', bad);
     ok(r.code !== 0, `${bad} was accepted`);
   }
-  eq(read().items[0].lastFired, '2026-09-10', 'the anchor moved anyway');
+  eq(read().items[0].lastFired, ANCHOR(), 'the anchor moved anyway');
 });
 
 t('★ a flag with no value is a usage error, not a silent no-op', () => {
@@ -176,7 +200,7 @@ t('★ a flag with no value is a usage error, not a silent no-op', () => {
   ok(run('update', '1', '--every').code !== 0, '--every with nothing after it reported success');
   ok(run('update', '1', '--anchor').code !== 0, '--anchor with nothing after it reported success');
   eq(read().items[0].every, 3);
-  eq(read().items[0].lastFired, '2026-09-10');
+  eq(read().items[0].lastFired, ANCHOR());
 });
 
 t('--every and --anchor are refused on a one-off, and the store is untouched', () => {
@@ -201,11 +225,11 @@ console.log('\n3. list and remove');
 t('list labels each shape, and only a cadence item carries a next date', () => {
   seed([
     { id: 1, kind: 'daily', at: '08:00', text: 'a' },
-    { id: 2, kind: 'daily', every: 3, at: '12:00', lastFired: '2026-09-10', text: 'b' },
+    { id: 2, kind: 'daily', every: 3, at: '12:00', lastFired: ANCHOR(), text: 'b' },
   ]);
   const lines = run('list').out.split('\n');
   ok(lines[0].includes('daily 08:00') && !lines[0].includes('next'), lines[0]);
-  ok(lines[1].includes('every 3d 12:00 (next 2026-09-13)'), lines[1]);
+  ok(lines[1].includes(`every 3d 12:00 (next ${NEXT_AFTER_ANCHOR()})`), lines[1]);
 });
 
 t('remove takes the item out, and an unknown id is an error', () => {

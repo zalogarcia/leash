@@ -179,6 +179,14 @@ const LIMIT_PHRASES = [
   // by accident, so it survives a rewording of the sentence around it.
   /out of usage credits/i,
   /from=cc_cli_limit_message/i,
+  // THE WEEKLY WALL, which says "weekly limit" and no other phrase above:
+  // "You've hit your weekly limit \u00b7 resets Sep 17 at 10am (America/Caracas)".
+  // Measured 2026-09-13 01:37 ET: a worker died on it, isLimitSignal read false,
+  // so the store marked nothing and rotated nothing, and the account sat in the
+  // file as "available" at 100 percent of its seven day window. The next worker
+  // would have picked it again. Matches the noun, not the sentence.
+  /hit your weekly limit/i,
+  /weekly limit reached/i,
 ];
 export function isLimitSignal(text) {
   const s = String(text || '');
@@ -212,6 +220,8 @@ function zonedWallClockToEpochMs(timeZone, y, mo, d, h, mi) {
   ts = naive - zoneOffsetMs(timeZone, ts);
   return ts;
 }
+
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
 
 function zoneToday(timeZone, nowMs) {
   const p = Object.fromEntries(
@@ -247,12 +257,21 @@ export function parseResetTime(text, { now = Date.now(), timeZone } = {}) {
     if (Number.isFinite(secs) && secs > 0) return { resetsAt: secs, guessed: false, note: 'absolute epoch' };
   }
 
-  // "resets 6:30pm (America/Caracas)" / "resets 1pm" / "reset at 18:30"
-  const m = s.match(/reset(?:s|\s+at)?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+  // "resets 6:30pm (America/Caracas)" / "resets 1pm" / "reset at 18:30", and the
+  // WEEKLY form which carries a date: "resets Sep 17 at 10am (America/Caracas)".
+  // The date group is optional and read before the time, because a weekly wall
+  // parsed as a bare time lands on the next 10am (hours away) instead of five
+  // days away, and the rotation walks back into a dead account every hour until
+  // the real reset (measured 2026-09-13).
+  const m = s.match(
+    /reset(?:s|\s+at)?\s+(?:on\s+)?(?:([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s+(?:at\s+)?)?(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i,
+  );
   if (!m) return fallback();
-  let hour = Number(m[1]);
-  const minute = m[2] ? Number(m[2]) : 0;
-  const mer = m[3] ? m[3].toLowerCase() : null;
+  const monthWord = m[1] || null;
+  const dayNum = m[2] ? Number(m[2]) : null;
+  let hour = Number(m[3]);
+  const minute = m[4] ? Number(m[4]) : 0;
+  const mer = m[5] ? m[5].toLowerCase() : null;
   if (mer) {
     if (hour < 1 || hour > 12) return fallback();
     if (mer === 'pm' && hour !== 12) hour += 12;
@@ -278,6 +297,22 @@ export function parseResetTime(text, { now = Date.now(), timeZone } = {}) {
   }
 
   const { y, mo, d } = zoneToday(zone, now);
+
+  // A named month plus a day is an explicit calendar date: take it as written,
+  // rolling to next year only when the date has already passed this year (a
+  // December wall quoted in January).
+  if (monthWord && dayNum >= 1 && dayNum <= 31) {
+    const idx = MONTHS.indexOf(monthWord.slice(0, 3).toLowerCase());
+    if (idx >= 0) {
+      let ts = zonedWallClockToEpochMs(zone, y, idx + 1, dayNum, hour, minute);
+      if (ts <= now) ts = zonedWallClockToEpochMs(zone, y + 1, idx + 1, dayNum, hour, minute);
+      return { resetsAt: Math.floor(ts / 1000), guessed: false, note: `${note}, dated` };
+    }
+    // An unrecognised month word must not silently become "today at that time",
+    // which would be days early: say it guessed.
+    return fallback();
+  }
+
   let ts = zonedWallClockToEpochMs(zone, y, mo, d, hour, minute);
   // "resets 6:30pm" always means the NEXT 6:30pm. Past means tomorrow.
   if (ts <= now) ts = zonedWallClockToEpochMs(zone, y, mo, d + 1, hour, minute);
