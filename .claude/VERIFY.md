@@ -74,7 +74,7 @@ The probes are in `scripts/probes/`. Two of them are LIVE and cost money.
 | `steer-probe.mjs` | yes | a steer end to end into a fake worker. Exit 0 is a pass. |
 | `codex-chat-probe.mjs` | NO, spawns the real `codex` and spends tokens | 0 thread continuity proven, 1 the thread did not carry over (a real defect), 2 blocked before any answer came back (usage limit, no login, no network). |
 | `codex-appserver-probe.mjs` | NO, spawns the real `codex app-server` and spends tokens | 0 every structural proof held AND answers came back, 1 a structural proof failed, 2 the protocol held but no answer came back. |
-| `codex-bg-appserver-probe.mjs` | NO, spawns the real `codex app-server` and spends tokens | non zero on any failed case; it prints one line per case. |
+| `codex-bg-appserver-probe.mjs` | NO, spawns the real `codex app-server` and spends tokens | 0 every case passed, non zero on any failed case, one printed line per case. **Its exit 1 is AMBIGUOUS while the account is walled**: it has no blocked arm and does not print the wall message, so a credit wall shows up as failed cases whose turns merely report `turn/completed: failed`. Read it together with a same minute run of `codex-appserver-probe.mjs`: if that one exits 2, this one's exit 1 is the wall, not a defect. |
 
 Two standing facts about the live probes:
 

@@ -39,7 +39,9 @@ function grab(name, kind = 'function') {
   for (let i = start + 1; i < SRC.length; i++) {
     const l = SRC[i];
     if (/^\S/.test(l)) {
-      if (l.startsWith('}') || l.startsWith('};')) out.push(l);
+      // `];` closes an array const the same way `};` closes an object or a
+      // function body. Kept identical to the other probes' grab().
+      if (/^[}\])]/.test(l)) out.push(l);
       break;
     }
     out.push(l);

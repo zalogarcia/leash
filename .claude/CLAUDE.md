@@ -64,10 +64,12 @@ the first failure hides the rest.
 
 ## Style
 
-- **No em dashes and no en dashes** anywhere: not in code, not in comments, not
-  in prose, not in a message the daemon sends. `dash-normalize.mjs` strips them
-  from outbound text when `style.noDashes` is set, and the source is expected
-  to be clean without it. Note that a BSD `grep` with `\|` alternation returns
+- **No em dashes and no en dashes** in anything you add or change: not in
+  code, not in comments, not in prose, not in a message the daemon sends.
+  `dash-normalize.mjs` strips them from outbound text when `style.noDashes` is
+  set, and new source is expected to be clean without it. The rule is forward
+  looking, not a claim about the whole tree: `README.md` still carries 60 em
+  dashes that predate it, and cleaning them is its own change. Note that a BSD `grep` with `\|` alternation returns
   a false negative on these bytes; use `grep -E` with `|`, two `-e` patterns,
   or a short Python check, and always with a positive control.
 - The daemon names itself from `config.json`. The public default is `Leash`.
