@@ -190,10 +190,12 @@ because a shed frame does not cost the same everywhere:
   is neither. Under bucket pressure (a second or two) it is sent as usual.
   Under a real wall it is **not sent at all**: its whole claim is "something is
   happening now", which is worth nothing once it could only arrive after the
-  answer it announces. A wall with ten seconds or less left is waited out and
-  then sent, so a turn can start up to about eleven seconds later than it
-  otherwise would. Nothing downstream depends on the bubble existing — every
-  path that would have edited it sends its own message instead.
+  answer it announces. A wall with about eleven seconds or less left is waited
+  out and then sent, so a turn can start that much later than it otherwise
+  would. Nothing downstream depends on the bubble existing: the turn's answer
+  is its own message either way, and the one report that used to live only on
+  the bubble — the line that says an account hit its limit and the daemon is
+  rotating — is sent on its own when there is no bubble to edit.
 
 A background worker's line is the one placeholder that is always sent: it is
 your only handle on a job measured in tens of minutes, and it stays true for
