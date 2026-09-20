@@ -176,10 +176,28 @@ with one clock and one set of files:
   summary of the last ten minutes.
 
 A short penalty (ten seconds or less) is still waited out in place, so the
-message lands in order. Anything longer is held. Chrome — typing pulses,
-progress edits, the placeholder bubble that gets edited into its own answer — is
-dropped rather than held, because a liveness frame delivered forty minutes late
-is a frame that lies.
+message lands in order. Anything longer is held. Chrome is not all one thing,
+because a shed frame does not cost the same everywhere:
+
+- **An intermediate frame** — a typing pulse, a progress edit mid-run — is
+  dropped rather than held. It is stale within seconds and the next tick
+  corrects it, so a liveness frame delivered forty minutes late is a frame that
+  lies.
+- **A terminal frame** — the edit that puts a bubble into Done, error or
+  stopped — is held, like an answer. Nothing corrects it, so dropping it leaves
+  an hourglass on screen for the rest of the chat.
+- **An opening placeholder** — the bubble a turn is about to be edited into —
+  is neither. Under bucket pressure (a second or two) it is sent as usual.
+  Under a real wall it is **not sent at all**: its whole claim is "something is
+  happening now", which is worth nothing once it could only arrive after the
+  answer it announces. A wall with ten seconds or less left is waited out and
+  then sent, so a turn can start up to about eleven seconds later than it
+  otherwise would. Nothing downstream depends on the bubble existing — every
+  path that would have edited it sends its own message instead.
+
+A background worker's line is the one placeholder that is always sent: it is
+your only handle on a job measured in tens of minutes, and it stays true for
+the whole of a wall.
 
 **What you see when a cooldown hits:** the bot goes quiet, because it is not
 allowed to write. If you send a message during the cooldown, it answers with one
@@ -864,6 +882,7 @@ node bridge.mjs --selftest "Reply with exactly: OK"
 node test.mjs                    # this repo's own bridge.mjs assertions
 node md-format.test.mjs          # markdown -> Telegram HTML, and safe chunking
 node progress-render.test.mjs    # the progress bubble
+node progress-priority.test.mjs  # which bubble writes are durable, disposable, or skipped
 node usage-limits.test.mjs       # plan limits, token counts, context windows
 node rich-format.test.mjs        # Bot API 10.2 rich blocks
 node detached-workers.test.mjs   # a worker must survive its daemon being killed
@@ -932,8 +951,10 @@ The engine and presentation keys: `name` (what the daemon calls itself in
 `false` always builds it from the on-disk chat ring instead), `style`
 (`{"noDashes": true}` rewrites em and en dashes out of every outbound reply on
 both engines, leaving code, fences and URLs alone — default `false`, the model
-keeps its own voice), `progress` (`{"background": false}` turns off the live
-line a background worker keeps on screen from dispatch to done — default `true`)
+keeps its own voice), `progress` (`{"background": false}` turns off the
+line a background worker keeps on screen from dispatch to done — default `true`;
+the line opens and resolves and spends nothing in between, so the chat lane's
+own progress edits keep the write budget)
 and `autoCompact` (`{"enabled": true, "thresholdPercent": 60, "cooldownMinutes": 30}`
 lets the daemon compact an idle chat by itself past the threshold, default off),
 `wakeUp` (`{"afterRestart": true, "afterCompact": true}`: wake the chat after a
