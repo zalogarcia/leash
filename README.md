@@ -909,10 +909,16 @@ node account-buttons.test.mjs    # the one-tap swap keyboard
 node credential-store.test.mjs   # the keychain / file store behind a swap
 node tg-governor.test.mjs        # the write governor: bucket, cooldown, outbox, ledger
 
-# probes (no Telegram, no daemon, no model spend)
-node scripts/probes/steer-probe.mjs         # a steer, end to end, into a fake worker
-node scripts/probes/codex-chat-probe.mjs    # a Codex chat turn against a fake CLI
-node scripts/probes/codex-appserver-probe.mjs  # the app-server lane against a fake app-server
+# probes. One is offline. The other three spawn the REAL codex binary and
+# SPEND TOKENS on your ChatGPT account, so none of them belongs in a gate or a
+# loop. Bound every run: macOS ships no `timeout`, and
+# `perl -e 'alarm shift; exec @ARGV' 300 node <probe>` is a portable stand in.
+# Exit codes: 0 proven, 1 a proof did not hold, 2 blocked before the model
+# answered (usage limit, no login, no network).
+node scripts/probes/steer-probe.mjs            # offline: a steer, end to end, into a fake worker
+node scripts/probes/codex-chat-probe.mjs       # live: a Codex chat turn on `codex exec`, and whether resume carries the thread
+node scripts/probes/codex-appserver-probe.mjs  # live: the chat lane on the real `codex app-server`
+node scripts/probes/codex-bg-appserver-probe.mjs  # live: a background job steered and interrupted mid turn
 
 # check the modules shared with the private sibling repo have not drifted
 BRIDGE_SIBLING_REPO=/path/to/sibling ./scripts/check-shared.sh
