@@ -118,6 +118,19 @@ const codexAppServerDeaths = [];
 let codexAppServerInitFailed = false;
 let codexAppServerTurn = null;
 const codexFallbackToldAbout = new Set();
+// Bookkeeping for two OTHER features that a finishing chat turn touches: the
+// "reading it now" line a background worker's notice carries, and the live
+// position line on a message queued behind a busy lane. Recorded rather than
+// sliced because each pulls in its own registry chain (workerNotices +
+// editWorkerNotice; registerLive + resolveQueueAck + queueAck) and neither is
+// part of the app-server protocol this probe exists to prove. They are NOT
+// optional, though: left undefined, every turn ended
+// "[bridge] codex chat finish failed: settleReadingNotices is not defined"
+// and each of the five proofs below was read off a half-finished turn.
+export const SETTLED_NOTICES = [];
+export const QUEUE_ACKS = [];
+const settleReadingNotices = () => { SETTLED_NOTICES.push(Date.now()); };
+const trackQueueAck = (item, lane, msgId, body) => { QUEUE_ACKS.push({ msgId, body }); };
 export const clientPid = () => codexAppServerClient?.child?.pid ?? null;
 export const clearAll = () => { SENT.length = 0; RESULTS.length = 0; PROGRESS.length = 0; RING.length = 0; };
 `,
@@ -125,6 +138,13 @@ export const clearAll = () => { SENT.length = 0; RESULTS.length = 0; PROGRESS.le
         grab('codexAppServerState', 'const'),
         grab('codexAppServerUsable', 'const'),
         grab('noteCodexAppServerDeath'),
+        // startCodexAppServer is a four-line wrapper: the spawn, the handshake
+        // and every deadline live in startAppServerChild, which it calls. Left
+        // out of the slice, the lane reported "codex app-server unavailable:
+        // startAppServerChild is not defined", fell through to the harness's
+        // runCodexChatExec stub, and the probe then sat in settled() for its
+        // full 240s deadline before failing as "the turn never settled".
+        grab('startAppServerChild'),
         grab('startCodexAppServer'),
         grab('getCodexAppServer'),
         grab('killCodexAppServer'),
@@ -132,6 +152,7 @@ export const clearAll = () => { SENT.length = 0; RESULTS.length = 0; PROGRESS.le
         grab('clearCodexThread'),
         grab('writeCodexMeta'),
         grab('finalizeCodexMeta'),
+        grab('confBool'),
         grab('runCodexChatTurn'),
         grab('runCodexChat'),
         'export { runCodexChat, runCodexChatTurn, killCodexAppServer };',
@@ -179,6 +200,13 @@ const cost = () => {
 
 console.log(`workspace: ${TMP}`);
 
+// Every structural proof below lands here, and the exit code is read off it.
+const CHECKS = [];
+const check = (name, ok) => { CHECKS.push([name, Boolean(ok)]); return ok; };
+let ANSWERS = 0;
+let BUBBLES = '';
+const tally = () => { ANSWERS += B.RESULTS.filter((r) => r && !String(r).startsWith('❌')).length; BUBBLES += [...B.SENT, ...B.RESULTS].join('\n') + '\n'; };
+
 // --------------------------------------------------------------------------
 console.log('\n=== 1. a cold turn on the app-server chat lane ===');
 // --------------------------------------------------------------------------
@@ -188,6 +216,8 @@ await settled();
 dump('turn 1');
 console.log('  thread stored :', B.STATE.codexThreadId ? 'yes' : 'NO');
 console.log('  cost sidecar  :', cost());
+check('1 thread stored', B.STATE.codexThreadId);
+tally();
 
 // --------------------------------------------------------------------------
 console.log('\n=== 2. a RESUMED turn that runs a shell command (the streamed steps) ===');
@@ -201,6 +231,9 @@ console.log('  same thread   :', B.STATE.codexThreadId === threadAfter1);
 console.log('  one server    : pid', B.clientPid());
 console.log('  cost sidecar  :', cost());
 console.log('  ring paths    :', JSON.stringify(B.RING.map((r) => r.paths || null)));
+check('2 same thread resumed', B.STATE.codexThreadId === threadAfter1);
+check('2 one app-server child', B.clientPid());
+tally();
 
 // --------------------------------------------------------------------------
 console.log('\n=== 3. a MID-TURN STEER into a slow turn ===');
@@ -214,6 +247,9 @@ await settled();
 dump('turn 3');
 console.log('  steers recorded :', JSON.stringify(live.steers));
 console.log('  cost sidecar    :', cost());
+check('3 steer accepted mid-turn', acked);
+check('3 steer recorded on the run', live.steers.length === 1);
+tally();
 
 // --------------------------------------------------------------------------
 console.log('\n=== 4. /stop mid-turn is a turn/interrupt, and the server survives ===');
@@ -227,6 +263,8 @@ live2.terminate();
 await settled();
 dump('turn 4');
 console.log('  server pid before /stop:', pidBeforeStop, ' after:', B.clientPid(), ' same:', pidBeforeStop === B.clientPid());
+check('4 app-server survives /stop', pidBeforeStop === B.clientPid());
+tally();
 
 // --------------------------------------------------------------------------
 console.log('\n=== 5. the app-server child is killed; the SAME thread resumes in a new one ===');
@@ -241,6 +279,9 @@ dump('turn 5');
 console.log('  thread before kill:', threadBeforeKill === B.STATE.codexThreadId ? 'same thread resumed' : 'THREAD CHANGED');
 console.log('  server pid before :', pidBeforeKill, ' after:', B.clientPid(), ' respawned:', pidBeforeKill !== B.clientPid());
 console.log('  cost sidecar      :', cost());
+check('5 same thread resumed in a new child', threadBeforeKill === B.STATE.codexThreadId);
+check('5 child respawned', pidBeforeKill !== B.clientPid());
+tally();
 
 console.log('\n=== every sidecar written by this probe (the /account and /usage tally) ===');
 for (const f of readdirSync(RUNS).filter((x) => x.endsWith('.meta.json')).sort()) {
@@ -249,4 +290,23 @@ for (const f of readdirSync(RUNS).filter((x) => x.endsWith('.meta.json')).sort()
 
 B.killCodexAppServer();
 rmSync(TMP, { recursive: true, force: true });
+
+// THE EXIT CODE IS THE VERDICT. This used to exit 0 unconditionally, so a run
+// in which every single turn came back "❌ Codex: you have hit your usage
+// limit" still reported success to anything reading the code. The protocol
+// proofs and the model's ANSWERS fail independently and are reported that way.
+//   0  every structural proof held AND real answers came back
+//   1  a structural proof failed: a real defect in the app-server lane
+//   2  the protocol held but OpenAI never answered (usage limit, login, network)
+console.log('\n=== verdict ===');
+for (const [name, ok] of CHECKS) console.log(`  ${ok ? 'ok  ' : 'FAIL'}  ${name}`);
+console.log(`  answers from the model: ${ANSWERS}`);
+const structural = CHECKS.every(([, ok]) => ok);
+const blocked = /usage limit|rate limit|not installed|login|Unauthorized|401|network/i.test(BUBBLES);
+if (!structural) { console.log('\nFAILED: a structural proof did not hold'); process.exit(1); }
+if (!ANSWERS) {
+  console.log(`\nBLOCKED: the protocol held on every turn but no answer came back${blocked ? ', see the bubbles above' : ''}`);
+  process.exit(2);
+}
+console.log('\nPASSED: the app-server lane is proven end to end');
 process.exit(0);
