@@ -653,14 +653,74 @@ function gov() {
 // retry429:false marks a disposable call (a progress edit, a typing pulse):
 // never retried, never held, dropped outright while the chat is cooling down.
 // The frame is stale by the time a penalty clears, and each retry extends it.
-// disposable:true says the same of a sendMessage that is only chrome (the
-// placeholder bubble), so it can never be delivered forty minutes late.
-async function tg(method, payload, attempt = 0, { retry429 = true, disposable = false } = {}) {
+// disposable:true says the same of a sendMessage that is only chrome.
+//
+// durable:true is the OPPOSITE classification, and it exists because not every
+// progress write costs the same when it is shed. An intermediate frame is worth
+// nothing once it is stale — the next tick corrects it. The write that OPENS a
+// bubble and the write that puts one into Done / error / stopped are worth the
+// whole turn: drop the first and there is no bubble at all, drop the second and
+// the bubble sits on a hourglass for the rest of the chat. Measured on a live
+// ledger (2026-09-19, 1296 rows): seven placeholder sends shed by bucket
+// starvation at retryAfter 1, and one more shed by a real 405s cooldown.
+//
+// A durable write is HELD in the governor's outbox rather than dropped, using
+// the same public enqueue() a real answer uses. Nothing about how the governor
+// treats a disposable changes — this only changes which writes are CLASSIFIED
+// as one, which is the whole of the fix. It has to work through the outbox
+// because `editMessageText` is in the governor's DISPOSABLE_METHODS and not in
+// its QUEUEABLE_METHODS, so its gate can only ever answer `drop` for an edit:
+// passing disposable:false alone would rescue an edit from bucket starvation
+// and still lose it to a cooldown.
+//
+// opening:true IS THE THIRD CLASSIFICATION, and it exists because the cost of
+// the one above was real. A placeholder that meets a real WALL used to be HELD
+// and flushed after it, as a fresh message the run can never edit (a held send
+// returns no message_id), so the chat read: throttle header, "🤖 Thinking…",
+// the answer: a line announcing work that had already finished, sitting above
+// its own result.
+//
+// So an opening placeholder is not held and not dropped: it is NOT SENT. Its
+// whole claim is "something is happening NOW", which is worth nothing once it
+// can only arrive later, and unlike a terminal edit nothing downstream depends
+// on it: every site's terminal path already degrades to a send when there is
+// no bubble to edit. The wall is the one condition that decides it: the token
+// BUCKET is measured in a second or two, so a placeholder held by bucket
+// pressure still lands while the work is running, and that case keeps today's
+// behaviour exactly.
+//
+// The terminal edit stays durable, unconditionally. A placeholder whose moment
+// has passed is the ONLY write this may skip.
+async function tg(method, payload, attempt = 0, { retry429 = true, disposable = false, durable = false, opening = false } = {}) {
   const g = gov();
-  const isDisposable = disposable || retry429 === false;
+  // Before the gate: a skipped placeholder spends no token either, so it cannot
+  // starve the bucket the answer behind it will need. Recorded, because "the
+  // bubble never appeared" has to be traceable to a decision rather than read
+  // as the silent shedding this whole module exists to stop.
+  //
+  // A SHORT COOLDOWN IS WAITED OUT, NOT SKIPPED, on the same bound the door
+  // below uses (inlineWaitMaxMs). Three seconds is not a lost moment: the
+  // bubble lands while the work is still running, which is the whole point of
+  // it. Skipping one that could still be true was the two doors disagreeing
+  // about the same wall. Re-checked after the wait, never looped: another
+  // lane's 429 landing during it would otherwise walk this placeholder into
+  // the outbox, which is exactly the late line this change exists to remove.
+  if (opening && g.coolingDown()) {
+    const waitable = g.remainingMs() <= g.inlineWaitMaxMs + 1000;
+    if (waitable) await sleep(g.remainingMs() + 100);
+    if (!waitable || g.coolingDown()) {
+      g.record({ method, outcome: 'skipped', retryAfter: Math.ceil(g.remainingMs() / 1000) });
+      return null;
+    }
+  }
+  const isDisposable = !durable && (disposable || retry429 === false);
   const decision = g.gate(method, payload, { disposable: isDisposable });
   if (decision.action === 'queue') return g.enqueue(method, payload);
   if (decision.action === 'drop') {
+    // Held, not dropped. The frame arrives late, which for a terminal state is
+    // right: an ending that lands with the answer is a resolved bubble, and a
+    // dropped one is a line that lies for the rest of the chat.
+    if (durable) return g.enqueue(method, payload);
     g.record({ method, outcome: 'dropped', retryAfter: decision.retryAfter });
     const err = new Error(`${method}: 429 held back, chat cooling down (${decision.retryAfter}s)`);
     err.code = 429;
@@ -685,7 +745,7 @@ async function tg(method, payload, attempt = 0, { retry429 = true, disposable = 
       // the old behaviour, wait it out briefly, nothing to hold.
       if (retry429 && attempt < 3 && retryAfter <= 300) {
         await sleep((retryAfter || 3) * 1000);
-        return tg(method, payload, attempt + 1, { retry429, disposable });
+        return tg(method, payload, attempt + 1, { retry429, disposable, durable, opening });
       }
       throw err;
     }
@@ -703,9 +763,22 @@ async function tg(method, payload, attempt = 0, { retry429 = true, disposable = 
     // +1000 on the shared bound.)
     if (!isDisposable && attempt < 3 && retryAfter * 1000 <= g.inlineWaitMaxMs && g.remainingMs() <= g.inlineWaitMaxMs + 1000) {
       await sleep(g.remainingMs() + 100);
-      return tg(method, payload, attempt + 1, { retry429, disposable });
+      return tg(method, payload, attempt + 1, { retry429, disposable, durable, opening });
     }
-    if (decision.queueable) return g.enqueue(method, payload);
+    // THE SECOND DOOR, and the reason the skip is not only a pre-gate check.
+    // The FIRST write of a wall finds no cooldown to check: the gate passes,
+    // Telegram answers 429, and throttle() above opens the deadline. Holding
+    // the placeholder here would re-create the exact line this change removes,
+    // one branch later: flushed after the wall, above an answer already read.
+    // The wait above has already refused it: whatever is left is longer than
+    // the inline bound, so this placeholder can only arrive late.
+    if (opening) {
+      g.record({ method, outcome: 'skipped', retryAfter: Math.ceil(g.remainingMs() / 1000) });
+      return null;
+    }
+    // A durable write is held on the same terms a real answer is: Telegram
+    // refusing the terminal frame is exactly when losing it hurts most.
+    if (decision.queueable || durable) return g.enqueue(method, payload);
     throw err;
   }
 }
@@ -717,7 +790,12 @@ async function tg(method, payload, attempt = 0, { retry429 = true, disposable = 
 // answers already use, so both paths render identically.
 // disposable:true is for chrome (a "Reading…" line that will be edited into its
 // answer): dropped rather than held while the chat is cooling down.
-async function send(text, { markdown = true, disposable = false } = {}) {
+// opening:true is for a placeholder that will be EDITED into its answer: not
+// sent at all while the chat is cooling down, because it would arrive after the
+// thing it announces. See tg(). A skipped opening returns null, which every
+// caller already treats as "no bubble", a path that predates this and is what a
+// failed send has always produced.
+async function send(text, { markdown = true, disposable = false, opening = false } = {}) {
   let last = null;
   for (const chunk of chunks(text, TG_MSG_LIMIT)) {
     if (markdown) {
@@ -730,14 +808,14 @@ async function send(text, { markdown = true, disposable = false } = {}) {
             parse_mode: 'HTML',
           },
           0,
-          { disposable },
+          { disposable, opening },
         );
         continue;
       } catch {
         /* fall through to plain */
       }
     }
-    last = await tg('sendMessage', { chat_id: CHAT_ID, text: chunk }, 0, { disposable });
+    last = await tg('sendMessage', { chat_id: CHAT_ID, text: chunk }, 0, { disposable, opening });
   }
   return last;
 }
@@ -845,13 +923,19 @@ let editCooldownUntil = 0;
 // on exactly the message the wall was removed from. renderProgressInner passes
 // its own function because it can re-render from the entry list; everyone else
 // gets this.
-async function editProgress(messageId, htmlText, plainTextFn = () => visibleOnly(htmlText)) {
+// `final:true` marks the edit that puts a bubble into its LAST state — Done,
+// error, stopped, ✅, ❌, 🛑. Every other edit here is an intermediate frame and
+// stays disposable: it is stale within seconds and the next tick corrects it.
+// The terminal one is corrected by nothing, so shedding it leaves a hourglass
+// on screen for the rest of the chat. See `durable` on tg().
+async function editProgress(messageId, htmlText, plainTextFn = () => visibleOnly(htmlText), { final = false } = {}) {
+  const how = final ? { durable: true } : { retry429: false };
   try {
     await tg(
       'editMessageText',
       { chat_id: CHAT_ID, message_id: messageId, text: htmlText, parse_mode: 'HTML' },
       0,
-      { retry429: false },
+      how,
     );
   } catch (e) {
     if (e.code === 429) {
@@ -865,7 +949,7 @@ async function editProgress(messageId, htmlText, plainTextFn = () => visibleOnly
         'editMessageText',
         { chat_id: CHAT_ID, message_id: messageId, text: plainTextFn() },
         0,
-        { retry429: false },
+        how,
       ).catch(() => {});
     } else if (e.code !== 400) {
       console.error('[bridge] edit failed:', e.message);
@@ -997,7 +1081,13 @@ function tickLiveMessages() {
  */
 async function pendingMessage(label, { tickMs = 3000 } = {}) {
   const startedAt = Date.now();
-  const m = await send(fetchingLine(label), { markdown: false, disposable: true }).catch(() => null);
+  // NOT disposable: this send IS the bubble. Shed it and the whole wait happens
+  // with nothing on screen, which is the case the liveness exists for.
+  // opening: and during a WALL it is not sent at all, because "⏳ fetching…"
+  // flushed after the wall would sit above an answer already delivered. msgId
+  // stays null either way, and both terminal arms below already degrade to a
+  // fresh send when there is nothing to edit, which is what the reader gets.
+  const m = await send(fetchingLine(label), { markdown: false, opening: true }).catch(() => null);
   const msgId = m?.message_id ?? null;
   let terminal = false;
   const timer =
@@ -1025,17 +1115,23 @@ async function pendingMessage(label, { tickMs = 3000 } = {}) {
       // answer would vanish. Keep the receipt, send the report.
       if (html.length > TG_MSG_LIMIT) {
         const el = Math.round((Date.now() - startedAt) / 1000);
-        await editProgress(msgId, escHtml(`✅ ${label} · ${fmtElapsed(el)}`), () => `✅ ${label} · ${fmtElapsed(el)}`);
+        await editProgress(
+          msgId,
+          escHtml(`✅ ${label} · ${fmtElapsed(el)}`),
+          () => `✅ ${label} · ${fmtElapsed(el)}`,
+          { final: true },
+        );
         return send(body, { markdown });
       }
-      return editProgress(msgId, html, () => body);
+      // final: this edit IS the answer. Shed it and the ⏳ is the last word.
+      return editProgress(msgId, html, () => body, { final: true });
     },
     /** The other terminal state. */
     async fail(what, error) {
       stop();
       const line = fetchFailedLine(what, error);
       if (msgId == null) return send(line, { markdown: false });
-      return editProgress(msgId, escHtml(line), () => line);
+      return editProgress(msgId, escHtml(line), () => line, { final: true });
     },
   };
 }
@@ -1098,7 +1194,8 @@ async function raiseWall(kind, { render, lifted, resolved }) {
     resolve(extra) {
       const final = resolved(extra || {});
       if (!final || this.msgId == null) return;
-      editProgress(this.msgId, escHtml(final), () => final).catch(() => {});
+      // The wall lifting is the one frame this notice exists to deliver.
+      editProgress(this.msgId, escHtml(final), () => final, { final: true }).catch(() => {});
     },
   });
   wallNotices.set(kind, entry);
@@ -1229,7 +1326,7 @@ function settleCompactNotice(text) {
   compactNotice = null;
   if (!n) return false;
   n.entry.done = true; // before the edit, so no sweep can write over the ending
-  editProgress(n.msgId, escHtml(text), () => text).catch(() => {});
+  editProgress(n.msgId, escHtml(text), () => text, { final: true }).catch(() => {});
   return true;
 }
 
@@ -1444,16 +1541,29 @@ function maybeRestartWakeUp() {
 // (with the report's size, which is what makes "there is more, one tap away"
 // true), the assistant reading it, and the plain Done it settles on.
 //
-// THE CADENCE IS 15s, NOT the chat bubble's 6s, and that number is doing real
-// work. This reverses a decision made on cost grounds when the bg lane's own
-// progress message and its 2.5s edits were removed as "pure rate-limit spend
-// against the SAME per-chat bucket the conversation needs". So the new version
-// has to be CHEAPER than the one that was deleted: 15s instead of 2.5s is 6x
-// fewer, the dedupe on the step line means an idle worker edits at most once a
-// minute, and four concurrent workers at 15s is 0.27 edits/sec against a bucket
-// of roughly one per second. They share editCooldownUntil with every other live
-// line, so one 429 pauses all of them together.
+// THE CADENCE WAS 15s, six times slower than the chat bubble's, and the sum of
+// several lanes at that cadence is still what pushed the chat over its ceiling:
+// four or five workers pulsing together starved the bucket, and the governor
+// shed the chat lane's own frames — and six of its opening placeholders — to
+// protect the answers. The trade taken on 2026-09-19: stop streaming the edits
+// from the background lanes into their bubbles, so the progress edits on the
+// chat lane are prioritised and the reader can see what the daemon is doing.
+// A background job's status is still one `/btw` or one `bg.mjs ps` away.
+//
+// So a background line now OPENS and RESOLVES and spends nothing in between.
+// The step count and the last action are still read every sweep — the terminal
+// edit is built from them, and `bg.mjs ps`, /btw and /steer read the run record
+// directly and never went through this line at all.
 // ---------------------------------------------------------------------------
+
+// WHICH LANE A LIVE LINE BELONGS TO. A property, never the icon: 🌙 is also a
+// scheduled job's ⏰ and a Codex worker's 🧠, so a string compare would have
+// silently exempted two of the three background shapes.
+const LANE_KIND = Object.freeze({ chat: 'chat', background: 'background' });
+
+// Only the chat lane spends the chat's write budget on intermediate frames.
+// One predicate, one place: the rule is not repeated at any call site.
+const streamsStepEdits = (laneKind) => laneKind === LANE_KIND.chat;
 
 // A Leash user on a busy chat, or with ten workers, can have the old static
 // notice back. Default on: the silence is the defect this fixes.
@@ -1506,8 +1616,15 @@ const workerNotices = new Map(); // runId -> live entry
  * elapsed, step count and last action all change under it, and the caller holds
  * the only reference to the lane that owns them.
  */
-async function startWorkerNotice(runId, base, read, extra = '') {
+// `laneKind` defaults to background because every caller of this function is a
+// background job (the bg pool, a Codex handoff, a scheduled run) — but it is a
+// PARAMETER rather than an assumption baked into the body, so the day a chat
+// lane wants this line it says so and gets its steps back, instead of silently
+// inheriting a rule written for somebody else.
+async function startWorkerNotice(runId, base, read, extra = '', { laneKind = LANE_KIND.background } = {}) {
   const text = workerLine({ ...base, phase: 'dispatch' }) + extra;
+  // NOT disposable. This send IS the bubble: shed it and the job runs with
+  // nothing on screen at all, which is the complaint this change answers.
   const m = await send(text, { markdown: false }).catch(() => null);
   if (!m?.message_id) return null;
   if (!BG_PROGRESS_ON) return null; // sent, but never ticked: the old static notice
@@ -1549,8 +1666,15 @@ async function startWorkerNotice(runId, base, read, extra = '') {
       }
       this.goneSince = 0;
       // Kept so the terminal edit still knows the step count and elapsed: the
-      // run record is gone by the time the close handler reports.
+      // run record is gone by the time the close handler reports. Read on EVERY
+      // sweep, including the ones that no longer edit — this is the only reason
+      // a silent line still has to tick, and the reason the ending it reaches
+      // still carries "· 23 steps" rather than a zero.
       this.lastLive = live;
+      // THE SHED. A background lane opens its bubble and resolves it, and spends
+      // nothing in between, so the chat lane's own frames survive the bucket.
+      // After lastLive, never before: the ending is built from it.
+      if (!streamsStepEdits(laneKind)) return;
       const line = workerLine({ ...this.base, ...live, phase: 'running' });
       const body = line.split('\n').slice(2).join('\n');
       const changed = body !== this.lastBody;
@@ -1601,7 +1725,12 @@ function editWorkerNotice(runId, patch, { keepAlive = false } = {}) {
       }
     };
   }
-  editProgress(entry.msgId, escHtml(line), () => line).catch(() => {});
+  // EVERY phase this function writes is terminal for the state it replaces —
+  // "done" is the ending, and "reading" is the one state after it that the
+  // bubble still owes the reader. Both are final:true, because a background
+  // line spends nothing else at all now, so the alternative to holding one of
+  // these is a ⏳ that never resolves.
+  editProgress(entry.msgId, escHtml(line), () => line, { final: true }).catch(() => {});
   return true;
 }
 
@@ -1712,8 +1841,17 @@ function runClaude(
           text: `${lane.icon} ${thinkingWord(wordSeed, THINKING_WORDS)}…${
             attachmentFrameNote(kinds) ? ` · ${attachmentFrameNote(kinds)}` : ''
           }${replyQuoteFrameNote(replyQuote || {}) ? ` · ${replyQuoteFrameNote(replyQuote || {})}` : ''}`,
-        }, 0, { disposable: true });
-        progressMsgId = m.message_id;
+          // NOT disposable. This is the chat lane's ONLY live object, and on a
+          // live ledger six of these were shed by bucket pressure and one by a
+          // 405s cooldown: the reader typed, and nothing appeared for the whole
+          // turn. So bucket pressure never sheds it.
+          // opening: a WALL is the other case, and there the bubble is skipped
+          // rather than held: it could only land after the answer it announces.
+          // Either way progressMsgId stays null and every edit below
+          // short-circuits exactly as it does for a lane that never opened one;
+          // the turn's ending is the answer message, which is sent regardless.
+        }, 0, { opening: true });
+        progressMsgId = m?.message_id ?? null;
       } catch (e) {
         console.error('[bridge] failed to send progress message:', e.message);
       }
@@ -1723,11 +1861,19 @@ function runClaude(
       // /stop arrived while the progress message was in flight — never spawn.
       if (lane.current === run) lane.current = null;
       if (progressMsgId != null)
-        await tg('editMessageText', {
-          chat_id: CHAT_ID,
-          message_id: progressMsgId,
-          text: '🛑 Stopped before start.',
-        }).catch(() => {});
+        // durable: the bubble's terminal state on the /stop path. `tg` alone is
+        // not enough — editMessageText is in the governor's DISPOSABLE_METHODS,
+        // so an unmarked edit is shed exactly like a tick.
+        await tg(
+          'editMessageText',
+          {
+            chat_id: CHAT_ID,
+            message_id: progressMsgId,
+            text: '🛑 Stopped before start.',
+          },
+          0,
+          { durable: true },
+        ).catch(() => {});
       resolve();
       // Was drainQueue() with no argument — `lane.current` on undefined throws,
       // and because the throw lands in an already-resolved Promise executor it is
@@ -2327,10 +2473,28 @@ function runClaude(
 
       // Final progress-message state: header + tool activity only — the answer
       // itself goes out as its own message below, so repeating it here duplicates.
-      if (progressMsgId != null && limitPlan?.line) {
+      if (limitPlan?.line) {
         // The whole bubble, not a header plus a tool tail: the steps that ran
         // before the wall are not what this message is about any more.
-        await editProgress(progressMsgId, escHtml(limitPlan.line), () => limitPlan.line).catch(() => {});
+        // final: the ✅ / ❌ / 🛑 the whole bubble has been climbing towards.
+        // An intermediate frame that is shed self-corrects on the next tick;
+        // this one is corrected by nothing, so shedding it leaves the run's
+        // last word as a hourglass for the rest of the chat.
+        //
+        // NO BUBBLE, STILL THE ONE MESSAGE THEY NEED. This line is the only
+        // place the limit is ever reported on the rotate-and-retry path: the
+        // dispatch arm below deliberately sends nothing, because "the bubble
+        // above already says the limit was hit". With no bubble to edit that
+        // reasoning has nothing under it, and a walled account, a rotation and
+        // a re-run would all happen in silence. A skipped opening (a Telegram
+        // wall) and a failed one (a hiccup) both land here.
+        if (progressMsgId != null) {
+          await editProgress(progressMsgId, escHtml(limitPlan.line), () => limitPlan.line, { final: true }).catch(
+            () => {},
+          );
+        } else {
+          await send(limitPlan.line, { markdown: false }).catch(() => {});
+        }
       } else if (progressMsgId != null) {
         const head = wasStopped ? '🛑 Stopped' : resultEvent && !resultEvent.is_error ? '✅ Done' : '❌ Error';
         const steps = toolLines.length;
@@ -2340,6 +2504,7 @@ function runClaude(
           progressMsgId,
           `<b>${head}</b> · ${meta}${quoteBlock(htmlBody)}`.slice(0, TG_MSG_LIMIT),
           () => `${head} (${meta})\n${renderTail(toolLines, false, PROGRESS_TAIL)}`.slice(0, TG_MSG_LIMIT),
+          { final: true },
         );
       }
 
@@ -2771,7 +2936,12 @@ function onDeadWorkers(dead, reason) {
           tick(now) {
             if (LANES.main.current?.prompt === note) {
               this.done = true;
-              editProgress(m.message_id, escHtml(deadWorkerLine({ ...n, name: BRIDGE_NAME, phase: 'salvaging' }))).catch(() => {});
+              editProgress(
+                m.message_id,
+                escHtml(deadWorkerLine({ ...n, name: BRIDGE_NAME, phase: 'salvaging' })),
+                undefined,
+                { final: true },
+              ).catch(() => {});
               return;
             }
             if (now > deadline) this.done = true;
@@ -3056,14 +3226,19 @@ async function startBtwNotice(record, lane) {
   let settled = false;
   let live = null;
 
-  const put = (text) => {
+  // `final` separates the two kinds of write this helper makes: the ticking
+  // states, which the next tick corrects, and the four ENDINGS, which nothing
+  // corrects. An ending shed by a cooldown would leave a side question showing
+  // ⏳ forever — and /btw is exactly what a reader now relies on instead of a
+  // background lane's stream, so its endings are the last thing that may be lost.
+  const put = (text, { final = false } = {}) => {
     if (msgId == null) {
       // No message to edit: a Telegram hiccup at ask time must cost the
       // liveness, never the answer.
       send(text, { markdown: false }).catch(() => {});
       return;
     }
-    editProgress(msgId, escHtml(text), () => text).catch(() => {});
+    editProgress(msgId, escHtml(text), () => text, { final }).catch(() => {});
   };
 
   const finish = (state, extra = {}) => {
@@ -3075,10 +3250,10 @@ async function startBtwNotice(record, lane) {
       // splits: the line becomes a receipt and the answer arrives on its own,
       // rather than being truncated into a fragment that reads like all of it.
       if (escHtml(full).length <= TG_MSG_LIMIT) {
-        put(full);
+        put(full, { final: true });
         return;
       }
-      put(btwAnsweredLine({ lane, elapsedSec: elapsed(), answer: clean, spilled: true }));
+      put(btwAnsweredLine({ lane, elapsedSec: elapsed(), answer: clean, spilled: true }), { final: true });
       send(clean, { markdown: false }).catch(() => {});
       return;
     }
@@ -3092,6 +3267,7 @@ async function startBtwNotice(record, lane) {
             state === 'refused'
             ? btwRefusedLine({ lane, why: extra.why })
             : btwEndedLine({ lane }),
+      { final: true },
     );
   };
 
@@ -3207,7 +3383,7 @@ function resolveBtwAfterRestart(id, rec) {
   const resumable = rec?.engine === 'codex' && rec?.transport === 'appserver' && Boolean(rec?.threadId);
   for (const p of list) {
     const text = btwLostLine({ lane: p?.lane || rec?.lane || '', resumable });
-    if (p?.msgId) editProgress(p.msgId, escHtml(text), () => text).catch(() => {});
+    if (p?.msgId) editProgress(p.msgId, escHtml(text), () => text, { final: true }).catch(() => {});
     else send(text, { markdown: false }).catch(() => {});
   }
   try {
@@ -5440,8 +5616,9 @@ async function engineCommand(arg) {
     const settledText = settleSwitchText(text, pendingLine, resolveCaptureLine(outcome));
     if (!settledText) return;
     // The progress bubble's own editor, so this obeys the same per-chat 429
-    // backoff every other edit in the daemon obeys.
-    editProgress(messageId, escHtml(settledText), () => settledText).catch(() => {});
+    // backoff every other edit in the daemon obeys — and final, because the
+    // capture settling is the only state this line has left to reach.
+    editProgress(messageId, escHtml(settledText), () => settledText, { final: true }).catch(() => {});
   });
 }
 
@@ -7143,8 +7320,13 @@ function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = f
         // change two things at once and make the next failure unreadable.
         runCodexChatExec(rawText, { images, prompt, retriedCold: true, carriesHandoff });
         if (progressMsgId != null) {
-          await editProgress(progressMsgId, '<b>🧵 Codex thread gone</b>, starting a fresh one', () =>
-            '🧵 Codex thread gone, starting a fresh one',
+          // Terminal for THIS bubble: the retry opens its own, and nothing
+          // ticks this one again.
+          await editProgress(
+            progressMsgId,
+            '<b>🧵 Codex thread gone</b>, starting a fresh one',
+            () => '🧵 Codex thread gone, starting a fresh one',
+            { final: true },
           ).catch(() => {});
         }
         await send(
@@ -7176,6 +7358,7 @@ function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = f
             progressMsgId,
             `<b>${head}</b> · ${fmtElapsed(elapsed)}`,
             () => `${head} · ${fmtElapsed(elapsed)}`,
+            { final: true },
           );
         }
         if (outcome.status === 'finished' && outcome.answer) {
@@ -7233,8 +7416,12 @@ function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = f
       const m = await tg('sendMessage', {
         chat_id: CHAT_ID,
         text: codexThinkingLine({ elapsedSec: 0, resumed, images: imgs.length }),
-      }, 0, { disposable: true });
-      progressMsgId = m.message_id;
+        // NOT disposable, for the same reason the Claude lane's is not: it is
+        // the chat lane's only live object for this turn. opening, for the same
+        // reason too: during a wall it is skipped rather than held, so it can
+        // never land above the answer it was announcing.
+      }, 0, { opening: true });
+      progressMsgId = m?.message_id ?? null;
     } catch (e) {
       console.error('[bridge] failed to send codex progress message:', e.message);
       return;
@@ -7243,6 +7430,12 @@ function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = f
       // It finished while this message was in flight, so the final edit below
       // ran against a null id and this bubble would sit at "thinking… · 0s"
       // forever, above the answer. Close it here instead.
+      //
+      // Guarded, because a skipped opening reaches this line too: there is no
+      // bubble to close, and editing a null id would spend a request on a
+      // message that does not exist. The turn's answer has already been sent by
+      // the finish handler, which is what settled means here.
+      if (progressMsgId == null) return;
       const elapsed = Math.round((Date.now() - run.startedAt) / 1000);
       // 'Done' is the state word everywhere else in this surface; the engine
       // belongs in a glyph, not in the slot that says what happened. This was
@@ -7454,6 +7647,7 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
           progressMsgId,
           `<b>${head}</b> · ${meta}${quoteBlock(renderTail(toolLines, true, PROGRESS_TAIL))}`.slice(0, TG_MSG_LIMIT),
           () => `${head} (${meta})\n${renderTail(toolLines, false, PROGRESS_TAIL)}`.slice(0, TG_MSG_LIMIT),
+          { final: true },
         );
       }
       if (run.stopped) {
@@ -7757,8 +7951,11 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
         text: `🧠 Codex · ${thinkingWord(wordSeed, THINKING_WORDS)}…${resumed ? ' · continuing this chat' : ''}${
           imgs.length ? ` · ${imgs.length} image${imgs.length === 1 ? '' : 's'}` : ''
         }`,
-      }, 0, { disposable: true });
-      progressMsgId = m.message_id;
+        // NOT disposable: the app-server lane's only live object for this turn.
+        // opening: and not held during a wall either, for the same reason as
+        // the other three: it would arrive after the answer it announces.
+      }, 0, { opening: true });
+      progressMsgId = m?.message_id ?? null;
     } catch (e) {
       console.error('[bridge] failed to send codex progress message:', e.message);
     }
@@ -7772,6 +7969,7 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
           progressMsgId,
           `<b>${head}</b> · ${fmtElapsed(elapsed)}`,
           () => `${head} · ${fmtElapsed(elapsed)}`,
+          { final: true },
         ).catch(() => {});
       }
       return;
@@ -9598,6 +9796,16 @@ async function handleCommand(text, msg = null) {
       // asked for and the last thing on screen stayed "restarting", forever.
       // Chrome: a "Restarting…" line delivered from the outbox after a wall,
       // with the daemon long since back, is a frame that lies.
+      //
+      // JUDGED AND KEPT DISPOSABLE, while every other opening placeholder
+      // stopped being one. The rule everywhere else is "a dropped opening costs
+      // the whole turn its bubble"; here it costs nothing, and holding it costs
+      // correctness. The process exits four lines below, so THIS daemon can
+      // never flush what it holds — the next one would, minutes later, with the
+      // restart long finished. And a null restartMsg is already a supported
+      // state: bootAnnouncePlan falls through to `announce` and the reboot is
+      // confirmed by a fresh 🟢 line instead of an edit. The hourglass has a
+      // resolution path either way, which is the actual invariant.
       const m = await send(restartingLine(), { markdown: false, disposable: true }).catch(() => null);
       state.restartMsg = m?.message_id ? { id: m.message_id, at: Date.now() } : null;
       state.lastAnnounce = 0; // force the 🟢 online announce on reboot as confirmation
@@ -9814,7 +10022,8 @@ function resolveQueueAck(item, state) {
   item.ackMsgId = null;
   const waitedSec = item.queuedAt ? Math.round((Date.now() - item.queuedAt) / 1000) : null;
   const text = state === 'dropped' ? queueDropped() : queueStarted({ waitedSec });
-  editProgress(msgId, escHtml(text), () => text).catch(() => {});
+  // Terminal, as the docblock above says: the ack has no state after this one.
+  editProgress(msgId, escHtml(text), () => text, { final: true }).catch(() => {});
 }
 
 /**
@@ -10642,7 +10851,12 @@ async function main() {
   if (plan.kind !== 'silent') state.lastAnnounce = Date.now();
   saveState();
   if (plan.kind === 'edit') {
-    await editProgress(plan.id, restartResolvedLine({ elapsedSec: plan.elapsedSec, workers: survivors }));
+    // "MUST NEVER BE SUPPRESSED" is the comment above, and final is what makes
+    // it true against the governor too: this edit resolves the ⏳ /restart left
+    // on screen, and it is the whole answer to "did it come back".
+    await editProgress(plan.id, restartResolvedLine({ elapsedSec: plan.elapsedSec, workers: survivors }), undefined, {
+      final: true,
+    });
   } else if (plan.kind === 'announce') {
     await send(bootAnnounceLine({ name: BRIDGE_NAME, host: hostname().replace(/\.local$/, ''), workers: survivors }), {
       markdown: false,

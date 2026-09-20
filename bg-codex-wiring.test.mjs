@@ -740,6 +740,8 @@ export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wa
         grab('settleWall'),
         grab('pendWallResolution'),
         grab('workerNotices', 'const'),
+        grab('LANE_KIND', 'const'),
+        grab('streamsStepEdits', 'const'),
         grab('startWorkerNotice'),
         grab('editWorkerNotice'),
         grab('bothEnginesWalledLine'),
@@ -1453,10 +1455,16 @@ await t('★ the close handler calls it with the message, not with a paraphrase'
 
 await t('★ the run bubble becomes the rotation line, and no error bubble follows', () => {
   const src = SRC.join('\n');
-  const settle = src.slice(src.indexOf('if (progressMsgId != null && limitPlan?.line)'), src.indexOf("const head = wasStopped ? '🛑 Stopped'"));
-  ok(settle.length > 0 && settle.length < 900, `the progress settle moved or grew unexpectedly (${settle.length} chars)`);
+  const settle = src.slice(src.indexOf('if (limitPlan?.line) {'), src.indexOf("const head = wasStopped ? '🛑 Stopped'"));
+  ok(settle.length > 0 && settle.length < 1600, `the progress settle moved or grew unexpectedly (${settle.length} chars)`);
   ok(/editProgress\(progressMsgId, escHtml\(limitPlan\.line\)/.test(settle), settle);
   ok(/limitPlan\?\.line/.test(settle), 'a rotation with no line to show must keep the ordinary ❌ header');
+  // NO LONGER GUARDED BY THE BUBBLE (2026-09-19). An opening placeholder met by
+  // a Telegram wall is now skipped, so progressMsgId can be null on a perfectly
+  // ordinary turn, and this line is the ONLY report of a walled account on the
+  // rotate-and-retry route, because the dispatch arm below sends nothing on
+  // purpose. Guarded, the whole rotation happened in silence.
+  ok(/\} else \{\n\s+await send\(limitPlan\.line, \{ markdown: false \}\)/.test(settle), `the no-bubble arm must send it:\n${settle}`);
   // The retry branch sends NOTHING: the edited bubble above is the whole
   // message. The ordinary failure still exists, on the other branch and on the
   // textless arm further down.
@@ -1766,6 +1774,8 @@ export const reset = () => {
         grab('BG_COMMAND_RE', 'const'),
         grab('unchosenCodex', 'const'),
         grab('workerNotices', 'const'),
+        grab('LANE_KIND', 'const'),
+        grab('streamsStepEdits', 'const'),
         grab('startWorkerNotice'),
         grab('editWorkerNotice'),
         grab('drainBgHandoff'),

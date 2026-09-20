@@ -975,6 +975,12 @@ const B = await import(
         grabFn('makeBgLane'),
         grabFn('getBgLane'),
         grabConst('workerNotices'),
+        // The lane split the worker line consults: extracted, not mirrored, so
+        // this suite reads the same rule the daemon does. A mirror here would
+        // have kept this suite green while a bg line silently went back to
+        // streaming, which is the regression progress-priority.test.mjs guards.
+        grabConst('LANE_KIND'),
+        grabConst('streamsStepEdits'),
         grabFn('startWorkerNotice'),
         grabFn('editWorkerNotice'),
         grabConst('PARKED_WALLED_JOBS_MAX'),
@@ -1443,7 +1449,16 @@ await t('★ the dispatch puts up ONE line and keeps it alive', async () => {
   eq(B.LIVE.size, 1, 'and it is registered to keep ticking');
 });
 
-await t('★ it ticks IN PLACE, and only when the step line changed', async () => {
+// A BACKGROUND LINE TICKS SILENTLY (2026-09-19). It used to edit in place every
+// 15s when the step line changed and once a minute otherwise; four or five of
+// them together starved the per-chat bucket and the governor shed the CHAT
+// lane's frames and placeholders to protect the answers. The trade taken:
+// stop streaming the edits from the background lanes into their bubbles, so the
+// progress edits on the chat lane are prioritised. The tick still RUNS — it is
+// what reads the step count the ending is built from, and what expires an
+// orphaned line — it just spends nothing. progress-priority.test.mjs proves the
+// same against the real governor; this proves it against the real drain.
+await t('★ it ticks SILENTLY: the run is read every sweep, and no edit is spent', async () => {
   B.reset([{}]);
   B.setQueue([{ text: '# Fix the engine-switch message' }]);
   B.drainBgHandoff();
@@ -1452,22 +1467,25 @@ await t('★ it ticks IN PLACE, and only when the step line changed', async () =
   const lane = B.bgLanes[0];
   lane.current.steps = 3;
   lane.current.lastAct = '💻 Bash npm test';
-  // Far enough past the last edit that a changed body is due.
+  // Every case that USED to be an edit: a changed body well past the cadence,
+  // an idle clock inside the idle window, an idle clock past it.
   entry.lastEditAt = Date.now() - 60_000;
   entry.tick(Date.now());
-  eq(B.EDITS.length, 1, 'the first real step is news');
-  eq(B.EDITS[0].id, 1, 'it edits the message the dispatch sent, never a new one');
-  ok(/⏳ .* · 3 steps · 💻 Bash npm test/.test(B.EDITS[0].html), B.EDITS[0].html);
-
-  // Nothing changed: the clock alone is not worth an edit inside the idle tick.
   entry.lastEditAt = Date.now() - 20_000;
   entry.tick(Date.now());
-  eq(B.EDITS.length, 1, 'an idle worker spent an edit on a moving clock');
-
-  // Still nothing changed, but a minute has passed, so the clock is refreshed.
   entry.lastEditAt = Date.now() - 61_000;
   entry.tick(Date.now());
-  eq(B.EDITS.length, 2, 'an idle worker must still prove it is alive once a minute');
+  eq(B.EDITS.length, 0, 'a background line spent an edit on an intermediate frame');
+
+  // What the silent tick is FOR: the reading the terminal edit needs.
+  eq(entry.lastLive.steps, 3, 'the step count was not read');
+  eq(entry.lastLive.lastAct, '💻 Bash npm test', 'the last action was not read');
+  const runId = `bg-${lane.current.startedAt}`;
+  B.editWorkerNotice(runId, { phase: 'done', status: 'finished', elapsedSec: 300 });
+  eq(B.EDITS.length, 1, 'the ending is the first and only edit');
+  eq(B.EDITS[0].id, 1, 'and it edits the message the dispatch sent, never a new one');
+  ok(/^✅ /.test(B.EDITS[0].html), `the ending is not terminal: ${B.EDITS[0].html}`);
+  ok(/Done · 5m · 3 steps/.test(B.EDITS[0].html), `the ending lost the count read while silent: ${B.EDITS[0].html}`);
 });
 
 await t('★ the completion is an EDIT, not a second message', async () => {
@@ -1601,7 +1619,7 @@ await t('★ a keepAlive line is not immortal: it retires if the handback never 
   eq(B.workerNotices.size, 0);
 });
 
-await t('★ a 429 pauses the worker line\'s EDITS but never its expiry', async () => {
+await t('★ a 429 never blocks the worker line\'s EXPIRY, and it spends nothing either side of one', async () => {
   B.reset([{}]);
   B.setQueue([{ text: '# Fix the engine-switch message' }]);
   B.drainBgHandoff();
@@ -1617,7 +1635,17 @@ await t('★ a 429 pauses the worker line\'s EDITS but never its expiry', async 
   eq(B.EDITS.length, before, 'it spent an edit inside the penalty');
   B.setCooldown(0);
   entry.tick(Date.now());
-  eq(B.EDITS.length, before + 1, 'and it resumes when the penalty is over');
+  eq(B.EDITS.length, before, 'a background line does not stream, penalty or not');
+  // The half this test always existed for: the run vanishes DURING a penalty,
+  // and the line must still be able to retire, or a 429 in the wrong second
+  // strands it for the life of the daemon.
+  B.setCooldown(Date.now() + 60_000);
+  lane.current = null;
+  const t0 = Date.now();
+  entry.tick(t0);
+  eq(entry.done, false, 'not yet: the close handler may still be reporting');
+  entry.tick(t0 + 120_001);
+  eq(entry.done, true, 'an orphaned line did not expire under a cooldown');
 });
 
 await t('a worker that outlived the daemon still gets its own ✅ message', async () => {
