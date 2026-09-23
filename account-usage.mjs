@@ -429,10 +429,20 @@ export async function fetchUsage(accessToken, opts = {}) {
 // readable, and specific: the two that need opposite reactions (wait versus
 // log in again) must never share a sentence. `name` is the slot to re-capture,
 // rendered as a code span for the same linkify reason every name in this file is.
-export function usageFailureText(failure, { name = '<name>' } = {}) {
+//
+// A 429 that named its own retry time says WHEN, as a clock in the owner's
+// zone: the live endpoint answered Retry-After 2714 (45 minutes) on
+// 2026-09-22, and "try again in a few minutes" over a row that is held for 45
+// would read as broken on the third tap. A clock, unlike a countdown, cannot
+// go stale while the row is held.
+export function usageFailureText(failure, { name = '<name>', now = Date.now(), timeZone = LOCAL_TZ } = {}) {
   const f = failure || {};
   switch (f.kind) {
     case 'rate-limited':
+      if (Number.isFinite(f.retryAt) && f.retryAt > Number(now)) {
+        const at = fmtResetClock(f.retryAt, { timeZone, now, compact: true });
+        return `usage lookup rate limited by Anthropic until ${at} (the account itself is fine)`;
+      }
       return 'usage lookup rate limited by Anthropic, try again in a few minutes (the account itself is fine)';
     case 'refused':
       return `login refused (HTTP ${f.status}), run /account capture \`${name}\` after logging in`;
@@ -750,11 +760,15 @@ export function createAccountUsage({
 
     // Still 'unavailable', so every consumer that branches on state is
     // untouched; what changed is that the row now says why.
+    const why = { kind: failure.kind, status: failure.status ?? null, code: failure.code ?? null };
+    if (failure.kind === 'rate-limited' && Number.isFinite(failure.retryAfterMs)) why.retryAt = t + failure.retryAfterMs;
     const row = {
       ...base,
       state: 'unavailable',
-      error: usageFailureText(failure, { name: captureName }),
-      failure: { kind: failure.kind, status: failure.status ?? null, code: failure.code ?? null },
+      // In the daemon's own zone, for readers with none (the rotation's log
+      // line). The two renderers below re-render a 429 in the owner's zone.
+      error: usageFailureText(why, { name: captureName, now: t }),
+      failure: why,
       usage: null,
     };
     if (failure.kind === 'rate-limited') {
@@ -927,10 +941,17 @@ function accountWindowLine(title, w, { now, timeZone }) {
   return `   ${gauge} resets ${clock} · ${left}`;
 }
 
+// Why a row has no numbers. A 429 is re-rendered here rather than read off
+// row.error, because only the renderer knows the owner's zone for its clock.
+function rowReason(row, { now, timeZone }) {
+  if (row?.failure?.kind === 'rate-limited') return usageFailureText(row.failure, { now, timeZone });
+  return row?.error || 'usage unavailable';
+}
+
 // The window lines under one /account row, or a single reason there are none.
 export function accountUsageBlock(row, { now = Date.now(), timeZone = LOCAL_TZ } = {}) {
   if (!row) return [];
-  if (row.state !== 'ok' || !row.usage) return [`   ⚠️ ${row.error || 'usage unavailable'}`];
+  if (row.state !== 'ok' || !row.usage) return [`   ⚠️ ${rowReason(row, { now, timeZone })}`];
   const lines = [
     accountWindowLine('5h', row.usage.fiveHour, { now, timeZone }),
     accountWindowLine('wk', row.usage.sevenDay, { now, timeZone }),
@@ -1117,7 +1138,7 @@ export function renderUsageReport({ active, rows }, { now = Date.now(), timeZone
     const fp = r.fingerprint ? ` \`${r.fingerprint}\`` : '';
     out.push('', `${r.live ? '▶︎' : '•'} \`${r.name}\`${fp}${r.refreshed ? ' _(token refreshed)_' : ''}`);
     if (r.state !== 'ok' || !r.usage) {
-      out.push(`   ⚠️ ${r.error || 'usage unavailable'}`);
+      out.push(`   ⚠️ ${rowReason(r, { now, timeZone })}`);
       continue;
     }
     out.push(...windowBlock('5h', r.usage.fiveHour, { now, timeZone }));

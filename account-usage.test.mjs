@@ -1353,6 +1353,32 @@ await t('a 429 renders the rate limited line on /account AND /usage, not "usage 
   eq(usageLine((await r.usage.activeOnly()).row), null);
 });
 
+await t('a 429 that names its retry time says WHEN, as a clock in the owner zone, on both views', async () => {
+  // The live answer on 2026-09-22 was Retry-After 2714 (45 minutes). "Try again
+  // in a few minutes" over a row held for 45 would read as broken.
+  const f = failingFetch('acc-a', () => resH(429, { type: 'error', error: { type: 'rate_limit_error' } }, { 'retry-after': '2714' }));
+  const r = clockRig(f.impl);
+  const { snap, account, usage } = await bothViews(r);
+  const row = snap.rows.find((x) => x.name === 'second@example.com');
+  eq(row.failure, { kind: 'rate-limited', status: 429, code: 'rate_limit_error', retryAt: NOW + 2_714_000 });
+  // NOW is 5:53pm in New York; 45m14s later is 6:38pm.
+  const want = '   ⚠️ usage lookup rate limited by Anthropic until 6:38pm (the account itself is fine)';
+  ok(account.includes(want), `/account:\n${account}`);
+  ok(usage.includes(want), `/usage:\n${usage}`);
+  ok(!account.includes('usage unavailable') && !usage.includes('usage unavailable'), 'fell back to usage unavailable');
+  ok(!DASHES.test(want), 'the line carries a dash');
+  // The clock is the RENDERER's zone, not the daemon's.
+  ok(accountUsageBlock(row, { now: NOW, timeZone: 'UTC' })[0].includes('until 10:38pm'), accountUsageBlock(row, { now: NOW, timeZone: 'UTC' })[0]);
+  // Twenty minutes on, the held row still names the same clock, not a stale countdown.
+  r.clock.t = NOW + 20 * 60_000;
+  const later = await bothViews(r);
+  ok(later.account.includes(want), `the held row changed its answer:\n${later.account}`);
+  eq(f.usageCalls('acc-a'), 1, 'asked the throttled endpoint again inside its Retry-After');
+  // A retry time already past falls back to the plain wording, never "until" a past clock.
+  eq(usageFailureText({ kind: 'rate-limited', status: 429, retryAt: NOW - 1 }, { now: NOW }), RATE_LIMITED_LINE);
+  eq(usageFailureText({ kind: 'rate-limited', status: 429, retryAt: NOW + 3_600_000 }, { now: NOW, timeZone: OWNER_TZ }), 'usage lookup rate limited by Anthropic until 6:53pm (the account itself is fine)');
+});
+
 await t('401 and 403 render a login refused line naming the slot to re-capture', async () => {
   for (const status of [401, 403]) {
     const f = failingFetch('acc-b', () => res(status, { type: 'error', error: { type: status === 401 ? 'authentication_error' : 'permission_error' } }));
@@ -1506,7 +1532,7 @@ await t('no response body text other than error.type reaches a rendered line, a 
   ok(!everything.includes('PLANTED'), `planted body text leaked:\n${everything}`);
   ok(r.logs.some((l) => l.includes('rate_limit_error')), `error.type is the one code allowed through, and it did not reach the log: ${r.logs.join(' | ')}`);
   eq(snap.rows.find((x) => x.name === 'first@example.com').failure, { kind: 'refused', status: 401, code: null }, 'a token-shaped error.type passed as a code');
-  ok(account.includes(RATE_LIMITED_LINE), 'the reason itself must still render');
+  ok(account.includes('usage lookup rate limited by Anthropic until '), `the reason itself must still render:\n${account}`);
 });
 
 // ---------- report ----------
