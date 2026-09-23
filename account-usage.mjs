@@ -67,9 +67,13 @@
 //      account is reported as broken and loudly, rather than shown a usage
 //      number that hides it.
 //
-// Everything ELSE degrades silently to "usage unavailable" for that account: a
-// timeout, a 500, a 401, unparseable JSON. A usage number decorates a reply; it
-// may never take one down.
+// Everything ELSE degrades quietly for that account: a timeout, a 500, a 401, a
+// 429, unparseable JSON. A usage number decorates a reply; it may never take one
+// down. Quietly is not the same as vaguely, though: the row carries WHY
+// (usageFailureText below), so "rate limited, the account is fine" and "the
+// login was refused, re-capture it" never read as the same "usage unavailable".
+// And a 429 is held for its Retry-After (else five minutes), so tapping /account
+// again does not ask a throttled endpoint again.
 //
 // NOTHING here prints a token. Access and refresh tokens appear only as
 // arguments and in request headers; every rendering of credentials goes through
@@ -95,6 +99,13 @@ export const DEFAULT_TTL_MS = 60_000;
 // Refresh only when the token is genuinely done. The skew keeps a token that
 // expires mid-flight from being sent.
 export const EXPIRY_SKEW_MS = 5 * 60_000;
+// How long a 429 is held when the server sends no Retry-After, and the most any
+// Retry-After is honoured for. The floor is the ordinary TTL: a throttled
+// account is never asked MORE often than a healthy one. The ceiling keeps a
+// bogus header from blanking an account's numbers for a day; asking once an
+// hour is not hammering anybody.
+export const THROTTLE_DEFAULT_MS = 5 * 60_000;
+export const THROTTLE_MAX_MS = 60 * 60_000;
 
 // The zone reset clocks render in. The owner may not be where the daemon is,
 // so every renderer takes `timeZone` as an option — the bridges inject the
@@ -300,33 +311,148 @@ function authHeaders(accessToken) {
   };
 }
 
-// One GET, JSON or null. Never throws and never rejects, for the same reason
+// The ONE piece of an error body allowed out of this file: the server's short
+// error code, and only in the lowercase snake_case shape every Anthropic
+// error.type has (rate_limit_error, authentication_error, api_error). Nothing
+// else is read: not error.message, not request_id, not a field this code has
+// never seen. A token carries capitals, digits and hyphens, so even one planted
+// in error.type itself fails the pattern and is dropped.
+function errorCode(body) {
+  const c = body?.error?.type;
+  return typeof c === 'string' && /^[a-z_]{1,40}$/.test(c) ? c : null;
+}
+
+function headerOf(res, name) {
+  const h = res?.headers;
+  if (!h) return null;
+  if (typeof h.get === 'function') return h.get(name);
+  return h[name] ?? null;
+}
+
+// Retry-After in milliseconds, or null when absent or unreadable. The header is
+// either delta seconds ("120") or an HTTP date; both are in the spec and both
+// are seen in the wild.
+export function parseRetryAfter(value, now = Date.now()) {
+  if (value === null || value === undefined) return null;
+  const s = String(value).trim();
+  if (!s) return null;
+  if (/^\d+(\.\d+)?$/.test(s)) return Math.round(Number(s) * 1000);
+  const at = Date.parse(s);
+  if (!Number.isFinite(at)) return null;
+  return Math.max(0, at - Number(now));
+}
+
+// How long to hold a 429 before asking again. See THROTTLE_DEFAULT_MS.
+export function throttleHoldMs(retryAfterMs, ttlMs = DEFAULT_TTL_MS) {
+  const asked = Number.isFinite(retryAfterMs) && retryAfterMs >= 0 ? retryAfterMs : THROTTLE_DEFAULT_MS;
+  return Math.min(THROTTLE_MAX_MS, Math.max(Number(ttlMs) || 0, asked));
+}
+
+const isAbort = (e) => e?.name === 'AbortError' || e?.name === 'TimeoutError';
+
+function failureKind(status) {
+  if (status === 429) return 'rate-limited';
+  if (status === 401 || status === 403) return 'refused';
+  return 'http';
+}
+
+// One GET. Resolves { ok: true, body } or { ok: false, kind, status, code,
+// retryAfterMs }, where kind is one of rate-limited, refused, http, timeout,
+// network, unreadable. Never throws and never rejects, for the same reason
 // usage-limits.mjs's execJson does not: the caller is decorating a reply.
-async function getJson(url, accessToken, fetchImpl, timeoutMs) {
+async function getJsonResult(url, accessToken, fetchImpl, timeoutMs, now = Date.now()) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const res = await fetchImpl(url, { headers: authHeaders(accessToken), signal: ctl.signal });
-    if (!res || !res.ok) return null;
-    return await res.json();
-  } catch {
-    return null; // timeout, DNS, TLS, non-JSON — all the same to the caller
+    let res;
+    try {
+      res = await fetchImpl(url, { headers: authHeaders(accessToken), signal: ctl.signal });
+    } catch (e) {
+      return { ok: false, kind: isAbort(e) ? 'timeout' : 'network', status: null, code: null };
+    }
+    if (!res) return { ok: false, kind: 'unreadable', status: null, code: null };
+    if (!res.ok) {
+      const status = Number(res.status) || null;
+      let code = null;
+      try {
+        code = errorCode(await res.json());
+      } catch {
+        /* body unreadable; the status alone is the reason */
+      }
+      const out = { ok: false, kind: failureKind(status), status, code };
+      if (status === 429) out.retryAfterMs = parseRetryAfter(headerOf(res, 'retry-after'), now);
+      return out;
+    }
+    try {
+      return { ok: true, body: await res.json() };
+    } catch (e) {
+      return { ok: false, kind: isAbort(e) ? 'timeout' : 'unreadable', status: Number(res.status) || null, code: null };
+    }
   } finally {
     clearTimeout(timer);
   }
 }
 
-export async function fetchUsage(
+// JSON or null, for the callers that only care whether it worked.
+async function getJson(url, accessToken, fetchImpl, timeoutMs) {
+  const r = await getJsonResult(url, accessToken, fetchImpl, timeoutMs);
+  return r.ok ? r.body : null;
+}
+
+// The usage numbers AND, when there are none, why: { usage, failure }. Exactly
+// one of the two is null. `failure` is { kind, status, code, retryAfterMs? }
+// and carries no body text beyond errorCode()'s snake_case code.
+export async function fetchUsageResult(
   accessToken,
-  { fetchImpl = globalThis.fetch, timeoutMs = REQUEST_TIMEOUT_MS, wallClockOnly = false } = {},
+  { fetchImpl = globalThis.fetch, timeoutMs = REQUEST_TIMEOUT_MS, wallClockOnly = false, now = Date.now() } = {},
 ) {
-  if (!accessToken) return null;
+  if (!accessToken) return { usage: null, failure: { kind: 'no-token', status: null, code: null } };
   // Claude Code uses the query-string variant when it wants only the wall-clock
   // numbers and no spend rollup; kept as an option, off by default because the
   // full body is what /usage renders.
   const url = `${API}/api/oauth/usage${wallClockOnly ? '?at_wall=1&skip_spend=1' : ''}`;
-  const body = await getJson(url, accessToken, fetchImpl, timeoutMs);
-  return normalizeUsage(body);
+  const r = await getJsonResult(url, accessToken, fetchImpl, timeoutMs, now);
+  if (!r.ok) {
+    const { ok: _ok, ...failure } = r;
+    return { usage: null, failure };
+  }
+  const usage = normalizeUsage(r.body);
+  return usage ? { usage, failure: null } : { usage: null, failure: { kind: 'unreadable', status: 200, code: null } };
+}
+
+// The numbers or null, unchanged for every caller that never needed the reason.
+export async function fetchUsage(accessToken, opts = {}) {
+  return (await fetchUsageResult(accessToken, opts)).usage;
+}
+
+// The line the owner reads when an account has no numbers. Short, phone
+// readable, and specific: the two that need opposite reactions (wait versus
+// log in again) must never share a sentence. `name` is the slot to re-capture,
+// rendered as a code span for the same linkify reason every name in this file is.
+export function usageFailureText(failure, { name = '<name>' } = {}) {
+  const f = failure || {};
+  switch (f.kind) {
+    case 'rate-limited':
+      return 'usage lookup rate limited by Anthropic, try again in a few minutes (the account itself is fine)';
+    case 'refused':
+      return `login refused (HTTP ${f.status}), run /account capture \`${name}\` after logging in`;
+    case 'timeout':
+      return 'usage lookup timed out';
+    case 'network':
+      return 'usage lookup failed (network error)';
+    case 'http':
+      return f.status ? `usage unavailable (HTTP ${f.status})` : 'usage unavailable';
+    default:
+      return 'usage unavailable';
+  }
+}
+
+// The same reason as one log line: status and code, never a body.
+function failureLogText(f) {
+  const bits = [f?.kind || 'unknown'];
+  if (f?.status) bits.push(`HTTP ${f.status}`);
+  if (f?.code) bits.push(f.code);
+  return bits.join(', ');
 }
 
 // Identity for a token, which is how an account is recognised after its tokens
@@ -433,6 +559,14 @@ export async function refreshAccessToken({
 // refresh and the tests both want. Keyed by account name (and by fingerprint for
 // profile lookups). Failures are cached too, for the same TTL: when the API is
 // down, three dead 5s requests per /status is the cost of NOT caching them.
+//
+// A 429 is the exception, and it is held in TWO places: in this cache for its
+// hold time, and in a per-reader throttle map (createAccountUsage below) that
+// invalidateUsageCache() does not clear. The second one is the point. A swap,
+// a capture and the rotation probe all invalidate on purpose, to stop a stale
+// "has headroom" reading; a throttled row carries no reading at all, so it
+// cannot lie about headroom, and asking the server again inside its own
+// Retry-After only earns another 429.
 // ---------------------------------------------------------------------------
 const cache = new Map();
 
@@ -473,6 +607,11 @@ export function createAccountUsage({
   log = (msg) => console.log(`[account-usage] ${msg}`),
 } = {}) {
   if (!store) throw new Error('createAccountUsage: an account `store` is required');
+
+  // Slot name -> { until, row } for accounts the usage endpoint answered 429.
+  // Per reader, not module level: the daemon has one reader, so this lives as
+  // long as it does, and every test rig starts with an empty one.
+  const throttle = new Map();
 
   // Which slot is live, and therefore which one must never be refreshed.
   //
@@ -581,10 +720,16 @@ export function createAccountUsage({
     return { token: blob.accessToken, live: false, refreshed: true };
   }
 
-  async function readOne(acct, active) {
+  // `captureName` is the slot a refused login should be re-captured into. It is
+  // the account's own name, except for activeOnly()'s stand-in row for a login
+  // that is in no slot, where the honest instruction is "/account capture <name>".
+  async function readOne(acct, active, { captureName = acct.name } = {}) {
     const t = now();
     const cached = cacheGet(acct.name, t);
     if (cached !== undefined) return { ...cached, cached: true };
+    const held = throttle.get(acct.name);
+    if (held && held.until > t) return { ...held.row, cached: true };
+    if (held) throttle.delete(acct.name);
 
     // The fingerprint travels on the row so /usage can print it. It moved there
     // out of /account, which is the daily view and did not need three token
@@ -600,10 +745,25 @@ export function createAccountUsage({
     if (!tok.token) {
       return cacheSet(acct.name, { ...base, state: tok.state, error: tok.error, usage: null }, t, ttlMs);
     }
-    const usage = await fetchUsage(tok.token, { fetchImpl, timeoutMs });
-    const row = usage
-      ? { ...base, state: 'ok', usage, refreshed: !!tok.refreshed }
-      : { ...base, state: 'unavailable', error: 'usage unavailable', usage: null };
+    const { usage, failure } = await fetchUsageResult(tok.token, { fetchImpl, timeoutMs, now: t });
+    if (usage) return cacheSet(acct.name, { ...base, state: 'ok', usage, refreshed: !!tok.refreshed }, t, ttlMs);
+
+    // Still 'unavailable', so every consumer that branches on state is
+    // untouched; what changed is that the row now says why.
+    const row = {
+      ...base,
+      state: 'unavailable',
+      error: usageFailureText(failure, { name: captureName }),
+      failure: { kind: failure.kind, status: failure.status ?? null, code: failure.code ?? null },
+      usage: null,
+    };
+    if (failure.kind === 'rate-limited') {
+      const holdMs = throttleHoldMs(failure.retryAfterMs, ttlMs);
+      throttle.set(acct.name, { until: t + holdMs, row });
+      log(`usage lookup for "${acct.name}" throttled (${failureLogText(failure)}), holding ${Math.round(holdMs / 1000)}s before asking again`);
+      return cacheSet(acct.name, row, t, holdMs);
+    }
+    log(`usage lookup for "${acct.name}" failed (${failureLogText(failure)})`);
     return cacheSet(acct.name, row, t, ttlMs);
   }
 
@@ -662,7 +822,7 @@ export function createAccountUsage({
       // of tokenFor (live token, never refreshed) instead of reporting "no
       // credentials captured" for the account that is actually running.
       const synthetic = acct || { name: active.name || active.email || 'the live login', email: active.email || null };
-      const row = await readOne(synthetic, { ...active, name: synthetic.name });
+      const row = await readOne(synthetic, { ...active, name: synthetic.name }, { captureName: acct ? acct.name : '<name>' });
       return { active, row };
     },
   };

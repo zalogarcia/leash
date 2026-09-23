@@ -23,6 +23,12 @@ import {
   fmtResetClock,
   normalizeUsage,
   fetchUsage,
+  fetchUsageResult,
+  usageFailureText,
+  parseRetryAfter,
+  throttleHoldMs,
+  THROTTLE_DEFAULT_MS,
+  THROTTLE_MAX_MS,
   fetchProfile,
   refreshAccessToken,
   createAccountUsage,
@@ -754,7 +760,8 @@ await t('a usage call that fails degrades to "usage unavailable" and never break
   eq(usageLine(rows[1]), null, '/status must omit the line, not print an error into a liveness view');
   // Same property as before the /account rewrite: a dead usage call becomes a
   // visible reason on that account's row, never a blank and never an exception.
-  eq(accountUsageBlock(rows[1]), ['   ⚠️ usage unavailable']);
+  // A plain server error keeps the words and gains its status code.
+  eq(accountUsageBlock(rows[1]), ['   ⚠️ usage unavailable (HTTP 500)']);
 });
 
 await t('every account is fetched CONCURRENTLY, so one slow account does not serialise the rest', async () => {
@@ -1214,6 +1221,292 @@ await t('no renderer can emit a token, even when handed one', () => {
   ].join('\n');
   ok(!all.includes('SHOULD-NEVER-RENDER'), 'a renderer printed an access token');
   ok(!all.includes('ALSO-NEVER'), 'a renderer printed a refresh token');
+});
+
+// ---------------------------------------------------------------------------
+// WHY A READ FAILED, and the 429 hold
+//
+// Probed live 2026-09-22: /api/oauth/usage answered 429 rate_limit_error while
+// /api/oauth/profile answered 200 on the same token with hours left on it. The
+// account was fine, the screen said "usage unavailable", and every /account tap
+// asked the throttled endpoint again. These pin the reason on the row, the
+// specific line on both views, and the hold.
+// ---------------------------------------------------------------------------
+
+const resH = (status, body, headers = {}) => ({
+  ...res(status, body),
+  headers: { get: (k) => headers[String(k).toLowerCase()] ?? null },
+});
+
+const RATE_LIMITED_LINE = 'usage lookup rate limited by Anthropic, try again in a few minutes (the account itself is fine)';
+const DASHES = /[\u2013\u2014]/;
+
+// Usage for every token except `failTok`, which gets whatever answer() returns
+// (or throws). Counts usage calls per token, which is what the hold is about.
+function failingFetch(failTok, answer) {
+  const calls = [];
+  const impl = async (url, opts) => {
+    const tok = String(opts.headers.Authorization).replace('Bearer ', '');
+    calls.push({ url, tok });
+    if (url.includes('/oauth/profile')) return res(200, REAL_PROFILE);
+    if (url.includes('/oauth/usage')) return tok === failTok ? answer(opts) : res(200, REAL_USAGE);
+    return res(404, {});
+  };
+  return { impl, calls, usageCalls: (tok) => calls.filter((c) => c.url.includes('/oauth/usage') && c.tok === tok).length };
+}
+
+// A reader whose clock the test moves.
+function clockRig(fetchImpl, { liveOauth = oauthFor('a'), timeoutMs } = {}) {
+  const clock = { t: NOW };
+  const logs = [];
+  const file = path.join(TMP, `accounts-${n++}.json`);
+  writeFileSync(file, JSON.stringify(SEED, null, 2), { mode: 0o600 });
+  const kc = fakeKeychain({ claudeAiOauth: liveOauth });
+  const store = createAccountStore({ file, credentials: createKeychainStore({ account: 'owner', runSecurity: (...a) => kc.run(...a) }), log: () => {} });
+  const usage = createAccountUsage({
+    store,
+    fetchImpl,
+    now: () => clock.t,
+    ttlMs: 60_000,
+    log: (m) => logs.push(m),
+    ...(timeoutMs ? { timeoutMs } : {}),
+  });
+  invalidateUsageCache();
+  return { clock, store, usage, logs };
+}
+
+// Both views, rendered exactly the way the bridge renders them.
+async function bothViews(r) {
+  const snap = await r.usage.all();
+  const account = renderAccountList({ rows: r.store.describe(), live: snap.active, usageRows: snap.rows }, { now: r.clock.t, timeZone: OWNER_TZ });
+  const usage = renderUsageReport(snap, { now: r.clock.t, timeZone: OWNER_TZ });
+  return { snap, account, usage };
+}
+
+await t('fetchUsageResult says WHY there are no numbers, and fetchUsage still says only null', async () => {
+  const cases = [
+    ['429', () => resH(429, { type: 'error', error: { type: 'rate_limit_error', message: 'x' } }, { 'retry-after': '30' }), { kind: 'rate-limited', status: 429, code: 'rate_limit_error', retryAfterMs: 30_000 }],
+    ['429, no header', () => res(429, {}), { kind: 'rate-limited', status: 429, code: null, retryAfterMs: null }],
+    ['401', () => res(401, { type: 'error', error: { type: 'authentication_error', message: 'x' } }), { kind: 'refused', status: 401, code: 'authentication_error' }],
+    ['403', () => res(403, { type: 'error', error: { type: 'permission_error' } }), { kind: 'refused', status: 403, code: 'permission_error' }],
+    ['500', () => res(500, {}), { kind: 'http', status: 500, code: null }],
+    ['529 non JSON', () => res(529, null, { json: false }), { kind: 'http', status: 529, code: null }],
+    ['200 non JSON', () => res(200, null, { json: false }), { kind: 'unreadable', status: 200, code: null }],
+    ['200 unrecognised', () => res(200, { nothing: 'here' }), { kind: 'unreadable', status: 200, code: null }],
+    ['nothing', () => undefined, { kind: 'unreadable', status: null, code: null }],
+    [
+      'abort',
+      () => {
+        const e = new Error('The operation was aborted');
+        e.name = 'AbortError';
+        throw e;
+      },
+      { kind: 'timeout', status: null, code: null },
+    ],
+    [
+      'DNS',
+      () => {
+        throw new TypeError('fetch failed: getaddrinfo ENOTFOUND');
+      },
+      { kind: 'network', status: null, code: null },
+    ],
+  ];
+  for (const [label, answer, want] of cases) {
+    const r = await fetchUsageResult('tok', { fetchImpl: async () => answer(), now: NOW });
+    eq(r.usage, null, label);
+    eq(r.failure, want, label);
+    eq(await fetchUsage('tok', { fetchImpl: async () => answer() }), null, `${label}: fetchUsage must stay null-or-numbers`);
+  }
+  const good = await fetchUsageResult('tok', { fetchImpl: async () => res(200, REAL_USAGE) });
+  eq(good.failure, null);
+  eq(good.usage.fiveHour.percent, 32);
+});
+
+await t('usageFailureText: one line per reason, none with an em or en dash', () => {
+  eq(usageFailureText({ kind: 'rate-limited', status: 429 }), RATE_LIMITED_LINE);
+  eq(usageFailureText({ kind: 'refused', status: 401 }, { name: 'a@b.co' }), 'login refused (HTTP 401), run /account capture `a@b.co` after logging in');
+  eq(usageFailureText({ kind: 'refused', status: 403 }), 'login refused (HTTP 403), run /account capture `<name>` after logging in');
+  eq(usageFailureText({ kind: 'timeout' }), 'usage lookup timed out');
+  eq(usageFailureText({ kind: 'network' }), 'usage lookup failed (network error)');
+  eq(usageFailureText({ kind: 'http', status: 502 }), 'usage unavailable (HTTP 502)');
+  eq(usageFailureText({ kind: 'unreadable', status: 200 }), 'usage unavailable');
+  eq(usageFailureText(null), 'usage unavailable');
+  for (const kind of ['rate-limited', 'refused', 'timeout', 'network', 'http', 'unreadable']) {
+    ok(!DASHES.test(usageFailureText({ kind, status: 500 }, { name: 'x@y.z' })), `${kind} carries a dash`);
+  }
+});
+
+await t('a 429 renders the rate limited line on /account AND /usage, not "usage unavailable"', async () => {
+  // The live account, as on 2026-09-22.
+  const f = failingFetch('acc-a', () => resH(429, { type: 'error', error: { type: 'rate_limit_error', message: 'Rate limited.' } }));
+  const r = clockRig(f.impl);
+  const { snap, account, usage } = await bothViews(r);
+  const row = snap.rows.find((x) => x.name === 'second@example.com');
+  eq(row.state, 'unavailable', 'every consumer that branches on state must be untouched');
+  eq(row.failure, { kind: 'rate-limited', status: 429, code: 'rate_limit_error' });
+  ok(account.includes(`   ⚠️ ${RATE_LIMITED_LINE}`), `/account lacks the rate limited line:\n${account}`);
+  ok(usage.includes(`   ⚠️ ${RATE_LIMITED_LINE}`), `/usage lacks the rate limited line:\n${usage}`);
+  ok(!account.includes('usage unavailable'), `/account still says usage unavailable:\n${account}`);
+  ok(!usage.includes('usage unavailable'), `/usage still says usage unavailable:\n${usage}`);
+  ok(account.includes('`5h '), `the healthy accounts must still show their bars:\n${account}`);
+  // /status omits the line rather than printing a reason into a liveness view.
+  eq(usageLine((await r.usage.activeOnly()).row), null);
+});
+
+await t('401 and 403 render a login refused line naming the slot to re-capture', async () => {
+  for (const status of [401, 403]) {
+    const f = failingFetch('acc-b', () => res(status, { type: 'error', error: { type: status === 401 ? 'authentication_error' : 'permission_error' } }));
+    const r = clockRig(f.impl);
+    const { account, usage } = await bothViews(r);
+    const want = `   ⚠️ login refused (HTTP ${status}), run /account capture \`first@example.com\` after logging in`;
+    ok(account.includes(want), `/account, ${status}:\n${account}`);
+    ok(usage.includes(want), `/usage, ${status}:\n${usage}`);
+    ok(!account.includes('usage unavailable') && !usage.includes('usage unavailable'), `${status} fell back to usage unavailable`);
+  }
+});
+
+await t('a refused login that is in no slot says /account capture <name>, not a made up slot name', async () => {
+  const impl = async (url) =>
+    url.includes('/oauth/profile')
+      ? res(200, { ...REAL_PROFILE, account: { ...REAL_PROFILE.account, email: 'fourth@example.com' } })
+      : res(401, {});
+  const r = clockRig(impl, { liveOauth: oauthFor('stranger') });
+  const { active, row } = await r.usage.activeOnly();
+  eq(active.matchedBy, 'profileEmailUnenrolled', 'the rig must really be a login in no slot');
+  eq(row.error, 'login refused (HTTP 401), run /account capture `<name>` after logging in');
+});
+
+await t('a timeout renders a timed out line, on both views, through the REAL abort', async () => {
+  const f = failingFetch('acc-c', (opts) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(res(200, REAL_USAGE)), 5_000);
+      opts.signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        const e = new Error('aborted');
+        e.name = 'AbortError';
+        reject(e);
+      });
+    }),
+  );
+  const r = clockRig(f.impl, { timeoutMs: 40 });
+  const { account, usage } = await bothViews(r);
+  ok(account.includes('   ⚠️ usage lookup timed out'), `/account:\n${account}`);
+  ok(usage.includes('   ⚠️ usage lookup timed out'), `/usage:\n${usage}`);
+});
+
+await t('a network error, a 500 and an unreadable body keep "usage unavailable" or say what they are', async () => {
+  const cases = [
+    [() => { throw new TypeError('fetch failed'); }, '   ⚠️ usage lookup failed (network error)'],
+    [() => res(500, {}), '   ⚠️ usage unavailable (HTTP 500)'],
+    [() => res(200, null, { json: false }), '   ⚠️ usage unavailable'],
+  ];
+  for (const [answer, want] of cases) {
+    const r = clockRig(failingFetch('acc-c', answer).impl);
+    const { account, usage } = await bothViews(r);
+    ok(account.split('\n').includes(want), `/account lacks ${want}:\n${account}`);
+    ok(usage.split('\n').includes(want), `/usage lacks ${want}:\n${usage}`);
+    ok(!account.includes('rate limited') && !account.includes('login refused'), 'a plain failure borrowed another reason');
+  }
+});
+
+await t('after a 429 with no Retry-After, nothing asks that account again for five minutes', async () => {
+  let throttled = true;
+  const f = failingFetch('acc-b', () => (throttled ? res(429, { type: 'error', error: { type: 'rate_limit_error' } }) : res(200, REAL_USAGE)));
+  const r = clockRig(f.impl);
+  await r.usage.all();
+  eq(f.usageCalls('acc-b'), 1);
+  eq(THROTTLE_DEFAULT_MS, 5 * 60_000);
+
+  r.clock.t = NOW + 61_000; // past the ordinary TTL
+  const again = await r.usage.all();
+  eq(f.usageCalls('acc-b'), 1, 'a second /account tap re-polled the throttled endpoint');
+  ok(f.usageCalls('acc-a') > 1, 'the healthy accounts must still refresh on the ordinary TTL');
+  eq(again.rows.find((x) => x.name === 'first@example.com').error, RATE_LIMITED_LINE, 'the held row lost its reason');
+
+  // Every path that invalidates on purpose (a swap, a capture, the rotation
+  // probe) must still respect the server's hold.
+  invalidateUsageCache();
+  await r.usage.all();
+  await r.usage.one('first@example.com');
+  invalidateUsageCache('first@example.com');
+  await r.usage.all();
+  eq(f.usageCalls('acc-b'), 1, 'an invalidation bypassed the 429 hold');
+
+  r.clock.t = NOW + THROTTLE_DEFAULT_MS - 1_000;
+  await r.usage.all();
+  eq(f.usageCalls('acc-b'), 1, 'the hold ended early');
+
+  throttled = false;
+  r.clock.t = NOW + THROTTLE_DEFAULT_MS + 1_000;
+  const after = await r.usage.all();
+  eq(f.usageCalls('acc-b'), 2, 'the hold never ended');
+  eq(after.rows.find((x) => x.name === 'first@example.com').state, 'ok', 'the account did not recover once the hold passed');
+  ok(r.logs.some((l) => /throttled \(rate-limited, HTTP 429, rate_limit_error\), holding 300s/.test(l)), `no hold log line: ${r.logs.join(' | ')}`);
+});
+
+await t('Retry-After is honoured: delta seconds, an HTTP date, a floor at the TTL, a ceiling at an hour', async () => {
+  const cases = [
+    ['120', 100_000, 121_000],
+    [new Date(NOW + 600_000).toUTCString(), 599_000, 601_000],
+    ['1', 59_000, 61_000], // floored at the ordinary 60s TTL
+    ['999999', THROTTLE_MAX_MS - 1_000, THROTTLE_MAX_MS + 1_000], // capped at an hour
+  ];
+  for (const [header, inside, outside] of cases) {
+    const f = failingFetch('acc-c', () => resH(429, {}, { 'retry-after': header }));
+    const r = clockRig(f.impl);
+    await r.usage.all();
+    r.clock.t = NOW + inside;
+    await r.usage.all();
+    eq(f.usageCalls('acc-c'), 1, `Retry-After ${header}: asked again inside the window`);
+    r.clock.t = NOW + outside;
+    await r.usage.all();
+    eq(f.usageCalls('acc-c'), 2, `Retry-After ${header}: never asked again after the window`);
+  }
+  eq(parseRetryAfter('120'), 120_000);
+  eq(parseRetryAfter(' 2.5 '), 2_500);
+  eq(parseRetryAfter(new Date(NOW + 90_000).toUTCString(), NOW), 90_000);
+  eq(parseRetryAfter(new Date(NOW - 90_000).toUTCString(), NOW), 0);
+  eq(parseRetryAfter('soon'), null);
+  eq(parseRetryAfter(null), null);
+  eq(throttleHoldMs(null, 60_000), THROTTLE_DEFAULT_MS);
+  eq(throttleHoldMs(0, 60_000), 60_000);
+  eq(throttleHoldMs(10 * 3600_000, 60_000), THROTTLE_MAX_MS);
+});
+
+await t('no response body text other than error.type reaches a rendered line, a row or a log line', async () => {
+  const PLANT = 'sk-ant-oat01-PLANTED-TOKEN-SHAPED-STRING-AAAA';
+  const bodies = {
+    'acc-a': () =>
+      resH(
+        429,
+        { type: 'error', error: { type: 'rate_limit_error', message: `retry with ${PLANT}` }, request_id: PLANT, echo: { token: PLANT } },
+        { 'retry-after': '60' },
+      ),
+    // A token planted in error.type ITSELF must not pass as a code either.
+    'acc-b': () => res(401, { type: 'error', error: { type: PLANT, message: PLANT } }),
+    'acc-c': () => res(500, PLANT),
+  };
+  const calls = [];
+  const impl = async (url, opts) => {
+    const tok = String(opts.headers.Authorization).replace('Bearer ', '');
+    calls.push(url);
+    if (url.includes('/oauth/profile')) return res(200, REAL_PROFILE);
+    return bodies[tok]();
+  };
+  const r = clockRig(impl);
+  const { snap, account, usage } = await bothViews(r);
+  const everything = [
+    account,
+    usage,
+    ...snap.rows.map((row) => accountUsageBlock(row).join('\n')),
+    ...snap.rows.map((row) => String(usageLine(row))),
+    JSON.stringify(snap.rows),
+    r.logs.join('\n'),
+  ].join('\n');
+  ok(!everything.includes('PLANTED'), `planted body text leaked:\n${everything}`);
+  ok(r.logs.some((l) => l.includes('rate_limit_error')), `error.type is the one code allowed through, and it did not reach the log: ${r.logs.join(' | ')}`);
+  eq(snap.rows.find((x) => x.name === 'first@example.com').failure, { kind: 'refused', status: 401, code: null }, 'a token-shaped error.type passed as a code');
+  ok(account.includes(RATE_LIMITED_LINE), 'the reason itself must still render');
 });
 
 // ---------- report ----------
