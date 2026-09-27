@@ -46,6 +46,9 @@ import {
   captureFailure,
   CLAUDE_CODE_CLIENT_ID,
   OAUTH_BETA,
+  normalizeRateLimitEvent,
+  liveSourceLine,
+  STREAM_FALLBACK_MAX_AGE_MS,
 } from './account-usage.mjs';
 import { createKeychainStore } from './credential-store.mjs';
 
@@ -1533,6 +1536,375 @@ await t('no response body text other than error.type reaches a rendered line, a 
   ok(r.logs.some((l) => l.includes('rate_limit_error')), `error.type is the one code allowed through, and it did not reach the log: ${r.logs.join(' | ')}`);
   eq(snap.rows.find((x) => x.name === 'first@example.com').failure, { kind: 'refused', status: 401, code: null }, 'a token-shaped error.type passed as a code');
   ok(account.includes('usage lookup rate limited by Anthropic until '), `the reason itself must still render:\n${account}`);
+});
+
+// ---------------------------------------------------------------------------
+// NUMBERS FROM THE LIVE SESSIONS
+//
+// Every Claude Code stream the bridge spawns carries a rate_limit_event after
+// each API response, with the same two windows the usage endpoint serves. On
+// 2026-09-27 the endpoint answered 429 for an hour on the active account
+// (Claude Code 2.1.280+ polls it from every process on that token), and
+// /account showed a warning where the bars should be. These pin the event's
+// normalization, the fallback, the skipped call and the provenance line.
+// ---------------------------------------------------------------------------
+
+// The live shape, seen 24 times in one run log on 2026-09-27 (ids anonymized).
+// utilization is a FRACTION here and resetsAt is epoch SECONDS; the usage API
+// sends a percent and an ISO string. Both conversions are what this pins.
+const S5 = Math.floor((NOW + 2 * 3600_000) / 1000); // 7:53pm ET
+const S7 = Math.floor(Date.parse('2026-09-05T05:00:00Z') / 1000); // Fri 1:00am ET
+const liveEvent = (over = {}, windows = null) => ({
+  type: 'rate_limit_event',
+  rate_limit_info: {
+    status: 'allowed',
+    resetsAt: S5,
+    rateLimitType: 'five_hour',
+    overageStatus: 'rejected',
+    overageDisabledReason: 'org_level_disabled',
+    isUsingOverage: false,
+    unifiedWindows: windows || { five_hour: { utilization: 0.66, resetsAt: S5 }, seven_day: { utilization: 0.63, resetsAt: S7 } },
+    ...over,
+  },
+  uuid: 'event-uuid',
+  session_id: 'session-uuid',
+});
+
+await t('normalizeRateLimitEvent: the live event becomes the usage API shape, fraction to percent, seconds to ISO', () => {
+  const u = normalizeRateLimitEvent(liveEvent());
+  eq(u.fiveHour, { percent: 66, resetsAt: new Date(S5 * 1000).toISOString(), severity: null, locked: null });
+  eq(u.sevenDay, { percent: 63, resetsAt: new Date(S7 * 1000).toISOString(), severity: null, locked: null });
+  eq(u.scoped, []);
+  eq(u.extraUsage, null);
+  eq(normalizeRateLimitEvent(liveEvent({}, { five_hour: { utilization: 0.41, resetsAt: S5 }, seven_day: { utilization: 0.59, resetsAt: S7 } })).fiveHour.percent, 41, 'float noise from 0.41 * 100 leaked');
+});
+
+await t('normalizeRateLimitEvent: a rejected window is locked, the other is not', () => {
+  const u = normalizeRateLimitEvent(
+    liveEvent({ status: 'rejected' }, { five_hour: { utilization: 1, resetsAt: S5 }, seven_day: { utilization: 0.18, resetsAt: S7 } }),
+  );
+  ok(u.fiveHour.locked, 'the rejected five_hour window must read as exhausted');
+  eq(u.sevenDay.locked, null, 'the weekly window was not the one rejected');
+  const w = normalizeRateLimitEvent(
+    liveEvent({ status: 'rejected', rateLimitType: 'seven_day', resetsAt: S7 }, { five_hour: { utilization: 0.35, resetsAt: S5 }, seven_day: { utilization: 1, resetsAt: S7 } }),
+  );
+  ok(w.sevenDay.locked && !w.fiveHour.locked, 'a weekly rejection locks the weekly window only');
+  const warn = normalizeRateLimitEvent(liveEvent({ status: 'allowed_warning', utilization: 0.9, surpassedThreshold: 0.75 }));
+  eq(warn.fiveHour.locked, null, 'a warning is not a wall');
+});
+
+await t('normalizeRateLimitEvent: per model weeklies map like /usage does, anything else is ignored', () => {
+  const u = normalizeRateLimitEvent(
+    liveEvent({}, {
+      five_hour: { utilization: 0.2, resetsAt: S5 },
+      seven_day: { utilization: 0.5, resetsAt: S7 },
+      seven_day_opus: { utilization: 0.12, resetsAt: S7 },
+      seven_day_sonnet: { utilization: 0.3, resetsAt: S7 },
+      seven_day_overage_included: { utilization: 0.4, resetsAt: S7 },
+    }),
+  );
+  eq(u.scoped, [
+    { label: 'Opus', percent: 12, resetsAt: new Date(S7 * 1000).toISOString() },
+    { label: 'Sonnet', percent: 30, resetsAt: new Date(S7 * 1000).toISOString() },
+  ]);
+});
+
+await t('normalizeRateLimitEvent: a partial or foreign event never throws and never invents a window', () => {
+  const weekOnly = normalizeRateLimitEvent(liveEvent({}, { seven_day: { utilization: 0.57, resetsAt: S7 } }));
+  eq(weekOnly.fiveHour, null, 'a window the event did not carry is null, not 0%');
+  eq(weekOnly.sevenDay.percent, 57);
+  eq(normalizeRateLimitEvent({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', isUsingOverage: false } }), null, 'no windows at all is no reading');
+  eq(normalizeRateLimitEvent({ type: 'assistant', message: {} }), null);
+  eq(normalizeRateLimitEvent(null), null);
+  eq(normalizeRateLimitEvent('rate_limit_event'), null);
+  eq(normalizeRateLimitEvent(liveEvent({}, { five_hour: { utilization: 'lots', resetsAt: 'soon' }, seven_day: { utilization: null } })), null);
+});
+
+// A reader with a stream provider the test controls, on a moving clock.
+function streamRig(fetchImpl, readings = {}, { liveOauth = oauthFor('a'), seed = SEED } = {}) {
+  const clock = { t: NOW };
+  const learned = [];
+  const file = path.join(TMP, `accounts-${n++}.json`);
+  writeFileSync(file, JSON.stringify(seed, null, 2), { mode: 0o600 });
+  const kc = fakeKeychain({ claudeAiOauth: liveOauth });
+  const store = createAccountStore({ file, credentials: createKeychainStore({ account: 'owner', runSecurity: (...a) => kc.run(...a) }), log: () => {} });
+  const usage = createAccountUsage({
+    store,
+    fetchImpl,
+    now: () => clock.t,
+    ttlMs: 60_000,
+    log: () => {},
+    streamReading: (name) => readings[name] || null,
+    onUsage: (name, u) => learned.push({ name, sevenDay: u.sevenDay?.resetsAt || null }),
+  });
+  invalidateUsageCache();
+  return { clock, store, usage, readings, learned };
+}
+// `verified`: the host's own account anchor agrees with the reading (see
+// stream-usage.mjs). Only a verified reading may replace a lookup outright.
+const reading = (ageMs, ev = liveEvent(), verified = true) => ({ usage: normalizeRateLimitEvent(ev), at: NOW - ageMs, verified });
+const RL429 = () => resH(429, { type: 'error', error: { type: 'rate_limit_error' } }, { 'retry-after': '2714' });
+const renderAccount = (r, snap) =>
+  renderAccountList({ rows: r.store.describe(), live: snap.active, usageRows: snap.rows }, { now: r.clock.t, timeZone: OWNER_TZ });
+
+await t('★ a rate limited lookup with a fresh live session reading shows the bars with a provenance line, not the warning', async () => {
+  const f = failingFetch('acc-a', RL429);
+  const r = streamRig(f.impl, { 'second@example.com': reading(10 * 60_000) });
+  const snap = await r.usage.all({ stream: true });
+  const row = snap.rows.find((x) => x.name === 'second@example.com');
+  eq(row.state, 'ok', 'a row with numbers is ok, whichever source they came from');
+  eq(row.source, { kind: 'stream', at: NOW - 10 * 60_000 });
+  eq(row.lookupFailure?.kind, 'rate-limited', 'why the lookup failed stays on the row for diagnostics');
+  eq(row.usage.fiveHour.percent, 66);
+  const account = renderAccount(r, snap);
+  ok(account.includes('   📡 from live sessions · 5:43pm'), `/account lacks the provenance line:\n${account}`);
+  ok(!account.includes('⚠️'), `/account still carries a warning:\n${account}`);
+  const block = accountUsageBlock(row, { now: NOW, timeZone: OWNER_TZ });
+  ok(block[0].startsWith('   `5h ') && block[0].includes('66%'), `the 5h bar: ${block[0]}`);
+  ok(block[1].startsWith('   `wk ') && block[1].includes('63%'), `the weekly bar: ${block[1]}`);
+  eq(block[2], '   📡 from live sessions · 5:43pm', 'the provenance line is the last line of the block');
+});
+
+await t('the fallback is opt in: all() without {stream: true} is exactly what it was', async () => {
+  const f = failingFetch('acc-a', RL429);
+  const r = streamRig(f.impl, { 'second@example.com': reading(10 * 60_000) });
+  const snap = await r.usage.all();
+  const row = snap.rows.find((x) => x.name === 'second@example.com');
+  eq(row.state, 'unavailable');
+  eq(row.source, undefined);
+  ok(renderAccount(r, snap).includes('⚠️ usage lookup rate limited by Anthropic until 6:38pm'), 'the warning must stay');
+});
+
+await t('a reading older than the bound keeps the warning and draws no bars', async () => {
+  const f = failingFetch('acc-a', RL429);
+  const r = streamRig(f.impl, { 'second@example.com': reading(STREAM_FALLBACK_MAX_AGE_MS + 60_000) });
+  const snap = await r.usage.all({ stream: true });
+  const row = snap.rows.find((x) => x.name === 'second@example.com');
+  eq(row.state, 'unavailable');
+  const account = renderAccount(r, snap);
+  ok(account.includes('   ⚠️ usage lookup rate limited by Anthropic until 6:38pm (the account itself is fine)'), `the warning must stay:\n${account}`);
+  ok(!account.includes('📡'), `a stale reading must not be presented as current:\n${account}`);
+  eq(STREAM_FALLBACK_MAX_AGE_MS, 30 * 60_000, 'the bound is half an hour');
+});
+
+await t('a reading from the future (clock moved back) is not trusted', async () => {
+  const f = failingFetch('acc-a', RL429);
+  const r = streamRig(f.impl, { 'second@example.com': { usage: normalizeRateLimitEvent(liveEvent()), at: NOW + 10 * 60_000 } });
+  const row = (await r.usage.all({ stream: true })).rows.find((x) => x.name === 'second@example.com');
+  eq(row.state, 'unavailable');
+  eq(f.usageCalls('acc-a'), 1, 'and it must not suppress the lookup either');
+});
+
+await t('★ a reading younger than the TTL skips the API call for that account and only that one', async () => {
+  const f = failingFetch('nobody', () => res(500, {}));
+  const r = streamRig(f.impl, { 'second@example.com': reading(20_000) });
+  const snap = await r.usage.all({ stream: true });
+  eq(f.usageCalls('acc-a'), 0, 'the bridge asked the endpoint anyway, competing with every session for the same allowance');
+  eq(f.usageCalls('acc-b'), 1);
+  eq(f.usageCalls('acc-c'), 1);
+  const row = snap.rows.find((x) => x.name === 'second@example.com');
+  eq(row.source, { kind: 'stream', at: NOW - 20_000 });
+  eq(row.lookupFailure, undefined, 'nothing failed: the lookup was never made');
+  // Forty seconds on, the same reading is a minute old: the TTL is spent, so ask.
+  r.clock.t = NOW + 40_000;
+  await r.usage.all({ stream: true });
+  eq(f.usageCalls('acc-a'), 1, 'a reading as old as the TTL no longer stands in for the lookup');
+  // Without the opt in, the call is made as it always was.
+  const f2 = failingFetch('nobody', () => res(500, {}));
+  const r2 = streamRig(f2.impl, { 'second@example.com': reading(20_000) });
+  await r2.usage.all();
+  eq(f2.usageCalls('acc-a'), 1);
+});
+
+await t('★ an unverified reading never replaces the lookup, but still stands in when the lookup fails', async () => {
+  // First boot, no anchor yet: the reading's identity is inferred, not proven.
+  // The lookup is what proves it, so it must be made.
+  const f = usageFetch({ 'acc-a': 12 });
+  const r = streamRig(f.impl, { 'second@example.com': reading(20_000, liveEvent(), false) });
+  const row = (await r.usage.all({ stream: true })).rows.find((x) => x.name === 'second@example.com');
+  eq(f.calls.filter((c) => c.url.includes('/oauth/usage') && c.tok === 'acc-a').length, 1, 'an unverified reading suppressed the lookup that would verify it');
+  eq(row.usage.fiveHour.percent, 12, 'the lookup answered, so its numbers are shown');
+  eq(row.source, undefined);
+  const f2 = failingFetch('acc-a', RL429);
+  const r2 = streamRig(f2.impl, { 'second@example.com': reading(20_000, liveEvent(), false) });
+  const row2 = (await r2.usage.all({ stream: true })).rows.find((x) => x.name === 'second@example.com');
+  eq(row2.source?.kind, 'stream', 'the lookup failed, and the reading is the best there is');
+  // A host that says nothing about verification gets no skip either.
+  const f3 = usageFetch({});
+  const r3 = streamRig(f3.impl, { 'second@example.com': { usage: normalizeRateLimitEvent(liveEvent()), at: NOW - 20_000 } });
+  await r3.usage.all({ stream: true });
+  eq(f3.calls.filter((c) => c.url.includes('/oauth/usage') && c.tok === 'acc-a').length, 1);
+});
+
+await t('★ a reading moved away mid render (a concurrent lookup proved it another account\'s) is not drawn', async () => {
+  // all() reads the slots concurrently. first@ answers at once and its lookup
+  // teaches the host that the reading held under second@ is really first@'s;
+  // second@'s own lookup then fails. The reading second@ saw BEFORE its await
+  // must not be the one it draws after it.
+  const readings = { 'second@example.com': reading(10 * 60_000) };
+  const impl = async (url, opts) => {
+    const tok = String(opts.headers.Authorization).replace('Bearer ', '');
+    if (url.includes('/oauth/profile')) return res(200, REAL_PROFILE);
+    if (tok === 'acc-a') {
+      await new Promise((r) => setTimeout(r, 30));
+      return RL429();
+    }
+    return res(200, REAL_USAGE);
+  };
+  const file = path.join(TMP, `accounts-${n++}.json`);
+  writeFileSync(file, JSON.stringify(SEED, null, 2), { mode: 0o600 });
+  const kc = fakeKeychain({ claudeAiOauth: oauthFor('a') });
+  const store = createAccountStore({ file, credentials: createKeychainStore({ account: 'owner', runSecurity: (...a) => kc.run(...a) }), log: () => {} });
+  const u = createAccountUsage({
+    store,
+    fetchImpl: impl,
+    now: () => NOW,
+    log: () => {},
+    streamReading: (name) => readings[name] || null,
+    onUsage: (name) => {
+      if (name === 'first@example.com') delete readings['second@example.com']; // the host's learn() re-homing it
+    },
+  });
+  invalidateUsageCache();
+  const row = (await u.all({ stream: true })).rows.find((x) => x.name === 'second@example.com');
+  eq(row.state, 'unavailable', 'drew a reading the host had already moved to another account');
+  eq(row.source, undefined);
+});
+
+await t('the newest reading wins each time: a stream row is never cached over a newer one', async () => {
+  const f = failingFetch('acc-a', RL429);
+  const r = streamRig(f.impl, { 'second@example.com': reading(5 * 60_000) });
+  await r.usage.all({ stream: true });
+  r.clock.t = NOW + 30_000;
+  r.readings['second@example.com'] = { usage: normalizeRateLimitEvent(liveEvent({}, { five_hour: { utilization: 0.7, resetsAt: S5 }, seven_day: { utilization: 0.64, resetsAt: S7 } })), at: NOW + 20_000 };
+  const row = (await r.usage.all({ stream: true })).rows.find((x) => x.name === 'second@example.com');
+  eq(row.usage.fiveHour.percent, 70);
+  eq(f.usageCalls('acc-a'), 1, 'the 429 hold still holds while the stream carries the numbers');
+});
+
+await t('the fallback covers timeout, network, unreadable and HTTP errors, and never a refused login', async () => {
+  const cases = [
+    ['timeout', () => { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }, 'ok'],
+    ['network', () => { throw new TypeError('fetch failed'); }, 'ok'],
+    ['unreadable', () => res(200, { nothing: 'here' }), 'ok'],
+    ['http', () => res(503, {}), 'ok'],
+    ['refused', () => res(401, { type: 'error', error: { type: 'authentication_error' } }), 'unavailable'],
+  ];
+  for (const [kind, answer, want] of cases) {
+    const f = failingFetch('acc-a', answer);
+    const r = streamRig(f.impl, { 'second@example.com': reading(5 * 60_000) });
+    const row = (await r.usage.all({ stream: true })).rows.find((x) => x.name === 'second@example.com');
+    eq(row.state, want, kind);
+    if (want === 'ok') eq(row.lookupFailure?.kind, kind, kind);
+    else ok(accountUsageBlock(row, { now: NOW, timeZone: OWNER_TZ })[0].includes('login refused'), `${kind}: the re-capture instruction must not be papered over`);
+  }
+});
+
+await t('★ an idle slot is always looked up: a fresh reading never skips its credential check', async () => {
+  // A worker still on the outgoing account after a swap keeps feeding readings
+  // for it, so a reading under the TTL for an IDLE slot is real. Its login can
+  // still be dead, and that instruction must reach the owner.
+  const seed = [
+    SEED[0],
+    { ...SEED[1], claudeAiOauth: oauthFor('b', { refreshTokenExpiresAt: NOW - 1000 }) },
+    SEED[2],
+  ];
+  const f = failingFetch('acc-c', () => res(401, { type: 'error', error: { type: 'authentication_error' } }));
+  const r = streamRig(f.impl, { 'first@example.com': reading(20_000), 'third@example.com': reading(20_000) }, { seed });
+  const snap = await r.usage.all({ stream: true });
+  const expired = snap.rows.find((x) => x.name === 'first@example.com');
+  eq(expired.state, 'credentials-expired', 'bars drawn over a dead login');
+  const refused = snap.rows.find((x) => x.name === 'third@example.com');
+  eq(refused.failure?.kind, 'refused', 'bars drawn over a refused login');
+  eq(f.usageCalls('acc-c'), 1, 'an idle slot must be looked up even with a fresh reading');
+  // A healthy idle slot with a fresh reading is looked up too, and shows the lookup.
+  const f2 = usageFetch({ 'acc-b': 12 });
+  const r2 = streamRig(f2.impl, { 'first@example.com': reading(20_000) });
+  const row2 = (await r2.usage.all({ stream: true })).rows.find((x) => x.name === 'first@example.com');
+  eq(row2.usage.fiveHour.percent, 12);
+  eq(row2.source, undefined);
+});
+
+await t('a slot with a credential problem keeps its instruction even with a reading', async () => {
+  const seed = [...SEED.slice(0, 2), { name: 'third@example.com', email: null, claudeAiOauth: null, limitedUntil: null, lastActiveAt: null }];
+  const f = usageFetch({});
+  const r = streamRig(f.impl, { 'third@example.com': reading(60 * 1000 * 5) }, { seed });
+  const row = (await r.usage.all({ stream: true })).rows.find((x) => x.name === 'third@example.com');
+  eq(row.state, 'no-credentials');
+});
+
+await t('a fresh reading never skips past a cached refused login', async () => {
+  const f = failingFetch('acc-a', () => res(401, { type: 'error', error: { type: 'authentication_error' } }));
+  const r = streamRig(f.impl, {});
+  await r.usage.all({ stream: true }); // caches the refused row
+  r.readings['second@example.com'] = reading(-5_000); // arrives after, 5s ago on the moved clock
+  r.clock.t = NOW + 10_000;
+  const row = (await r.usage.all({ stream: true })).rows.find((x) => x.name === 'second@example.com');
+  eq(row.state, 'unavailable');
+  eq(row.failure?.kind, 'refused');
+});
+
+await t('★ the rotation probe one() never takes a stream reading, fresh or not', async () => {
+  const f = failingFetch('acc-a', RL429);
+  const r = streamRig(f.impl, { 'second@example.com': reading(20_000) });
+  const row = await r.usage.one('second@example.com');
+  eq(f.usageCalls('acc-a'), 1, 'the probe must ask the API: that is the whole point of fresh:true');
+  eq(row.state, 'unavailable');
+  eq(row.source, undefined);
+});
+
+await t('activeOnly() takes the stream only when asked, so usageResetFor is untouched and /status gets bars', async () => {
+  const f = failingFetch('acc-a', RL429);
+  const r = streamRig(f.impl, { 'second@example.com': reading(10 * 60_000) });
+  const plain = await r.usage.activeOnly();
+  eq(plain.row.state, 'unavailable', 'the default is the old behaviour');
+  eq(usageLine(plain.row), null);
+  const live = await r.usage.activeOnly({ stream: true });
+  eq(live.row.state, 'ok');
+  const line = usageLine(live.row, { now: NOW, timeZone: OWNER_TZ });
+  ok(line.includes('5h 66%') && line.includes('wk 63%'), line);
+  ok(line.endsWith('\n   📡 from live sessions · 5:43pm'), `/status lacks the provenance line:\n${line}`);
+});
+
+await t('/usage renders the stream row with its provenance line, the way it renders any row', async () => {
+  const f = failingFetch('acc-a', RL429);
+  const r = streamRig(f.impl, {
+    'second@example.com': reading(
+      10 * 60_000,
+      liveEvent({}, { five_hour: { utilization: 0.66, resetsAt: S5 }, seven_day: { utilization: 0.63, resetsAt: S7 }, seven_day_sonnet: { utilization: 0.3, resetsAt: S7 } }),
+    ),
+  });
+  const report = renderUsageReport(await r.usage.all({ stream: true }), { now: NOW, timeZone: OWNER_TZ });
+  ok(report.includes('   📡 from live sessions · 5:43pm'), report);
+  ok(report.includes('   Sonnet `███░░░░░░░` 30%'), `the sub window rides the existing scoped slot:\n${report}`);
+  ok(!report.includes('⚠️'), report);
+});
+
+await t('onUsage hears every successful API reading and nothing else', async () => {
+  const f = failingFetch('acc-a', RL429);
+  const r = streamRig(f.impl, { 'second@example.com': reading(5 * 60_000) });
+  await r.usage.all({ stream: true });
+  eq(r.learned.map((x) => x.name).sort(), ['first@example.com', 'third@example.com'], 'a failed lookup or a stream row taught it something');
+  eq(r.learned[0].sevenDay, '2026-09-05T05:00:00.241459+00:00');
+  // A throwing listener costs nothing.
+  const store = r.store;
+  const u = createAccountUsage({ store, fetchImpl: usageFetch({}).impl, now: () => NOW, log: () => {}, onUsage: () => { throw new Error('boom'); } });
+  invalidateUsageCache();
+  const snap = await u.all();
+  eq(snap.rows.map((x) => x.state), ['ok', 'ok', 'ok']);
+});
+
+await t('liveSourceLine: one fact, the middle dot, no dash, fits a phone line', () => {
+  const row = { state: 'ok', usage: normalizeRateLimitEvent(liveEvent()), source: { kind: 'stream', at: NOW - 60_000 } };
+  eq(liveSourceLine(row, { now: NOW, timeZone: OWNER_TZ }), '   📡 from live sessions · 5:52pm');
+  const yesterday = liveSourceLine({ ...row, source: { kind: 'stream', at: NOW - 20 * 3600_000 } }, { now: NOW, timeZone: OWNER_TZ });
+  eq(yesterday, '   📡 from live sessions · Sun 9:53pm', 'a reading from another day names the day');
+  for (const s of [liveSourceLine(row, { now: NOW, timeZone: OWNER_TZ }), yesterday]) {
+    ok(!DASHES.test(s), s);
+    ok(s.length <= 44, `${s.length} chars: ${s}`);
+  }
+  eq(liveSourceLine({ state: 'ok', usage: row.usage }, { now: NOW }), null, 'an API row carries no provenance line');
+  eq(liveSourceLine(null), null);
 });
 
 // ---------- report ----------

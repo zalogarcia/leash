@@ -297,6 +297,13 @@ export function createInflightRegistry({ file }) {
 //                               the alert; wording is not this module's business
 //   onOutcome(task, outcome, id) deliver a re-attached worker's result the same
 //                               way the close handler would have
+//   onEvent(ev, { id, rec, backlog }) every parsed event of a re-attached worker's
+//                               log, for a host that reads more than the
+//                               outcome (the private bridge takes the plan
+//                               usage off rate_limit_event). `backlog` is true
+//                               for the lines already in the log when the
+//                               re-attach began: the previous daemon saw those
+//                               live. Optional; a throw is contained.
 //   log(msg)                     informational line, defaults to console.log
 export function createWorkerWatchdog({
   registry,
@@ -306,6 +313,7 @@ export function createWorkerWatchdog({
   reattachKeepCap = 400, // bound memory: only outcome-bearing lines are kept
   onDeadWorkers,
   onOutcome,
+  onEvent = null,
   log = (m) => console.log(m),
   now = () => Date.now(),
 }) {
@@ -340,14 +348,34 @@ export function createWorkerWatchdog({
   // silent death this whole design exists to prevent, just moved one step later.
   function reattachWorker(id, rec) {
     const kept = [];
+    // tailLines starts at byte 0, so the whole log so far arrives first. Bytes
+    // are counted per line to tell that backlog from what the worker writes
+    // after this moment. Blank lines never reach the handler, so the count can
+    // only run SHORT, which errs toward calling a new line backlog, never the
+    // reverse.
+    let backlogBytes = 0;
+    try {
+      backlogBytes = fs.statSync(rec.log).size;
+    } catch {
+      /* no log yet: nothing is backlog */
+    }
+    let consumed = 0;
     const tail = tailLines(
       rec.log,
       (line) => {
+        consumed += Buffer.byteLength(line, 'utf8') + 1;
         let ev = null;
         try {
           ev = JSON.parse(line);
         } catch {
           /* non-JSON on a bg lane is stderr — keep it, it becomes the failure detail */
+        }
+        if (ev && typeof onEvent === 'function') {
+          try {
+            onEvent(ev, { id, rec, backlog: consumed <= backlogBytes });
+          } catch {
+            /* the host's reading never costs the outcome its line */
+          }
         }
         // Assistant/tool events are progress, and a re-attached worker has no
         // progress bubble to render them into. Keep only what the outcome is

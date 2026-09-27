@@ -299,6 +299,70 @@ export function normalizeUsage(body) {
 }
 
 // ---------------------------------------------------------------------------
+// THE SAME NUMBERS, FROM A LIVE SESSION
+//
+// Every Claude Code process run with --output-format stream-json emits a
+// rate_limit_event after each API response, carrying the windows the usage
+// endpoint serves:
+//
+//   {"type":"rate_limit_event","rate_limit_info":{"status":"allowed",
+//    "rateLimitType":"five_hour","resetsAt":1790527800,...,"unifiedWindows":{
+//    "five_hour":{"utilization":0.66,"resetsAt":1790527800},
+//    "seven_day":{"utilization":0.63,"resetsAt":1790661600}}}}
+//
+// Two units differ from the endpoint's and both are converted here, because a
+// renderer handed either one raw reads it wrong without an error: utilization is
+// a FRACTION (0.66, where the endpoint says 66), and resetsAt is epoch SECONDS
+// (resetsAtToMs reads a bare number as milliseconds, so 1970).
+//
+// Why it matters: from Claude Code 2.1.280 every process on the machine polls
+// the usage endpoint on the live account's token, so on a busy day the endpoint
+// answers the bridge 429 for up to an hour while the sessions themselves are
+// carrying the numbers on every turn. The host records the newest reading per
+// account and injects it as `streamReading` (createAccountUsage below).
+//
+// status "rejected" names the window that refused the request in rateLimitType;
+// that window is marked locked, the same flag the endpoint's locked_reason
+// sets. Only the two windows /account draws and the per model weeklies /usage
+// already has a slot for are read; any other key (seven_day_overage_included,
+// seen live) is ignored rather than given a line format of its own.
+// ---------------------------------------------------------------------------
+export const STREAM_FALLBACK_MAX_AGE_MS = 30 * 60_000;
+// Per model weeklies, labelled exactly as normalizeUsage labels the flat ones.
+const STREAM_SCOPED = [
+  ['seven_day_opus', 'Opus'],
+  ['seven_day_sonnet', 'Sonnet'],
+];
+const STREAM_LOCKED = 'limit reached';
+
+function streamWindow(w, locked) {
+  if (!w || typeof w !== 'object') return null;
+  const f = num(w.utilization);
+  if (f === null) return null;
+  const secs = num(w.resetsAt);
+  // Rounded to a tenth: 0.41 * 100 is 41.00000000000001, and a percent that
+  // prints as 41 must also compare as 41.
+  return win(Math.round(f * 1000) / 10, secs && secs > 0 ? new Date(secs * 1000).toISOString() : null, null, locked);
+}
+
+export function normalizeRateLimitEvent(ev) {
+  if (!ev || typeof ev !== 'object' || ev.type !== 'rate_limit_event') return null;
+  const info = ev.rate_limit_info;
+  const uw = info && typeof info === 'object' ? info.unifiedWindows : null;
+  if (!uw || typeof uw !== 'object') return null;
+  const lockedFor = (key) => (info.status === 'rejected' && info.rateLimitType === key ? STREAM_LOCKED : null);
+  const fiveHour = streamWindow(uw.five_hour, lockedFor('five_hour'));
+  const sevenDay = streamWindow(uw.seven_day, lockedFor('seven_day'));
+  if (!fiveHour && !sevenDay) return null;
+  const scoped = [];
+  for (const [key, label] of STREAM_SCOPED) {
+    const w = streamWindow(uw[key], null);
+    if (w) scoped.push({ label, percent: w.percent, resetsAt: w.resetsAt });
+  }
+  return { fiveHour, sevenDay, scoped, extraUsage: null };
+}
+
+// ---------------------------------------------------------------------------
 // NETWORK
 // ---------------------------------------------------------------------------
 
@@ -615,6 +679,18 @@ export function createAccountUsage({
   clientId = CLAUDE_CODE_CLIENT_ID,
   timeoutMs = REQUEST_TIMEOUT_MS,
   log = (msg) => console.log(`[account-usage] ${msg}`),
+  // (name) => { usage, at, verified } | null: the newest live session reading
+  // the host recorded for that slot, `usage` already normalized
+  // (normalizeRateLimitEvent), `at` the epoch ms it was received, and
+  // `verified` true only when the host has PROVEN the reading is this slot's
+  // (the private bridge: the slot's own lookup named the same weekly reset).
+  // Consulted only by calls that pass { stream: true }; see readOne. Absent,
+  // every call behaves as it always did.
+  streamReading = null,
+  // (name, usage) => void, after every SUCCESSFUL usage lookup. The host learns
+  // each account's weekly reset from it, which is how it tells whose session a
+  // reading came from. Never allowed to throw into a lookup.
+  onUsage = null,
 } = {}) {
   if (!store) throw new Error('createAccountUsage: an account `store` is required');
 
@@ -730,33 +806,115 @@ export function createAccountUsage({
     return { token: blob.accessToken, live: false, refreshed: true };
   }
 
-  // `captureName` is the slot a refused login should be re-captured into. It is
-  // the account's own name, except for activeOnly()'s stand-in row for a login
-  // that is in no slot, where the honest instruction is "/account capture <name>".
-  async function readOne(acct, active, { captureName = acct.name } = {}) {
-    const t = now();
-    const cached = cacheGet(acct.name, t);
-    if (cached !== undefined) return { ...cached, cached: true };
-    const held = throttle.get(acct.name);
-    if (held && held.until > t) return { ...held.row, cached: true };
-    if (held) throttle.delete(acct.name);
-
-    // The fingerprint travels on the row so /usage can print it. It moved there
-    // out of /account, which is the daily view and did not need three token
-    // digests on it; /usage is the diagnostic view, and telling three accounts
-    // apart when their identity is in doubt is exactly what it is for.
-    const base = {
+  // The fingerprint travels on the row so /usage can print it. It moved there
+  // out of /account, which is the daily view and did not need three token
+  // digests on it; /usage is the diagnostic view, and telling three accounts
+  // apart when their identity is in doubt is exactly what it is for.
+  function baseRow(acct, active) {
+    return {
       name: acct.name,
       email: acct.email || null,
       live: active.name === acct.name,
       fingerprint: fingerprint(acct.claudeAiOauth),
     };
+  }
+
+  // The newest live session reading for a slot, if it is young enough to show:
+  // under STREAM_FALLBACK_MAX_AGE_MS old, and not from the future (a clock that
+  // moved back would otherwise make a reading "fresh" for as long as the gap).
+  function streamFor(name, t) {
+    if (typeof streamReading !== 'function') return null;
+    let r = null;
+    try {
+      r = streamReading(name);
+    } catch {
+      return null;
+    }
+    if (!r || !r.usage || !Number.isFinite(Number(r.at))) return null;
+    const age = t - Number(r.at);
+    if (age < -60_000 || age > STREAM_FALLBACK_MAX_AGE_MS) return null;
+    return { usage: r.usage, at: Number(r.at), age: Math.max(0, age), verified: r.verified === true };
+  }
+
+  // Never cached: the reading is in memory already, and a cached copy could
+  // only ever be older than the one the host holds by the next call.
+  function streamRow(acct, active, s, lookupFailure = null) {
+    const row = { ...baseRow(acct, active), state: 'ok', usage: s.usage, source: { kind: 'stream', at: s.at } };
+    if (lookupFailure) row.lookupFailure = lookupFailure;
+    return row;
+  }
+
+  // Which failed lookups a live reading may stand in for: the ones that say
+  // nothing about the account. A refused login and every credential state
+  // (no credentials, expired, refresh or persist failed) carry an instruction
+  // the owner has to act on, and numbers drawn over them would hide it.
+  const STANDS_IN_FOR = new Set(['rate-limited', 'timeout', 'network', 'unreadable', 'http']);
+  // The reading is read HERE, at the moment it would be drawn, never carried
+  // across the lookup's await: all() reads the slots concurrently, and another
+  // slot's successful lookup (onUsage) can prove, mid render, that the reading
+  // held under this slot was another account's all along.
+  function orStream(row, acct, active, stream) {
+    if (!stream || !row || row.state !== 'unavailable' || !STANDS_IN_FOR.has(row.failure?.kind)) return row;
+    const s = streamFor(acct.name, now());
+    return s ? streamRow(acct, active, s, row.failure) : row;
+  }
+
+  // `captureName` is the slot a refused login should be re-captured into. It is
+  // the account's own name, except for activeOnly()'s stand-in row for a login
+  // that is in no slot, where the honest instruction is "/account capture <name>".
+  //
+  // `stream` opts this read into the live session readings. Display paths only:
+  // the rotation probe (one) and usageResetFor never pass it, because a
+  // reading is by construction older than the last request made on that
+  // account, and those two exist to refuse exactly that kind of reading.
+  // Two uses, in this order:
+  //   1. For the LIVE slot, a reading younger than the TTL is as fresh as a
+  //      cached lookup, so it is served and the lookup is not made at all.
+  //      Every Claude Code process on the machine already polls this endpoint
+  //      on the live account's token; the bridge asking too only spends the
+  //      same allowance. Live only, because the live slot is the one whose
+  //      token cannot be in a credential state (tokenFor hands it the store's
+  //      own token), and a fresh reading from it proves that token is serving
+  //      requests. An idle slot always goes through tokenFor, so an expired or
+  //      refused login there still says so. And VERIFIED only: a reading whose
+  //      owner the host inferred rather than proved must not suppress the one
+  //      lookup that would prove it.
+  //   2. Otherwise the lookup runs as always, and when it fails for a reason
+  //      in STANDS_IN_FOR, a reading under STREAM_FALLBACK_MAX_AGE_MS stands
+  //      in for its row. The 429 hold and the TTL cache are untouched: a held
+  //      or cached failure is still what the lookup says, and still not asked
+  //      again inside its hold; only what is RETURNED changes.
+  async function readOne(acct, active, { captureName = acct.name, stream = false } = {}) {
+    const t = now();
+    const s = stream ? streamFor(acct.name, t) : null;
+    const cached = cacheGet(acct.name, t);
+    // A cached row that carries an instruction (a refused login, a credential
+    // state) is returned as it is even beside a fresh reading: skipping the
+    // lookup must never skip past something the owner has to act on.
+    const mustShow = cached !== undefined && cached.state !== 'ok' && !STANDS_IN_FOR.has(cached.failure?.kind);
+    const isLive = !!active.name && active.name === acct.name;
+    if (s && s.verified && isLive && s.age < ttlMs && !mustShow) return streamRow(acct, active, s);
+    if (cached !== undefined) return orStream({ ...cached, cached: true }, acct, active, stream);
+    const held = throttle.get(acct.name);
+    if (held && held.until > t) return orStream({ ...held.row, cached: true }, acct, active, stream);
+    if (held) throttle.delete(acct.name);
+
+    const base = baseRow(acct, active);
     const tok = await tokenFor(acct, active);
     if (!tok.token) {
       return cacheSet(acct.name, { ...base, state: tok.state, error: tok.error, usage: null }, t, ttlMs);
     }
     const { usage, failure } = await fetchUsageResult(tok.token, { fetchImpl, timeoutMs, now: t });
-    if (usage) return cacheSet(acct.name, { ...base, state: 'ok', usage, refreshed: !!tok.refreshed }, t, ttlMs);
+    if (usage) {
+      if (typeof onUsage === 'function') {
+        try {
+          onUsage(acct.name, usage);
+        } catch {
+          /* a listener never costs the lookup its answer */
+        }
+      }
+      return cacheSet(acct.name, { ...base, state: 'ok', usage, refreshed: !!tok.refreshed }, t, ttlMs);
+    }
 
     // Still 'unavailable', so every consumer that branches on state is
     // untouched; what changed is that the row now says why.
@@ -775,10 +933,10 @@ export function createAccountUsage({
       const holdMs = throttleHoldMs(failure.retryAfterMs, ttlMs);
       throttle.set(acct.name, { until: t + holdMs, row });
       log(`usage lookup for "${acct.name}" throttled (${failureLogText(failure)}), holding ${Math.round(holdMs / 1000)}s before asking again`);
-      return cacheSet(acct.name, row, t, holdMs);
+      return orStream(cacheSet(acct.name, row, t, holdMs), acct, active, stream);
     }
     log(`usage lookup for "${acct.name}" failed (${failureLogText(failure)})`);
-    return cacheSet(acct.name, row, t, ttlMs);
+    return orStream(cacheSet(acct.name, row, t, ttlMs), acct, active, stream);
   }
 
   return {
@@ -797,10 +955,11 @@ export function createAccountUsage({
     },
 
     // Every account, concurrently. One slow account must not serialise the rest.
-    async all() {
+    // { stream: true } for the display paths (/account, /usage): see readOne.
+    async all({ stream = false } = {}) {
       const active = await resolveActive();
       const list = store.listAccounts();
-      const rows = await Promise.all(list.map((a) => readOne(a, active)));
+      const rows = await Promise.all(list.map((a) => readOne(a, active, { stream })));
       return { active, rows };
     },
 
@@ -815,7 +974,9 @@ export function createAccountUsage({
     // cache can hold a row read a minute before the account ran out, and a
     // reading taken while it still had headroom is a reading that says it has
     // headroom: exactly the false clean bill of health this probe exists to
-    // stop. The same reason usageResetFor invalidates before it reads.
+    // stop. The same reason usageResetFor invalidates before it reads, and
+    // the reason this never takes a live session reading (readOne's `stream`):
+    // a reading is at best as old as the last request made on that account.
     async one(name, { fresh = true } = {}) {
       if (!name) return null;
       if (fresh) invalidateUsageCache(name);
@@ -825,8 +986,10 @@ export function createAccountUsage({
       return readOne(acct, active);
     },
 
-    // Just the live one, for /status's single compact line.
-    async activeOnly() {
+    // Just the live one, for /status's single compact line. Also what
+    // usageResetFor reads after a wall, which is why `stream` defaults off
+    // here and /status opts in: the rotation's reading stays the lookup's.
+    async activeOnly({ stream = false } = {}) {
       const active = await resolveActive();
       if (!active.oauth) return { active, row: null };
       const list = store.listAccounts();
@@ -836,7 +999,7 @@ export function createAccountUsage({
       // of tokenFor (live token, never refreshed) instead of reporting "no
       // credentials captured" for the account that is actually running.
       const synthetic = acct || { name: active.name || active.email || 'the live login', email: active.email || null };
-      const row = await readOne(synthetic, { ...active, name: synthetic.name }, { captureName: acct ? acct.name : '<name>' });
+      const row = await readOne(synthetic, { ...active, name: synthetic.name }, { captureName: acct ? acct.name : '<name>', stream });
       return { active, row };
     },
   };
@@ -901,7 +1064,18 @@ export function usageLine(row, { now = Date.now(), timeZone = LOCAL_TZ } = {}) {
     windowInline('wk', row.usage.sevenDay, { now, timeZone }),
   ].filter(Boolean);
   if (!bits.length) return null;
-  return [`👤 ${row.email || row.name}`, ...bits.map((b) => `   ${b}`)].join('\n');
+  const source = liveSourceLine(row, { now, timeZone });
+  return [`👤 ${row.email || row.name}`, ...bits.map((b) => `   ${b}`), ...(source ? [source] : [])].join('\n');
+}
+
+// Where a row's numbers came from, when it was not the usage lookup: one line
+// under the bars, the clock the reading arrived in the owner's zone. Null for
+// an ordinary lookup row, which needs no provenance. The clock rather than an
+// age, for the same reason the 429 line names a clock: a message the owner
+// reads an hour later still says the true thing.
+export function liveSourceLine(row, { now = Date.now(), timeZone = LOCAL_TZ } = {}) {
+  if (!row || row.source?.kind !== 'stream' || !Number.isFinite(Number(row.source.at))) return null;
+  return `   📡 from live sessions · ${fmtResetClock(Number(row.source.at), { timeZone, now, compact: true })}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -956,7 +1130,9 @@ export function accountUsageBlock(row, { now = Date.now(), timeZone = LOCAL_TZ }
     accountWindowLine('5h', row.usage.fiveHour, { now, timeZone }),
     accountWindowLine('wk', row.usage.sevenDay, { now, timeZone }),
   ].filter(Boolean);
-  return lines.length ? lines : ['   ⚠️ usage unavailable'];
+  if (!lines.length) return ['   ⚠️ usage unavailable'];
+  const source = liveSourceLine(row, { now, timeZone });
+  return source ? [...lines, source] : lines;
 }
 
 // The name line. `✅ available` is gone: availability is the default state and
@@ -1150,6 +1326,8 @@ export function renderUsageReport({ active, rows }, { now = Date.now(), timeZone
     if (eu?.enabled) {
       out.push(`   extra usage ${fmtPercent(eu.percent)}${eu.usedCredits != null ? ` · ${eu.usedCredits} credits used` : ''}`);
     }
+    const source = liveSourceLine(r, { now, timeZone });
+    if (source) out.push(source);
   }
   out.push('', `Times are ${timeZone}. /account <name> to swap.`);
   return out.join('\n');

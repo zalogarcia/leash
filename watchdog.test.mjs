@@ -97,6 +97,55 @@ await new Promise((r) => child.on('exit', r));
 await new Promise((r) => setTimeout(r, 100));
 ok('SIGKILLed child reads dead (the restart-killed-worker case)', pidAlive(child.pid) === false);
 
+// onEvent: a re-attached worker's parsed events reach the host, and the ones
+// already in the log when the re-attach began are flagged as backlog. The
+// previous daemon parsed those live; a host that took them as new would stamp
+// hours-old readings with the time of the restart.
+{
+  const log = path.join(TMP, 'reattach.jsonl');
+  const old = { type: 'rate_limit_event', rate_limit_info: { status: 'allowed' }, n: 1 };
+  fs.writeFileSync(log, `${JSON.stringify(old)}\n${JSON.stringify({ type: 'assistant', n: 2 })}\nnot json, stderr\n`);
+  const seen = [];
+  const wd = createWorkerWatchdog({
+    registry: createInflightRegistry({ file: path.join(TMP, 'reattach-inflight.json') }),
+    tailIntervalMs: 20,
+    reattachPollMs: 60_000,
+    onEvent: (ev, meta) => seen.push({ n: ev.n, type: ev.type, ...meta }),
+    log: () => {},
+  });
+  const h = wd.reattachWorker('bg9-1', { pid: process.pid, task: 't', log, account: 'a@example.com' });
+  await new Promise((r) => setTimeout(r, 120));
+  fs.appendFileSync(log, `${JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed' }, n: 3 })}\n`);
+  await new Promise((r) => setTimeout(r, 120));
+  h.stop();
+  ok('onEvent sees every parsed event, and no stderr line', seen.map((e) => e.n).join() === '1,2,3');
+  ok('the lines already in the log are backlog', seen[0]?.backlog === true && seen[1]?.backlog === true);
+  ok('a line written after the re-attach is not', seen[2]?.backlog === false);
+  ok('onEvent names the worker', seen.length === 3 && seen.every((e) => e.id === 'bg9-1'));
+  ok('onEvent hands the host the registry record', seen.every((e) => e.rec?.account === 'a@example.com'));
+  // A throwing host costs the tail nothing: the result line behind it still
+  // reaches the outcome when the worker exits.
+  const log2 = path.join(TMP, 'reattach2.jsonl');
+  fs.writeFileSync(log2, '');
+  const outcomes = [];
+  const sleeper = spawn('sleep', ['0.4']);
+  const wd2 = createWorkerWatchdog({
+    registry: createInflightRegistry({ file: path.join(TMP, 'reattach-inflight2.json') }),
+    tailIntervalMs: 20,
+    reattachPollMs: 50,
+    onEvent: () => {
+      throw new Error('host blew up');
+    },
+    onOutcome: (task, outcome) => outcomes.push(outcome),
+    log: () => {},
+  });
+  wd2.reattachWorker('bg9-2', { pid: sleeper.pid, task: 't', log: log2 });
+  fs.appendFileSync(log2, `${JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done' })}\n`);
+  await new Promise((r) => sleeper.on('exit', r));
+  await new Promise((r) => setTimeout(r, 200));
+  ok('a throwing onEvent does not stop the tail', outcomes.length === 1 && JSON.stringify(outcomes[0]).includes('done'));
+}
+
 // THE containment check. If this fails, the suite has been writing to the
 // registry a live background worker depends on — the exact state that makes
 // safe-restart.sh see zero live workers and restart over real work.
