@@ -11,19 +11,19 @@ Almost everything provable about it is provable OFFLINE, and the section
 "What this repo cannot prove offline" is the one that matters most: it names
 the surfaces where a green gate is not evidence.
 
-## Commands (each actually run on 2026-09-20, exit codes captured)
+## Commands (each actually run on 2026-09-26, exit codes captured)
 
 There is no package.json, no build step and no bundler. Node is the only
 runtime requirement (verified against node v22.16.0).
 
 - syntax gate (entry point): `node --check bridge.mjs` (exit 0)
-- syntax gate (everything): `for f in *.mjs scripts/probes/*.mjs; do node --check "$f" || echo "FAIL $f"; done` (71 files, 0 failures)
+- syntax gate (everything): `for f in *.mjs scripts/probes/*.mjs; do node --check "$f" || echo "FAIL $f"; done` (74 files, 0 failures)
 - shell syntax gate: `for f in *.sh scripts/*.sh; do bash -n "$f" || echo "FAIL $f"; done` (5 files, 0 failures)
 - offline suites: `for f in test.mjs *.test.mjs; do node "$f" >/dev/null 2>&1 || echo "FAIL $f"; done`
-  (36 suites: `test.mjs` plus 35 `*.test.mjs`. 2095 assertions passed, 0 failed.
-  34 of the 36 print an `N passed, M failed` line; `detached-workers.test.mjs`
+  (38 suites: `test.mjs` plus 37 `*.test.mjs`. 2190 assertions passed, 0 failed.
+  36 of the 38 print an `N passed, M failed` line; `detached-workers.test.mjs`
   and `watchdog.test.mjs` report by exit code only.)
-- shared module gate: `./scripts/check-shared.sh` (33 of 33 identical, exit 0)
+- shared module gate: `./scripts/check-shared.sh` (34 of 34 identical, exit 0)
 - installer rehearsal: `./install.sh --dry-run` (exit 0, changes nothing)
 - typecheck / lint: none exist. There is no tsconfig, no eslint and no
   prettier config in this repo. Do not invent one in a manifest row.
@@ -60,8 +60,9 @@ would actually show it.
 | the Codex app-server progress bubble | `runCodexChatTurn` in `bridge.mjs`, on `codex-appserver.mjs` | offline: `node codex-appserver.test.mjs` (protocol, against a captured transcript) and `node bg-codex-wiring.test.mjs` (against a fake server). Live: `node scripts/probes/codex-appserver-probe.mjs`. |
 | the background worker notice line | `bg-notify.mjs`, driven from `bridge.mjs` | `node bg-notify.test.mjs` for the line itself, `node bg-reports.test.mjs` for the report on disk and the handback that names it, and `node progress-priority.test.mjs` for the rule that this line opens and resolves and spends nothing in between. |
 | the usage limit rotation report path | `accounts.mjs`, `account-selector.mjs`, `account-buttons.mjs`, wired in `bridge.mjs` | `node limit-rotation.test.mjs` is the one that covers the report, including the arm that sends its own message when there is no bubble to edit. `node accounts.test.mjs` and `node account-usage.test.mjs` cover the store and the plan readings underneath it. Every wall in all three is a FABRICATED response; see below. |
-| the offline test suites | `test.mjs` and `*.test.mjs` in the repo root | the command in the Commands section. Run them individually and read each exit code; a wrapper that stops at the first failure hides the rest. Under heavy machine load `bg-codex-wiring.test.mjs` can time out on one interrupt case and pass on a re-run, so a single failure there is re-run before it is believed. |
-| the public and private split | `scripts/check-shared.sh` | `./scripts/check-shared.sh`, which exits 0 only when all 33 shared modules are byte identical. It finds the sibling repo from this repo's own directory name, or from `BRIDGE_SIBLING_REPO`. Exit 2 means the sibling was not found, which is NOT a pass. `bridge.mjs` is deliberately excluded and must never be added: the two copies diverge by design. |
+| the offline test suites | `test.mjs` and `*.test.mjs` in the repo root | the command in the Commands section. Run them individually and read each exit code; a wrapper that stops at the first failure hides the rest. Under heavy machine load `bg-codex-wiring.test.mjs` can time out on one interrupt case, and `system-wiring.test.mjs` can miss its 30 ms `pendingMessage` tick case ("expected the clock to advance at least twice"), and both pass on a re-run, so a single failure in either is re-run before it is believed. |
+| the background concurrency cap | `bg-admission.mjs` (the decisions), applied in `drainBgHandoff` and `checkSchedules` in `bridge.mjs`, listed by `bg.mjs ps` | `node bg-admission.test.mjs` for the pure decisions (slots, FIFO, the QUEUED block) and `node bg-concurrency-wiring.test.mjs`, which runs the REAL drain and schedule path sliced out of `bridge.mjs` at a real cap against a real temp drop box. Neither spawns a worker, so neither proves the running daemon holds the cap; that needs a live run with more handoffs than `maxConcurrentWorkers` and `bg.mjs ps` showing the QUEUED block. |
+| the public and private split | `scripts/check-shared.sh` | `./scripts/check-shared.sh`, which exits 0 only when all 34 shared modules are byte identical. It finds the sibling repo from this repo's own directory name, or from `BRIDGE_SIBLING_REPO`. Exit 2 means the sibling was not found, which is NOT a pass. `bridge.mjs` is deliberately excluded and must never be added: the two copies diverge by design. |
 | the probes | `scripts/probes/` | see the probe table below. |
 | the install path | `install.sh`, `config.json`, `uninstall.sh` | `./install.sh --dry-run` (exit 0) proves it gets as far as deciding what it would write. It does NOT prove the install: only a real run creates the LaunchAgent, and only the daemon answering proves that worked. |
 
@@ -110,8 +111,8 @@ that some claims cannot be made from a green suite, and the following are the
 ones that have been made anyway.
 
 - **Nothing here has ever run against real Telegram.** No suite imports
-  `bridge.mjs` (verified 2026-09-20: zero `import` or `import()` of it across
-  all 36 suites; the ten that need it read it as TEXT and slice it). Only
+  `bridge.mjs` (verified 2026-09-26: zero `import` or `import()` of it across
+  all 38 suites; the eleven that need it read it as TEXT and slice it). Only
   `bridge.mjs` itself reaches `api.telegram.org`. So no gate in this repo
   exercises the real API: not its rate limiter, not its entity parsing, not its
   message length limits, not its file size limits, not `editMessageText` on a
@@ -136,6 +137,10 @@ ones that have been made anyway.
   was not reached. It is not a pass.
 - **The Claude CLI path is not exercised at all.** The lanes that spawn
   `claude` are covered only by fakes.
+- **Voice-note transcription never runs offline.** `transcribeVoice` posts to
+  OpenAI's `/v1/audio/transcriptions` with `transcribeModel` (default
+  `gpt-4o-mini-transcribe`); no suite calls it. Only a real voice note sent to
+  a running daemon with an OpenAI key proves the model name is accepted.
 - **The LaunchAgent, the watchdog and `safe-restart.sh` are covered by
   `watchdog.test.mjs` and by `--dry-run`, not by an install.** Nothing in the
   gates loads a real LaunchAgent or kills a real daemon.

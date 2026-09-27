@@ -1692,6 +1692,7 @@ import fs from 'node:fs';
 import { codexCwdForBrief, codexReasonText, lintCodexBrief, parseEnginePrefix, shouldRouteToCodex, CODEX_LANE } from ${url('bg-codex.mjs')};
 import { briefRepo, briefTitle, handoffNotice, stripLaneRules, workerLine, WORKER_TICK_MS, WORKER_IDLE_MS } from ${url('bg-notify.mjs')};
 import { claudeMissingLine, resolveEngine } from ${url('engine-state.mjs')};
+import { hasSlot, mergeRequeue } from ${url('bg-admission.mjs')};
 const { existsSync, readFileSync, writeFileSync, renameSync } = fs;
 // The live worker line. Real builder, recorded transport: this file is about
 // WHICH ENGINE the drain picks, and the notice rides along so a shape change
@@ -1721,6 +1722,25 @@ export const RECORDED = [];
 const recordBgResult = (task, record) => { RECORDED.push({ task, record }); };
 const getBgLane = () => ({ name: 'bg', current: null, queue: [] });
 export const bgLanes = [];
+// THE CONCURRENCY CAP, by the module-binding names production uses, the same
+// rule as chatState below: the drain consults it on every Claude item, so
+// a harness missing it makes the drain throw ReferenceError and eat the job.
+//
+// Set HIGH on purpose rather than to the production default. This section is
+// about WHICH ENGINE the drain picks, and a cap that deferred a Claude item
+// here would change the routing these assertions read for a reason that has
+// nothing to do with engines. The pacing has its own suite,
+// bg-concurrency-wiring.test.mjs, which runs this same drain at a real cap.
+const MAX_CONCURRENT_WORKERS = 99;
+let bgStrandedJobs = [];
+// runningBgWorkers is extracted rather than mirrored, so this is the pool the
+// real counter counts. dispatchPrompt above records instead of claiming a lane,
+// so it stays empty and only the cap arithmetic is exercised.
+function bgWorkerDescriptors() {
+  return bgLanes
+    .filter((l) => l.isBg && l.current)
+    .map((l) => ({ runId: l.name + '-' + l.current.startedAt, lane: l.name, engine: 'claude' }));
+}
 export let CHAT_CWD = ${JSON.stringify(TMP)};
 export const setChatCwd = (p) => { CHAT_CWD = p; };
 const chatState = () => ({ cwd: CHAT_CWD });
@@ -1778,6 +1798,11 @@ export const reset = () => {
         grab('streamsStepEdits', 'const'),
         grab('startWorkerNotice'),
         grab('editWorkerNotice'),
+        // The cap's two daemon-side helpers, extracted for the same reason the
+        // drain is: they are what it calls, and a mirror would keep agreeing
+        // with itself after bridge.mjs changed.
+        grab('runningBgWorkers'),
+        grab('requeueDeferredBgJobs'),
         grab('drainBgHandoff'),
         'export { drainBgHandoff, workerNotices };',
       ].join('\n'),

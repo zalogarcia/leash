@@ -797,6 +797,10 @@ function grabConst(name) {
 const NOTIFY_URL = pathToFileURL(path.join(DIR, 'bg-notify.mjs')).href;
 const CODEX_URL = pathToFileURL(path.join(DIR, 'bg-codex.mjs')).href;
 const ENGINE_URL = pathToFileURL(path.join(DIR, 'engine-state.mjs')).href;
+// The concurrency cap's pure half. The extracted drain consults it on every
+// Claude item now, so it has to come along for the same reason bg-codex.mjs
+// does: a mirror of hasSlot here would keep agreeing with itself.
+const ADMISSION_URL = pathToFileURL(path.join(DIR, 'bg-admission.mjs')).href;
 // The real due-logic, not a mirror: checkSchedules' cadence gate is the whole
 // point of the `every N days` shape, and a stub of it here would keep agreeing
 // with itself after schedule-due.mjs changed.
@@ -811,6 +815,7 @@ const HARNESS = `
 import path from 'node:path';
 import { handoffNotice, completionNotice, parseRunId, briefRepo, briefTitle, stripLaneRules, workerLine, WORKER_TICK_MS, WORKER_IDLE_MS } from ${JSON.stringify(NOTIFY_URL)};
 import { describeWhen, isDailyDue } from ${JSON.stringify(SCHEDULE_DUE_URL)};
+import { hasSlot, mergeRequeue } from ${JSON.stringify(ADMISSION_URL)};
 export const SENT = [];
 export const DISPATCHED = [];
 export const EDITS = [];
@@ -837,6 +842,26 @@ const dispatchPrompt = (text, lane) => { DISPATCHED.push({ text, lane: lane && l
 // code under test a binding that production does not have.
 export const chatState = () => ({ cwd: '/Users/owner/dev/claude-telegram-bridge' });
 export const bgLanes = [];
+// THE CONCURRENCY CAP, by the module-binding names production uses, the same
+// rule as chatState above: drainBgHandoff consults it on every Claude item, so
+// a harness missing it makes the drain throw ReferenceError and silently eat a
+// queued job, which is exactly the class of bug the chatState comment records.
+//
+// The cap is set HIGH here on purpose rather than to the production default.
+// This suite is about the NOTICE the drain puts up, and a cap that deferred one
+// of its drains would change what every assertion below sees for a reason that
+// has nothing to do with notices. The pacing itself is not skipped, it is owned
+// by bg-concurrency-wiring.test.mjs, which runs this same extracted drain at a
+// real cap against a real worker pool.
+const MAX_CONCURRENT_WORKERS = 99;
+let bgStrandedJobs = [];
+// runningBgWorkers is extracted, not mirrored, so the real counter runs here
+// too; this is the pool it counts.
+function bgWorkerDescriptors() {
+  return bgLanes
+    .filter((l) => l.isBg && l.current)
+    .map((l) => ({ runId: l.name + '-' + l.current.startedAt, lane: l.name, engine: 'claude' }));
+}
 let bgSeq = 0;
 const BG_TASK_TIMEOUT_MS = 1;
 export const reset = (ls = []) => { SENT.length = 0; DISPATCHED.length = 0; EDITS.length = 0; LIVE.clear(); workerNotices.clear(); msgSeq = 0; CODEX_STARTED.length = 0; rotationPausedUntil = 0; codexFallbackValue = true; codexTransport = 'appserver'; ENGINE_CFG = {}; CHAT_ENGINE_STATE = {}; bgLanes.length = 0; bgSeq = 0; SAVED.length = 0; SCHED_LANDS_ON_CLAUDE = true; SCHEDULES = { nextId: 1, items: [] }; heldContent = '[]'; pendingWrite = null; writeFails = false; WALLS_RAISED.length = 0; RESUMES.length = 0; DECISIONS.length = 0; WRITES.length = 0; pendingWrite = null; for (const l of ls) { bgSeq++; bgLanes.push({ name: bgSeq === 1 ? 'bg' : 'bg' + bgSeq, isBg: true, n: bgSeq, current: null, queue: [], ...l }); } };
@@ -988,9 +1013,20 @@ const B = await import(
         grabFn('readHeldBgJobs'),
         grabFn('writeHeldBgJobs'),
         grabFn('holdBgJob'),
+        // The cap's two daemon-side helpers, extracted for the same reason the
+        // drain itself is: they are what the drain calls, and a mirror of them
+        // here would keep agreeing with itself after bridge.mjs changed.
+        grabFn('runningBgWorkers'),
+        grabFn('requeueDeferredBgJobs'),
         grabFn('drainBgHandoff'),
         grabFn('flushParkedWalledJobs'),
         grabFn('notifyOwnerBgFinished'),
+        // checkSchedules calls this when the pool is full. The cap is 99 here
+        // so the && short-circuits and it is never reached, but a harness that
+        // stays green only because of a short-circuit is one edit away from a
+        // ReferenceError, which is the exact class of bug the chatState comment
+        // above records. Extract it rather than rely on the branch not running.
+        grabFn('queueScheduledRun'),
         grabFn('checkSchedules'),
         'export { drainBgHandoff, flushParkedWalledJobs, readHeldBgJobs, holdBgJob, PARKED_WALLED_JOBS_MAX, notifyOwnerBgFinished, getBgLane, startWorkerNotice, editWorkerNotice, workerNotices, checkSchedules };',
       ].join('\n'),

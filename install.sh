@@ -149,6 +149,7 @@ else
   "ownerName": "the owner",
   "timeoutMs": 1800000,
   "bgTimeoutMs": 28800000,
+  "maxConcurrentWorkers": 3,
   "staleSec": 3600,
   "engine": { "chat": "claude", "bg": "claude" },
   "codexAppServer": "true",

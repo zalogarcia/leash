@@ -44,7 +44,7 @@ of Node that long-polls the Telegram Bot API and pipes messages into
 | 🔒 **No inbound network** | Long-polls Telegram. No tunnel, no open ports, no webhook, no third-party relay. |
 | 💬 **Persistent sessions** | Ask something today, follow up tomorrow — same conversation. Survives restarts and reboots. |
 | 🗂️ **Named, resumable chats** | `/rename` a conversation, `/chats` to list them, `/resume` to switch back. `/compact` summarizes a long one into a fresh chat. |
-| 🌙 **Unlimited background workers** | Long jobs (`/goal`, `/autopilot`, test suites) run in *separate* Claude sessions. If a worker is busy, another spawns — parallel, never queued behind each other. |
+| 🌙 **Background workers** | Long jobs (`/goal`, `/autopilot`, test suites) run in *separate* Claude sessions, in parallel. Hand off as many as you like: none is ever refused, up to 3 Claude workers run at once (`maxConcurrentWorkers`), and the rest start as slots free. |
 | ➡️ **Mid-task steering** | Message while a task is running and it goes *into* the running task, exactly like typing mid-turn in Claude Code. |
 | 🎯 **Steer a background worker** | `/steer latest <one more instruction>` writes into a *running* worker, so it keeps the context it has already built. Correcting a job no longer means killing it. |
 | ❓ **Ask one a side question** | `/btw did the migration apply?` puts a question to a *running* worker without changing its job. It answers in one message here, then carries on with its plan untouched. [Details.](#btw-asking-a-worker-a-question-without-changing-its-job) |
@@ -114,8 +114,17 @@ assistant-initiated handoffs run in their own Claude session instead. You keep
 chatting while they work. That is the off-leash half of the name: the work runs
 far, you keep hold of the end.
 
-The background pool is **unbounded**: every job that arrives while the pool is
-busy spawns its own worker (`bg2`, `bg3`, …) rather than queueing. Workers are
+The background pool never refuses a job: every job that arrives while the pool
+is busy gets its own worker (`bg2`, `bg3`, …). What is bounded is how many Claude
+workers run **at once**, `maxConcurrentWorkers` in `config.json` (default 3),
+because a burst of parallel workers plus the chat lane can exhaust every Claude
+account at the same moment and kill the jobs in flight. A job past the cap is
+deferred, not refused: it waits in the drop box in arrival order, `bg.mjs ps`
+lists it under a QUEUED block, and it starts the moment a worker exits. A
+scheduled `--run` task that fires at a full pool queues behind the jobs already
+waiting and says so in one line. Codex jobs are not capped (separate billing,
+and the fallback a walled Claude job escapes to), and `bg.mjs --now` starts one
+job past the cap when it cannot wait. Workers are
 **ephemeral** — each runs one self-contained task in a fresh session and is
 cleaned up when it drains, so a worker never resumes (or pays for) the context of
 an earlier job. They also get an hour-scale timeout rather than the chat lane's
@@ -382,6 +391,7 @@ node bg.mjs btw latest --file ./question.md                  # anything longer
 node bg.mjs ps                                               # what is running
 node bg.mjs --engine codex --file ./brief.md                 # hand a job to the other engine
 node bg.mjs "codex: review the last commit"                  # same, inline prefix
+node bg.mjs --now --file ./brief.md                          # start it past the concurrency cap
 ```
 
 The target is a lane name (`bg`, `bg2`), a run id (`bg2-1788453512237`), a pid,
@@ -392,6 +402,16 @@ that names all of them:
 RUNID              LANE  PID    ELAPSED  STEPS  STEER  SENT  ENGINE  TITLE
 bg-1788453512237   bg    41022  18m      64     yes    1     claude  Port the second engine
 bg2-1788453999999  bg2   41190  4m       9      no     0     claude  Rebuild the search index
+```
+
+When jobs are waiting for a slot, the same table ends with a QUEUED block, one
+row per job in the drop box, in the order they will start:
+
+```
+QUEUED (2 in the drop box · 1 waiting for a slot · 3 of 3 workers busy)
+  #  WAIT     ENGINE  TITLE
+  1  no       codex   Review the last commit
+  2  yes (1)  claude  Regenerate the fixtures
 ```
 
 **`STEER: no` is the honest answer, not a bug.** A worker that outlived a daemon
@@ -903,6 +923,8 @@ node dash-normalize.test.mjs     # style.noDashes, and everything it must not to
 node system-messages.test.mjs    # every message the daemon writes about itself
 node system-wiring.test.mjs      # those messages, against the real send path
 node bg-notify.test.mjs          # the background worker's start / live / done line
+node bg-admission.test.mjs       # the concurrency cap's pure half: slots, FIFO, the QUEUED block
+node bg-concurrency-wiring.test.mjs  # the real drain and schedule path at a real cap
 node bg-reports.test.mjs         # the full report on disk, and the handback that names it
 node accounts.test.mjs           # the account store and the rotation rules
 node account-usage.test.mjs      # live plan usage per account
@@ -943,7 +965,9 @@ reset clocks on `/account`, `/usage` and `/status` — empty means this machine'
 own zone, which is only wrong if you read Leash from somewhere else),
 `openaiApiKey` (voice-note transcription; usually better as `$OPENAI_API_KEY`),
 `transcribeModel` (the OpenAI speech to text model, default `gpt-4o-mini-transcribe`;
-`whisper-1` still works),
+`whisper-1` still works), `maxConcurrentWorkers` (how many Claude background
+workers run at once, default 3, floor 1; jobs past it queue and start as slots
+free, Codex jobs are not counted),
 `logFile` (empty = the service manager's own log path), `timeoutMs` (chat lane,
 default 30 min), `bgTimeoutMs` (background workers, default 8h — that lane is for
 hour-scale jobs), `staleSec` (skip messages older than this — default 1h, so a
@@ -994,8 +1018,9 @@ force a restart while real background work is in flight. See
   and are skipped as stale if older than an hour.
 - **20MB file limit** — a Telegram Bot API cap, not ours.
 - **One task per lane.** The chat lane runs one at a time (extra messages steer
-  into it or queue); background workers are unbounded and run in parallel.
-  Internal work never gets dropped.
+  into it or queue); background workers run in parallel, up to
+  `maxConcurrentWorkers` Claude workers at once, and a job past that waits for a
+  slot instead of being refused. Internal work never gets dropped.
 - **Only one poller per bot token.** Running a second instance causes Telegram 409s
   (the daemon backs off and recovers, but don't do it on purpose).
 - Tested on macOS with Claude Code 2.x. The Linux/systemd path is included and

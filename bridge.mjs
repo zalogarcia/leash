@@ -168,6 +168,9 @@ import {
 // block nobody is looking at.
 import { readPeers, sortPeers, PEER_MAX } from './peers.mjs';
 import { buildReplyQuote, composeWithQuote } from './reply-quote.mjs';
+// The background concurrency cap. Pure decisions only: the wiring that makes
+// this daemon obey them is proven by bg-concurrency-wiring.test.mjs.
+import { hasSlot, maxConcurrentWorkers, mergeRequeue, queueRows, queuedBlock } from './bg-admission.mjs';
 import {
   STEER_RECORD_MAX,
   STEER_SOCK_NAME,
@@ -864,6 +867,14 @@ const LANES = {
 // conversation), so continuity bought nothing. Fresh every time, 2026-07-27.
 const bgLanes = [];
 let bgSeq = 0;
+// HOW MANY OF THEM MAY RUN AT ONCE. The pool above is deliberately unbounded in
+// shape (a busy pool never blocks a job) and that is still true: what is bounded
+// now is how many run CONCURRENTLY. Jobs past the cap wait in the drop box and
+// start as slots free, so the promise "hand off as many as you like" is intact
+// and only the pacing changed. bg-admission.mjs carries the full why and owns
+// the default; `maxConcurrentWorkers` in config.json (or
+// BRIDGE_MAX_CONCURRENT_WORKERS) overrides it.
+const MAX_CONCURRENT_WORKERS = maxConcurrentWorkers(conf('maxConcurrentWorkers', undefined));
 function makeBgLane() {
   bgSeq++;
   const n = bgSeq;
@@ -890,6 +901,28 @@ function gcBgLane(lane) {
   if (lane.isBg && lane.n > 1 && !lane.current && !lane.queue.length && !lane.finishing) {
     const i = bgLanes.indexOf(lane);
     if (i >= 0) bgLanes.splice(i, 1);
+  }
+}
+/**
+ * How many CLAUDE background workers are alive right now, which is what the cap
+ * counts.
+ *
+ * Read off bgWorkerDescriptors rather than off bgLanes, because a worker that
+ * survived a daemon restart is re-attached by log and holds no lane: it is a
+ * real `claude` process burning a real account, and a cap that could not see it
+ * would let a restart double the fleet. Codex runs are excluded for the reason
+ * in bg-admission.mjs: separate billing, and they are the fallback a walled
+ * Claude job escapes to.
+ */
+function runningBgWorkers() {
+  try {
+    return bgWorkerDescriptors().filter((w) => (w.engine || 'claude') !== 'codex').length;
+  } catch (e) {
+    // The count feeds an admission decision, and failing OPEN here would be the
+    // incident this cap exists to prevent. Report the cap as full instead: the
+    // job waits one poll cycle and nothing is lost.
+    console.error('[bridge] could not count the running workers, treating the pool as full:', e.message);
+    return MAX_CONCURRENT_WORKERS;
   }
 }
 const allLanes = () => [LANES.main, ...bgLanes];
@@ -2718,6 +2751,19 @@ function runClaude(
       // claimed the lane defers it once more, as it should.
       if (lane === LANES.main) maybeRestartWakeUp();
       gcBgLane(lane);
+      // A SLOT JUST FREED, so whatever the concurrency cap deferred starts NOW
+      // rather than waiting out the next 50 second long poll. The poll loop
+      // drains too and would eventually catch it; this is what makes "the next
+      // job starts when a worker exits" true in seconds instead of a minute.
+      // Guarded, because this is an async close callback and a throw here would
+      // be an unhandled rejection that costs the daemon.
+      if (lane.isBg) {
+        try {
+          drainBgHandoff();
+        } catch (e) {
+          console.error('[bridge] the post-worker drain failed, the poll loop will retry:', e.message);
+        }
+      }
     });
   });
 }
@@ -3403,7 +3449,19 @@ function handleSteerRequest(raw) {
   if (!req.ok) return steerFailure(req.reason, { detail: req.detail });
   if (req.op === 'ps') {
     const workers = bgWorkerDescriptors().map(publicWorker);
-    return { ok: true, workers, table: psTable(workers) };
+    // QUEUED JOBS ARE PART OF THE ANSWER, not a footnote. `ps` used to list only
+    // what was running, which was complete right up until there was a cap: a job
+    // admitted and waiting looked exactly like a job that never arrived.
+    const running = runningBgWorkers();
+    const queued = queuedBgJobRows({ running });
+    const block = queuedBlock(queued, { running, max: MAX_CONCURRENT_WORKERS });
+    return {
+      ok: true,
+      workers,
+      queued,
+      capacity: { running, max: MAX_CONCURRENT_WORKERS },
+      table: block ? `${psTable(workers)}\n\n${block}` : psTable(workers),
+    };
   }
   if (req.op === 'btw') return btwInto(req.target, req.text);
   return steerInto(req.target, req.text);
@@ -8170,15 +8228,104 @@ function flushParkedCodexChats() {
   dispatchPrompt(codexParkedNote({ ownerName: OWNER_NAME, items }), LANES.main, { priority: true });
 }
 
-// (see bg.mjs). Drained each poll cycle so the chat lane can reply immediately.
+/**
+ * Jobs the LAST drain deferred past the concurrency cap but could not write
+ * back to the drop box (a failed rename, which is a disk-level anomaly).
+ *
+ * They were already claimed out of bg-queue.json, so they exist NOWHERE else:
+ * dropping them to keep the code simple would destroy a brief with no dispatch,
+ * no row and no report. Held in memory, retried at the top of every drain, and
+ * put back at the FRONT so a job that has already waited is not overtaken.
+ */
+let bgStrandedJobs = [];
+
+/**
+ * The deferred jobs, back into the drop box `drainBgHandoff` reads.
+ *
+ * Written back rather than held, so a queued job survives a daemon restart for
+ * free: the drop box is a file, and the next daemon's first poll drains it. The
+ * read-modify-write window is the same one bg.mjs's append and the walled-job
+ * flush already have.
+ */
+function requeueDeferredBgJobs(deferred) {
+  if (!deferred.length) return true;
+  let queued = [];
+  try {
+    const raw = JSON.parse(readFileSync(BG_QUEUE_FILE, 'utf8'));
+    if (Array.isArray(raw)) queued = raw;
+  } catch {
+    queued = []; // no file, or a half-written one: the deferred items are the queue
+  }
+  try {
+    const tmp = `${BG_QUEUE_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(mergeRequeue(deferred, queued), null, 2));
+    renameSync(tmp, BG_QUEUE_FILE);
+    return true;
+  } catch (e) {
+    console.error('[bridge] could not re-queue the deferred background jobs, holding them in memory:', e.message);
+    bgStrandedJobs = [...deferred, ...bgStrandedJobs];
+    return false;
+  }
+}
+
+/**
+ * WHAT IS WAITING, for `bg.mjs ps` and for the dispatch acknowledgement.
+ *
+ * A job sitting in a queue with no way to see it is worse than a rejection: the
+ * rejection at least tells the caller. This is the whole licence for the cap to
+ * be silent about admission, so it reads the SAME two places a drain does (the
+ * drop box on disk, plus anything stranded in memory by a failed write back) and
+ * resolves the engine the SAME way, or ps and the daemon would disagree about
+ * which jobs are even capped.
+ */
+function queuedBgJobRows({ running = runningBgWorkers() } = {}) {
+  let items = [];
+  try {
+    const raw = JSON.parse(readFileSync(BG_QUEUE_FILE, 'utf8'));
+    if (Array.isArray(raw)) items = raw;
+  } catch {
+    items = []; // no file, or a half-written one
+  }
+  const rows = [...bgStrandedJobs, ...items]
+    .map((it) => {
+      const queuedText = typeof it === 'string' ? it : it?.text;
+      if (!queuedText) return null;
+      const pre = parseEnginePrefix(queuedText);
+      const forced = (typeof it === 'object' && it?.engine) || pre.engine || null;
+      let engine = forced || 'claude';
+      try {
+        engine = engineFor('bg', forced).engine || engine;
+      } catch {
+        /* the settled view is decoration; the forced value is already right */
+      }
+      return {
+        engine,
+        bypass: Boolean(typeof it === 'object' && it?.now),
+        title: briefTitle(stripLaneRules(pre.text)),
+        queuedAt: (typeof it === 'object' && it?.queuedAt) || null,
+      };
+    })
+    .filter(Boolean);
+  return queueRows(rows, { running, max: MAX_CONCURRENT_WORKERS });
+}
+
+// A running session hands a long job to the background lane by appending here
+// (see bg.mjs). Drained each poll cycle so the chat lane can reply immediately,
+// and again whenever a worker exits so a queued job starts within seconds
+// rather than waiting out a 50 second long poll.
 function drainBgHandoff() {
+  // Taken BEFORE the read: these exist only here, and a throw between the two
+  // would lose them. Put back by hand on the claim-failure path below.
+  const stranded = bgStrandedJobs.splice(0);
   let items;
   try {
     items = JSON.parse(readFileSync(BG_QUEUE_FILE, 'utf8'));
   } catch {
-    return;
+    items = [];
   }
-  if (!Array.isArray(items) || !items.length) return;
+  if (!Array.isArray(items)) items = [];
+  items = [...stranded, ...items];
+  if (!items.length) return;
   try {
     // pid-unique temp so a concurrent bg.mjs write can't clobber ours
     const tmp = `${BG_QUEUE_FILE}.${process.pid}.tmp`;
@@ -8186,8 +8333,14 @@ function drainBgHandoff() {
     renameSync(tmp, BG_QUEUE_FILE); // claim before dispatch — never run an item twice
   } catch (e) {
     console.error('[bridge] bg handoff drain failed:', e.message);
+    bgStrandedJobs = stranded; // the FILE still holds its own; only these had no other home
     return; // items stay queued in memory below — do NOT drop them
   }
+  // THE CONCURRENCY CAP. Counted once here and incremented per dispatch rather
+  // than re-read per item: nothing else in this synchronous loop can change it,
+  // and bgWorkerDescriptors() reads the inflight registry off disk.
+  let running = runningBgWorkers();
+  const deferred = [];
   for (const it of items) {
     const queuedText = typeof it === 'string' ? it : it?.text;
     if (!queuedText) continue;
@@ -8334,6 +8487,24 @@ function drainBgHandoff() {
     // clipping the composed text would make every handoff notice byte-identical
     // boilerplate. The title is the first real line of the brief.
     //
+    // THE CAP, and the one place it is applied. Everything above this line has
+    // already left the loop: a Codex job (not capped, separate billing, and the
+    // escape hatch a walled Claude job needs), a job with no engine at all, and
+    // a job the wall parked. What is left is a `claude` worker, which is the
+    // thing four of walled every account on 2026-09-21.
+    //
+    // DEFERRED, NOT REFUSED. The item goes back to the drop box exactly as it
+    // arrived, keeps its place in line, and starts the moment a slot frees
+    // (the poll loop drains, and so does every worker's exit). The caller was
+    // told "hand off as many as you like" and that stays true.
+    //
+    // `--now` is the only way past, and it has to be typed at dispatch: a cap
+    // that lifts itself under load is not a cap, and load is when it matters.
+    const bypass = Boolean(typeof it === 'object' && it?.now);
+    if (!hasSlot({ running, max: MAX_CONCURRENT_WORKERS, engine: 'claude', bypass })) {
+      deferred.push(typeof it === 'object' && it ? it : { text: queuedText });
+      continue;
+    }
     // The lane is resolved BEFORE the send so the notice can name the worker
     // the owner will see in /status. getBgLane() only ever returns an idle lane, so
     // it is never already in the active set — this job is the +1.
@@ -8357,6 +8528,7 @@ function drainBgHandoff() {
     const active = bgLanes.filter((l) => l.current || l.queue.length || l.finishing).length + 1;
     const queued = bgLanes.reduce((n, l) => n + l.queue.length, 0);
     dispatchPrompt(text, lane, { priority: true }); // already claimed out of the file — must not be dropped
+    running++; // this worker is live from here on, so the next item sees a fuller pool
     try {
       // runClaude sets lane.current synchronously, so the id exists by now. If
       // it somehow does not, handoffNotice falls back to the lane name.
@@ -8398,6 +8570,11 @@ function drainBgHandoff() {
       console.error('[bridge] handoff notice failed (the job was already dispatched):', e.message);
     }
   }
+  // THE DEFERRED JOBS, back on disk before this function returns. Last, because
+  // every dispatch above is what decides how many there are, and one write beats
+  // one per item. A failure here does not lose them: requeueDeferredBgJobs moves
+  // them into bgStrandedJobs and the next drain tries again.
+  requeueDeferredBgJobs(deferred);
 }
 
 function loadSchedules() {
@@ -8450,6 +8627,51 @@ function fmtSchedule(s) {
   return `#${s.id} · ${describeWhen(s)} · ${s.run ? '🤖 run' : '⏰ remind'} · ${clip(oneLine(s.text), 80)}`;
 }
 
+/**
+ * A scheduled `--run` job that arrived at a FULL pool, into the drop box.
+ *
+ * THE SAME QUEUE, NOT A SECOND ONE. `bg-queue.json` is already the place a job
+ * waits for a slot: `drainBgHandoff` reads it every poll cycle and again on
+ * every worker exit, `bg.mjs ps` lists it, and it is a FILE, so a queued job
+ * survives a daemon restart for free. Inventing a schedule-side waiting list
+ * would mean a second thing that can starve, a second thing to make visible,
+ * and a second thing to drain.
+ *
+ * AT THE TAIL, so the schedule queues BEHIND the jobs already waiting rather
+ * than jumping them. A 03:00 nightly job that starts at 03:40 is harmless; a
+ * handoff the owner is waiting on, overtaken by a cron they did not think about
+ * this morning, is not. `requeueDeferredBgJobs` merges to the FRONT for the
+ * opposite reason: those items already waited a cycle.
+ *
+ * The item is the shape bg.mjs writes, plus `scheduleId`, so a queue file read
+ * by hand at 03:05 answers "which schedule put this here". The drain ignores
+ * the extra field.
+ *
+ * Returns false on a write failure, and the caller then starts the job anyway:
+ * the same drops-open-rather-than-shut choice the walled-job hold makes, for
+ * the same reason. One worker over the cap is a pacing miss. A schedule that
+ * fired and went nowhere is lost work with nothing on screen saying so.
+ */
+function queueScheduledRun(s) {
+  let items = [];
+  try {
+    const raw = JSON.parse(readFileSync(BG_QUEUE_FILE, 'utf8'));
+    if (Array.isArray(raw)) items = raw;
+  } catch {
+    items = []; // no file, or a half-written one: this job is the queue
+  }
+  items.push({ text: s.text, queuedAt: new Date().toISOString(), scheduleId: s.id });
+  try {
+    const tmp = `${BG_QUEUE_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(items, null, 2));
+    renameSync(tmp, BG_QUEUE_FILE); // atomic, so a concurrent bg.mjs read never sees half of it
+    return true;
+  } catch (e) {
+    console.error('[bridge] could not queue the scheduled job, starting it instead:', e.message);
+    return false;
+  }
+}
+
 // Called from the poll loop (≤~90s granularity). Sleep-tolerant: a time that
 // passed while the Mac slept fires on the next check instead of being lost.
 function checkSchedules() {
@@ -8475,6 +8697,63 @@ function checkSchedules() {
     if (due) {
       changed = true;
       if (s.run) {
+        // THE CONCURRENCY CAP, asked here the same way the drop box asks it.
+        //
+        // This is the second of the paths that spawn a background Claude
+        // worker, and the only UNATTENDED one: nobody types a schedule at
+        // 03:00. Two `--run` schedules on the same `daily 03:00` start two
+        // workers together every night, on top of whatever the drop box is
+        // already running. Uncapped here, they were COUNTED once alive, so they
+        // starved later bg.mjs jobs while nothing stopped them pushing the fleet
+        // past the cap.
+        //
+        // Same three inputs as drainBgHandoff, in the same order, so the two
+        // paths cannot disagree about who gets a slot: a Codex job is not
+        // capped (separate billing, and it is the escape hatch a walled Claude
+        // job needs), and otherwise it is running < max. There is no bypass
+        // here: `--now` is typed at dispatch, and nobody is at the keyboard.
+        //
+        // QUEUE, DO NOT JUMP. The deferred schedule goes to the TAIL of the
+        // same drop box, so it waits behind the handoffs already in line. A
+        // 03:00 nightly job that starts at 03:40 is harmless; a job the owner
+        // handed over and is waiting on, overtaken by a cron, is not.
+        //
+        // NOTHING IS DROPPED. The schedule has already been consumed above
+        // (lastFired stamped, or a `once` item removed), so the job now exists
+        // in the drop box and nowhere else: the drain starts it the moment a
+        // slot frees, `bg.mjs ps` lists it while it waits, and a daemon restart
+        // does not lose it because the drop box is a file.
+        let schedEngine = 'claude';
+        try {
+          schedEngine = engineFor('bg').engine || 'claude';
+        } catch {
+          /* the settled view is decoration; 'claude' is the capped case, so the cap holds */
+        }
+        if (
+          !hasSlot({ running: runningBgWorkers(), max: MAX_CONCURRENT_WORKERS, engine: schedEngine }) &&
+          queueScheduledRun(s)
+        ) {
+          // QUEUED, then the notice, the same order as a dispatch: the job is
+          // already durable before anything composes a message about it.
+          //
+          // A static line, not a live one. This job's start has its own worker
+          // card from the drain, so a ⏳ here would be a second bubble waiting
+          // on an event that resolves somewhere else, which is the shape the
+          // live-message rule calls a line that lies.
+          try {
+            send(
+              [
+                `⏰ #${s.id} · ${describeWhen(s)} · 📥 queued`,
+                briefTitle(stripLaneRules(s.text)),
+                `${runningBgWorkers()} of ${MAX_CONCURRENT_WORKERS} workers busy · it starts when a slot frees`,
+              ].join('\n'),
+              { markdown: false },
+            ).catch(() => {});
+          } catch (e) {
+            console.error('[bridge] scheduled-job queue notice failed (the job is already queued):', e.message);
+          }
+          continue;
+        }
         // scheduled work must never block chat, and must not be dropped on a
         // full queue. getBgLane(), not the old LANES.bg — that key died in the
         // lane-pool refactor and the undefined fell through to the CHAT lane.
@@ -8772,11 +9051,11 @@ Commands:
 
 Custom /commands pass through to Claude Code: /autopilot, /bug, /qa-loop, /plan, /brainstorm, /goal, …
 
-Unlimited background workers: long jobs (/goal, /autopilot, /qa-loop, /bug, /go-live), scheduled tasks and anything prefixed "bg:" get a 🌙 worker each, another spawns when all are busy, and nothing queues behind background work, so the 🤖 chat lane stays free. Each is a fresh self-contained session (no history between jobs) with an hour-scale timeout, not the chat lane's ${Math.round(TASK_TIMEOUT_MS / 60000)}-minute ceiling.
+Background workers: long jobs (/goal, /autopilot, /qa-loop, /bug, /go-live), scheduled tasks and anything prefixed "bg:" get a 🌙 worker each, another spawns when all are busy, and past the worker cap jobs wait for a slot, so the 🤖 chat lane stays free. Each is a fresh self-contained session (no history between jobs) with an hour-scale timeout, not the chat lane's ${Math.round(TASK_TIMEOUT_MS / 60000)}-minute ceiling.
 
 Attachments: photos, videos and files (≤20MB each) land in the inbox and go to Claude; a caption (or a text right after) is the instruction. Voice notes are transcribed (OpenAI speech to text) and run as prompts. A message sent mid-task is steered INTO the run, as in Claude Code: folded in, or answered right after. What cannot be steered queues (max 5); /stop kills the task and drops the queue. Model: ${DEFAULT_MODEL || 'CLI default'} (effort ${DEFAULT_EFFORT || 'CLI default'}).
 
-Notes: one chat-lane task at a time (workers unlimited) · messages older than ${Math.round(STALE_SEC / 60)} min are skipped · only while this machine is awake.`;
+Notes: one chat-lane task at a time (workers never refused) · messages older than ${Math.round(STALE_SEC / 60)} min are skipped · only while this machine is awake.`;
 
 function expandPath(p) {
   if (p === '~') return HOME;

@@ -4,6 +4,7 @@
 //   node bg.mjs "run the full test suite and report what fails"
 //   node bg.mjs --file ./brief.md                   (preferred for real briefs)
 //   node bg.mjs --engine codex --file ./brief.md    (run it on OpenAI Codex, not Claude)
+//   node bg.mjs --now --file ./brief.md             (start it past the concurrency cap)
 //   node bg.mjs "codex: review the last commit"     (same thing, inline prefix)
 //   node bg.mjs --engine claude --file /tmp/b.md    (pin to Claude on a Codex-first install)
 //   node bg.mjs steer <lane|runId|pid|latest> "one more instruction"
@@ -16,8 +17,11 @@
 // text in its own background Claude session, streaming progress to Telegram.
 // The calling session is free immediately.
 //
-// Workers are unbounded: if one is busy, the daemon spawns another, so several
-// handoffs run in PARALLEL rather than queueing behind each other.
+// Workers are never refused: if one is busy, the daemon spawns another, so
+// several handoffs run in PARALLEL. How many Claude workers run AT ONCE is
+// capped (`maxConcurrentWorkers` in config.json, default 3); a job past the cap
+// waits in this same drop box and starts as a slot frees, and `bg.mjs ps`
+// lists it while it waits.
 //
 // When the job finishes, its output is delivered to the CHAT lane as a worker
 // report — the assistant decides what to do and gives you a short update.
@@ -226,6 +230,26 @@ if (argv[0] === 'btw') {
 const ENGINE_PREFIX_RE = /^\s*(codex|claude):\s*/i;
 let engine = null;
 const dispatchArgs = argv.slice();
+
+// --now: START THIS ONE PAST THE CONCURRENCY CAP.
+//
+// The daemon runs at most `maxConcurrentWorkers` Claude workers at a time
+// (config.json, default 3) because four of them plus the chat lane exhausted
+// every Claude account at once on 2026-09-21 and three jobs died mid flight.
+// Everything past the cap QUEUES and starts as slots free, so this flag is not
+// about getting work accepted: it is accepted either way. It is about jumping a
+// queue, and it exists because "the build is broken and three renders are
+// running" is a real situation.
+//
+// Explicit at dispatch, never automatic, and deliberately not a config value: a
+// cap that lifts itself under pressure is not a cap, and pressure is exactly
+// when it has to hold.
+let now = false;
+const nowFlag = dispatchArgs.indexOf('--now');
+if (nowFlag !== -1) {
+  now = true;
+  dispatchArgs.splice(nowFlag, 1);
+}
 const engineFlag = dispatchArgs.indexOf('--engine');
 if (engineFlag !== -1) {
   const v = String(dispatchArgs[engineFlag + 1] ?? '').toLowerCase();
@@ -237,7 +261,7 @@ if (engineFlag !== -1) {
   dispatchArgs.splice(engineFlag, 2);
 }
 
-let text = payload(dispatchArgs, 'usage: node bg.mjs [--engine codex] --file <path-to-brief>');
+let text = payload(dispatchArgs, 'usage: node bg.mjs [--engine codex] [--now] --file <path-to-brief>');
 
 // `codex: do the thing` / `claude: do the thing` are the engine siblings of the
 // `bg:` prefix, for when typing a flag is more friction than the job is worth.
@@ -253,6 +277,7 @@ if (!text) {
     [
       'usage: node bg.mjs "<task>"   |   node bg.mjs --file <path-to-brief>',
       '       node bg.mjs --engine codex|claude --file <path>   (pick the engine for this job)',
+      '       node bg.mjs --now --file <path>                   (start it past the concurrency cap)',
       '       node bg.mjs "codex: <task>" | "claude: <task>"    (same, inline prefix)',
       '       node bg.mjs steer <lane|runId|pid|latest> "<text>" | --file <path>',
       '       node bg.mjs btw <lane|runId|pid|latest> "<question>" | --file <path>',
@@ -307,6 +332,13 @@ if (engine !== 'codex' && !text.startsWith('LANE RULES')) text = `${LANE_RULES}$
 // from clobbering (or being clobbered by) its claim, and re-reading inside the
 // retry loop means an item can't be lost to a drain that landed mid-flight.
 const TMP = `${FILE}.${process.pid}.tmp`;
+// Stamped ONCE, before the retry loop, rather than per attempt. A retry happens
+// because the daemon's claim landed between our read and our rename, which is a
+// property of the disk, not of when the job was handed over: restamping would
+// make a contended dispatch look later than an uncontended one and reorder the
+// FIFO the admission queue depends on. It is also this item's identity in
+// `bg.mjs ps`, which is how a queued job is told apart from its neighbours.
+const queuedAt = new Date().toISOString();
 let pending = 0;
 let lastErr;
 
@@ -318,7 +350,7 @@ for (let attempt = 0; attempt < 5; attempt++) {
   } catch {
     /* missing or mid-rename — treat as empty and retry on failure */
   }
-  items.push({ text, queuedAt: new Date().toISOString(), ...(engine ? { engine } : {}) });
+  items.push({ text, queuedAt, ...(engine ? { engine } : {}), ...(now ? { now: true } : {}) });
   try {
     writeFileSync(TMP, JSON.stringify(items, null, 2));
     renameSync(TMP, FILE);
@@ -335,6 +367,66 @@ if (lastErr) {
   process.exit(1);
 }
 
-console.log(
-  `handed to ${engine === 'codex' ? 'the CODEX lane' : engine === 'claude' ? 'the background lane (pinned to Claude)' : 'background lane'} (${pending} pending): ${text.slice(0, 80)}`,
-);
+const where =
+  engine === 'codex'
+    ? 'the CODEX lane'
+    : engine === 'claude'
+      ? 'the background lane (pinned to Claude)'
+      : 'background lane';
+
+// "HANDED OFF" NO LONGER IMPLIES "RUNNING", so the acknowledgement says so.
+// The daemon runs a bounded number of Claude workers (see --now above) and
+// everything past the cap waits in this same drop box, so an ack that read
+// only "3 pending" would let a job sit in a queue with nothing on screen
+// saying it was waiting.
+//
+// SAID, NOT ASKED, and that is deliberate. An earlier version of this line put
+// the question to the daemon over the steer socket. Three things were wrong
+// with it, and only the last one is about tests:
+//
+//   1. It blocked. ask() sets a 15 second socket timeout, so a daemon that was
+//      busy or mid restart turned "returns instantly" (the entire reason this
+//      CLI exists, and the reason the chat stays reachable) into a stall on a
+//      path whose work had ALREADY SUCCEEDED.
+//   2. It raced. The daemon drains on its own cycle, so the answer was a
+//      snapshot that could be stale before it finished printing, and
+//      "QUEUED, position 2" that is wrong is worse than no position at all.
+//   3. It touched the steer socket on the DISPATCH path. `bg.mjs steer the
+//      reels pipeline away from the old template` is a brief, not a steer, and
+//      the guard that proves it stayed a brief is "the socket was not touched".
+//      Making every dispatch touch the socket retires that discriminator for
+//      good, so a future misroute would sail straight through it.
+//
+// The live view belongs to `bg.mjs ps`, which is a QUERY: it may ask the
+// daemon, it is not on the hot path, and it is the one authoritative answer.
+// This line's job is to point at it and to never imply a start it cannot know.
+//
+// The cap is read best effort for the number only, in the daemon's own order
+// (BRIDGE_MAX_CONCURRENT_WORKERS, then config.json at BRIDGE_CONFIG or beside
+// this file), and the number is simply omitted when it cannot be read. There is
+// deliberately no fallback default here: bg.mjs is run from sessions whose
+// environment is not the daemon's, and a second hardcoded copy of the default
+// would be a second thing to get wrong the day it changes. bg-admission.mjs
+// owns it.
+let cap = null;
+try {
+  let raw = process.env.BRIDGE_MAX_CONCURRENT_WORKERS;
+  if (raw === undefined) {
+    const c = JSON.parse(readFileSync(process.env.BRIDGE_CONFIG || path.join(SCRIPT_DIR, 'config.json'), 'utf8'));
+    raw = c?.maxConcurrentWorkers;
+  }
+  const n = Number(raw);
+  if (raw !== '' && raw !== null && Number.isFinite(n) && n >= 1) cap = Math.floor(n);
+} catch {
+  /* no config.json, or an unreadable one: say it without the number */
+}
+const pacing =
+  engine === 'codex'
+    ? 'not capped' // Codex is billed separately, see bg-admission.mjs
+    : now
+      ? 'starts past the cap (--now)'
+      : cap
+        ? `up to ${cap} run at once, the rest start as slots free · bg.mjs ps`
+        : 'past the cap jobs queue and start as slots free · bg.mjs ps';
+
+console.log(`handed to ${where} (${pending} pending · ${pacing}): ${text.slice(0, 80)}`);

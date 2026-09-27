@@ -70,6 +70,7 @@ SHARED_MODULES=(
   wake-up.test.mjs
   tg-governor.mjs
   tg-governor.test.mjs
+  bg-admission.test.mjs
 )
 
 # NOT LISTED, and why. These modules came from the private sibling and behave
@@ -92,6 +93,13 @@ SHARED_MODULES=(
 #                                        assistant's name; here the daemon names
 #                                        itself from config.json, and the test
 #                                        fixtures name public repos)
+#       bg-admission.mjs                 (the header prose names the assistant
+#                                        and the owner; the code is identical,
+#                                        and its test IS listed above, so the
+#                                        two copies are held to the same cases)
+#       bg-concurrency-wiring.test.mjs   (its harness stubs this repo's own
+#                                        drain dependencies, and its schedule
+#                                        fixtures are generic here)
 #
 # (b) This repo carries fixes the private one does not, found by the QA pass on
 #     the port (2026-09-04). Listing these would make the gate demand that the

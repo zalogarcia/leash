@@ -7,12 +7,14 @@
 //   • a worker spawned through spawnWorker the way runClaude spawns one
 //     (detached, stdout/stderr on a file, stdin HELD OPEN)
 //   • bgWorkerDescriptors / steerInto / handleSteerRequest / startSteerServer,
-//     extracted by source from bridge.mjs
+//     and the concurrency cap's runningBgWorkers / queuedBgJobRows that
+//     `ps` now reads, extracted by source from bridge.mjs
 //   • the real `bg.mjs steer` and `bg.mjs ps` CLIs over a real unix socket
 //   • steerFraming on the way in and steeredInBlock on the way out
 //
 // PASS = the fake worker's stdin received the FRAMED steer, `bg.mjs ps` showed
-// it as steerable, and the text comes back in the STEERED IN block.
+// it as steerable and listed a job waiting in the drop box under QUEUED, and
+// the text comes back in the STEERED IN block.
 import { execFile } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, chmodSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -66,13 +68,27 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { clip, oneLine } from ${url('progress-render.mjs')};
-import { briefTitle } from ${url('bg-lane-rules.mjs')};
+import { briefTitle, stripLaneRules } from ${url('bg-lane-rules.mjs')};
+import { parseEnginePrefix } from ${url('bg-codex.mjs')};
+import { maxConcurrentWorkers, queueRows, queuedBlock } from ${url('bg-admission.mjs')};
 import {
   STEER_SOCK_NAME, decodeLine, encodeLine, parseRunId, psTable, resolveSteerTarget,
   steerFailure, steerResponse, validateRequest, REASONS as STEER_REASONS,
 } from ${url('bg-steer.mjs')};
-const { existsSync, unlinkSync } = fs;
+const { existsSync, unlinkSync, readFileSync } = fs;
 const SCRIPT_DIR = ${JSON.stringify(SOCK_DIR)};
+// The concurrency cap, which handleSteerRequest's ps arm reads. The cap is 1
+// so the one worker below fills the pool and a job in the drop box is WAITING,
+// which is the row ps exists to show. The drop box is a file in this probe's
+// own temp directory, never the daemon's.
+const MAX_CONCURRENT_WORKERS = maxConcurrentWorkers(1);
+export const BG_QUEUE_FILE = path.join(SCRIPT_DIR, 'bg-queue.json');
+let bgStrandedJobs = [];
+// A SEAM, not the subject: the real engineFor reads the chat's engine state,
+// the config and the wall, none of which this probe stands up. Every job here
+// is a Claude job unless it names Codex, which is the settled answer on an
+// install with no engine configured.
+const engineFor = (lane, forced) => ({ engine: forced || 'claude' });
 const STEER_SOCK = path.join(SCRIPT_DIR, STEER_SOCK_NAME);
 const CODEX_LANE = 'codex';
 export const bgLanes = [];
@@ -82,6 +98,8 @@ const inflight = { read: () => Object.fromEntries(REGISTRY), add: (id, r) => REG
 export const watchdog = { reattachedIds: new Set() };
 `,
   grab('bgWorkerDescriptors'),
+  grab('runningBgWorkers'),
+  grab('queuedBgJobRows'),
   grab('publicWorker', 'const'),
   grab('steerInto'),
   grab('handleSteerRequest'),
@@ -126,6 +144,13 @@ console.log(ps.stdout.trimEnd());
 ok('bg.mjs ps lists the running worker as steerable', /\bbg\b/.test(ps.stdout) && /\byes\b/.test(ps.stdout), ps.stdout);
 ok('ps shows the JOB, not the LANE RULES preamble', ps.stdout.includes('Port the second engine') && !ps.stdout.includes('LANE RULES'), ps.stdout);
 ok('ps names the engine column', ps.stdout.includes('ENGINE') && ps.stdout.includes('claude'), ps.stdout);
+
+// A job past the cap waits in the drop box, and ps is the only place it shows.
+writeFileSync(D.BG_QUEUE_FILE, JSON.stringify([{ text: 'LANE RULES (you are a background worker: headless).\n\n--- TASK ---\n\n# Regenerate the fixtures', queuedAt: new Date().toISOString() }]));
+const psQueued = await cli(['ps']);
+console.log(psQueued.stdout.trimEnd());
+ok('★ ps lists a job waiting in the drop box under QUEUED', psQueued.stdout.includes('QUEUED (1 in the drop box · 1 waiting for a slot · 1 of 1 workers busy)') && /yes \(1\)\s+claude\s+Regenerate the fixtures/.test(psQueued.stdout), psQueued.stdout);
+rmSync(D.BG_QUEUE_FILE, { force: true });
 
 const TEXT = "Don't rebuild `dist`; check [a, b] first.";
 const bodyFile = path.join(TMP, 'steer.md');

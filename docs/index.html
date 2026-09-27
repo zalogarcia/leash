@@ -219,7 +219,7 @@
       </div>
       <div class="lane">
         <p class="lane-k">worker pool</p>
-        <p>bg1, bg2, bg3 and on. Unbounded and parallel. Each worker is a fresh, self contained session, discarded when it drains.</p>
+        <p>bg1, bg2, bg3 and on. Parallel, and never refused: up to three Claude workers run at once and the rest start as slots free. Each worker is a fresh, self contained session, discarded when it drains.</p>
       </div>
       <div class="lane lane-wide">
         <p class="lane-k">the handback</p>
@@ -250,7 +250,7 @@
       <p class="eyebrow"><span class="tag">04</span> OFF-LEASH</p>
       <h2 class="h2">Hand it the long job. <span class="hl">Keep talking.</span></h2>
       <p>A headless run occupies its process until it finishes, so a twenty minute job would normally mean twenty minutes of silence. Long commands, anything you prefix <code>bg:</code>, scheduled tasks and handoffs from a session go to their own worker instead.</p>
-      <p>The pool is unbounded. A job that arrives while the pool is busy spawns its own worker rather than waiting. Workers are detached, in their own process group, writing to a file rather than a pipe, so restarting the daemon does not kill them. On the next boot it re-attaches to the ones still running and tells you about the ones that died.</p>
+      <p>The pool never refuses a job. Up to three Claude workers run at once (<code>maxConcurrentWorkers</code> in <code>config.json</code>); a job past that waits in the drop box in arrival order, shows in <code>bg.mjs ps</code>, and starts the moment a worker exits. Codex jobs are not counted. Workers are detached, in their own process group, writing to a file rather than a pipe, so restarting the daemon does not kill them. On the next boot it re-attaches to the ones still running and tells you about the ones that died.</p>
       <div class="mini">
         <code>node bg.mjs --file ./brief.md</code>
         <p>Pass a real brief as a file, never as a shell argument: backticks inside it would turn into command substitution and the worker would get a brief with those terms silently blanked out.</p>

@@ -14,6 +14,7 @@
 
   "timeoutMs": 1800000,
   "bgTimeoutMs": 28800000,
+  "maxConcurrentWorkers": 3,
   "staleSec": 3600,
 
   "engine": { "chat": "claude", "bg": "claude" },
@@ -50,6 +51,7 @@
     "ownerTz": "IANA timezone for /account, /usage and /status reset clocks (e.g. 'Europe/Lisbon'). Empty = this machine's local zone.",
     "timeoutMs": "Kill a CHAT-lane task after this long. Default 30 minutes, because you're waiting on the reply.",
     "bgTimeoutMs": "Kill a BACKGROUND worker after this long. Default 8 hours, because that lane is for hour-scale jobs.",
+    "maxConcurrentWorkers": "How many CLAUDE background workers run at once. Default 3, floor 1. Past it a job is never refused: it waits in the drop box in arrival order, `bg.mjs ps` lists it, and it starts when a worker exits. Codex jobs are not counted. `bg.mjs --now` starts one job past the cap.",
     "staleSec": "Ignore messages older than this (e.g. queued while the machine slept). Default 1 hour.",
     "engine": "Which engine each lane runs on by default: {\"chat\":\"claude\",\"bg\":\"claude\"}. A bare string ('codex') sets both. /engine changes it for this chat at runtime, and a 'codex:' or 'claude:' prefix pins one message.",
     "codexBin": "The OpenAI Codex CLI, for the second engine (/codex, /engine codex and the rate-limit fallback). Optional: with no binary installed every Codex path says so and nothing else changes.",
