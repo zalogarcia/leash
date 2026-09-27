@@ -28,7 +28,10 @@
 // testable without a token. See system-messages.test.mjs.
 
 import { clip, oneLine, fmtElapsed } from './progress-render.mjs';
-import { fmtResetClock } from './account-usage.mjs';
+// usageBar and fmtPercent are IMPORTED rather than re-implemented: /account and
+// /status now draw the same gauge, and a second bar renderer here is exactly
+// the drift the comment above tightenAccountView forbids.
+import { fmtResetClock, fmtPercent, usageBar } from './account-usage.mjs';
 
 // ---------------------------------------------------------------------------
 // THE PLAIN-TEXT FALLBACK
@@ -711,6 +714,146 @@ export function queueFull({ lane = 'main', max = 5 } = {}) {
 // /status
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// THE GAUGES
+//
+// Asked for from a phone, looking at a /status screenshot: every percentage
+// in /status was a bare number while /account draws a bar for the same fact,
+// and the two views should match.
+//
+// The bar is usageBar() in account-usage.mjs, IMPORTED and not reimplemented,
+// for the reason the tightenAccountView comment below gives in full: that
+// module is SHARED (scripts/check-shared.sh) and both views render the same
+// numbers, so a second bar renderer here is drift by construction.
+//
+// Being shared is also why the window rows are fixed by a post-pass instead of
+// at source. windowInline() over there builds
+//
+//   5h 6% · resets 6:50pm · 4h 44m left
+//
+// and statusUsageGauges is the smallest anchored rewrite that puts a bar in it,
+// the same conservative move tightenAccountView makes: one pattern matching all
+// four parts, so a rewording on the other side of the boundary makes this a
+// no-op rather than a corrupted view.
+// ---------------------------------------------------------------------------
+
+// THE GAUGE IS PLAIN TEXT HERE, AND THAT IS NOT AN OVERSIGHT.
+//
+// /account wraps its title, bar and percent in ONE code span, which is what
+// makes its rows column-align in Telegram's proportional font. Copying that
+// here looked obviously right and is obviously WRONG, because the two views do
+// not leave the daemon the same way:
+//
+//   /account  sendAccountView({ markdown: true })  -> mdToTelegramHtml -> <code>
+//   /status   send(..., { markdown: false })       -> no parse_mode at all
+//
+// bridge.mjs sends /status as plain text on purpose, and the comment on that
+// call gives the reason: "titles, repo names and cwds carry _ and *", which the
+// markdown converter would eat (`~/dev/my_repo_name` comes out as
+// `my<i>repo</i>name`). On that path a backtick is a backtick: the first cut of
+// this change would have put a literal ` on three rows of every /status, and
+// every builder test would still have passed, because the strings were right
+// and the send mode was the bug.
+//
+// So: the bar, which is the thing that was asked for, and no span. The bar
+// reads as a bar regardless of the font because it is two full-cell glyphs.
+// The percent column does NOT align across rows, and cannot until the /status
+// arm renders HTML, which is a bridge.mjs change this change deliberately does
+// not make. Padding the percent is therefore dropped too: leading spaces in a
+// proportional font buy no column and cost a visible gap.
+function gauge(title, percent, bar = usageBar(percent)) {
+  return `${title} ${bar} ${fmtPercent(percent)}`;
+}
+
+// windowInline's exact output: the indent, the title, the percent, an optional
+// lock, then ' · ' and the prose. Anchored on all four so anything else, an
+// already-barred row included, passes through untouched.
+const WINDOW_ROW = /^(\s*)(5h|wk) (n\/a|\d{1,3}%)( ⛔)? · (.+)$/;
+
+/** usageLine()'s block, with a bar on every window row. */
+export function statusUsageGauges(text) {
+  if (!text) return text;
+  return String(text)
+    .split('\n')
+    .map((line) => {
+      const m = WINDOW_ROW.exec(line);
+      if (!m) return line;
+      const [, indent, title, pct, lock, rest] = m;
+      // Re-read from the text, never recomputed: this side of the boundary
+      // never sees the number, and 'n/a' has to stay 'n/a' rather than becoming
+      // a confident empty bar, which is the one thing num() exists to prevent.
+      const n = pct === 'n/a' ? null : Number(pct.slice(0, -1));
+      // windowInline's own ' · ' is KEPT. /account drops it because the code
+      // span ending is the break; with no span there is no break, and the
+      // middle dot is this house's only separator.
+      return `${indent}${gauge(title, n)}${lock || ''} · ${rest}`;
+    })
+    .join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// The ctx gauge, and the one thing the /account rows do not need: a marker.
+//
+// These two lines sit next to each other in /status:
+//
+//   💬 chat 7984d2c9 · ctx 24%
+//   📦 auto compact on · 60% · last 1:34pm
+//
+// Two percentages of the SAME quantity, one the current level and one the
+// trigger, with nothing on screen saying which is which. The marker puts the
+// trigger INSIDE the bar, on the boundary it actually sits on, so "how close am
+// I to auto compact" is answered by looking instead of by subtracting.
+//
+// It marks a BOUNDARY and not a cell, on purpose: auto compact fires when the
+// level CROSSES the threshold, so the glyph goes BETWEEN two cells and all ten
+// cells keep meaning ten percent each. Shading the cell instead would have to
+// pick between a light glyph that vanishes exactly when the bar fills past it
+// and a dark one that reads as a dip in a run of full cells.
+//
+// The glyph is a BLOCK ELEMENT (U+258F) and not the prettier box-drawing dashed
+// rule (U+250A), for one reason that is not taste: █ and ░ are U+2588 and
+// U+2591, so /account already proves that block's font coverage on every phone
+// it renders on, and box drawing is a different block this repo has never
+// shipped. A marker that lands as tofu is worse than no marker. It is also
+// lighter than an ASCII pipe, so it reads as a gate rather than as a second
+// separator.
+// ---------------------------------------------------------------------------
+const COMPACT_MARK = '▏';
+
+/** The threshold, read back off the 📦 row autoCompactStatusLine built.
+ *
+ * Both builders live in THIS file, so this crosses no shared boundary and no
+ * module boundary either: statusHeader is handed that row already rendered, and
+ * asking bridge.mjs for the same number a second time would mean editing a file
+ * this change has no other reason to touch. `compactAt` on statusHeader is the
+ * direct path for when it does.
+ */
+const COMPACT_THRESHOLD = /^📦 auto compact on · (\d{1,3})% · /;
+
+export function compactThresholdOf(autoCompactRow) {
+  const m = COMPACT_THRESHOLD.exec(String(autoCompactRow ?? ''));
+  return m ? Number(m[1]) : null;
+}
+
+/** The ctx row, or null when there is no context percentage to draw. */
+export function ctxGaugeRow({ ctxPct = null, compactAt = null } = {}) {
+  if (!Number.isFinite(ctxPct)) return null;
+  const at = Number.isFinite(compactAt) && compactAt > 0 && compactAt <= 100 ? compactAt : null;
+  const bar = usageBar(ctxPct);
+  // Math.round, matching usageBar's own rounding, so the marker lands on the
+  // boundary the cells are actually drawn at rather than half a cell off it.
+  const cut = at === null ? null : Math.min(10, Math.max(0, Math.round(at / 10)));
+  const marked = cut === null ? bar : `${bar.slice(0, cut)}${COMPACT_MARK}${bar.slice(cut)}`;
+  const row = `${STATUS_INDENT}${gauge('ctx', ctxPct, marked)}`;
+  if (at === null) return row;
+  // The GAP, not the threshold: the 📦 row below already prints the threshold,
+  // and one number printed twice on one screen is read as two numbers. The word
+  // is "compact" and not "auto compact" because that row is directly beneath it
+  // and the longer form pushes this line past the width a phone wraps at.
+  const gap = Math.round(at - ctxPct);
+  return `${row} · ${gap > 0 ? `${gap}% to compact` : 'past compact'}`;
+}
+
 /**
  * The header block: where, what, and which engines, one fact per line.
  *
@@ -737,6 +880,7 @@ export function statusHeader({
   engineLine = null,
   session = '',
   ctxPct = null,
+  compactAt = null,
   threadNote = '',
   autoCompact = null,
   wakeUp = null,
@@ -748,15 +892,27 @@ export function statusHeader({
   const engineBits = [model, permissions, fallbackOn == null ? null : `fallback ${fallbackOn ? 'on' : 'off'}`].filter(Boolean);
   if (engineBits.length) lines.push(`🤖 ${engineBits.join(' · ')}`);
   if (engineLine) lines.push(engineLine);
-  const ctx = Number.isFinite(ctxPct) ? ` · ctx ${ctxPct}%` : '';
-  lines.push(`💬 chat ${session || 'fresh'}${ctx}${threadNote ? ` · ${threadNote}` : ''}`);
-  // The auto compact row sits under the chat line it describes: it is a fact
-  // about THIS chat's context, so it reads next to the percentage.
+  lines.push(`💬 chat ${session || 'fresh'}${threadNote ? ` · ${threadNote}` : ''}`);
+  // The context gauge gets its OWN indented row under the chat line, which is
+  // the shape the 5h and wk rows already take under 👤: a header line naming
+  // the thing, its gauges indented beneath it. As a ` · ctx 24%` suffix it was
+  // the least visual number on a screen whose whole job is to be glanced at,
+  // and it is the number that decides /new or /compact.
+  const ctxRow = ctxGaugeRow({
+    ctxPct,
+    // The caller may pass the threshold straight in; otherwise it is read back
+    // off the 📦 row, which is this file's own output either way.
+    compactAt: Number.isFinite(compactAt) ? compactAt : compactThresholdOf(autoCompact),
+  });
+  if (ctxRow) lines.push(ctxRow);
+  // The auto compact row sits under the gauge it describes: it is a fact about
+  // THIS chat's context, and it carries the one thing the bar cannot, which is
+  // when it last fired.
   if (autoCompact) lines.push(autoCompact);
   // The wake-up row sits under it: both are the daemon acting on this chat
   // by itself, and both answer "when did it last happen".
   if (wakeUp) lines.push(wakeUp);
-  if (usageBlock) lines.push(usageBlock);
+  if (usageBlock) lines.push(statusUsageGauges(usageBlock));
   // UNDER the live account's headroom, because it answers the next question:
   // that block says how much is left here, this one says whether there is
   // anywhere to go when it runs out.

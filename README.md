@@ -245,7 +245,7 @@ left to be guessed. The ack and the run bubble both say a quote went with the me
 | `/context` | Session context size, your 5h and weekly plan limits (% used + time left), and token/cost totals ([ccusage](https://github.com/ryoppippi/ccusage)). The limits need [one line in your statusline](docs/statusline.md); everything else works out of the box |
 | `/account` | Which Claude account is live + each enrolled account's headroom, with one-tap swap buttons. `/account <name>` swaps; `/account capture <name>` enrolls the current login ([multi-account setup](docs/multi-account.md)) |
 | `/usage` | Live 5h-block and weekly plan usage for **every** enrolled account — which one still has headroom |
-| `/status` | Directory, session, model, and a live block per lane: elapsed, steps, current task, latest action. Names each worker's run id and whether it can still be steered. It ends with a **Peers** block: every terminal-multiplexer session on this machine that the daemon did NOT spawn (another Claude Code or Codex session someone opened in a terminal), one line each saying working-or-idle, how long, and which engine, with the last thing a working one said underneath. Read only, capped at 12 sessions, and omitted entirely when there is no multiplexer server |
+| `/status` | Directory, session, model, the chat's context and the live account's 5h and weekly usage drawn as bars (the same bar `/account` draws), and a live block per lane: elapsed, steps, current task, latest action. Names each worker's run id and whether it can still be steered. It ends with a **Peers** block: every terminal-multiplexer session on this machine that the daemon did NOT spawn (another Claude Code or Codex session someone opened in a terminal), one line each saying working-or-idle, how long, and which engine, with the last thing a working one said underneath. Read only, capped at 12 sessions, and omitted entirely when there is no multiplexer server |
 | `/steer <target> <text>` | Write one more instruction into a **running** background worker. Target is a lane (`bg2`), a run id, a pid, or `latest`. `/steer` alone lists what is running |
 | `/btw [target] <question>` | Ask a **running** background worker a SIDE question. It answers in one message, here in the chat, and carries on with its plan unchanged; it is explicitly not an instruction and not approval. No target means `latest`. Availability is identical to `/steer` |
 | `/engine [bg] claude\|codex` | Which engine a lane runs on. Bare `/engine` shows both lanes, where each value came from, the Codex model/effort and the sandbox |
@@ -274,7 +274,8 @@ at or past the threshold (default 60% of the context window) and nothing is
 queued, steered in or asked and unanswered, the summary turn starts on its own,
 under a live message that says it was automatic, and your next message queues
 behind it exactly as it would behind `/compact`. A cooldown (default 30 minutes)
-keeps two compactions apart; `/status` shows the setting and when it last fired.
+keeps two compactions apart; `/status` shows the setting and when it last fired,
+and marks the threshold inside the context bar (`ctx ██░░░░▏░░░░ 24% · 36% to compact`).
 The summary ends with an "Unfinished work" list, and when that list is not
 empty the fresh chat is primed to continue it at once rather than acknowledge
 and wait for your next message (`wakeUp.afterCompact`, default on).

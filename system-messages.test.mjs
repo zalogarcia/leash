@@ -55,6 +55,9 @@ import {
   queueRunningNow,
   queueFull,
   statusHeader,
+  statusUsageGauges,
+  ctxGaugeRow,
+  compactThresholdOf,
   idleLaneLine,
   newSessionLine,
   attachmentNoun,
@@ -92,6 +95,9 @@ import {
 } from './system-messages.mjs';
 import { readFileSync } from 'node:fs';
 import { escHtml } from './md-format.mjs';
+// The REAL bar and the REAL window row, so a gauge assertion below cannot pass
+// against a second renderer that merely looks like usageBar's output.
+import { usageBar, usageLine } from './account-usage.mjs';
 
 let pass = 0;
 const failures = [];
@@ -851,7 +857,7 @@ const HEADER_ARGS = {
 t('status: exactly the header the mock sheet shows', () => {
   eq(
     statusHeader(HEADER_ARGS),
-    '📍 Leash on dev-box\n📁 ~/dev/claude-telegram-bridge\n🤖 opus · YOLO · fallback on\n⚙️ engine: chat claude · bg claude\n💬 chat 7f4e3041 · ctx 34%',
+    '📍 Leash on dev-box\n📁 ~/dev/claude-telegram-bridge\n🤖 opus · YOLO · fallback on\n⚙️ engine: chat claude · bg claude\n💬 chat 7f4e3041\n   ctx ███░░░░░░░ 34%',
   );
 });
 
@@ -877,10 +883,196 @@ t('status: the engine line only appears when there is one to show', () => {
   ok(!statusHeader({ ...HEADER_ARGS, engineLine: null }).includes('⚙️'), 'a Claude-on-both install gets nothing new');
 });
 
-t('status: the usage block arrives whole, with its own indent preserved', () => {
-  const usage = '👤 owner@example.com\n   5h ██████░░░░  58% · resets 13:45';
+t('status: the usage block keeps its own header and indent, and grows bars', () => {
+  const usage = '👤 owner@example.com\n   5h 58% · resets 13:45';
   const s = statusHeader({ ...HEADER_ARGS, usageBlock: usage });
-  ok(s.endsWith(usage), 'the bars are the best thing here and must not be re-rendered');
+  ok(s.includes('👤 owner@example.com'), 'the account header passes through untouched');
+  ok(s.endsWith('   5h ██████░░░░ 58% · resets 13:45'), s.split('\n').at(-1));
+});
+
+t('status: an already-barred usage block is left alone, never barred twice', () => {
+  // The idempotence guard. This is the shape /account produces, and the day the
+  // shared module starts producing it here too, this post-pass must become a
+  // no-op rather than render a bar inside a bar.
+  const usage = '👤 owner@example.com\n   5h ██████░░░░ 58% · resets 13:45';
+  eq(statusUsageGauges(usage), usage);
+  eq(statusUsageGauges(statusUsageGauges('   5h 58% · resets 13:45')), statusUsageGauges('   5h 58% · resets 13:45'));
+});
+
+// ---------------------------------------------------------------------------
+// The /status gauges: the post-pass over the SHARED window rows, and the ctx row
+// ---------------------------------------------------------------------------
+
+/** The bar out of a ctx row, marker included. */
+const CTX_BAR = (row) => /^ +ctx (\S+) /.exec(row)[1];
+
+t('gauges: ★ NOTHING in /status may carry markdown, because it is sent as plain text', () => {
+  // THE regression this whole block exists to prevent, and the one every
+  // builder test in this file is blind to on its own. bridge.mjs sends /status
+  // with `send(..., { markdown: false })`, which posts the text with NO
+  // parse_mode, because titles, repo names and cwds carry _ and *. A backtick
+  // in a builder that feeds this surface is therefore a literal backtick on the
+  // phone: the first cut of the gauge wrapped the bar in a code span copied
+  // from /account, every test passed, and it would have shipped ` on three
+  // rows of every /status. The strings were right; the send mode was the bug.
+  //
+  // If the /status arm ever does render HTML, this assertion is the thing to
+  // come back and delete, deliberately, along with the comment above gauge().
+  const s = statusHeader({
+    ...HEADER_ARGS,
+    ctxPct: 24,
+    autoCompact: autoCompactStatusLine({ enabled: true, thresholdPercent: 60 }),
+    usageBlock: '👤 owner@example.com\n   5h 58% · resets 13:45\n   wk n/a · no reset time',
+  });
+  for (const ch of ['`', '<', '>', '&']) {
+    ok(!s.includes(ch), `${JSON.stringify(ch)} reaches a plain-text surface as itself:\n${s}`);
+  }
+  ok(!/\*|_/.test(s), `a markdown emphasis character would survive the plain path and read as itself:\n${s}`);
+});
+
+t('gauges: ★ the bar is usageBar()\'s, not a second renderer that looks like it', () => {
+  const out = statusUsageGauges('   5h 6% · resets 6:50pm · 4h 44m left\n   wk 32% · resets Fri 25 Sep 9:00pm · 4d 6h left');
+  ok(out.includes(`5h ${usageBar(6)}`), 'the 5h bar drifted from usageBar()');
+  ok(out.includes(`wk ${usageBar(32)}`), 'the wk bar drifted from usageBar()');
+  ok(ctxGaugeRow({ ctxPct: 24 }).includes(usageBar(24)), 'the ctx bar drifted from usageBar()');
+});
+
+t('gauges: the real windowInline output, end to end through the shared module', () => {
+  // Not a hand-typed fixture: the shared builder renders it, so a rewording on
+  // the other side of the byte-locked boundary fails HERE rather than silently
+  // turning the post-pass into a pass-through in production.
+  const now = Date.parse('2026-09-21T14:06:00-04:00');
+  const row = {
+    state: 'ok',
+    email: 'owner@example.com',
+    usage: {
+      fiveHour: { percent: 6, resetsAt: '2026-09-21T22:50:00.000Z', locked: false },
+      sevenDay: { percent: 32, resetsAt: '2026-09-26T01:00:00.000Z', locked: false },
+    },
+  };
+  const lines = statusUsageGauges(usageLine(row, { now, timeZone: 'America/New_York' })).split('\n');
+  eq(lines[0], '👤 owner@example.com');
+  eq(lines[1], '   5h █░░░░░░░░░ 6% · resets 6:50pm · 4h 44m left');
+  eq(lines[2], '   wk ███░░░░░░░ 32% · resets Fri 25 Sep 9:00pm · 4d 6h left');
+});
+
+t('gauges: the ⛔ lock survives, outside the span, exactly where /account puts it', () => {
+  eq(statusUsageGauges('   wk 95% ⛔ · resets 9:00pm · 2h left'), '   wk ██████████ 95% ⛔ · resets 9:00pm · 2h left');
+});
+
+t('gauges: n/a stays n/a and draws an EMPTY bar, never a confident zero', () => {
+  const out = statusUsageGauges('   5h n/a · no reset time');
+  eq(out, '   5h ░░░░░░░░░░ n/a · no reset time');
+  ok(!out.includes('0%'), 'missing data must not render as a number');
+});
+
+t('gauges: the no-active-block row keeps its words', () => {
+  eq(statusUsageGauges('   5h 0% · no active block'), '   5h ░░░░░░░░░░ 0% · no active block');
+});
+
+t('gauges: anything that is not a window row passes through untouched', () => {
+  for (const s of ['👤 owner@example.com', '   ⚠️ usage unavailable', '🗂 Accounts · 2 free of 4', '   5h something else', '', null]) {
+    eq(statusUsageGauges(s), s, `rewrote a line it does not own: ${s}`);
+  }
+});
+
+t('gauges: the bar is a fixed ten-cell track at every percentage', () => {
+  const tracks = new Set();
+  for (const p of [0, 6, 24, 100]) tracks.add(/^   5h (\S+) /.exec(statusUsageGauges(`   5h ${p}% · x`))[1].length);
+  eq(tracks.size, 1, `the track changed length between percentages: ${[...tracks]}`);
+  eq([...tracks][0], 10);
+});
+
+t('ctx: the gauge replaces the bare number, on its own row under the chat line', () => {
+  eq(ctxGaugeRow({ ctxPct: 24 }), '   ctx ██░░░░░░░░ 24%', 'no threshold known, no marker and no prose');
+  eq(ctxGaugeRow({ ctxPct: null }), null, 'an unknown context window prints no row at all');
+  eq(ctxGaugeRow({}), null);
+});
+
+t('ctx: ★ the threshold is a BOUNDARY between cells, not a cell', () => {
+  eq(ctxGaugeRow({ ctxPct: 24, compactAt: 60 }), '   ctx ██░░░░▏░░░░ 24% · 36% to compact');
+  const bar = CTX_BAR(ctxGaugeRow({ ctxPct: 24, compactAt: 60 }));
+  eq([...bar].length, 11, 'ten cells plus one marker: every cell still means ten percent');
+  eq([...bar].filter((c) => c === '█' || c === '░').length, 10, 'the marker must not eat a cell');
+});
+
+t('ctx: the marker tracks the threshold it was given', () => {
+  const at = (n) => CTX_BAR(ctxGaugeRow({ ctxPct: 58, compactAt: n })).indexOf('▏');
+  eq(at(40), 4);
+  eq(at(60), 6);
+  eq(at(80), 8);
+  eq(at(100), 10, 'a threshold at the far edge marks the far edge');
+});
+
+t('ctx: the prose is the GAP, because the 📦 row below already prints the threshold', () => {
+  eq(ctxGaugeRow({ ctxPct: 24, compactAt: 60 }).endsWith('36% to compact'), true);
+  eq(ctxGaugeRow({ ctxPct: 58, compactAt: 60 }).endsWith('2% to compact'), true);
+  for (const p of [60, 62, 84, 97, 100]) {
+    ok(ctxGaugeRow({ ctxPct: p, compactAt: 60 }).endsWith('past compact'), `at ${p}% it is past the trigger`);
+  }
+  // 58 and 62 draw the SAME six filled cells (usageBar rounds honestly), so the
+  // prose is what separates "about to fire" from "already past", and it earns
+  // its place on the line rather than repeating the bar.
+  const six = (p) => CTX_BAR(ctxGaugeRow({ ctxPct: p, compactAt: 60 }));
+  eq(six(58), six(62), 'the fixture this test rests on: both round to six cells');
+  ok(ctxGaugeRow({ ctxPct: 58, compactAt: 60 }) !== ctxGaugeRow({ ctxPct: 62, compactAt: 60 }));
+});
+
+t('ctx: a threshold that is absent, off or nonsense draws no marker', () => {
+  for (const at of [null, undefined, 0, -5, 101, NaN, 'sixty']) {
+    const r = ctxGaugeRow({ ctxPct: 24, compactAt: at });
+    eq(r, '   ctx ██░░░░░░░░ 24%', `drew a marker for a threshold of ${String(at)}`);
+  }
+});
+
+t('ctx: the threshold is read back off the 📦 row this same file built', () => {
+  eq(compactThresholdOf(autoCompactStatusLine({ enabled: true, thresholdPercent: 60 })), 60);
+  eq(compactThresholdOf(autoCompactStatusLine({ enabled: true, thresholdPercent: 85 })), 85);
+  eq(compactThresholdOf(autoCompactStatusLine({ enabled: false })), null, 'auto compact off, nothing to mark');
+  for (const s of [null, undefined, '', '📦 auto compact on', '📦 something else · 60% · last 1:34pm']) {
+    eq(compactThresholdOf(s), null, `invented a threshold from: ${String(s)}`);
+  }
+});
+
+t('ctx: statusHeader takes the threshold directly, and the 📦 row only as fallback', () => {
+  const row = autoCompactStatusLine({ enabled: true, thresholdPercent: 60 });
+  ok(statusHeader({ name: 'Leash', ctxPct: 24, autoCompact: row }).includes('▏'), 'read off the row when nothing was passed');
+  ok(
+    statusHeader({ name: 'Leash', ctxPct: 24, compactAt: 90, autoCompact: row }).includes('66% to compact'),
+    'an explicit compactAt wins over the row, so this never needs a bridge.mjs edit to be steered',
+  );
+  ok(!statusHeader({ name: 'Leash', ctxPct: 24, autoCompact: autoCompactStatusLine({ enabled: false }) }).includes('▏'));
+});
+
+t('gauges: ★ house style on every gauge state, including the longest ones', () => {
+  const rows = [
+    ctxGaugeRow({ ctxPct: 4, compactAt: 60 }),
+    ctxGaugeRow({ ctxPct: 100, compactAt: 60 }),
+    ctxGaugeRow({ ctxPct: 58, compactAt: 100 }),
+    ctxGaugeRow({ ctxPct: 24 }),
+    statusUsageGauges('   5h 100% ⛔ · resets 6:50pm'),
+    statusUsageGauges('   wk n/a · no reset time'),
+  ];
+  for (const s of rows) {
+    houseStyle(s, 'status gauge');
+    // The marker lives in the bar or nowhere. With no code span to contain it
+    // it must never become a second separator, and the middle dot is the only
+    // separator this house has.
+    const marked = s.split(' ').filter((w) => w.includes('▏'));
+    ok(marked.length <= 1, `the marker escaped the bar: ${s}`);
+    for (const w of marked) ok(/^[█░▏]+$/.test(w), `the marker is loose in the prose: ${s}`);
+  }
+});
+
+t('gauges: ★ the marker is a BLOCK element, the same Unicode block as the bar', () => {
+  // Not taste. █ (U+2588) and ░ (U+2591) are already proven on the phone by
+  // /account; box drawing (U+2500 to U+257F) has never shipped from this repo,
+  // and a marker that lands as tofu is worse than no marker at all.
+  const bar = CTX_BAR(ctxGaugeRow({ ctxPct: 24, compactAt: 60 }));
+  for (const ch of bar) {
+    const cp = ch.codePointAt(0);
+    ok(cp >= 0x2580 && cp <= 0x259f, `U+${cp.toString(16).toUpperCase()} is outside Block Elements: ${ch}`);
+  }
 });
 
 t('status: the idle lane keeps its one-liner, in three states', () => {
@@ -1334,11 +1526,12 @@ t('auto compact: ★ the /status row, in its three states', () => {
   );
 });
 
-t('auto compact: the row sits under the chat line in the header', () => {
+t('auto compact: the row sits under the ctx gauge it describes', () => {
   const row = autoCompactStatusLine({ enabled: true, thresholdPercent: 60 });
   const lines = statusHeader({ name: 'M', session: '7f4e3041', ctxPct: 63, autoCompact: row }).split('\n');
-  eq(lines[1], '💬 chat 7f4e3041 · ctx 63%');
-  eq(lines[2], row);
+  eq(lines[1], '💬 chat 7f4e3041');
+  eq(lines[2], '   ctx ██████▏░░░░ 63% · past compact', 'the gauge sits between the chat line and the 📦 row');
+  eq(lines[3], row, 'the 📦 row still carries the fact the bar cannot: when it last fired');
   ok(!statusHeader({ name: 'M' }).includes('auto compact'), 'no row given, no row printed');
 });
 
@@ -1465,9 +1658,10 @@ t('wake-up: ★ the /status row, in its states', () => {
 t('wake-up: the row sits under the auto compact row in the header', () => {
   const ac = autoCompactStatusLine({ enabled: true, thresholdPercent: 60 });
   const wu = wakeUpStatusLine({});
+  // lines[2] is the ctx gauge, which sits between the chat line and the 📦 row.
   const lines = statusHeader({ name: 'M', session: '7f4e3041', ctxPct: 63, autoCompact: ac, wakeUp: wu }).split('\n');
-  eq(lines[2], ac);
-  eq(lines[3], wu);
+  eq(lines[3], ac);
+  eq(lines[4], wu);
   ok(!statusHeader({ name: 'M' }).includes('wake-up'), 'no row given, no row printed');
 });
 
