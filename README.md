@@ -50,7 +50,7 @@ of Node that long-polls the Telegram Bot API and pipes messages into
 | ❓ **Ask one a side question** | `/btw did the migration apply?` puts a question to a *running* worker without changing its job. It answers in one message here, then carries on with its plan untouched. [Details.](#btw-asking-a-worker-a-question-without-changing-its-job) |
 | 🧠 **A second engine, as a peer** | OpenAI Codex, if you have it. `/engine codex` moves a whole lane to it (or `engine` in `config.json`, for an install that never had Claude), a `codex:` prefix pins one message, and switching engines carries a redacted handoff of the conversation across. While every Claude account is rate limited it keeps background work moving instead of stalling. Optional, billed separately. [Details.](#codex-second-engine-and-fallback) |
 | 📊 **Live progress** | Watch tool calls stream in as it works — including subagent activity, indented. |
-| 🎙️ **Voice notes** | Talk instead of typing. Transcribed with Whisper, run as a prompt. |
+| 🎙️ **Voice notes** | Talk instead of typing. Transcribed with OpenAI speech to text (`gpt-4o-mini-transcribe` by default), run as a prompt. |
 | 📎 **Files & photos** | Send a screenshot with "why does this look broken?" — images, PDFs, code, anything ≤20MB. |
 | ⏰ **Reminders & cron** | "Remind me at 8" or "every morning summarize yesterday's commits" — the second one actually runs. |
 | 👤 **Multiple Claude accounts** | Hold a personal *and* a work subscription? Enroll both, see each one's live 5h/weekly headroom, swap with one tap. When the active account is rate limited, Leash swaps to the next one and retries your message, chat and background alike. [Details.](docs/multi-account.md) |
@@ -234,7 +234,7 @@ left to be guessed. The ack and the run bubble both say a quote went with the me
 | `codex:` / `claude:` prefix | Pins **that one message** to an engine, beating `/engine` and the config |
 | *any other* `/command` | Passed straight to Claude Code — your custom commands work |
 | photo / file | Saved to `inbox/` and handed to Claude; the caption is the instruction |
-| voice note | Transcribed (Whisper) and run as a prompt |
+| voice note | Transcribed (OpenAI speech to text) and run as a prompt |
 | `/new [bg\|all]` | Fresh chat (Claude Code's `/clear`) — the old one is archived, not deleted |
 | `/chats` | List recent chats: name, id prefix, age, directory, context size |
 | `/rename <name>` | Name the current chat so you can find it again |
@@ -855,7 +855,7 @@ code on your machine.
   fetched a web page carries text you didn't write. This is defense in depth, not
   a sandbox — the usual prompt-injection caveats for autonomous agents apply.
 - **Nothing leaves your machine** except the Telegram messages themselves (and
-  voice-note audio, if you enable Whisper transcription).
+  voice-note audio, if you enable voice-note transcription).
 
 ## Operations
 
@@ -941,6 +941,8 @@ release with an upgrade path. Nothing you have configured needs to change today.
 reset clocks on `/account`, `/usage` and `/status` — empty means this machine's
 own zone, which is only wrong if you read Leash from somewhere else),
 `openaiApiKey` (voice-note transcription; usually better as `$OPENAI_API_KEY`),
+`transcribeModel` (the OpenAI speech to text model, default `gpt-4o-mini-transcribe`;
+`whisper-1` still works),
 `logFile` (empty = the service manager's own log path), `timeoutMs` (chat lane,
 default 30 min), `bgTimeoutMs` (background workers, default 8h — that lane is for
 hour-scale jobs), `staleSec` (skip messages older than this — default 1h, so a

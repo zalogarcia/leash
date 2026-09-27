@@ -300,7 +300,7 @@ else
   echo "  Open Telegram and send your bot /help — it should answer."
   echo
   echo "  Optional next steps:"
-  echo "    • Voice notes: export OPENAI_API_KEY=…  (Whisper transcription)"
+  echo "    • Voice notes: export OPENAI_API_KEY=…  (voice-note transcription)"
   echo "    • Teach your Claude sessions to use it: see templates/CLAUDE.md.example"
   echo "    • Logs:  tail -f ~/Library/Logs/claude-telegram-bridge.log"
 fi

@@ -381,12 +381,12 @@ export function voiceUntranscribedLine(engine = 'claude', { reason = 'no_key' } 
   const lines = ['🎙️ I cannot hear that voice note'];
   if (reason === 'no_key') {
     lines.push('No OPENAI_API_KEY on this machine, and');
-    lines.push('whisper is what turns audio into words.');
+    lines.push('speech to text turns audio into words.');
   } else {
     lines.push('The transcription failed.');
   }
   lines.push(`${engine === 'codex' ? '🧠 Codex' : '🤖 Claude'} only has the file path.`);
-  // The key is named on BOTH paths: a failed whisper call and a missing key
+  // The key is named on BOTH paths: a failed transcription call and a missing key
   // leave them in the same place, and a wrong key is the most common cause of
   // the first. Only the no_key line claims it is absent.
   lines.push(reason === 'no_key' ? 'Set the key, or type the message instead.' : 'Check OPENAI_API_KEY, or type it instead.');

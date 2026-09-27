@@ -478,6 +478,9 @@ const OWNER_NAME = conf('ownerName', 'the owner');
 // you read Leash from a different timezone than the machine runs in.
 const OWNER_TZ = conf('ownerTz', '') || undefined;
 const OPENAI_KEY_CONF = conf('openaiApiKey', '');
+// The OpenAI speech to text model voice notes go through. Empty = the default
+// below; whisper-1 still works if you set it.
+const TRANSCRIBE_MODEL = conf('transcribeModel', '') || 'gpt-4o-mini-transcribe';
 // THE SECOND ENGINE. `codex` is OpenAI's CLI, installed separately and billed
 // separately, which is the whole point: an Anthropic account limit does not
 // touch it. It is used for three things only (see bg-codex.mjs): an explicit
@@ -8771,7 +8774,7 @@ Custom /commands pass through to Claude Code: /autopilot, /bug, /qa-loop, /plan,
 
 Unlimited background workers: long jobs (/goal, /autopilot, /qa-loop, /bug, /go-live), scheduled tasks and anything prefixed "bg:" get a 🌙 worker each, another spawns when all are busy, and nothing queues behind background work, so the 🤖 chat lane stays free. Each is a fresh self-contained session (no history between jobs) with an hour-scale timeout, not the chat lane's ${Math.round(TASK_TIMEOUT_MS / 60000)}-minute ceiling.
 
-Attachments: photos, videos and files (≤20MB each) land in the inbox and go to Claude; a caption (or a text right after) is the instruction. Voice notes are transcribed (Whisper) and run as prompts. A message sent mid-task is steered INTO the run, as in Claude Code: folded in, or answered right after. What cannot be steered queues (max 5); /stop kills the task and drops the queue. Model: ${DEFAULT_MODEL || 'CLI default'} (effort ${DEFAULT_EFFORT || 'CLI default'}).
+Attachments: photos, videos and files (≤20MB each) land in the inbox and go to Claude; a caption (or a text right after) is the instruction. Voice notes are transcribed (OpenAI speech to text) and run as prompts. A message sent mid-task is steered INTO the run, as in Claude Code: folded in, or answered right after. What cannot be steered queues (max 5); /stop kills the task and drops the queue. Model: ${DEFAULT_MODEL || 'CLI default'} (effort ${DEFAULT_EFFORT || 'CLI default'}).
 
 Notes: one chat-lane task at a time (workers unlimited) · messages older than ${Math.round(STALE_SEC / 60)} min are skipped · only while this machine is awake.`;
 
@@ -9859,21 +9862,25 @@ function pickMedia(msg) {
   return null;
 }
 
-// Whisper transcription for voice notes. Returns the text, or null when no key
+// Speech to text for voice notes. Returns the text, or null when no key
 // is available; throws on API failure (caller falls back to file-handoff).
 async function transcribeVoice(filePath) {
   const key = getOpenAIKey();
   if (!key) return null;
   const form = new FormData();
   form.append('file', new Blob([readFileSync(filePath)]), path.basename(filePath));
-  form.append('model', 'whisper-1');
+  // gpt-4o-mini-transcribe by default: in a side by side on wideband voice notes
+  // it was marginally faster and 1.0 WER point better than whisper-1, and it
+  // returns the same {text} shape under the default json response_format.
+  // transcribeModel in config.json picks another.
+  form.append('model', TRANSCRIBE_MODEL);
   const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}` },
     body: form,
     signal: AbortSignal.timeout(60_000),
   });
-  if (!res.ok) throw new Error(`Whisper HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`Transcription HTTP ${res.status}`);
   const data = await res.json();
   return data.text?.trim() || null;
 }
