@@ -39,10 +39,15 @@ const ok = (cond, msg) => {
 
 const seed = (items) => writeFileSync(STORE, JSON.stringify({ nextId: items.length, items }, null, 2));
 const read = () => JSON.parse(readFileSync(STORE, 'utf8'));
-const run = (...args) => {
-  const r = spawnSync(process.execPath, [path.join(WORK, 'schedule.mjs'), ...args], { encoding: 'utf8' });
+// Hermetic: the suite may itself run inside a worker or a tmux pane, and the
+// write approval below is refused or allowed by those env names.
+const CLEAN_ENV = { ...process.env };
+for (const k of ['LEASH_LANE', 'LEASH_TRIGGER', 'LEASH_SCHEDULE_ID', 'LEASH_ALLOW_WRITE', 'TMUX']) delete CLEAN_ENV[k];
+const runEnv = (env, ...args) => {
+  const r = spawnSync(process.execPath, [path.join(WORK, 'schedule.mjs'), ...args], { encoding: 'utf8', env: { ...CLEAN_ENV, ...env } });
   return { code: r.status, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
 };
+const run = (...args) => runEnv({}, ...args);
 const today = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -241,7 +246,150 @@ t('remove takes the item out, and an unknown id is an error', () => {
 
 t('the usage text names the new forms', () => {
   const out = run('help').out;
-  for (const form of ['add every 3d', '--every N', '--anchor YYYY-MM-DD']) ok(out.includes(form), `usage is missing ${form}`);
+  for (const form of ['add every 3d', '--every N', '--anchor YYYY-MM-DD', '--allow-write']) ok(out.includes(form), `usage is missing ${form}`);
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n4. --allow-write: the owner approving writes in an unattended run');
+// A scheduled run is marked unattended (LEASH_TRIGGER=schedule) and hooks may
+// refuse database writes and migrations in it. This flag is the owner's
+// approval for ONE entry, so it has to be visible every time it is set.
+
+const APPROVED = 'database writes and migrations allowed in this unattended run: owner approved';
+
+t('★ add --run --allow-write stores the approval and says so in words', () => {
+  seed([]);
+  const r = run('add', 'daily', '03:00', '--run', '--allow-write', 'nightly migration check');
+  eq(r.code, 0, r.err);
+  const item = read().items[0];
+  eq(item.allowWrite, true);
+  eq(item.run, true);
+  eq(item.text, 'nightly migration check', 'the text after a bare --allow-write must survive');
+  ok(r.out.includes(APPROVED), r.out);
+  eq(r.out.split('\n').length, 1, 'one confirmation line');
+});
+
+t('★ --allow-write without --run is refused in one line, and nothing is written', () => {
+  seed([]);
+  const r = run('add', 'daily', '03:00', '--allow-write', 'call the accountant');
+  ok(r.code !== 0, 'a reminder was given write approval');
+  eq(r.err.split('\n').length, 1, `the refusal must be one line:\n${r.err}`);
+  ok(r.err.includes('--run'), r.err);
+  eq(read().items.length, 0, 'the refused entry was written anyway');
+});
+
+t('add --allow-write false stores nothing, and the text still survives', () => {
+  seed([]);
+  const r = run('add', 'in', '90m', '--run', '--allow-write', 'false', 'audit');
+  eq(r.code, 0, r.err);
+  ok(!('allowWrite' in read().items[0]), JSON.stringify(read().items[0]));
+  eq(read().items[0].text, 'audit');
+  ok(!r.out.includes(APPROVED), r.out);
+});
+
+// QA 2026-09-27 round 2: the approval is the owner's. A worker or a scheduled
+// run (the run the write guard just held) must not be able to grant it to
+// itself; a tmux pane is the owner's own session and may.
+t('★ --allow-write from a background worker is refused, nothing written', () => {
+  seed([]);
+  const r = runEnv({ LEASH_LANE: 'bg' }, 'add', 'in', '1m', '--run', '--allow-write', 're-run the held write');
+  ok(r.code !== 0, `expected a refusal, got ${r.code} ${r.out}`);
+  ok(/owner/i.test(r.err) && /worker|scheduled run/i.test(r.err), r.err);
+  eq(read().items.length, 0, 'nothing may be stored');
+});
+t('★ --allow-write from inside a scheduled run is refused on update too', () => {
+  seed([{ id: 23, kind: 'daily', at: '03:00', text: 'nightly', run: true }]);
+  const r = runEnv({ LEASH_LANE: 'bg', LEASH_TRIGGER: 'schedule', LEASH_SCHEDULE_ID: '23' }, 'update', '23', '--allow-write');
+  ok(r.code !== 0, `expected a refusal, got ${r.code} ${r.out}`);
+  ok(read().items[0].allowWrite !== true, 'the approval must not be stored');
+});
+t('a worker may still REVOKE an approval', () => {
+  seed([{ id: 23, kind: 'daily', at: '03:00', text: 'nightly', run: true, allowWrite: true }]);
+  const r = runEnv({ LEASH_LANE: 'bg' }, 'update', '23', '--allow-write', 'false');
+  eq(r.code, 0, r.err);
+  ok(read().items[0].allowWrite !== true, 'revoked');
+});
+t('the chat lane and a tmux pane may grant it', () => {
+  seed([]);
+  eq(runEnv({ LEASH_LANE: 'chat' }, 'add', 'in', '1m', '--run', '--allow-write', 'a').code, 0, 'chat lane');
+  eq(runEnv({ LEASH_LANE: 'bg', TMUX: '/tmp/tmux-501/default,1,0' }, 'add', 'in', '1m', '--run', '--allow-write', 'b').code, 0, 'tmux pane with an inherited LEASH_LANE');
+});
+
+t('★ update --allow-write true approves a run entry and echoes it', () => {
+  seed([{ id: 1, kind: 'daily', at: '03:00', text: 'sync', run: true }]);
+  const r = run('update', '1', '--allow-write', 'true');
+  eq(r.code, 0, r.err);
+  eq(read().items[0].allowWrite, true);
+  ok(r.out.includes(APPROVED), r.out);
+});
+
+t('★ update --allow-write false takes it back and says so', () => {
+  seed([{ id: 1, kind: 'daily', at: '03:00', text: 'sync', run: true, allowWrite: true }]);
+  const r = run('update', '1', '--allow-write', 'false');
+  eq(r.code, 0, r.err);
+  ok(!('allowWrite' in read().items[0]), 'the field must go, not become false');
+  ok(!r.out.includes(APPROVED), r.out);
+  ok(r.out.includes('no longer allowed'), r.out);
+});
+
+t('update --allow-write true on a reminder is refused, and the store is untouched', () => {
+  const reminder = { id: 1, kind: 'daily', at: '03:00', text: 'call' };
+  seed([{ ...reminder }]);
+  const r = run('update', '1', '--allow-write', 'true');
+  ok(r.code !== 0, 'a reminder was approved for writes');
+  eq(JSON.stringify(read().items[0]), JSON.stringify(reminder));
+});
+
+t('update --run true --allow-write true in one call works', () => {
+  seed([{ id: 1, kind: 'daily', at: '03:00', text: 'call' }]);
+  const r = run('update', '1', '--run', 'true', '--allow-write', 'true');
+  eq(r.code, 0, r.err);
+  eq(read().items[0].run, true);
+  eq(read().items[0].allowWrite, true);
+});
+
+t('update --allow-write with a value that is not true or false is a usage error', () => {
+  seed([{ id: 1, kind: 'daily', at: '03:00', text: 'sync', run: true }]);
+  ok(run('update', '1', '--allow-write', 'yes').code !== 0, 'yes was read as approval');
+  ok(!('allowWrite' in read().items[0]));
+});
+
+t('★ turning --run off drops the approval with it: a reminder cannot carry it', () => {
+  seed([{ id: 1, kind: 'daily', at: '03:00', text: 'sync', run: true, allowWrite: true }]);
+  const r = run('update', '1', '--run', 'false');
+  eq(r.code, 0, r.err);
+  ok(!('allowWrite' in read().items[0]), JSON.stringify(read().items[0]));
+  ok(r.out.includes('no longer allowed'), r.out);
+});
+
+t('an update that does not name the flag keeps the approval and still echoes it', () => {
+  seed([{ id: 1, kind: 'daily', at: '03:00', text: 'sync', run: true, allowWrite: true }]);
+  const r = run('update', '1', '--text', 'nightly sync');
+  eq(r.code, 0, r.err);
+  eq(read().items[0].allowWrite, true);
+  ok(r.out.includes(APPROVED), r.out);
+});
+
+t('★ an existing entry without the field is untouched by an update and gets no marker', () => {
+  const old = { id: 1, kind: 'daily', at: '03:00', text: 'sync', run: true };
+  seed([{ ...old }]);
+  const r = run('update', '1', '--text', 'sync');
+  eq(r.code, 0, r.err);
+  eq(JSON.stringify(read().items[0]), JSON.stringify(old));
+  ok(!r.out.includes('writes'), r.out);
+});
+
+t('list marks an approved entry, and only that one', () => {
+  seed([
+    { id: 1, kind: 'daily', at: '03:00', text: 'a', run: true },
+    { id: 2, kind: 'daily', at: '03:00', text: 'b', run: true, allowWrite: true },
+    { id: 3, kind: 'daily', at: '08:00', text: 'c' },
+  ]);
+  const lines = run('list').out.split('\n');
+  ok(!lines[0].includes('writes'), lines[0]);
+  ok(lines[1].includes('writes approved'), lines[1]);
+  ok(!lines[2].includes('writes'), lines[2]);
+  ok(!/[\u2013\u2014]/.test(lines.join('\n')), 'no dash in the marker');
 });
 
 // ---------------------------------------------------------------------------

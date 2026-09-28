@@ -9,9 +9,10 @@
 //   node schedule.mjs add every 3d 12:00 "text"         # every N days, N 2..365
 //   node schedule.mjs add once 2026-07-30 09:30 "text"  # specific date+time
 //   node schedule.mjs add in 90m "text"                 # relative: m|h|d
+//   node schedule.mjs add daily 03:00 --run --allow-write "text"  # a run approved for db writes
 //   node schedule.mjs remove <id>
 //   node schedule.mjs update <id> [--at HH:MM|YYYY-MM-DDTHH:MM] [--text "…"] [--run true|false]
-//                                 [--every N] [--anchor YYYY-MM-DD]
+//                                 [--every N] [--anchor YYYY-MM-DD] [--allow-write true|false]
 //
 // Flags: --run  → execute the text as a Claude task instead of sending a
 //        plain reminder (same as the "run:" prefix in Telegram's /remind).
@@ -20,6 +21,12 @@
 //        --anchor YYYY-MM-DD  → record that date as the last fire, so the next
 //        one lands on anchor + N days. `list` prints that date, so the way to
 //        make an every-3d item fire on the 13th is --anchor 2026-09-10.
+//        --allow-write  → with --run only: the owner approves database writes
+//        and migrations in this unattended run. A scheduled run is marked as
+//        one in its worker's env (LEASH_TRIGGER=schedule) so hooks can guard
+//        it; this adds LEASH_ALLOW_WRITE=1 for this entry. Turning --run off
+//        takes the approval with it. A background worker or a scheduled run
+//        cannot grant it (refused); only revoke.
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import path from 'node:path';
@@ -58,8 +65,13 @@ const localToday = () => {
 // an every-N-days item shows the date it actually lands on next.
 const fmt = (s) => {
   const next = nextDaily(s, localToday());
-  return `#${s.id} · ${describeWhen(s)}${next ? ` (next ${next})` : ''} · ${s.run ? 'run' : 'remind'} · ${s.text}`;
+  return `#${s.id} · ${describeWhen(s)}${next ? ` (next ${next})` : ''} · ${s.run ? `run${s.allowWrite === true ? ' (writes approved)' : ''}` : 'remind'} · ${s.text}`;
 };
+// The owner's approval is a permission, so the confirmation says it in words
+// every time an approved entry is added or updated, and says so when it goes.
+const APPROVED = 'database writes and migrations allowed in this unattended run: owner approved';
+const REVOKED = 'database writes and migrations no longer allowed in this unattended run';
+const writeNote = (item, revoked) => (item.allowWrite === true ? ` · ${APPROVED}` : revoked ? ` · ${REVOKED}` : '');
 const die = (m) => {
   console.error(m);
   process.exit(1);
@@ -81,11 +93,24 @@ const hasFlag = (name) => argv.includes(`--${name}`);
 // owns the next token when that token is literally true or false, the same rule
 // `update` documents below. Treating every flag as value-taking made
 // `add daily 08:00 --run "text"` swallow the text and die with "missing text".
+// `--allow-write` follows the same rule, for the same reason.
 const VALUE_FLAGS = new Set(['at', 'text', 'every', 'anchor']);
+const BOOL_FLAGS = new Set(['run', 'allow-write']);
+
+// THE WRITE APPROVAL IS THE OWNER'S. A background worker or a scheduled run
+// (LEASH_LANE=bg, or LEASH_TRIGGER set, outside tmux) is exactly the run the
+// write guard in ~/.claude holds, so it must not be able to grant itself the
+// approval: refused here, on add and on update. Revoking is always allowed. A
+// tmux pane is the owner's own session (its env can carry LEASH_LANE from the
+// tmux server), and the chat lane is where he asks for it.
+const grantFromUnattended = () =>
+  !process.env.TMUX && (process.env.LEASH_LANE === 'bg' || !!process.env.LEASH_TRIGGER);
+const REFUSE_GRANT =
+  "--allow-write is the owner's approval for database writes and migrations, and a background worker or a scheduled run cannot grant it (that is the run the write guard holds). Nothing was changed. Put the write in your report for Zalo; he approves it from his own chat.";
 const takesValue = (tok, next) => {
   if (!tok?.startsWith('--')) return false;
   const name = tok.slice(2);
-  return VALUE_FLAGS.has(name) || (name === 'run' && (next === 'true' || next === 'false'));
+  return VALUE_FLAGS.has(name) || (BOOL_FLAGS.has(name) && (next === 'true' || next === 'false'));
 };
 const positional = argv.filter((a, i) => !a.startsWith('--') && !(i > 0 && takesValue(argv[i - 1], a)));
 
@@ -137,10 +162,18 @@ if (cmd === 'list') {
   if (item.kind === 'once' && item.at <= Date.now())
     die(`${new Date(item.at).toLocaleString()} is in the past — nothing scheduled; give a future date/time`);
   if (hasFlag('run')) item.run = true;
+  // Refused BEFORE anything is saved: an approval for writes only means
+  // something on an entry that runs, and a reminder carrying one would read as
+  // approved the day someone turns --run on.
+  if (hasFlag('allow-write') && flag('allow-write') !== 'false') {
+    if (grantFromUnattended()) die(REFUSE_GRANT);
+    if (!item.run) die('--allow-write needs --run: only a scheduled run can be approved for database writes and migrations');
+    item.allowWrite = true;
+  }
   item.id = store.nextId = (store.nextId || 0) + 1;
   store.items.push(item);
   save(store);
-  console.log(`added ${fmt(item)}`);
+  console.log(`added ${fmt(item)}${writeNote(item, false)}`);
 } else if (cmd === 'remove') {
   const id = Number(positional[1]);
   const before = store.items.length;
@@ -216,8 +249,27 @@ if (cmd === 'list') {
     if (v === 'false') delete item.run;
     else item.run = true;
   }
+  // `--allow-write true|false`, read AFTER --run so the two can be set in one
+  // call. Bare means true, like --run. Any other value is refused rather than
+  // guessed at: this is a permission.
+  const hadWrite = item.allowWrite === true;
+  if (argv.includes('--allow-write')) {
+    const v = flag('allow-write');
+    if (v === 'false') delete item.allowWrite;
+    else if (v === undefined || v === 'true' || v.startsWith('--')) {
+      if (grantFromUnattended()) die(REFUSE_GRANT);
+      if (!item.run) die('--allow-write needs a --run schedule: only a scheduled run can be approved for database writes and migrations');
+      item.allowWrite = true;
+    } else die('update <id> --allow-write true|false');
+  }
+  // A reminder cannot carry the approval, so turning --run off takes it too.
+  if (!item.run) delete item.allowWrite;
   save(store);
-  console.log(`updated ${fmt(item)}`);
+  console.log(`updated ${fmt(item)}${writeNote(item, hadWrite && item.allowWrite !== true)}`);
 } else {
-  console.log(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n').slice(1, 22).join('\n'));
+  // The usage is the header comment, read up to its first non-comment line so a
+  // new flag documented there cannot fall off the end of a hard-coded range.
+  const lines = readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n');
+  const end = lines.findIndex((l, i) => i > 0 && !l.startsWith('//'));
+  console.log(lines.slice(1, end === -1 ? undefined : end).join('\n'));
 }
