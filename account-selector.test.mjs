@@ -11,7 +11,18 @@
 //
 //   node account-selector.test.mjs
 
-import { probeVerdict, selectAccount, EXHAUSTED_PERCENT, FALLBACK_WALL_SECONDS, PROBE_TIMEOUT_MS } from './account-selector.mjs';
+import {
+  probeVerdict,
+  selectAccount,
+  limitClearVerdict,
+  createRecheckLimiter,
+  EXHAUSTED_PERCENT,
+  FALLBACK_WALL_SECONDS,
+  PROBE_TIMEOUT_MS,
+  CLEAR_BELOW_PERCENT,
+  CLEAR_EVIDENCE_MAX_AGE_MS,
+  RECHECK_INTERVAL_MS,
+} from './account-selector.mjs';
 
 let pass = 0;
 const failures = [];
@@ -333,6 +344,182 @@ await t('★ a candidate is never asked twice, whatever the overlay says', async
   // candidate is taken rather than walled. Either answer is fine here; not
   // returning at all is not.
   ok(r.outcome === 'selected' || r.outcome === 'all_walled', r.outcome);
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n4. a wall the ledger holds is re-checked, and lifted on strong evidence only');
+// ---------------------------------------------------------------------------
+// 2026-09-30: a paid usage reset left an account at 5h 0% and weekly 0% on
+// /account while the ledger still held its weekly wall for another day, and
+// nothing ever asked again. These pin both halves: the reading that frees it,
+// and every weaker reading that must not.
+
+const MIN = 60_000;
+// A lookup row as account-usage.mjs builds one: stamped with when it was read.
+const read = (usage, name, readAt = NOW - 20_000) => ({ name, state: 'ok', usage, readAt });
+const RESET = (name, readAt) => read({ fiveHour: win(0, null), sevenDay: win(0, iso(40 * HOUR)), scoped: [] }, name, readAt);
+const NEAR = (name, pct = 99) => read({ fiveHour: win(3, iso(4 * HOUR)), sevenDay: win(pct, iso(40 * HOUR)), scoped: [] }, name);
+// A wall set well before the re-check interval, so only the reading decides.
+const OLD_WALL = new Date(NOW - 2 * HOUR).toISOString();
+const walled = (name, extra = {}) => slot(name, { limitedUntil: secs(22 * HOUR), limitedVerifiedAt: OLD_WALL, ...extra });
+
+await t('★ THE PAID RESET: a fresh 0% reading of this slot clears its wall, with the numbers', () => {
+  const v = limitClearVerdict(RESET('b'), { name: 'b', now: NOW, wallSetAt: OLD_WALL });
+  eq(v.clear, true, v.reason);
+  eq(v.reason, '5h 0%, weekly 0%');
+});
+
+await t('the threshold is derived from the tiers: 90, under the 95 near-ceiling tier', () => {
+  eq(CLEAR_BELOW_PERCENT, 90);
+  ok(CLEAR_BELOW_PERCENT < 95 && CLEAR_BELOW_PERCENT < EXHAUSTED_PERCENT, 'a window the rotation could still read as the wall must never free it');
+  eq(limitClearVerdict(NEAR('b', 89), { name: 'b', now: NOW }).clear, true, '89 has room');
+  eq(limitClearVerdict(NEAR('b', 90), { name: 'b', now: NOW }).clear, false, '90 is near the ceiling');
+});
+
+for (const [what, row, re] of [
+  ['★ a window at 99% (still near its ceiling)', NEAR('b', 99), /weekly window is at 99%/],
+  ['a scoped per-model window near its ceiling', read({ fiveHour: win(0, null), sevenDay: win(10, iso(40 * HOUR)), scoped: [{ label: 'Fable', percent: 97, resetsAt: iso(40 * HOUR) }] }, 'b'), /weekly Fable window is at 97%/],
+  ['a locked window, whatever percent it reads', read({ fiveHour: win(0, null, { locked: 'usage_credits' }), sevenDay: win(0, iso(40 * HOUR)), scoped: [] }, 'b'), /5h window is locked/],
+  ['an unreadable percent', read({ fiveHour: win(null, null), sevenDay: win(0, iso(40 * HOUR)), scoped: [] }, 'b'), /5h window is unreadable/],
+  ['a reading with no weekly window', read({ fiveHour: win(0, null), sevenDay: null, scoped: [] }, 'b'), /no weekly window/],
+  ['★ a failed probe (null)', null, /no usage reading/],
+  ['★ a failed probe (an unavailable row)', { name: 'b', state: 'unavailable', error: 'usage unavailable (HTTP 429)', usage: null, readAt: NOW }, /HTTP 429/],
+  ['a credential state row', { name: 'b', state: 'refresh-failed', error: 'refresh refused', usage: null }, /refresh refused/],
+  ["★ ANOTHER slot's row, however clean", RESET('c'), /belongs to "c"/],
+  ['★ a stale reading (older than a few minutes)', RESET('b', NOW - CLEAR_EVIDENCE_MAX_AGE_MS - 1_000), /s old/],
+  ['a reading with no time on it', { ...RESET('b'), readAt: undefined }, /age is unknown/],
+  ['a reading dated in the future', RESET('b', NOW + 5 * MIN), /future/],
+  ['a live session (stream) reading, fresh or not', { name: 'b', state: 'ok', usage: RESET('b').usage, source: { kind: 'stream', at: NOW - 5_000 } }, /live session reading/],
+]) {
+  await t(`${what} keeps the wall`, () => {
+    const v = limitClearVerdict(row, { name: 'b', now: NOW, wallSetAt: OLD_WALL });
+    eq(v.clear, false, `cleared on: ${JSON.stringify(row)}`);
+    ok(re.test(v.reason), v.reason);
+  });
+}
+
+await t('★ a wall set under five minutes ago is not cleared by any reading', () => {
+  eq(RECHECK_INTERVAL_MS, 5 * MIN);
+  const young = limitClearVerdict(RESET('b'), { name: 'b', now: NOW, wallSetAt: new Date(NOW - 90_000).toISOString() });
+  eq(young.clear, false, 'a death 90s ago is fresher evidence than a window that cannot see why it died');
+  ok(/set 90s ago/.test(young.reason), young.reason);
+  eq(limitClearVerdict(RESET('b'), { name: 'b', now: NOW, wallSetAt: NOW - 5 * MIN }).clear, true, 'five minutes on, the reading decides');
+});
+
+await t('★ the limiter: one re-check per account per interval, and the wall counts as the first', () => {
+  const l = createRecheckLimiter();
+  eq(l.take('b', NOW), true, 'never checked: due');
+  eq(l.take('b', NOW + 4 * MIN), false, 'four minutes later: held');
+  eq(l.take('c', NOW + 4 * MIN), true, 'per account, not global');
+  eq(l.take('b', NOW + 5 * MIN), true, 'five minutes later: due again');
+  eq(l.due('d', NOW, { since: new Date(NOW - 2 * MIN).toISOString() }), false, 'a wall set two minutes ago is its own first check');
+  eq(l.due('d', NOW, { since: new Date(NOW - 6 * MIN).toISOString() }), true);
+});
+
+await t('★ every candidate walled: the re-check probes the walled slot and SELECTS it when clear', async () => {
+  const h = harness({ b: RESET('b') });
+  const decisions = [];
+  const r = await selectAccount({
+    accounts: [slot('a'), walled('b')],
+    activeName: 'a',
+    now: NOW,
+    probe: h.probe,
+    recheck: createRecheckLimiter(),
+    onDecision: (d) => decisions.push(d),
+  });
+  eq(r.outcome, 'selected');
+  eq(r.name, 'b');
+  deepEq(r.cleared, [{ name: 'b', reason: '5h 0%, weekly 0%' }], 'the caller persists this through clearLimit');
+  deepEq(h.asked, ['b']);
+  const d = decisions.find((x) => x.decision === 'account_limit_cleared_by_probe');
+  ok(d, JSON.stringify(decisions));
+  eq(d.account, 'b');
+  eq(d.wasUntil, secs(22 * HOUR), 'the decision line names the wall it lifted');
+  eq(d.reason, '5h 0%, weekly 0%', 'and the numbers that justified it');
+});
+
+for (const [what, probeAnswer] of [
+  ['★ a walled slot at 99% stays walled', NEAR('b', 99)],
+  ['★ a failed probe (throws) keeps the wall', 'throw'],
+  ['★ a failed probe (unreadable) keeps the wall', null],
+  ["★ another slot's clean row keeps the wall", RESET('c')],
+  ['a stale clean row keeps the wall', RESET('b', NOW - 10 * MIN)],
+]) {
+  await t(what, async () => {
+    const h = harness({ b: probeAnswer });
+    const decisions = [];
+    const r = await selectAccount({
+      accounts: [slot('a', { limitedUntil: secs(2 * HOUR) }), walled('b')],
+      activeName: 'a',
+      now: NOW,
+      probe: h.probe,
+      recheck: createRecheckLimiter(),
+      onDecision: (d) => decisions.push(d),
+    });
+    eq(r.outcome, 'all_walled');
+    deepEq(r.cleared, []);
+    deepEq(h.asked, ['b'], 'it did ask');
+    ok(decisions.some((d) => d.decision === 'account_limit_kept' && d.account === 'b'), JSON.stringify(decisions));
+    ok(!decisions.some((d) => d.decision === 'account_limit_cleared_by_probe'), JSON.stringify(decisions));
+    eq(r.earliest, secs(2 * HOUR), 'the wall clock is unchanged');
+  });
+}
+
+await t('★ the rate limit holds across selections: one probe per walled slot per five minutes', async () => {
+  const l = createRecheckLimiter();
+  const h = harness({ b: NEAR('b', 99), c: NEAR('c', 99) });
+  const run = (now) =>
+    selectAccount({ accounts: [slot('a'), walled('b'), walled('c')], activeName: 'a', now, probe: h.probe, recheck: l });
+  await run(NOW);
+  deepEq(h.asked, ['b', 'c'], 'the first pass asks each walled slot once');
+  await run(NOW + MIN);
+  await run(NOW + 4 * MIN);
+  deepEq(h.asked, ['b', 'c'], 'a message a minute must not become a probe a minute');
+  await run(NOW + 5 * MIN);
+  deepEq(h.asked, ['b', 'c', 'b', 'c'], 'five minutes on, each is asked again');
+});
+
+await t('the ledger-free path is unchanged: a free healthy candidate wins and no wall is re-checked', async () => {
+  const h = harness({ b: RESET('b'), c: HEALTHY('c') });
+  const r = await selectAccount({ accounts: [slot('a'), walled('b'), slot('c')], activeName: 'a', now: NOW, probe: h.probe, recheck: createRecheckLimiter() });
+  eq(r.name, 'c');
+  deepEq(r.cleared, []);
+  deepEq(h.asked, ['c'], 'a known wall costs nothing while something free has room');
+});
+
+await t('the active account and a young wall are never re-checked', async () => {
+  const h = harness({ a: RESET('a'), b: RESET('b') });
+  const r = await selectAccount({
+    accounts: [walled('a'), walled('b', { limitedVerifiedAt: new Date(NOW - 2 * MIN).toISOString() })],
+    activeName: 'a',
+    now: NOW,
+    probe: h.probe,
+    recheck: createRecheckLimiter(),
+  });
+  eq(r.outcome, 'all_walled');
+  deepEq(h.asked, [], 'the active one just died, and b was walled two minutes ago');
+});
+
+await t('with no active account (the wall sweep) the live slot is re-checked too', async () => {
+  const h = harness({ a: RESET('a') });
+  const r = await selectAccount({ accounts: [walled('a'), walled('b')], activeName: null, now: NOW, probe: h.probe, recheck: createRecheckLimiter() });
+  eq(r.name, 'a');
+  deepEq(r.cleared.map((c) => c.name), ['a']);
+});
+
+await t('a wall discovered by THIS pass is not re-checked in the same pass', async () => {
+  const h = harness({ b: SPENT('b') });
+  const r = await selectAccount({ accounts: [slot('a'), slot('b')], activeName: 'a', now: NOW, probe: h.probe, recheck: createRecheckLimiter() });
+  eq(r.outcome, 'all_walled');
+  deepEq(h.asked, ['b'], 'asked once, as a candidate, and not again as a wall');
+});
+
+await t('without `recheck` a known wall is still never asked about', async () => {
+  const h = harness({ b: RESET('b') });
+  const r = await selectAccount({ accounts: [slot('a'), walled('b')], activeName: 'a', now: NOW, probe: h.probe });
+  eq(r.outcome, 'all_walled');
+  deepEq(h.asked, []);
+  deepEq(r.cleared, []);
 });
 
 // ---------------------------------------------------------------------------

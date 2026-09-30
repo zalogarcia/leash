@@ -913,7 +913,11 @@ export function createAccountUsage({
           /* a listener never costs the lookup its answer */
         }
       }
-      return cacheSet(acct.name, { ...base, state: 'ok', usage, refreshed: !!tok.refreshed }, t, ttlMs);
+      // `readAt` is when this lookup was made, and it travels with the cached
+      // copy, so a reader can tell a reading from a belief: the rotation's
+      // re-check (account-selector.mjs limitClearVerdict) lifts a ledger wall
+      // on a young reading only. A stream row carries its time in `source.at`.
+      return cacheSet(acct.name, { ...base, state: 'ok', usage, refreshed: !!tok.refreshed, readAt: t }, t, ttlMs);
     }
 
     // Still 'unavailable', so every consumer that branches on state is

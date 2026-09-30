@@ -1907,6 +1907,32 @@ await t('liveSourceLine: one fact, the middle dot, no dash, fits a phone line', 
   eq(liveSourceLine(null), null);
 });
 
+await t('★ a lookup row carries readAt, and its cached copy keeps the ORIGINAL time', async () => {
+  // The rotation's re-check (account-selector.mjs limitClearVerdict) lifts a
+  // ledger wall on a young reading only, so a cached row must not look fresh.
+  const r = clockRig(usageFetch({}).impl);
+  const first = await r.usage.all();
+  eq(first.rows.map((x) => x.readAt), [NOW, NOW, NOW], 'every lookup row is stamped with the clock it was read at');
+  r.clock.t = NOW + 30_000; // inside the TTL: served from the cache
+  const cached = await r.usage.all();
+  ok(cached.rows.every((x) => x.cached === true), 'the second read was not served from the cache');
+  eq(cached.rows.map((x) => x.readAt), [NOW, NOW, NOW], 'a cached copy was re-stamped as if it were fresh');
+  const probe = await r.usage.one('second@example.com');
+  eq(probe.readAt, NOW + 30_000, 'the rotation probe reads fresh, so it is stamped now');
+});
+
+await t('a failed lookup and a stream row carry no readAt', async () => {
+  const f = failingFetch('acc-a', RL429);
+  const r = streamRig(f.impl, { 'second@example.com': reading(20_000) });
+  const snap = await r.usage.all({ stream: true });
+  const streamed = snap.rows.find((x) => x.name === 'second@example.com');
+  eq(streamed.source?.kind, 'stream');
+  eq(streamed.readAt, undefined, 'a stream row dates itself in source.at, never as a lookup');
+  const failed = await r.usage.one('second@example.com');
+  eq(failed.state, 'unavailable');
+  eq(failed.readAt, undefined);
+});
+
 // ---------- report ----------
 rmSync(TMP, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${failures.length} failed\n`);

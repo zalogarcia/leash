@@ -64,6 +64,25 @@
 // every account on this machine the moment the network blinked. An unreadable
 // probe takes the candidate anyway and says so (`account_probe_failed`). The
 // worst case is the behaviour that shipped before this file existed.
+//
+// ---------------------------------------------------------------------------
+// A WALL THE LEDGER HOLDS CAN BE LIFTED EARLY, on strong evidence only
+// (2026-09-30)
+//
+// The owner bought a usage reset for one account. /account showed it at 5h 0%
+// and weekly 0% and still "limited · 1d 0h", because the ledger held a weekly
+// wall until the next day and nothing cleared a `limitedUntil` early: the
+// selector skipped the account as known walled without asking, and with every
+// account walled nothing asked at all. The slot was cleared by hand.
+//
+// So a walled account is re-checked, and cleared (the store's clearLimit) when
+// its OWN fresh reading shows room on every window. The asymmetry with the
+// section above is deliberate. A probe that fails does not wall an account,
+// and it does not free one either: an unreadable probe is not proof of health.
+// limitClearVerdict below lists what counts; everything else keeps the wall.
+// The re-checks are rate limited (createRecheckLimiter), and setting the wall
+// counts as its first check, so an account that just died is never freed a
+// minute later by a reading that cannot see why it died.
 // ---------------------------------------------------------------------------
 
 import { isLimited, nextAvailable, earliestReset } from './accounts.mjs';
@@ -82,6 +101,120 @@ export const EXHAUSTED_PERCENT = 100;
  * enough that being wrong costs one more rotation rather than an afternoon.
  */
 export const FALLBACK_WALL_SECONDS = 3600;
+
+/**
+ * A walled account is cleared only when EVERY window reads below this. Derived
+ * from the two tiers the code already has: 100 is the wall (EXHAUSTED_PERCENT
+ * above), and 95 is where the rotation treats a window as possibly the wall
+ * because the CLI and the API round differently (bridge.mjs usageResetFor).
+ * Ninety keeps the same five point step again below that tier, so a window the
+ * rotation could still read as the wall is never the one that frees it. A paid
+ * reset reads 0%, so the margin costs the case this exists for nothing.
+ */
+export const CLEAR_BELOW_PERCENT = 90;
+
+/**
+ * The oldest reading that may clear a wall. A lookup row is served from the
+ * usage module's cache for at most its TTL (a minute), so a genuine read is
+ * always well inside this; anything older is a belief, not a reading.
+ */
+export const CLEAR_EVIDENCE_MAX_AGE_MS = 3 * 60_000;
+
+/**
+ * How often a walled account may be re-checked, and how old a wall must be
+ * before any reading may clear it. One number for both, because setting the
+ * wall IS the first check: a death one minute ago is fresher evidence than a
+ * window that cannot show why the account died, and an account freed that
+ * soon is handed the next message to die on.
+ */
+export const RECHECK_INTERVAL_MS = 5 * 60_000;
+
+// Epoch ms from what the ledger and the rows carry: ms numbers, or ISO strings
+// (accounts.json `limitedVerifiedAt`). Anything else is NaN.
+function toMs(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : NaN;
+  if (typeof v === 'string' && v) return Date.parse(v);
+  return NaN;
+}
+
+/**
+ * MAY THIS READING CLEAR THIS ACCOUNT'S WALL? Pure: a usage row in, a verdict
+ * out. Returns { clear, reason }; when `clear` is true the reason carries the
+ * numbers that justified it, for the decision line.
+ *
+ * Every rule here keeps the wall unless the evidence is strong:
+ *   - no row, a failed lookup, or an ok row with no usage: a probe that fails
+ *     is not proof of health
+ *   - a row filed under another slot: another account's numbers are never
+ *     this account's window (the same guard usageResetFor applies)
+ *   - a live session reading (`source.kind` 'stream') rather than a lookup made
+ *     with this slot's own token: whose it is was inferred, not proven, and it
+ *     is at best as old as the last request made on the account
+ *   - a reading with no `readAt`, older than CLEAR_EVIDENCE_MAX_AGE_MS, or
+ *     from the future
+ *   - a wall set less than RECHECK_INTERVAL_MS ago (`wallSetAt`)
+ *   - a missing five hour or weekly window, any window locked, unreadable, or
+ *     at or above CLEAR_BELOW_PERCENT, scoped per-model windows included
+ */
+export function limitClearVerdict(row, { name = null, now = Date.now(), wallSetAt = null, maxAgeMs = CLEAR_EVIDENCE_MAX_AGE_MS } = {}) {
+  const keep = (reason) => ({ clear: false, reason });
+  if (!row) return keep('no usage reading');
+  if (!name || row.name !== name) return keep(`the reading belongs to "${row.name}", not this slot`);
+  if (row.state !== 'ok' || !row.usage) return keep(String(row.error || 'the usage lookup failed'));
+  if (row.source?.kind === 'stream') return keep("a live session reading, not a lookup made with this slot's own token");
+
+  const t = Number(now);
+  const set = toMs(wallSetAt);
+  if (Number.isFinite(set) && t - set < RECHECK_INTERVAL_MS) {
+    return keep(`the wall was set ${Math.max(0, Math.round((t - set) / 1000))}s ago`);
+  }
+  const at = toMs(row.readAt);
+  if (!Number.isFinite(at)) return keep('the reading carries no time, so its age is unknown');
+  if (at - t > 60_000) return keep('the reading is dated in the future');
+  if (t - at > maxAgeMs) return keep(`the reading is ${Math.round((t - at) / 1000)}s old`);
+
+  const u = row.usage;
+  if (!u.fiveHour) return keep('the reading has no 5h window');
+  if (!u.sevenDay) return keep('the reading has no weekly window');
+  const windows = [
+    { ...u.fiveHour, label: '5h' },
+    { ...u.sevenDay, label: 'weekly' },
+    ...(Array.isArray(u.scoped) ? u.scoped : []).map((w) => ({ ...w, label: `weekly ${w?.label || 'scoped'}` })),
+  ];
+  for (const w of windows) {
+    if (w.locked) return keep(`the ${w.label} window is locked`);
+    const p = w.percent === null || w.percent === undefined || w.percent === '' ? NaN : Number(w.percent);
+    if (!Number.isFinite(p)) return keep(`the ${w.label} window is unreadable`);
+    if (p >= CLEAR_BELOW_PERCENT) return keep(`the ${w.label} window is at ${Math.round(p)}%`);
+  }
+  return { clear: true, reason: windows.map((w) => `${w.label} ${Math.round(Number(w.percent))}%`).join(', ') };
+}
+
+/**
+ * THE RE-CHECK RATE LIMIT: at most one extra probe per walled account per
+ * RECHECK_INTERVAL_MS, counted from the later of its last re-check and the
+ * moment its wall was set (`since`). In memory only: a daemon restart costs
+ * one early re-check per account, never a storm.
+ *
+ * `take` records the attempt BEFORE the probe runs, so a probe that fails
+ * spends its slot too: an unreachable API is re-asked on the same cadence as a
+ * reachable one, not on every sweep.
+ */
+export function createRecheckLimiter({ intervalMs = RECHECK_INTERVAL_MS } = {}) {
+  const last = new Map();
+  const due = (name, now, { since = null } = {}) => {
+    const prev = Math.max(last.get(name) ?? -Infinity, Number.isFinite(toMs(since)) ? toMs(since) : -Infinity);
+    return Number(now) - prev >= intervalMs;
+  };
+  return {
+    due,
+    take(name, now, opts = {}) {
+      if (!name || !due(name, now, opts)) return false;
+      last.set(name, Number(now));
+      return true;
+    },
+  };
+}
 
 /**
  * Is this account spent, and until when? Pure: a usage row in, a verdict out.
@@ -165,10 +298,16 @@ function headroom(windows) {
  * `probe` is async (name) => usage row. Omit it and the old behaviour returns:
  * the first ledger-free candidate, unverified.
  * `onDecision` receives one record per decision, for the daemon log.
+ * `recheck` is a createRecheckLimiter(). With it, when no ledger-free
+ * candidate has headroom, each account the ledger holds walled is re-checked
+ * (at most once per RECHECK_INTERVAL_MS) and taken if limitClearVerdict clears
+ * it. Omit it and a known wall is never asked about, as before.
  *
- * Returns { outcome, name, account, walls, earliest, probed }:
+ * Returns { outcome, name, account, walls, cleared, earliest, probed }:
  *   'selected'   `name` is safe to swap to, verified unless `probed` says the
- *                probe could not be read
+ *                probe could not be read. When `cleared` names it, its ledger
+ *                wall was lifted by a re-check and the CALLER persists that
+ *                (clearLimit), exactly as it persists `walls` (markLimited)
  *   'all_walled' every account is walled; `earliest` is when the first frees
  *                up and `walls` is what this pass discovered
  *   'none'       there are no accounts enrolled at all
@@ -179,6 +318,7 @@ export async function selectAccount({
   now = Date.now(),
   probe = null,
   onDecision = () => {},
+  recheck = null,
 } = {}) {
   const list = (accounts || []).filter((a) => a && a.name);
   // Walls this pass DISCOVERED, held locally so the very next turn of the loop
@@ -216,7 +356,7 @@ export async function selectAccount({
 
     if (typeof probe !== 'function') {
       onDecision({ decision: 'account_selected', account: cand.name, reason: 'no probe wired' });
-      return { outcome: 'selected', name: cand.name, account: cand, walls: walls(), earliest: null, probed };
+      return { outcome: 'selected', name: cand.name, account: cand, walls: walls(), cleared: [], earliest: null, probed };
     }
 
     let row = null;
@@ -251,7 +391,44 @@ export async function selectAccount({
       onDecision({ decision: 'account_probe_failed', account: cand.name, reason: v.reason });
     }
     onDecision({ decision: 'account_selected', account: cand.name, reason: v.reason, verified: v.state === 'healthy' });
-    return { outcome: 'selected', name: cand.name, account: cand, walls: walls(), earliest: null, probed };
+    return { outcome: 'selected', name: cand.name, account: cand, walls: walls(), cleared: [], earliest: null, probed };
+  }
+
+  // RE-CHECK THE KNOWN WALLS, only now that nothing ledger-free can take the
+  // run: a paid reset, or a wall marked on the wrong account, is otherwise
+  // invisible until the ledger's own clock runs out. The ORIGINAL ledger, in
+  // file order: a wall this pass just discovered was asked seconds ago, and
+  // `asked` keeps it out. The active account is never re-checked here, for the
+  // same reason it is never selected: it is the one that just died.
+  if (recheck && typeof recheck.take === 'function' && typeof probe === 'function') {
+    for (const a of list) {
+      if (a.name === activeName || !a.claudeAiOauth || asked.has(a.name) || !isLimited(a, now)) continue;
+      if (!recheck.take(a.name, now, { since: a.limitedVerifiedAt })) continue;
+      asked.add(a.name);
+      let row = null;
+      try {
+        row = await probe(a.name);
+      } catch {
+        row = null; // a probe that threw keeps the wall, see limitClearVerdict
+      }
+      const v = limitClearVerdict(row, { name: a.name, now, wallSetAt: a.limitedVerifiedAt });
+      const wasUntil = Number(a.limitedUntil) || null;
+      probed.push({ name: a.name, state: v.clear ? 'cleared' : 'kept', reason: v.reason });
+      if (!v.clear) {
+        onDecision({ decision: 'account_limit_kept', account: a.name, until: wasUntil, reason: v.reason });
+        continue;
+      }
+      onDecision({ decision: 'account_limit_cleared_by_probe', account: a.name, wasUntil, reason: v.reason });
+      return {
+        outcome: 'selected',
+        name: a.name,
+        account: { ...a, limitedUntil: null },
+        walls: walls(),
+        cleared: [{ name: a.name, reason: v.reason }],
+        earliest: null,
+        probed,
+      };
+    }
   }
 
   // Nothing left. `earliest` reads the OVERLAID list, so a wall this pass just
@@ -259,8 +436,8 @@ export async function selectAccount({
   const earliest = earliestReset(view(), now);
   if (!list.length) {
     onDecision({ decision: 'all_accounts_walled_until', until: null, count: 0, reason: 'no accounts enrolled' });
-    return { outcome: 'none', name: null, account: null, walls: walls(), earliest: null, probed };
+    return { outcome: 'none', name: null, account: null, walls: walls(), cleared: [], earliest: null, probed };
   }
   onDecision({ decision: 'all_accounts_walled_until', until: earliest, count: list.length });
-  return { outcome: 'all_walled', name: null, account: null, walls: walls(), earliest, probed };
+  return { outcome: 'all_walled', name: null, account: null, walls: walls(), cleared: [], earliest, probed };
 }
