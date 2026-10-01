@@ -521,6 +521,19 @@ export function usageFailureText(failure, { name = '<name>', now = Date.now(), t
   }
 }
 
+// DOES THIS ROW SAY THE ACCOUNT NEEDS A LOGIN? The short reason, or null.
+//
+// The rotation reads this before it takes a candidate (account-selector.mjs):
+// an account whose refresh was refused, whose token was refused, whose login is
+// past its own expiry, or whose refreshed login could not be saved cannot take
+// a run, and selecting it anyway is how a verified=false swap ends a session
+// (2026-09-30). Never for the LIVE slot: the running session owns that token
+// and refreshes it itself, so a refusal there is not proof of anything.
+export function rowLoginProblem(row) {
+  if (!row || row.live || row.state === 'ok') return null;
+  return typeof row.loginProblem === 'string' && row.loginProblem ? row.loginProblem : null;
+}
+
 // The same reason as one log line: status and code, never a body.
 function failureLogText(f) {
   const bits = [f?.kind || 'unknown'];
@@ -582,15 +595,25 @@ export async function refreshAccessToken({
     // Only the STATUS and the server's short error CODE. Never the body: an
     // OAuth error body is the one response that could echo a token back, and an
     // error string is exactly what ends up in a log.
-    let code = '';
+    // The code goes through errorCode's shape check (snake_case, 40 at most):
+    // it reaches the log, the slot's needs-login reason and a Telegram notice,
+    // and a body is the one place a token could come back at us.
+    let code = null;
     try {
       const j = await res.json();
-      if (typeof j?.error === 'string' && j.error.length <= 80) code = ` (${j.error})`;
-      else if (typeof j?.error?.type === 'string' && j.error.type.length <= 80) code = ` (${j.error.type})`;
+      const c = typeof j?.error === 'string' ? j.error : j?.error?.type;
+      if (typeof c === 'string' && /^[a-z_]{1,40}$/.test(c)) code = c;
     } catch {
       /* body unreadable; the status alone is the message */
     }
-    throw new Error(`token refresh rejected: HTTP ${res?.status ?? '???'}${code}`);
+    // `rejected`, `status` and `code` let the caller tell a refused login
+    // (400 invalid_grant, 401, 403) from a server having a bad minute, without
+    // parsing its own message back.
+    const err = new Error(`token refresh rejected: HTTP ${res?.status ?? '???'}${code ? ` (${code})` : ''}`);
+    err.rejected = true;
+    err.status = Number(res?.status) || null;
+    err.code = code;
+    throw err;
   }
 
   let j;
@@ -617,8 +640,15 @@ export async function refreshAccessToken({
     // doing so, keeping the old one is correct rather than writing undefined.
     refreshToken: j.refresh_token || j.refreshToken || refreshToken,
     expiresAt,
+    // The token endpoint states the NEW refresh token's lifetime as
+    // `refresh_token_expires_in` (seconds, the field Claude Code itself reads).
+    // Carrying the previous token's expiry over it would date the new token by
+    // the old one, and an expired refreshTokenExpiresAt reads as a dead login.
     refreshTokenExpiresAt:
-      Number(j.refresh_token_expires_at ?? j.refreshTokenExpiresAt) || previous?.refreshTokenExpiresAt || null,
+      Number(j.refresh_token_expires_at ?? j.refreshTokenExpiresAt) ||
+      (Number(j.refresh_token_expires_in) > 0 ? Number(now) + Number(j.refresh_token_expires_in) * 1000 : null) ||
+      previous?.refreshTokenExpiresAt ||
+      null,
     scopes,
     subscriptionType: j.subscription_type || previous?.subscriptionType || null,
     rateLimitTier: j.rate_limit_tier || previous?.rateLimitTier || null,
@@ -745,7 +775,9 @@ export function createAccountUsage({
   }
 
   // Decide which access token to use for one slot, refreshing only when every
-  // rule in the header allows it. Returns { token } or { state, error }.
+  // rule in the header allows it. Returns { token } or { state, error }, and
+  // `loginProblem` (a short reason) when the failure means the account cannot
+  // run until the owner signs into it again.
   async function tokenFor(acct, active) {
     if (active.name && acct.name === active.name) {
       // Rule 1: the live account's token comes from the credential store,
@@ -755,12 +787,26 @@ export function createAccountUsage({
     const oauth = acct.claudeAiOauth;
     if (!oauth?.accessToken) return { state: 'no-credentials', error: 'no credentials captured for this slot' };
 
+    // A slot already flagged as needing a login is not asked again: its refresh
+    // token is dead or its token was refused, and asking once more only spends
+    // a request on the same answer. The flag is cleared by a fresh capture.
+    const flag = acct.needsLogin && typeof acct.needsLogin === 'object' ? acct.needsLogin : null;
+    if (flag) {
+      const why = String(flag.reason || 'the login was refused');
+      return {
+        state: 'needs-login',
+        error: `needs a fresh login (${why}), log into it with Claude Code's /login, then run /account capture ${acct.name}`,
+        loginProblem: why,
+      };
+    }
+
     const t = now();
     const rtExp = Number(oauth.refreshTokenExpiresAt);
     if (Number.isFinite(rtExp) && rtExp > 0 && rtExp <= t) {
       return {
         state: 'credentials-expired',
         error: `credentials expired, run /account capture ${acct.name} after logging in`,
+        loginProblem: 'its login expired',
       };
     }
 
@@ -776,7 +822,93 @@ export function createAccountUsage({
       };
     }
 
-    // Rule 3: one attempt, no retry loop.
+    // Rule 3: one attempt, no retry loop, and ONE FLIGHT PER SLOT across every
+    // caller (accounts.mjs refreshOnce, see its header): a second reader that
+    // arrives while a refresh is in flight waits for it and takes its result
+    // instead of presenting the same refresh token again.
+    return refreshFlight(acct.name, () => refreshSlot(acct.name, oauth));
+  }
+
+  // The store's single flight when it has one (accounts.mjs does), else one of
+  // this reader's own, so a store without it still never refreshes one slot
+  // twice at once.
+  const ownFlights = new Map();
+  const ownSpent = new Map();
+  function refreshFlight(name, run) {
+    if (typeof store.refreshOnce === 'function') return store.refreshOnce(name, run);
+    const inflight = ownFlights.get(name);
+    if (inflight) return inflight;
+    const p = Promise.resolve()
+      .then(run)
+      .finally(() => {
+        if (ownFlights.get(name) === p) ownFlights.delete(name);
+      });
+    ownFlights.set(name, p);
+    return p;
+  }
+  // False, or why the token was spent: 'rotated', or a refusal's reason.
+  const spentWhy = (name, rt) =>
+    typeof store.refreshSpent === 'function' ? store.refreshSpent(name, rt) : ownSpent.get(name)?.get(rt) || false;
+  const spentAdd = (name, rt, why = 'rotated') => {
+    if (typeof store.noteRefreshSpent === 'function') return store.noteRefreshSpent(name, rt, why);
+    const seen = ownSpent.get(name) || new Map();
+    seen.set(rt, why);
+    ownSpent.set(name, seen);
+  };
+
+  // A server answer that says THIS LOGIN is the problem: the token endpoint's
+  // own invalid_grant, which is what a dead or reused refresh token gets.
+  // Nothing looser: a bare 401 or 403 (an edge block answers 403 with an HTML
+  // page) or a client-level code would retire a healthy account, or every
+  // account at once, until the owner re-captured it (QA, 2026-09-30). A
+  // timeout, a 5xx or a 429 says nothing about the account either.
+  const isLoginRejection = (e) => e?.rejected === true && e.code === 'invalid_grant';
+
+  // THE REFRESH ITSELF, run inside the flight. `snap` is the blob the first
+  // caller read; the slot is read AGAIN here, because a refresh that finished a
+  // moment ago has already banked a new blob, and the snapshot may hold the
+  // refresh token that refresh spent.
+  async function refreshSlot(name, snap) {
+    const cur = store.listAccounts().find((a) => a.name === name);
+    const oauth = cur?.claudeAiOauth?.accessToken ? cur.claudeAiOauth : snap;
+    const t = now();
+    const exp = Number(oauth.expiresAt);
+    if (!(Number.isFinite(exp) && exp > 0 && exp - EXPIRY_SKEW_MS <= t)) {
+      // Another refresh (or a capture) already put a live token in the slot.
+      return { token: oauth.accessToken, live: false };
+    }
+    // Rule 1 again, at the last moment: a swap can make this slot the live
+    // login between the caller resolving the active account and this line, and
+    // the live session refreshes its own token. Unreadable means unprovable,
+    // which is Rule 2's answer too.
+    let live = null;
+    try {
+      live = await store.readCredentials();
+    } catch {
+      live = null;
+    }
+    if (!live?.claudeAiOauth?.accessToken) {
+      return {
+        state: 'unavailable',
+        error: 'access token expired and the live login could not be read, so no refresh was attempted',
+      };
+    }
+    if (matchAccount([{ name, claudeAiOauth: oauth }], live.claudeAiOauth)) {
+      return { token: live.claudeAiOauth.accessToken, live: true };
+    }
+    // A refresh token the server has already answered for is never presented
+    // again: a refused one is dead, and a rotated one whose replacement never
+    // reached the slot is spent.
+    const why = spentWhy(name, oauth.refreshToken);
+    if (why && why !== 'rotated') {
+      return { state: 'refresh-failed', error: `token refresh refused earlier (${why}), not sent again`, loginProblem: why };
+    }
+    if (why) {
+      const msg = `the refresh token on disk for "${name}" was already spent by an earlier refresh whose result was not saved, so it was not sent again. Re-capture this account.`;
+      log(msg);
+      return { state: 'persist-failed', error: msg, loginProblem: 'a refreshed login could not be saved' };
+    }
+
     let blob;
     try {
       blob = await refreshAccessToken({
@@ -788,21 +920,31 @@ export function createAccountUsage({
         now: t,
       });
     } catch (e) {
-      log(`refresh failed for "${acct.name}": ${e.message}`);
+      log(`refresh failed for "${name}": ${e.message}`);
+      if (isLoginRejection(e)) {
+        const reason = `login refused (${e.code || `HTTP ${e.status}`})`;
+        spentAdd(name, oauth.refreshToken, reason);
+        return { state: 'refresh-failed', error: e.message, loginProblem: reason };
+      }
       return { state: 'refresh-failed', error: e.message };
     }
+    // Spent the moment the server answered with a replacement, before the
+    // persist: if the write fails, the old token must still never go out again.
+    // Only when it WAS replaced: a response that keeps the refresh token (which
+    // refreshAccessToken tolerates) leaves it valid (QA, 2026-09-30).
+    if (blob.refreshToken !== oauth.refreshToken) spentAdd(name, oauth.refreshToken);
 
     // Rules 4 and 5: persist through accounts.mjs's atomic writer BEFORE use,
     // and shout if that fails, because the token on disk is now dead.
     try {
-      const r = store.bankOauth(acct.name, blob);
+      const r = store.bankOauth(name, blob);
       if (!r?.ok) throw new Error(r?.error || 'the account store refused the write');
     } catch (e) {
-      const msg = `REFRESHED BUT NOT SAVED for "${acct.name}" (${fingerprint(blob)}): ${e.message}. The old refresh token is now dead — re-capture this account.`;
+      const msg = `REFRESHED BUT NOT SAVED for "${name}" (${fingerprint(blob)}): ${e.message}. The old refresh token is now dead — re-capture this account.`;
       log(msg);
-      return { state: 'persist-failed', error: msg };
+      return { state: 'persist-failed', error: msg, loginProblem: 'a refreshed login could not be saved' };
     }
-    log(`refreshed the expired token for idle account "${acct.name}" (${fingerprint(blob)})`);
+    log(`refreshed the expired token for idle account "${name}" (${fingerprint(blob)})`);
     return { token: blob.accessToken, live: false, refreshed: true };
   }
 
@@ -902,7 +1044,12 @@ export function createAccountUsage({
     const base = baseRow(acct, active);
     const tok = await tokenFor(acct, active);
     if (!tok.token) {
-      return cacheSet(acct.name, { ...base, state: tok.state, error: tok.error, usage: null }, t, ttlMs);
+      const row = { ...base, state: tok.state, error: tok.error, usage: null };
+      // Only with the live login IDENTIFIED: an unidentified one may be this
+      // very slot, whose stored blob is older than the session's (Rule 2's
+      // reasoning), and a dead verdict on it would flag a working login.
+      if (tok.loginProblem && !base.live && active.name) row.loginProblem = tok.loginProblem;
+      return cacheSet(acct.name, row, t, ttlMs);
     }
     const { usage, failure } = await fetchUsageResult(tok.token, { fetchImpl, timeoutMs, now: t });
     if (usage) {
@@ -933,6 +1080,13 @@ export function createAccountUsage({
       failure: why,
       usage: null,
     };
+    // A 401 on an IDLE slot's own token is a login problem. Not on the live
+    // slot (the running session may be refreshing it right now), not with the
+    // live login unidentified (it may be this slot), and not a 403, which an
+    // edge block or a missing scope answers too.
+    if (failure.kind === 'refused' && failure.status === 401 && !base.live && !tok.live && active.name) {
+      row.loginProblem = 'login refused (HTTP 401)';
+    }
     if (failure.kind === 'rate-limited') {
       const holdMs = throttleHoldMs(failure.retryAfterMs, ttlMs);
       throttle.set(acct.name, { until: t + holdMs, row });

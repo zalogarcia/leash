@@ -136,13 +136,15 @@ export function decodeAccountCallback(data) {
 // instead of swapping.
 export function labelForSwap(row) {
   const name = row?.name ?? '';
+  // A login the server refused outranks a wall: the wall lifting will not help.
+  if (row?.needsLogin) return `🔑 ${name} (needs login)`;
   if (row?.limited) return `⛔ ${name} (limited)`;
   if (!row?.captured) return `⚠️ ${name} (no credentials)`;
   return `Swap to ${name}`;
 }
 
-const LABEL_PREFIXES = ['Swap to ', '⛔ ', '⚠️ '];
-const LABEL_SUFFIXES = [' (limited)', ' (no credentials)'];
+const LABEL_PREFIXES = ['Swap to ', '⛔ ', '⚠️ ', '🔑 '];
+const LABEL_SUFFIXES = [' (limited)', ' (no credentials)', ' (needs login)'];
 
 // The inverse of labelForSwap, for cross-checking a tap against the caption the
 // button actually carried.
@@ -216,6 +218,16 @@ export function resolveSwapTarget(rows, decoded, expectedName = null) {
       ok: false,
       reason: 'no-credentials',
       error: `"${row.name}" has no captured credentials. Log into it, then /account capture ${row.name}.`,
+    };
+  }
+  // Flagged by a refused refresh (accounts.mjs markNeedsLogin): installing it
+  // would hand every worker a login that cannot refresh. Refused like a wall,
+  // and the typed command stays the way to force it.
+  if (row.needsLogin) {
+    return {
+      ok: false,
+      reason: 'needs-login',
+      error: `"${row.name}" needs a fresh login: /login as it in Claude Code, then /account capture ${row.name}. Type /account ${row.name} if you want to force it.`,
     };
   }
   if (row.limited) {

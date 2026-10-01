@@ -112,10 +112,46 @@
 // the known-good state from before this tool ever touched the credential
 // store, and the recovery path when a write corrupts the store AND the
 // rollback fails. Its `blob` key is the exact credential payload.
+//
+// ---------------------------------------------------------------------------
+// ONE REFRESH PER SLOT AT A TIME (2026-09-30 18:22 ET)
+//
+// A refresh token is single use: the server rotates it and the old one dies the
+// moment the new one is issued. On 2026-09-30 two readers refreshed the same idle
+// slot within milliseconds of each other, the /account view's read and the
+// rotation's pre-swap probe. The first one won and was banked; the second
+// presented the refresh token the first had just spent, got invalid_grant, and
+// the rotation swapped onto the account anyway. Presenting a spent refresh token
+// is also what a server's reuse detection is built to punish.
+//
+// So the store owns the flight, because the store owns both ends of it: the slot
+// the refresh token is read from and the write that persists what replaces it.
+// refreshOnce(name, run) runs `run` (refresh AND persist) at most once per slot
+// at a time; every caller that arrives while it is in flight gets the same
+// promise and the same result. swapTo waits for a flight on its target before it
+// reads the slot, so a swap never installs the pre-refresh blob whose refresh
+// token the flight is spending. And every refresh token the server has answered
+// for (a rotation or a rejection) is remembered by digest, never by value, so it
+// is never presented again, even when its replacement did not reach the disk.
+//
+// ---------------------------------------------------------------------------
+// A SLOT THAT NEEDS A LOGIN (2026-09-30)
+//
+// A probe that fails with an AUTH error (a refused refresh, a refused token, a
+// login past its own expiry) says something a failed network call does not: the
+// account cannot take a run until the owner signs into it again. The same night
+// the rotation selected such an account with `verified=false`. markNeedsLogin
+// persists that belief in the slot (`needsLogin: { reason, at, fingerprint }`),
+// nextAvailable and earliestReset skip a flagged slot, and the flag is cleared
+// only by a fresh login landing in the slot: captureCurrent, or the banking
+// ladder identifying a new login as this account. markNeedsLogin reports
+// `changed` only when it raises a NEW flag, which is what lets the host send its
+// notice once rather than on every probe.
 // ---------------------------------------------------------------------------
 
 import { existsSync, readFileSync, writeFileSync, chmodSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { createCredentialStore } from './credential-store.mjs';
 
 // ---------------------------------------------------------------------------
@@ -324,6 +360,14 @@ export function isLimited(acct, now = Date.now()) {
   return Number.isFinite(until) && until > 0 && until * 1000 > now;
 }
 
+// The slot's needs-login flag, or null. A slot carrying one cannot take a run
+// until the owner signs into that account again (see the header), so every
+// "which account next" question skips it.
+export function loginFlag(acct) {
+  const f = acct?.needsLogin;
+  return f && typeof f === 'object' ? f : null;
+}
+
 // Pick the next account to run on: available, not the one that just died, and
 // least-recently-active so several accounts rotate rather than ping-pong
 // between two. A never-used slot (lastActiveAt null) sorts first, because it
@@ -332,7 +376,7 @@ export function isLimited(acct, now = Date.now()) {
 export function nextAvailable(accounts, { activeName = null, now = Date.now() } = {}) {
   const usable = (accounts || [])
     .map((a, i) => ({ a, i }))
-    .filter(({ a }) => a && a.claudeAiOauth && a.name !== activeName && !isLimited(a, now));
+    .filter(({ a }) => a && a.claudeAiOauth && a.name !== activeName && !isLimited(a, now) && !loginFlag(a));
   if (!usable.length) return null;
   usable.sort((x, y) => {
     const lx = x.a.lastActiveAt ? Date.parse(x.a.lastActiveAt) : 0;
@@ -343,9 +387,11 @@ export function nextAvailable(accounts, { activeName = null, now = Date.now() } 
 }
 
 // Earliest moment any account frees up, for the "everything is limited" message.
+// A slot that needs a login frees nothing when its wall ends, so its clock is
+// not a moment anything can resume at.
 export function earliestReset(accounts, now = Date.now()) {
   const times = (accounts || [])
-    .filter((a) => isLimited(a, now))
+    .filter((a) => isLimited(a, now) && !loginFlag(a))
     .map((a) => Number(a.limitedUntil))
     .filter((n) => Number.isFinite(n));
   return times.length ? Math.min(...times) : null;
@@ -401,6 +447,24 @@ export function createAccountStore({
   // What swapTo() last wrote, so checkDrift() has something to compare against.
   // In memory only, so a daemon restart just means the first check re-learns it.
   let intended = null; // { name, fp }
+
+  // THE REFRESH SINGLE FLIGHT (see the header). Slot name -> the promise of the
+  // refresh in flight for it, held until `run` has persisted its result.
+  const refreshing = new Map();
+  // Slot name -> Map(digest -> why) of refresh tokens the server has already
+  // answered for: 'rotated' (a replacement was issued) or the refusal's short
+  // reason. Digests, never values: this is memory the daemon keeps for its whole
+  // life. In memory only; the persisted half of "this login is dead" is
+  // needsLogin.
+  const spent = new Map();
+  const SPENT_PER_SLOT = 16;
+  // Slot name -> a promise that settles when a swap ONTO that slot has finished.
+  // A refresh that starts while one is running waits for it, so the swap never
+  // installs a blob whose refresh token a flight is presenting at that moment,
+  // and the flight's own live-login check then sees the slot live and does not
+  // refresh it at all (QA, 2026-09-30).
+  const swapping = new Map();
+  const digest = (token) => createHash('sha256').update(String(token)).digest('hex');
 
   function read() {
     try {
@@ -507,13 +571,17 @@ export function createAccountStore({
       const slot = slotByIdentity(list, email);
       if (slot) {
         const i = list.findIndex((a) => a.name === slot.name);
+        // A login identified as this account is a fresh login landing in its
+        // slot, so a needs-login flag on it is answered.
+        const { needsLogin: _answered, ...rest } = list[i];
         list[i] = {
-          ...list[i],
+          ...rest,
           claudeAiOauth: live.claudeAiOauth,
           capturedAt: new Date().toISOString(),
           ...(markActive ? { lastActiveAt: new Date().toISOString() } : {}),
         };
         write(list);
+        if (_answered) log(`the needs-login flag on "${slot.name}" is cleared: a new login was identified as it`);
         log(
           believedName && slot.name !== believedName
             ? `${site}: live blob identified as "${slot.name}" (${fingerprint(live.claudeAiOauth)}) and banked THERE — the old behaviour would have mislabeled it into "${believedName}"`
@@ -641,10 +709,13 @@ export function createAccountStore({
       lastActiveAt: prev?.lastActiveAt ?? null,
       capturedAt: at,
     };
+    // `rec` names its fields, so a needs-login flag on the slot does not carry
+    // over: a capture IS the fresh login that flag was waiting for.
     if (i === -1) list.push(rec);
     else list[i] = rec;
     write(list);
     log(`captured live credentials into slot "${name}" (${fingerprint(rec.claudeAiOauth)})`);
+    if (loginFlag(prev)) log(`the needs-login flag on "${name}" is cleared by the capture`);
     // A capture into a slot matching the parked blob's identity CLAIMS it: the
     // slot now holds that account's current tokens, so the parked rotation is
     // superseded and the /account warning line can go.
@@ -683,7 +754,40 @@ export function createAccountStore({
 
   // Capture the outgoing account, then write the incoming one, preserving
   // mcpOAuth. See the header for why this ordering and what it does not fix.
-  async function swapTo(name) {
+  // `refuseFlagged`: the rotation's swaps pass it, so a slot flagged as needing
+  // a login WHILE the swap waited (a refusal that answered after the probe's
+  // deadline) is refused rather than installed. A swap the owner asks for by
+  // hand does not: he can see something the daemon cannot.
+  async function swapTo(name, { refuseFlagged = false } = {}) {
+    // A refresh in flight for the TARGET is spending the refresh token its slot
+    // holds right now. Installing that blob would hand the live session a
+    // refresh token that is already dead, so the swap waits for the flight to
+    // persist its replacement, and reads the slot after it. Looped, because a
+    // new flight can start while the swap waits on the last one. From the
+    // moment the wait ends, the swap holds the slot (`swapping`), and a flight
+    // that starts meanwhile waits for the swap instead: there is no await
+    // between the loop's last check and the hold. After each flight it yields
+    // one macrotask, so the flight's own readers finish first: a late probe's
+    // refusal flags the slot several promise hops after the flight settles,
+    // and on a credential store that answers in the same tick (the file store)
+    // the swap otherwise re-read its target before the flag existed and
+    // installed the dead login (QA, 2026-09-30).
+    for (let p = refreshing.get(name); p; p = refreshing.get(name)) {
+      await p.catch(() => {});
+      await new Promise((r) => setImmediate(r));
+    }
+    let release;
+    const held = new Promise((r) => (release = r));
+    swapping.set(name, held);
+    try {
+      return await swapHeld(name, { refuseFlagged });
+    } finally {
+      if (swapping.get(name) === held) swapping.delete(name);
+      release();
+    }
+  }
+
+  async function swapHeld(name, { refuseFlagged = false } = {}) {
     const list = read();
     const target = list.find((a) => a.name === name);
     if (!target) return { ok: false, error: `no account slot named "${name}". Run /account capture ${name} first` };
@@ -695,12 +799,19 @@ export function createAccountStore({
     // 1. Bank whatever the outgoing account refreshed to while it was active —
     //    through the banking ladder. hasCredentials gates everything first:
     //    never bank a blob with no access token.
-    const from = matchAccount(list, live.claudeAiOauth);
+    //
+    //    The list is READ AGAIN after the keychain await and written with no
+    //    await in between: a list read before it would write back whatever it
+    //    held then, over a refresh another slot banked meanwhile, and that
+    //    refresh's new refresh token would be the only copy there was (QA,
+    //    2026-09-30).
+    const cur = read();
+    const from = matchAccount(cur, live.claudeAiOauth);
     if (from && from.account.name !== name && hasCredentials(live)) {
       // Rung 1: a fingerprint match IS that slot's own rotation.
-      const i = list.findIndex((a) => a.name === from.account.name);
-      list[i] = { ...list[i], claudeAiOauth: live.claudeAiOauth, capturedAt: new Date().toISOString() };
-      write(list);
+      const i = cur.findIndex((a) => a.name === from.account.name);
+      cur[i] = { ...cur[i], claudeAiOauth: live.claudeAiOauth, capturedAt: new Date().toISOString() };
+      write(cur);
       log(`banked outgoing "${from.account.name}" refresh before swapping (${fingerprint(live.claudeAiOauth)})`);
     } else if (!from && hasCredentials(live)) {
       // Rungs 2-3: unknown fingerprint means unknown owner. Identify it or park
@@ -718,6 +829,15 @@ export function createAccountStore({
     //    tokens, and installing the stale pre-bank copy would swap in a token
     //    the login may have rotated to death.
     const freshTarget = read().find((a) => a.name === name) || target;
+    if (refuseFlagged && loginFlag(freshTarget)) {
+      // `needsLogin` tells the caller this is the TARGET, not the keychain: the
+      // rotation selects again instead of reporting a failed swap.
+      return {
+        ok: false,
+        needsLogin: true,
+        error: `slot "${name}" needs a fresh login (${loginFlag(freshTarget).reason || 'refused'}), so nothing was changed`,
+      };
+    }
     const merged = mergeBlob(live, freshTarget.claudeAiOauth);
     if (!(await writeCredentials(merged))) {
       // Do not claim "unchanged" on faith. writeCredentials rolls back on
@@ -766,6 +886,72 @@ export function createAccountStore({
     write(list);
     log(`banked a refreshed token into slot "${name}" (${fingerprint(oauth)})`);
     return { ok: true, account: list[i] };
+  }
+
+  // THE REFRESH SINGLE FLIGHT. `run` is the whole refresh: the network call AND
+  // the persist (bankOauth). Every caller for the same slot while it runs gets
+  // the same promise, so two readers cannot present the same refresh token, and
+  // the flight ends only once the replacement is on disk.
+  function refreshOnce(name, run) {
+    const inflight = refreshing.get(name);
+    if (inflight) return inflight;
+    // A swap onto this slot that is already running finishes first: `run`
+    // re-reads the slot and the live login after it (see `swapping`).
+    const p = Promise.resolve(swapping.get(name))
+      .then(run)
+      .finally(() => {
+        if (refreshing.get(name) === p) refreshing.delete(name);
+      });
+    refreshing.set(name, p);
+    return p;
+  }
+
+  // The refresh token the server has already answered for (rotated or refused)
+  // is never presented again. See the header. `why` is 'rotated' or the
+  // refusal's short reason, so a later caller can say which it was.
+  function noteRefreshSpent(name, refreshToken, why = 'rotated') {
+    if (!name || !refreshToken) return;
+    const seen = spent.get(name) || new Map();
+    seen.set(digest(refreshToken), String(why || 'rotated'));
+    while (seen.size > SPENT_PER_SLOT) seen.delete(seen.keys().next().value);
+    spent.set(name, seen);
+  }
+
+  // False, or why the token was spent ('rotated' or the refusal's reason).
+  function refreshSpent(name, refreshToken) {
+    if (!name || !refreshToken) return false;
+    return spent.get(name)?.get(digest(refreshToken)) || false;
+  }
+
+  // THE NEEDS-LOGIN FLAG (see the header). `changed` is true only when this
+  // raises a flag the slot did not already carry, which is what the host keys
+  // its one notice on. The reason is built by the caller from status codes and
+  // short server error codes, never from a response body.
+  function markNeedsLogin(name, reason, { now = Date.now() } = {}) {
+    const list = read();
+    const i = list.findIndex((a) => a.name === name);
+    if (i === -1) return { ok: false, changed: false, error: `no account slot named "${name}"` };
+    if (loginFlag(list[i])) return { ok: true, changed: false, account: list[i] };
+    const fp = fingerprint(list[i].claudeAiOauth);
+    list[i] = {
+      ...list[i],
+      needsLogin: { reason: String(reason || 'the login was refused').slice(0, 160), at: new Date(now).toISOString(), fingerprint: fp },
+    };
+    write(list);
+    log(`slot "${name}" needs a fresh login (${fp}): ${list[i].needsLogin.reason}`);
+    return { ok: true, changed: true, account: list[i] };
+  }
+
+  function clearNeedsLogin(name) {
+    const list = read();
+    const i = list.findIndex((a) => a.name === name);
+    if (i === -1) return { ok: false, error: `no account slot named "${name}"` };
+    if (!loginFlag(list[i])) return { ok: true, changed: false, account: list[i] };
+    const { needsLogin: _gone, ...rest } = list[i];
+    list[i] = rest;
+    write(list);
+    log(`the needs-login flag on "${name}" is cleared`);
+    return { ok: true, changed: true, account: list[i] };
   }
 
   // THE HEALTH LEDGER, one row per account, and the reason it is persisted
@@ -876,6 +1062,9 @@ export function createAccountStore({
       // from and how old it is.
       limitedSource: a.limitedSource || null,
       limitedVerifiedAt: a.limitedVerifiedAt || null,
+      // The login is dead until the owner signs in again: a slot that is not
+      // walled but carries this is not free either.
+      needsLogin: loginFlag(a) ? { reason: a.needsLogin.reason || null, at: a.needsLogin.at || null } : null,
     }));
   }
 
@@ -894,10 +1083,16 @@ export function createAccountStore({
     writeCredentials,
     captureCurrent,
     bankOauth,
+    refreshOnce,
+    refreshPending: (name) => refreshing.get(name) || null,
+    noteRefreshSpent,
+    refreshSpent,
     activeAccount,
     swapTo,
     markLimited,
     clearLimit,
+    markNeedsLogin,
+    clearNeedsLogin,
     checkDrift,
     nextAvailable: (opts) => nextAvailable(read(), opts),
     earliestReset: (now) => earliestReset(read(), now),

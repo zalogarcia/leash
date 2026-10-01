@@ -992,6 +992,229 @@ await t('a failed file write cannot corrupt the credentials file, and reports th
   eq(leftovers, [], 'a failed write left its temp file behind');
 });
 
+// ---------- ONE REFRESH PER SLOT, and a slot that needs a login (2026-09-30 18:22 ET) ----------
+//
+// Two readers refreshed the same idle slot at once: the /account view's read and
+// the rotation's probe. The second presented the refresh token the first had
+// just spent (invalid_grant) and the rotation swapped onto the account anyway.
+
+await t('★ refreshOnce: two callers for one slot at once run the refresh ONCE and share its result', async () => {
+  const { store } = freshStore(LIVE_BLOB, [{ name: 'idle', claudeAiOauth: oauth('idle') }]);
+  let runs = 0;
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const run = async () => {
+    runs++;
+    await gate;
+    return { token: 'the-new-one' };
+  };
+  const a = store.refreshOnce('idle', run);
+  const b = store.refreshOnce('idle', run);
+  ok(store.refreshPending('idle'), 'the flight must be visible while it runs');
+  release();
+  const [ra, rb] = await Promise.all([a, b]);
+  eq(runs, 1, 'a second refresh ran, presenting a refresh token the first was spending');
+  ok(ra === rb, 'the second caller must get the SAME result, not one of its own');
+  eq(store.refreshPending('idle'), null, 'the flight must end once it has settled');
+  await store.refreshOnce('idle', run);
+  eq(runs, 2, 'a refresh after the flight ended is a new flight');
+});
+
+await t('refreshOnce: a failed flight fails every caller and still ends, and slots do not share a flight', async () => {
+  const { store } = freshStore(LIVE_BLOB, [
+    { name: 'one', claudeAiOauth: oauth('one') },
+    { name: 'two', claudeAiOauth: oauth('two') },
+  ]);
+  let runs = 0;
+  const boom = async () => {
+    runs++;
+    throw new Error('refused');
+  };
+  const got = await Promise.allSettled([store.refreshOnce('one', boom), store.refreshOnce('one', boom)]);
+  eq(got.map((g) => g.status), ['rejected', 'rejected']);
+  eq(runs, 1);
+  eq(store.refreshPending('one'), null, 'a failed flight must not wedge the slot');
+  await Promise.all([store.refreshOnce('one', async () => runs++), store.refreshOnce('two', async () => runs++)]);
+  eq(runs, 3, 'two different slots are two flights');
+});
+
+await t('★ swapTo waits for a refresh in flight on its TARGET, then installs what that refresh persisted', async () => {
+  const { store, kc } = freshStore(LIVE_BLOB, [
+    { name: 'live', claudeAiOauth: LIVE_BLOB.claudeAiOauth },
+    { name: 'idle', claudeAiOauth: oauth('idle-old') },
+  ]);
+  const fresh = oauth('idle-new');
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const flight = store.refreshOnce('idle', async () => {
+    await gate;
+    store.bankOauth('idle', fresh);
+    return { token: fresh.accessToken };
+  });
+  const swap = store.swapTo('idle');
+  await new Promise((r) => setTimeout(r, 10));
+  eq(kc.writes, 0, 'the swap wrote credentials while the refresh of its target was still in flight');
+  release();
+  await flight;
+  const r = await swap;
+  ok(r.ok, r.error);
+  eq(
+    fingerprint(kc.blob.claudeAiOauth),
+    fingerprint(fresh),
+    'the swap installed the pre-refresh blob, whose refresh token the flight had just spent',
+  );
+});
+
+await t('★ a swap never writes back over a refresh another slot banked during its keychain read (QA)', async () => {
+  const { store, kc, file } = freshStore(LIVE_BLOB, [
+    { name: 'live', claudeAiOauth: LIVE_BLOB.claudeAiOauth },
+    { name: 'target', claudeAiOauth: oauth('t') },
+    { name: 'other', claudeAiOauth: oauth('o-old') },
+  ]);
+  const real = kc.run;
+  let release;
+  const gate = new Promise((r) => (release = r));
+  let gated = true;
+  kc.run = async (args, stdin) => {
+    if (gated && args[0] === 'find-generic-password') await gate;
+    return real(args, stdin);
+  };
+  const swap = store.swapTo('target');
+  await new Promise((r) => setTimeout(r, 10));
+  // A refresh of ANOTHER idle slot lands while the swap waits on the keychain.
+  store.bankOauth('other', oauth('o-new'));
+  gated = false;
+  release();
+  const r = await swap;
+  ok(r.ok, r.error);
+  const disk = JSON.parse(readFileSync(file, 'utf8'));
+  eq(
+    disk.find((a) => a.name === 'other').claudeAiOauth.refreshToken,
+    oauth('o-new').refreshToken,
+    'the swap wrote its stale list over the refreshed slot: the only copy of the new refresh token is gone',
+  );
+});
+
+await t('★ a refresh that starts DURING a swap onto its slot waits for the swap to finish (QA)', async () => {
+  const { store, kc } = freshStore(LIVE_BLOB, [
+    { name: 'live', claudeAiOauth: LIVE_BLOB.claudeAiOauth },
+    { name: 'target', claudeAiOauth: oauth('t') },
+  ]);
+  const real = kc.run;
+  let release;
+  const gate = new Promise((r) => (release = r));
+  let gated = true;
+  kc.run = async (args, stdin) => {
+    if (gated && args[0] === 'find-generic-password') await gate;
+    return real(args, stdin);
+  };
+  const swap = store.swapTo('target');
+  await new Promise((r) => setTimeout(r, 10));
+  // What the refresh would see when it runs: the swap's credential write must
+  // already have landed, so the flight's live-login check finds the slot live.
+  let liveWhenRun = null;
+  const flight = store.refreshOnce('target', async () => {
+    liveWhenRun = fingerprint(kc.blob.claudeAiOauth);
+  });
+  gated = false;
+  release();
+  const [r] = await Promise.all([swap, flight]);
+  ok(r.ok, r.error);
+  eq(liveWhenRun, fingerprint(oauth('t')), 'the refresh ran while the swap was still installing the blob it would spend');
+  // And a swap that arrives while a refresh waits on an earlier swap still
+  // completes: no deadlock either way round.
+  const again = store.swapTo('target');
+  const f2 = store.refreshOnce('target', async () => 'ok');
+  const done = await Promise.race([Promise.all([again, f2]).then(() => 'done'), new Promise((r) => setTimeout(() => r('deadlock'), 2000))]);
+  eq(done, 'done');
+});
+
+await t('★ a rotation swap refuses a slot flagged while it waited; a hand swap does not (QA)', async () => {
+  const { store, kc } = freshStore(LIVE_BLOB, [
+    { name: 'live', claudeAiOauth: LIVE_BLOB.claudeAiOauth },
+    { name: 'dead', claudeAiOauth: oauth('dead'), needsLogin: { reason: 'login refused (invalid_grant)', at: 'then' } },
+  ]);
+  const r = await store.swapTo('dead', { refuseFlagged: true });
+  eq(r.ok, false, 'the rotation installed a dead login');
+  eq(r.needsLogin, true, 'the caller must be able to tell a dead target from a failed keychain');
+  ok(/needs a fresh login/.test(r.error), r.error);
+  eq(fingerprint(kc.blob.claudeAiOauth), fingerprint(LIVE_BLOB.claudeAiOauth), 'a refused swap must change nothing');
+  const byHand = await store.swapTo('dead');
+  ok(byHand.ok, 'a swap he asks for by hand is his call');
+});
+
+await t('a spent refresh token is remembered per slot, by digest', async () => {
+  const { store } = freshStore(LIVE_BLOB, [{ name: 'idle', claudeAiOauth: oauth('idle') }]);
+  store.noteRefreshSpent('idle', tok('ref-spent'));
+  eq(store.refreshSpent('idle', tok('ref-spent')), 'rotated');
+  store.noteRefreshSpent('idle', tok('ref-refused'), 'login refused (invalid_grant)');
+  eq(store.refreshSpent('idle', tok('ref-refused')), 'login refused (invalid_grant)', 'a refusal remembers why');
+  eq(store.refreshSpent('idle', tok('ref-other')), false);
+  eq(store.refreshSpent('someone-else', tok('ref-spent')), false, 'per slot, not global');
+  eq(store.refreshSpent('idle', null), false);
+});
+
+await t('★ markNeedsLogin raises a flag ONCE: `changed` only the first time, persisted across a restart', async () => {
+  const { store, file, logs } = freshStore(LIVE_BLOB, [
+    { name: 'a', claudeAiOauth: oauth('a') },
+    { name: 'b', claudeAiOauth: oauth('b') },
+  ]);
+  const first = store.markNeedsLogin('b', 'login refused (invalid_grant)');
+  eq(first.changed, true, 'the first dead-login verdict must raise the flag');
+  eq(store.markNeedsLogin('b', 'login refused (HTTP 401)').changed, false, 'a second probe must not raise it again');
+  const disk = JSON.parse(readFileSync(file, 'utf8'));
+  eq(disk[1].needsLogin.reason, 'login refused (invalid_grant)', 'the FIRST reason stands');
+  ok(!JSON.stringify(disk).includes('"needsLogin":{"reason":"login refused (HTTP 401)"'), 'the second reason overwrote the first');
+  ok(!JSON.stringify(disk[1].needsLogin).includes(oauth('b').refreshToken), 'the flag leaked a token');
+  eq(store.describe()[1].needsLogin.reason, 'login refused (invalid_grant)');
+  eq(store.describe()[0].needsLogin, null);
+  ok(logs.some((l) => l.includes('needs a fresh login')), 'raising the flag must be logged');
+  // A daemon restart is a new store over the same file: the flag is still there
+  // and is still not "new", so no second notice after a restart.
+  const again = createAccountStore({ file, credentials: createKeychainStore({ account: 'owner', runSecurity: async () => ({ code: 44, stdout: '' }) }), log: () => {} });
+  eq(again.markNeedsLogin('b', 'login refused (invalid_grant)').changed, false, 'a restart must not re-raise a persisted flag');
+  eq(store.markNeedsLogin('no-such-slot', 'x').ok, false);
+});
+
+await t('★ a flagged slot is never the next account, and its wall is never the resume clock', () => {
+  const flag = { reason: 'login refused (invalid_grant)', at: new Date(NOW).toISOString() };
+  const list = [
+    { name: 'live', claudeAiOauth: oauth('l') },
+    { name: 'dead', claudeAiOauth: oauth('d'), needsLogin: flag },
+    { name: 'ok', claudeAiOauth: oauth('o'), lastActiveAt: new Date(NOW).toISOString() },
+  ];
+  eq(nextAvailable(list, { activeName: 'live', now: NOW })?.name, 'ok', 'the dead login sorts first by lastActiveAt and must still be skipped');
+  eq(nextAvailable(list.slice(0, 2), { activeName: 'live', now: NOW }), null, 'a dead login is not somewhere to go');
+  const walls = [
+    { name: 'dead', claudeAiOauth: oauth('d'), limitedUntil: secs(3600_000), needsLogin: flag },
+    { name: 'later', claudeAiOauth: oauth('x'), limitedUntil: secs(5 * 3600_000) },
+  ];
+  eq(earliestReset(walls, NOW), secs(5 * 3600_000), 'a dead login freeing up frees nothing');
+});
+
+await t('★ a capture into a flagged slot clears the flag, and a later dead login raises it anew', async () => {
+  const { store, logs } = freshStore(LIVE_BLOB, [{ name: 'main', claudeAiOauth: oauth('old') }]);
+  store.markNeedsLogin('main', 'login refused (invalid_grant)');
+  const r = await store.captureCurrent('main');
+  ok(r.ok, r.error);
+  eq(store.describe()[0].needsLogin, null, 'the capture he was asked for must answer the flag');
+  ok(logs.some((l) => l.includes('cleared by the capture')), 'the clear must be logged');
+  eq(store.markNeedsLogin('main', 'login refused (HTTP 401)').changed, true, 'a new dead login is a new flag');
+  eq(store.clearNeedsLogin('main').changed, true);
+  eq(store.describe()[0].needsLogin, null);
+  eq(store.clearNeedsLogin('main').changed, false);
+});
+
+await t('a new login the banking ladder IDENTIFIES as a flagged slot clears the flag too', async () => {
+  const { store } = freshStore(LIVE_BLOB, [
+    { name: 'two@x.app', email: 'two@x.app', claudeAiOauth: oauth('two-dead'), needsLogin: { reason: 'login refused (invalid_grant)', at: 'then' } },
+  ], { identify: async () => 'two@x.app' });
+  store.setIntended('two@x.app', 'a…before/r…before');
+  const d = await store.checkDrift();
+  eq(d.action, 'rebanked', JSON.stringify(d));
+  eq(store.describe()[0].needsLogin, null, 'a fresh /login banked into the slot is the fresh login the flag waits for');
+});
+
 rmSync(TMP, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${failures.length} failed\n`);
 if (failures.length) {

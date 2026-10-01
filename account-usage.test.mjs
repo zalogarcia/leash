@@ -49,8 +49,9 @@ import {
   normalizeRateLimitEvent,
   liveSourceLine,
   STREAM_FALLBACK_MAX_AGE_MS,
+  rowLoginProblem,
 } from './account-usage.mjs';
-import { createKeychainStore } from './credential-store.mjs';
+import { createKeychainStore, createFileStore } from './credential-store.mjs';
 
 // Every zone-dependent assertion pins this zone explicitly, so the suite is
 // deterministic on any machine. (The module's own default is the local zone;
@@ -721,6 +722,303 @@ await t('a dead refreshTokenExpiresAt short-circuits with the capture-again inst
   ok(/\/account capture first@example\.com/.test(rows[1].error), rows[1].error);
   eq(f.calls.filter((c) => c.url.includes('/oauth/token')).length, 0, 'a dead refresh token must not be spent on an attempt');
   eq(f.calls.filter((c) => c.tok === 'acc-b').length, 0, 'an expired account must not be asked for usage either');
+});
+
+// ---------------------------------------------------------------------------
+// ONE REFRESH PER SLOT (2026-09-30 18:22 ET). The /account view's read and the
+// rotation's probe refreshed an idle account at the same moment: the first
+// won and was banked, the second presented the refresh token the first had
+// just spent and got invalid_grant, and the rotation took the account anyway.
+// ---------------------------------------------------------------------------
+
+// A token endpoint that holds its answer until the test releases it, so two
+// readers can be caught with one refresh in flight, deterministically.
+function gatedRefreshFetch({ answer = () => res(200, { access_token: 'acc-c-new', refresh_token: 'ref-c-new', expires_in: 28800 }) } = {}) {
+  const calls = { token: [], usage: [] };
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const impl = async (url, opts) => {
+    if (url.includes('/oauth/token')) {
+      calls.token.push(JSON.parse(opts.body).refresh_token);
+      await gate;
+      return answer(calls.token.length);
+    }
+    const tok = String(opts.headers.Authorization).replace('Bearer ', '');
+    if (url.includes('/oauth/profile')) return res(200, REAL_PROFILE);
+    calls.usage.push(tok);
+    return res(200, REAL_USAGE);
+  };
+  return { impl, calls, release: () => release() };
+}
+const tick = () => new Promise((r) => setTimeout(r, 5));
+
+await t('★ two readers of one expired idle slot at once cause ONE refresh, and both get the new token', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED));
+  seed[2].claudeAiOauth = oauthFor('c', { expiresAt: NOW - 60_000 });
+  const f = gatedRefreshFetch();
+  const r = rig({ seed, liveOauth: oauthFor('a'), fetchImpl: f.impl });
+  // The /account view's read and the rotation's probe, exactly the two of 18:22.
+  const view = r.usage.all();
+  await tick();
+  const probe = r.usage.one('third@example.com');
+  await tick();
+  f.release();
+  const [{ rows }, probed] = await Promise.all([view, probe]);
+  eq(f.calls.token.length, 1, 'a second refresh presented the refresh token the first one was spending');
+  eq(f.calls.token[0], 'ref-c', 'the refresh presented the wrong token');
+  eq(rows[2].state, 'ok', rows[2].error);
+  eq(probed.state, 'ok', `the probe must get the refreshed token, not a failure: ${probed.error}`);
+  eq(rowLoginProblem(probed), null, 'the probe was told the login is dead');
+  ok(f.calls.usage.includes('acc-c-new'), 'nobody used the refreshed token');
+  ok(!f.calls.usage.includes('acc-c'), 'the expired token was sent anyway');
+  eq(r.onDisk()[2].claudeAiOauth.refreshToken, 'ref-c-new', 'the rotation must be banked');
+});
+
+await t('★ a reader that arrives right AFTER a refresh landed uses the banked token and presents nothing', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED));
+  seed[2].claudeAiOauth = oauthFor('c', { expiresAt: NOW - 60_000 });
+  const f = gatedRefreshFetch();
+  const r = rig({ seed, liveOauth: oauthFor('a'), fetchImpl: f.impl });
+  f.release();
+  await r.usage.all();
+  const again = await r.usage.one('third@example.com');
+  eq(f.calls.token.length, 1, 'the spent refresh token was presented again');
+  eq(again.state, 'ok');
+});
+
+await t('★ a refresh token whose replacement never reached the disk is NEVER presented again', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED));
+  seed[2].claudeAiOauth = oauthFor('c', { expiresAt: NOW - 60_000 });
+  const f = gatedRefreshFetch();
+  f.release();
+  const r = rig({ seed, liveOauth: oauthFor('a'), fetchImpl: f.impl });
+  r.store.bankOauth = () => {
+    throw new Error('EROFS: read-only file system');
+  };
+  const first = await r.usage.one('third@example.com');
+  eq(first.state, 'persist-failed');
+  const second = await r.usage.one('third@example.com');
+  eq(f.calls.token.length, 1, 'the spent refresh token went out a second time');
+  eq(second.state, 'persist-failed');
+  eq(rowLoginProblem(second), 'a refreshed login could not be saved');
+});
+
+await t('★ a REFUSED refresh (invalid_grant) marks the row as a login problem; a 500 does not', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED));
+  seed[2].claudeAiOauth = oauthFor('c', { expiresAt: NOW - 60_000 });
+  const refused = gatedRefreshFetch({ answer: () => res(400, { error: 'invalid_grant' }) });
+  refused.release();
+  const r = rig({ seed, liveOauth: oauthFor('a'), fetchImpl: refused.impl });
+  const row = await r.usage.one('third@example.com');
+  eq(row.state, 'refresh-failed');
+  eq(rowLoginProblem(row), 'login refused (invalid_grant)');
+  // Refused once, never presented again (the second read is a dead login, not a retry).
+  const again = await r.usage.one('third@example.com');
+  eq(refused.calls.token.length, 1, 'a refused refresh token was presented again');
+  eq(again.state, 'refresh-failed', 'a refused token is not a persist failure');
+  eq(rowLoginProblem(again), 'login refused (invalid_grant)');
+  ok(/refused earlier \(login refused \(invalid_grant\)\)/.test(again.error), again.error);
+
+  const flaky = gatedRefreshFetch({ answer: () => res(503, {}) });
+  flaky.release();
+  const r2 = rig({ seed: JSON.parse(JSON.stringify(seed)), liveOauth: oauthFor('a'), fetchImpl: flaky.impl });
+  const row2 = await r2.usage.one('third@example.com');
+  eq(row2.state, 'refresh-failed');
+  eq(rowLoginProblem(row2), null, 'a server having a bad minute says nothing about the login');
+});
+
+await t('★ only invalid_grant retires a login: a bare 401, a 403 page or invalid_client does not (QA)', async () => {
+  for (const [status, body] of [[401, {}], [403, { error: 'forbidden' }], [401, { error: 'invalid_client' }], [403, null]]) {
+    const seed = JSON.parse(JSON.stringify(SEED));
+    seed[2].claudeAiOauth = oauthFor('c', { expiresAt: NOW - 60_000 });
+    const f = gatedRefreshFetch({ answer: () => (body ? res(status, body) : res(status, null, { json: false })) });
+    f.release();
+    const r = rig({ seed, liveOauth: oauthFor('a'), fetchImpl: f.impl });
+    const row = await r.usage.one('third@example.com');
+    eq(row.state, 'refresh-failed', `${status} ${JSON.stringify(body)}`);
+    eq(rowLoginProblem(row), null, `HTTP ${status} ${JSON.stringify(body)} retired a login`);
+  }
+});
+
+await t('a 403 on an idle slot\'s usage lookup is not a dead login; a 401 is (QA)', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED));
+  const impl = async (url) => {
+    if (url.includes('/oauth/profile')) return res(200, REAL_PROFILE);
+    return res(403, { error: { type: 'permission_error' } });
+  };
+  const r = rig({ seed, liveOauth: oauthFor('a'), fetchImpl: impl });
+  const { rows } = await r.usage.all();
+  eq(rows[1].failure?.kind, 'refused');
+  eq(rowLoginProblem(rows[1]), null, 'a 403 retired a login');
+});
+
+await t('with the live login UNIDENTIFIED, an expired-looking slot is not called dead (it may be the live one) (QA)', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED));
+  seed[1].claudeAiOauth = oauthFor('b', { expiresAt: NOW - 60_000, refreshTokenExpiresAt: NOW - 86400_000 });
+  // A live blob that matches no slot, and a profile lookup that fails.
+  const impl = async () => res(500, {});
+  const r = rig({ seed, liveOauth: oauthFor('zzz-unknown'), fetchImpl: impl });
+  const { active, rows } = await r.usage.all();
+  eq(active.name, null);
+  eq(rows[1].state, 'credentials-expired');
+  eq(rowLoginProblem(rows[1]), null, 'a slot that may be the live login was declared dead');
+});
+
+await t('a refused token on an IDLE slot is a login problem; on the LIVE slot it is not', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED));
+  const impl = async (url, opts) => {
+    if (url.includes('/oauth/profile')) return res(200, REAL_PROFILE);
+    return res(401, { error: { type: 'authentication_error' } });
+  };
+  const r = rig({ seed, liveOauth: oauthFor('a'), fetchImpl: impl });
+  const { rows } = await r.usage.all();
+  eq(rows[0].live, true);
+  eq(rowLoginProblem(rows[0]), null, 'the live session refreshes its own token; a 401 there proves nothing');
+  eq(rowLoginProblem(rows[1]), 'login refused (HTTP 401)');
+  eq(rowLoginProblem(null), null);
+  eq(rowLoginProblem({ state: 'unavailable', failure: { kind: 'timeout' } }), null);
+});
+
+await t('★ a slot already flagged as needing a login is not asked at all, and says what to do', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED));
+  seed[2].claudeAiOauth = oauthFor('c', { expiresAt: NOW - 60_000 });
+  seed[2].needsLogin = { reason: 'login refused (invalid_grant)', at: 'then', fingerprint: 'x' };
+  const f = gatedRefreshFetch();
+  f.release();
+  const r = rig({ seed, liveOauth: oauthFor('a'), fetchImpl: f.impl });
+  const row = await r.usage.one('third@example.com');
+  eq(row.state, 'needs-login');
+  eq(f.calls.token.length, 0, 'a flagged slot spent a refresh');
+  ok(!f.calls.usage.includes('acc-c'), 'a flagged slot was asked for usage');
+  eq(rowLoginProblem(row), 'login refused (invalid_grant)');
+  ok(/\/account capture third@example\.com/.test(row.error), row.error);
+});
+
+await t('an expired login past its own refresh expiry is a login problem too', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED));
+  seed[1].claudeAiOauth = oauthFor('b', { expiresAt: NOW - 60_000, refreshTokenExpiresAt: NOW - 86400_000 });
+  const r = rig({ seed, liveOauth: oauthFor('a'), fetchImpl: usageFetch({}).impl });
+  const { rows } = await r.usage.all();
+  eq(rows[1].state, 'credentials-expired');
+  eq(rowLoginProblem(rows[1]), 'its login expired');
+});
+
+await t('a slot that became the LIVE login while its refresh was queued is never refreshed by the reader', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED));
+  seed[2].claudeAiOauth = oauthFor('c', { expiresAt: NOW - 60_000 });
+  const f = gatedRefreshFetch();
+  f.release();
+  const r = rig({ seed, liveOauth: oauthFor('a'), fetchImpl: f.impl });
+  // The reader resolves "a is live", then a swap lands the expired slot c in the
+  // keychain before the refresh would go out.
+  const readCreds = r.store.readCredentials;
+  let calls = 0;
+  r.store.readCredentials = async () => {
+    calls++;
+    return calls === 1 ? readCreds() : { claudeAiOauth: seed[2].claudeAiOauth };
+  };
+  const row = await r.usage.one('third@example.com');
+  eq(f.calls.token.length, 0, 'the reader refreshed the live login out from under its session');
+  eq(row.state, 'ok');
+});
+
+await t('★ a probe that arrives DURING a swap onto its slot does not refresh the login the swap just made live (QA)', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED));
+  seed[2].claudeAiOauth = oauthFor('c', { expiresAt: NOW - 60_000 });
+  const f = gatedRefreshFetch();
+  f.release();
+  const r = rig({ seed, liveOauth: oauthFor('a'), fetchImpl: f.impl });
+  const real = r.kc.run;
+  let release;
+  const gate = new Promise((res2) => (release = res2));
+  let gated = true;
+  r.kc.run = async (args, stdin) => {
+    if (gated && args[0] === 'find-generic-password') await gate;
+    return real(args, stdin);
+  };
+  const swap = r.store.swapTo('third@example.com');
+  await tick();
+  const probe = r.usage.one('third@example.com');
+  await tick();
+  gated = false;
+  release();
+  const [sw, row] = await Promise.all([swap, probe]);
+  ok(sw.ok, sw.error);
+  eq(f.calls.token.length, 0, 'the probe refreshed the slot the swap was installing: the live login now holds a spent refresh token');
+  eq(r.kc.blob.claudeAiOauth.refreshToken, 'ref-c', 'the live login must be the slot as it was swapped in');
+  eq(r.onDisk()[2].claudeAiOauth.refreshToken, 'ref-c', 'and the slot must agree with it');
+  eq(rowLoginProblem(row), null, 'a live login was reported dead');
+});
+
+await t('★ a rotation swap that waited on a refresh sees the flag its LATE refusal raises, on a credential store that answers at once (QA)', async () => {
+  // The macOS keychain read is a child process, and only that let the late
+  // flag land before the swap re-read its target. A file store (the Linux
+  // backend) answers in the same tick, and the swap installed the dead login
+  // live unless it first let the flight's own readers finish (QA, 2026-09-30).
+  const seed = JSON.parse(JSON.stringify(SEED));
+  seed[2].claudeAiOauth = oauthFor('c', { expiresAt: NOW - 60_000 });
+  const f = gatedRefreshFetch({ answer: () => res(400, { error: 'invalid_grant' }) });
+  const credFile = path.join(TMP, `credentials-${n}.json`);
+  writeFileSync(credFile, JSON.stringify({ claudeAiOauth: oauthFor('a'), mcpOAuth: { heygen: { token: 'machine-scoped' } } }), { mode: 0o600 });
+  const file = path.join(TMP, `accounts-${n++}.json`);
+  writeFileSync(file, JSON.stringify(seed, null, 2), { mode: 0o600 });
+  const store = createAccountStore({ file, credentials: createFileStore({ path: credFile }), log: () => {} });
+  const usage = createAccountUsage({ store, fetchImpl: f.impl, now: () => NOW, log: () => {} });
+  invalidateUsageCache();
+  // The bridge's probe after its deadline: the selector has already taken the
+  // candidate as unreadable, so only this late reader can flag the refusal.
+  const probe = usage.one('third@example.com');
+  probe
+    .then((row) => {
+      const why = rowLoginProblem(row);
+      if (why) store.markNeedsLogin('third@example.com', why);
+    })
+    .catch(() => {});
+  await tick();
+  eq(f.calls.token.length, 1, 'the probe should have its refresh in the air');
+  const swap = store.swapTo('third@example.com', { refuseFlagged: true });
+  f.release();
+  const sw = await swap;
+  eq(sw.ok, false, 'the rotation installed a login the server had just refused');
+  eq(sw.needsLogin, true, 'the refusal must read as a dead target so the rotation selects again');
+  eq(JSON.parse(readFileSync(credFile, 'utf8')).claudeAiOauth.refreshToken, 'ref-a', 'the live login must be untouched');
+  ok(JSON.parse(readFileSync(file, 'utf8'))[2].needsLogin, 'the late refusal was not flagged');
+});
+
+await t('a refresh answered WITHOUT a new refresh token leaves that token usable (QA)', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED));
+  seed[2].claudeAiOauth = oauthFor('c', { expiresAt: NOW - 60_000 });
+  const f = gatedRefreshFetch({ answer: () => res(200, { access_token: 'acc-c-new', expires_in: 1 }) });
+  f.release();
+  const r = rig({ seed, liveOauth: oauthFor('a'), fetchImpl: f.impl });
+  const first = await r.usage.one('third@example.com');
+  eq(first.state, 'ok');
+  const second = await r.usage.one('third@example.com');
+  eq(second.state, 'ok', `a refresh token the server kept was treated as spent: ${second.error}`);
+  eq(rowLoginProblem(second), null);
+  eq(f.calls.token.length, 2);
+});
+
+await t('a refused refresh keeps only a snake_case error code: nothing else from the body reaches the flag or the notice (QA)', async () => {
+  const err = await refreshAccessToken({
+    refreshToken: 'r',
+    fetchImpl: async () => res(400, { error: 'sk-ant-oat01-LEAKED-TOKEN-VALUE' }),
+  }).catch((e) => e);
+  eq(err.code, null);
+  ok(!err.message.includes('sk-ant'), err.message);
+  eq(err.message, 'token refresh rejected: HTTP 400');
+});
+
+await t('refresh_token_expires_in dates the NEW refresh token, as Claude Code reads it', async () => {
+  const blob = await refreshAccessToken({
+    refreshToken: 'r',
+    now: NOW,
+    previous: { refreshTokenExpiresAt: NOW - 1000 },
+    fetchImpl: async () => res(200, { access_token: 'a2', refresh_token: 'r2', expires_in: 28800, refresh_token_expires_in: 2592000 }),
+  });
+  eq(blob.refreshTokenExpiresAt, NOW + 2592000 * 1000, 'the old token expiry was carried over the new one');
+  const err = await refreshAccessToken({ refreshToken: 'r', fetchImpl: async () => res(400, { error: 'invalid_grant' }) }).catch((e) => e);
+  eq([err.rejected, err.status, err.code], [true, 400, 'invalid_grant']);
 });
 
 await t('a slot with no credentials is reported, not skipped', async () => {

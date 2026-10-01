@@ -172,6 +172,13 @@ await t('labelForSwap marks limited and uncaptured slots, and round-trips', () =
   }
 });
 
+await t('★ a slot flagged as needing a login is labelled so, and round-trips (QA)', () => {
+  const flagged = { name: 'x@y.z', captured: true, limited: false, needsLogin: { reason: 'login refused (invalid_grant)', at: 'then' } };
+  eq(labelForSwap(flagged), '🔑 x@y.z (needs login)');
+  eq(labelForSwap({ ...flagged, limited: true }), '🔑 x@y.z (needs login)', 'a dead login outranks a wall: the wall lifting will not help');
+  eq(nameFromLabel(labelForSwap(flagged)), 'x@y.z', 'label did not round-trip:');
+});
+
 await t('nameFromLabel survives junk', () => {
   eq(nameFromLabel(null), '');
   eq(nameFromLabel(undefined), '');
@@ -486,6 +493,23 @@ await t('tapping a limited account refuses with why, and does not swap', async (
   eq(out.reason, 'limited');
   eq(calls.swapTo, [], 'swapped into a limited account');
   ok(/rate limited/i.test(calls.answers[0].text), calls.answers[0].text);
+});
+
+await t('★ tapping a slot flagged as needing a login refuses with the fix, and does not swap (QA)', async () => {
+  const rows = [{ ...ROWS[0], needsLogin: { reason: 'login refused (invalid_grant)', at: 'then' } }, ...ROWS.slice(1)];
+  const r = resolveSwapTarget(rows, decodeAccountCallback(encodeSwap(0, ROWS[0].name)), null);
+  eq(r.ok, false);
+  eq(r.reason, 'needs-login');
+  const { handle, calls } = harness({ rows });
+  const out = await handle(tapOn(rows, 0));
+  eq(out.action, 'refuse');
+  eq(out.reason, 'needs-login');
+  eq(calls.swapTo, [], 'a tap installed a login the server had refused');
+  const text = calls.answers[0].text;
+  ok(/needs a fresh login/.test(text) && text.includes(`/account capture ${ROWS[0].name}`), text);
+  ok(text.includes(`/account ${ROWS[0].name} if you want to force it`), 'the typed command must stay the way to force it: ' + text);
+  ok(text.length <= 200, `a callback answer over 200 characters is cut by Telegram: ${text.length}`);
+  ok(!/[\u2013\u2014]/.test(text), 'no em or en dash at source');
 });
 
 await t('a failed swap is reported, not silently swallowed', async () => {

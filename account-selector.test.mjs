@@ -523,6 +523,119 @@ await t('without `recheck` a known wall is still never asked about', async () =>
 });
 
 // ---------------------------------------------------------------------------
+console.log('\n6. A DEAD LOGIN IS NEVER SELECTED: the 18:22 swap of 2026-09-30');
+// ---------------------------------------------------------------------------
+//
+// The rotation's probe of an idle account came back "token refresh rejected:
+// HTTP 400 (invalid_grant)", which probeVerdict reads as 'unreadable', and the
+// selector took the account with verified=false. These rows are what
+// account-usage.mjs builds for a refused refresh, a refused token, and a slot
+// already flagged (rowLoginProblem reads `loginProblem`).
+
+const REFUSED = (name) => ({
+  name,
+  state: 'refresh-failed',
+  error: 'token refresh rejected: HTTP 400 (invalid_grant)',
+  usage: null,
+  loginProblem: 'login refused (invalid_grant)',
+});
+const FLAG = { reason: 'login refused (invalid_grant)', at: 'then' };
+
+await t('★ a candidate whose refresh was REFUSED is never selected; the next healthy one is', async () => {
+  const decisions = [];
+  const h = harness({ b: REFUSED('b'), c: HEALTHY('c') });
+  const r = await selectAccount({
+    accounts: [slot('a'), slot('b'), slot('c')],
+    activeName: 'a',
+    now: NOW,
+    probe: h.probe,
+    onDecision: (d) => decisions.push(d),
+  });
+  eq(r.outcome, 'selected');
+  eq(r.name, 'c', 'the rotation swapped onto a dead login');
+  deepEq(r.needsLogin, [{ name: 'b', reason: 'login refused (invalid_grant)' }], 'the dead login must be handed back for the host to flag');
+  deepEq(h.asked, ['b', 'c']);
+  ok(decisions.some((d) => d.decision === 'account_needs_login' && d.account === 'b'), 'the refusal must be a decision line');
+  ok(!decisions.some((d) => d.decision === 'account_selected' && d.account === 'b'), 'b was selected');
+  ok(!decisions.some((d) => d.decision === 'account_probe_failed' && d.account === 'b'), 'a refused login is not an unreadable probe');
+});
+
+await t('★ when the ONLY other account has a dead login, nothing is selected at all', async () => {
+  const h = harness({ b: REFUSED('b') });
+  const r = await selectAccount({ accounts: [slot('a'), slot('b')], activeName: 'a', now: NOW, probe: h.probe });
+  ok(r.outcome !== 'selected', `a dead login was selected (${r.outcome} ${r.name}); the old rule took it with verified=false`);
+  eq(r.name, null);
+  deepEq(r.needsLogin.map((d) => d.name), ['b']);
+});
+
+await t('★ a refused TOKEN (401 on an idle slot) and an expired login are dead logins too', async () => {
+  const h = harness({
+    b: { name: 'b', state: 'unavailable', failure: { kind: 'refused', status: 401 }, usage: null, loginProblem: 'login refused (HTTP 401)' },
+    c: { name: 'c', state: 'credentials-expired', usage: null, loginProblem: 'its login expired' },
+    d: HEALTHY('d'),
+  });
+  const r = await selectAccount({ accounts: [slot('a'), slot('b'), slot('c'), slot('d')], activeName: 'a', now: NOW, probe: h.probe });
+  eq(r.name, 'd');
+  deepEq(r.needsLogin.map((x) => x.name), ['b', 'c']);
+});
+
+await t('a probe that merely could not be READ is still taken, as before (a timeout is not a dead login)', async () => {
+  const h = harness({ b: { name: 'b', state: 'unavailable', failure: { kind: 'timeout' }, usage: null } });
+  const r = await selectAccount({ accounts: [slot('a'), slot('b')], activeName: 'a', now: NOW, probe: h.probe });
+  eq(r.name, 'b');
+  deepEq(r.needsLogin, []);
+});
+
+await t('★ a slot already FLAGGED as needing a login is skipped without a probe', async () => {
+  const decisions = [];
+  const h = harness({ b: HEALTHY('b'), c: HEALTHY('c') });
+  const r = await selectAccount({
+    accounts: [slot('a'), slot('b', { needsLogin: FLAG }), slot('c')],
+    activeName: 'a',
+    now: NOW,
+    probe: h.probe,
+    onDecision: (d) => decisions.push(d),
+  });
+  eq(r.name, 'c');
+  deepEq(h.asked, ['c'], 'a flagged slot cost a probe (and, on a dead refresh token, a refresh)');
+  ok(decisions.some((d) => d.decision === 'account_skipped_needs_login' && d.account === 'b'));
+});
+
+await t('★ the ALL-WALLED fallback: a walled account whose re-check shows a dead login is never selected, and its clock is not the resume clock', async () => {
+  const h = harness({ b: REFUSED('b'), c: HEALTHY('c') });
+  const r = await selectAccount({
+    accounts: [slot('a'), walled('b', { limitedUntil: secs(1 * HOUR) }), walled('c', { limitedUntil: secs(9 * HOUR) })],
+    activeName: 'a',
+    now: NOW,
+    probe: async (name) => (name === 'b' ? REFUSED('b') : SPENT('c', 9 * HOUR)),
+    recheck: createRecheckLimiter(),
+  });
+  eq(r.outcome, 'all_walled', `a dead login was freed by the re-check: ${r.name}`);
+  deepEq(r.cleared, []);
+  deepEq(r.needsLogin.map((x) => x.name), ['b']);
+  eq(r.earliest, secs(9 * HOUR), 'the resume clock must not be the dead login\'s wall');
+});
+
+await t('a walled slot already flagged is not re-checked at all', async () => {
+  const h = harness({ b: HEALTHY('b') });
+  const r = await selectAccount({
+    accounts: [slot('a'), walled('b', { needsLogin: FLAG })],
+    activeName: 'a',
+    now: NOW,
+    probe: h.probe,
+    recheck: createRecheckLimiter(),
+  });
+  deepEq(h.asked, []);
+  ok(r.outcome !== 'selected');
+});
+
+await t('a row filed under ANOTHER slot is never read as this slot\'s dead login', async () => {
+  const h = harness({ b: REFUSED('someone-else') });
+  const r = await selectAccount({ accounts: [slot('a'), slot('b')], activeName: 'a', now: NOW, probe: h.probe });
+  deepEq(r.needsLogin, []);
+});
+
+// ---------------------------------------------------------------------------
 if (failures.length) {
   console.log(`\n${pass} passed, ${failures.length} failed\n`);
   for (const f of failures) console.log(`  ❌ ${f}`);

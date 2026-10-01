@@ -83,10 +83,24 @@
 // The re-checks are rate limited (createRecheckLimiter), and setting the wall
 // counts as its first check, so an account that just died is never freed a
 // minute later by a reading that cannot see why it died.
+//
+// ---------------------------------------------------------------------------
+// A PROBE THAT FAILS ON THE LOGIN IS NOT "UNREADABLE" (2026-09-30 18:22 ET)
+//
+// "A probe that fails is not a wall" was written for the network. It also let
+// through a probe whose refresh the server REFUSED (invalid_grant): the account
+// was selected with verified=false and swapped onto. A refused refresh, a
+// refused token, a login past its own expiry: each says the account cannot take
+// a run until the owner signs into it again, which is stronger evidence than a
+// timeout and points the other way. So a candidate whose probe row carries a
+// login problem (account-usage.mjs rowLoginProblem) is never selected, in the
+// probe loop or the re-check loop; it is returned in `needsLogin` for the host
+// to persist (accounts.mjs markNeedsLogin) and say once, and the loop moves on.
+// A slot already flagged is skipped without a probe, like a known wall.
 // ---------------------------------------------------------------------------
 
-import { isLimited, nextAvailable, earliestReset } from './accounts.mjs';
-import { resetsAtToMs } from './account-usage.mjs';
+import { isLimited, nextAvailable, earliestReset, loginFlag } from './accounts.mjs';
+import { resetsAtToMs, rowLoginProblem } from './account-usage.mjs';
 
 /** One candidate, one GET. The API aborts itself at 5s (account-usage.mjs). */
 export const PROBE_TIMEOUT_MS = 5_000;
@@ -303,7 +317,10 @@ function headroom(windows) {
  * (at most once per RECHECK_INTERVAL_MS) and taken if limitClearVerdict clears
  * it. Omit it and a known wall is never asked about, as before.
  *
- * Returns { outcome, name, account, walls, cleared, earliest, probed }:
+ * Returns { outcome, name, account, walls, cleared, needsLogin, earliest, probed }.
+ * `needsLogin` is [{ name, reason }], the candidates whose probe showed a dead
+ * login this pass; the CALLER persists them (markNeedsLogin) and tells the
+ * owner, exactly as it persists `walls`. The outcomes:
  *   'selected'   `name` is safe to swap to, verified unless `probed` says the
  *                probe could not be read. When `cleared` names it, its ledger
  *                wall was lifted by a re-check and the CALLER persists that
@@ -325,16 +342,32 @@ export async function selectAccount({
   // honours them without a disk write in the middle of it. The caller persists
   // them through markLimited; this overlay only keeps the loop honest.
   const found = new Map();
+  // Logins this pass found dead, held the same way: overlaid so the loop never
+  // hands the same candidate back, returned for the caller to persist.
+  const deadLogins = new Map();
   const guessUntil = Math.floor(Number(now) / 1000) + FALLBACK_WALL_SECONDS;
   const view = () =>
-    list.map((a) => (found.has(a.name) ? { ...a, limitedUntil: found.get(a.name).until } : a));
+    list.map((a) => {
+      let v = found.has(a.name) ? { ...a, limitedUntil: found.get(a.name).until } : a;
+      if (deadLogins.has(a.name) && !loginFlag(v)) v = { ...v, needsLogin: { reason: deadLogins.get(a.name) } };
+      return v;
+    });
   const walls = () => [...found].map(([name, w]) => ({ name, ...w }));
+  const needsLogin = () => [...deadLogins].map(([name, reason]) => ({ name, reason }));
+  const loginDead = (name, reason) => {
+    deadLogins.set(name, reason);
+    onDecision({ decision: 'account_needs_login', account: name, reason });
+  };
 
   // SAID OUT LOUD ONCE, before any probe: an account the ledger already knows
   // is walled is never hopped onto and never costs a round trip. This is the
-  // line that was missing from the 12:46 incident's log.
+  // line that was missing from the 12:46 incident's log. The same for a slot
+  // already flagged as needing a login.
   for (const a of list) {
-    if (a.name !== activeName && isLimited(a, now)) {
+    if (a.name === activeName) continue;
+    if (loginFlag(a)) {
+      onDecision({ decision: 'account_skipped_needs_login', account: a.name, reason: loginFlag(a).reason || null });
+    } else if (isLimited(a, now)) {
       onDecision({ decision: 'account_skipped_known_walled', account: a.name, until: Number(a.limitedUntil) || null });
     }
   }
@@ -356,7 +389,7 @@ export async function selectAccount({
 
     if (typeof probe !== 'function') {
       onDecision({ decision: 'account_selected', account: cand.name, reason: 'no probe wired' });
-      return { outcome: 'selected', name: cand.name, account: cand, walls: walls(), cleared: [], earliest: null, probed };
+      return { outcome: 'selected', name: cand.name, account: cand, walls: walls(), cleared: [], needsLogin: needsLogin(), earliest: null, probed };
     }
 
     let row = null;
@@ -366,6 +399,14 @@ export async function selectAccount({
       // A probe that THREW is a probe that could not be read, not a wall. The
       // verdict below reaches 'unreadable' from the null and says so.
       row = null;
+    }
+    // A LOGIN THE SERVER REFUSED is not an unreadable probe (see the header).
+    // Checked before the verdict, which would call it 'unreadable' and take it.
+    const dead = row && row.name === cand.name ? rowLoginProblem(row) : null;
+    if (dead) {
+      probed.push({ name: cand.name, state: 'needs-login', reason: dead });
+      loginDead(cand.name, dead);
+      continue;
     }
     const v = probeVerdict(row, { now });
     probed.push({ name: cand.name, state: v.state, reason: v.reason });
@@ -391,7 +432,7 @@ export async function selectAccount({
       onDecision({ decision: 'account_probe_failed', account: cand.name, reason: v.reason });
     }
     onDecision({ decision: 'account_selected', account: cand.name, reason: v.reason, verified: v.state === 'healthy' });
-    return { outcome: 'selected', name: cand.name, account: cand, walls: walls(), cleared: [], earliest: null, probed };
+    return { outcome: 'selected', name: cand.name, account: cand, walls: walls(), cleared: [], needsLogin: needsLogin(), earliest: null, probed };
   }
 
   // RE-CHECK THE KNOWN WALLS, only now that nothing ledger-free can take the
@@ -402,7 +443,7 @@ export async function selectAccount({
   // same reason it is never selected: it is the one that just died.
   if (recheck && typeof recheck.take === 'function' && typeof probe === 'function') {
     for (const a of list) {
-      if (a.name === activeName || !a.claudeAiOauth || asked.has(a.name) || !isLimited(a, now)) continue;
+      if (a.name === activeName || !a.claudeAiOauth || asked.has(a.name) || !isLimited(a, now) || loginFlag(a)) continue;
       if (!recheck.take(a.name, now, { since: a.limitedVerifiedAt })) continue;
       asked.add(a.name);
       let row = null;
@@ -410,6 +451,14 @@ export async function selectAccount({
         row = await probe(a.name);
       } catch {
         row = null; // a probe that threw keeps the wall, see limitClearVerdict
+      }
+      // A refused login keeps the wall AND is said, so the owner learns the
+      // account needs him before its wall even ends.
+      const dead = row && row.name === a.name ? rowLoginProblem(row) : null;
+      if (dead) {
+        probed.push({ name: a.name, state: 'needs-login', reason: dead });
+        loginDead(a.name, dead);
+        continue;
       }
       const v = limitClearVerdict(row, { name: a.name, now, wallSetAt: a.limitedVerifiedAt });
       const wasUntil = Number(a.limitedUntil) || null;
@@ -425,6 +474,7 @@ export async function selectAccount({
         account: { ...a, limitedUntil: null },
         walls: walls(),
         cleared: [{ name: a.name, reason: v.reason }],
+        needsLogin: needsLogin(),
         earliest: null,
         probed,
       };
@@ -436,8 +486,8 @@ export async function selectAccount({
   const earliest = earliestReset(view(), now);
   if (!list.length) {
     onDecision({ decision: 'all_accounts_walled_until', until: null, count: 0, reason: 'no accounts enrolled' });
-    return { outcome: 'none', name: null, account: null, walls: walls(), cleared: [], earliest: null, probed };
+    return { outcome: 'none', name: null, account: null, walls: walls(), cleared: [], needsLogin: needsLogin(), earliest: null, probed };
   }
   onDecision({ decision: 'all_accounts_walled_until', until: earliest, count: list.length });
-  return { outcome: 'all_walled', name: null, account: null, walls: walls(), cleared: [], earliest, probed };
+  return { outcome: 'all_walled', name: null, account: null, walls: walls(), cleared: [], needsLogin: needsLogin(), earliest, probed };
 }
