@@ -355,7 +355,7 @@ t('a capped chain waits while the chat lane is busy', () => {
 });
 
 // Caps the chain WITHOUT resetChain, so the auto-resume budget carries across caps
-// the way it does in the daemon between two of his messages.
+// the way it does in the daemon between two of their messages.
 function capAgain(prefix) {
   for (let i = 0; i <= HANDBACK_STREAK_MAX; i++) {
     M.handBackToChat(`${prefix} task ${i}`, `output ${i}`, 'finished', `${prefix}-${i}`);
@@ -363,7 +363,7 @@ function capAgain(prefix) {
   eq(M.parkedHandbacks.length, 1, 'the over-cap report should be parked');
 }
 
-t('the quiet resume is bounded per human message; his message restores the budget', () => {
+t('the quiet resume is bounded per human message; their message restores the budget', () => {
   M.resetChain();
   for (let n = 0; n < HANDBACK_AUTO_RESUMES_MAX; n++) {
     capAgain(`run-budget-${n}`);
@@ -371,11 +371,11 @@ t('the quiet resume is bounded per human message; his message restores the budge
   }
   capAgain('run-budget-spent');
   const before = M.dispatched.length;
-  eq(M.maybeAutoResumeHandbacks(M.lastParked() + 10 * HANDBACK_AUTO_RESUME_MS), false, 'the budget is spent: park until he types');
+  eq(M.maybeAutoResumeHandbacks(M.lastParked() + 10 * HANDBACK_AUTO_RESUME_MS), false, 'the budget is spent: park until they type');
   eq(M.dispatched.length, before, 'nothing dispatched past the budget');
-  // His message is the other way in: it flushes regardless of the budget.
+  // Their message is the other way in: it flushes regardless of the budget.
   eq(M.flushParkedHandbacks('message'), true, 'a message flushes the parked list');
-  ok(M.dispatched[M.dispatched.length - 1].includes('what the owner just asked'), 'a message flush keeps the answer-him framing');
+  ok(M.dispatched[M.dispatched.length - 1].includes('what the owner just asked'), 'a message flush keeps the answer-them framing');
   eq(M.parkedHandbacks.length, 0);
 });
 

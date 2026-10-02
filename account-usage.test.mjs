@@ -56,7 +56,7 @@ import { createKeychainStore, createFileStore } from './credential-store.mjs';
 // Every zone-dependent assertion pins this zone explicitly, so the suite is
 // deterministic on any machine. (The module's own default is the local zone;
 // the bridges inject the owner's zone at the call sites.)
-const OWNER_TZ = 'America/New_York';
+const OWNER_TZ = 'America/Toronto';
 
 let pass = 0;
 const failures = [];
@@ -198,17 +198,17 @@ await t('fmtResetLeft gives h+m under a day', () => {
 });
 
 await t('fmtResetLeft names the DAY once the reset is more than a day out', () => {
-  // 2026-09-05T05:00Z is 1:00am Saturday in New York; the label must be his day,
+  // 2026-09-05T05:00Z is 1:00am Saturday in OWNER_TZ; the label must be the owner's day,
   // not UTC's, which is the whole reason the zone is a parameter.
   const s = fmtResetLeft('2026-09-05T05:00:00Z', Date.parse('2026-09-01T00:00:00Z'), { timeZone: OWNER_TZ });
   eq(s, 'Sat 5 Sep, 4d 5h left');
   // In UTC the same instant is still the 5th, but at 5am, and still Saturday.
   eq(fmtResetLeft('2026-09-05T05:00:00Z', Date.parse('2026-09-01T00:00:00Z'), { timeZone: 'UTC' }), 'Sat 5 Sep, 4d 5h left');
-  // A reset just past midnight UTC on the 5th is the 4th in New York.
+  // A reset just past midnight UTC on the 5th is the 4th in OWNER_TZ.
   eq(
     fmtResetLeft('2026-09-05T01:00:00Z', Date.parse('2026-09-01T00:00:00Z'), { timeZone: OWNER_TZ }),
     'Fri 4 Sep, 4d 1h left',
-    'the day label must be rendered in HIS zone',
+    'the day label must be rendered in THEIR zone',
   );
 });
 
@@ -229,10 +229,10 @@ await t('fmtResetLeft takes ISO strings, epoch MILLISECONDS and Dates — never 
   eq(fmtResetLeft(Math.floor((NOW + 90 * 60_000) / 1000), NOW), 'due now');
 });
 
-await t('fmtResetClock prints his local clock, and adds the day only when it is not today', () => {
-  // 22:10Z on 2026-08-31 is 6:10pm the same day in New York.
+await t('fmtResetClock prints their local clock, and adds the day only when it is not today', () => {
+  // 22:10Z on 2026-08-31 is 6:10pm the same day in OWNER_TZ.
   eq(fmtResetClock('2026-08-31T22:10:00Z', { timeZone: OWNER_TZ, now: NOW }), '6:10pm');
-  // 05:00Z on 2026-09-05 is 1:00am Saturday the 5th in New York — a different day.
+  // 05:00Z on 2026-09-05 is 1:00am Saturday the 5th in OWNER_TZ, a different day.
   eq(fmtResetClock('2026-09-05T05:00:00Z', { timeZone: OWNER_TZ, now: NOW }), 'Sat 5 Sep 1:00am');
   // Same instant read in UTC is 5:00am, still the 5th.
   eq(fmtResetClock('2026-09-05T05:00:00Z', { timeZone: 'UTC', now: NOW }), 'Sat 5 Sep 5:00am');
@@ -1255,7 +1255,7 @@ const ACCT_USAGE = [
 ];
 
 await t('renderAccountList puts the LIVE account first and marks it', () => {
-  // The live one is second in the file. He opens /account to see where he is,
+  // The live one is second in the file. They open /account to see where they are,
   // so it has to be the first thing on the screen, not found by hunting ▶︎.
   const out = renderAccountList(
     { rows: ACCT_ROWS, live: { name: 'first@example.com', matchedBy: 'refreshToken', liveFingerprint: 'a…X/r…Y' }, usageRows: ACCT_USAGE },
@@ -1349,7 +1349,7 @@ await t('swapFailure keeps the routine/urgent distinction accounts.mjs draws', (
   ok(routine.startsWith('❌ Swap to `first@example.com` failed'), routine);
   ok(routine.includes('the previous account is still active'), routine);
   ok(routine.endsWith('The live account is unchanged.'), routine);
-  // Urgent: the rollback did NOT take, so no worker can start until he logs in.
+  // Urgent: the rollback did NOT take, so no worker can start until they log in.
   const urgent = swapFailure({ to: 'first@example.com', error: 'keychain write failed AND the rollback did not take. Run: claude /login' });
   ok(urgent.startsWith('🚨'), `the urgent failure reads like the routine one:\n${urgent}`);
   ok(urgent.includes('claude /login'), 'the urgent failure lost the instruction that fixes it');
@@ -1440,7 +1440,7 @@ await t('NO renderer leaves a bare email for Telegram to turn into a mailto link
   }
 });
 
-await t('renderUsageReport prints bars, percents, HIS clock and time left for every account', () => {
+await t('renderUsageReport prints bars, percents, THEIR clock and time left for every account', () => {
   const rows = [
     { ...OK_ROW, live: true, fingerprint: 'a…f-rwAA/r…qGHAAA' },
     { name: 'first@example.com', live: false, state: 'ok', fingerprint: 'a…QVmgAA/r…f0NAAA', usage: normalizeUsage(REAL_USAGE) },
@@ -1460,11 +1460,11 @@ await t('renderUsageReport prints bars, percents, HIS clock and time left for ev
   ok(out.includes('• `first@example.com` `a…QVmgAA/r…f0NAAA`'), 'the idle rows lost their fingerprint too');
   ok(out.includes('5h `███░░░░░░░` 32%'), `missing the 5h bar:\n${out}`);
   ok(out.includes('wk `██░░░░░░░░` 24%'), 'missing the weekly bar');
-  ok(out.includes('resets 6:10pm · 17m left'), `missing his local 5h reset clock:\n${out}`);
-  ok(out.includes('Sat 5 Sep 1:00am'), 'missing the weekly reset in his zone');
+  ok(out.includes('resets 6:10pm · 17m left'), `missing their local 5h reset clock:\n${out}`);
+  ok(out.includes('Sat 5 Sep 1:00am'), 'missing the weekly reset in their zone');
   ok(out.includes('Fable'), 'the per-model weekly_scoped row was dropped');
   ok(out.includes('⚠️ usage unavailable'), 'a broken account must still appear');
-  ok(out.includes('America/New_York'), 'the reply must say which clock it is quoting');
+  ok(out.includes(OWNER_TZ), 'the reply must say which clock it is quoting');
   ok(!out.includes('extra usage'), 'extra_usage is disabled on this account and must not be shown');
 });
 
@@ -1662,7 +1662,7 @@ await t('a 429 that names its retry time says WHEN, as a clock in the owner zone
   const { snap, account, usage } = await bothViews(r);
   const row = snap.rows.find((x) => x.name === 'second@example.com');
   eq(row.failure, { kind: 'rate-limited', status: 429, code: 'rate_limit_error', retryAt: NOW + 2_714_000 });
-  // NOW is 5:53pm in New York; 45m14s later is 6:38pm.
+  // NOW is 5:53pm in OWNER_TZ; 45m14s later is 6:38pm.
   const want = '   ⚠️ usage lookup rate limited by Anthropic until 6:38pm (the account itself is fine)';
   ok(account.includes(want), `/account:\n${account}`);
   ok(usage.includes(want), `/usage:\n${usage}`);

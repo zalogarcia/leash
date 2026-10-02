@@ -52,7 +52,7 @@ const ok = (cond, msg) => {
   if (!cond) throw new Error(msg);
 };
 
-const TZ = 'America/New_York';
+const TZ = 'America/Toronto';
 
 // ---------------------------------------------------------------------------
 // Fixtures. The token is SYNTHETIC, the same shape as a real id_token, no signature
@@ -448,8 +448,8 @@ t('a half-written sidecar costs one row, not the view', () => {
 });
 
 t('the tally splits today from the rolling week, in the OWNER’s zone', () => {
-  // 2026-09-03 20:00 America/New_York = 2026-09-04 00:00 UTC, so local midnight
-  // is 20 hours back. A run 21 hours back is yesterday in New York and TODAY in
+  // 2026-09-03 20:00 America/Toronto = 2026-09-04 00:00 UTC, so local midnight
+  // is 20 hours back. A run 21 hours back is yesterday in Toronto and TODAY in
   // UTC, which is exactly the case a zone-blind boundary gets wrong.
   const now = Date.parse('2026-09-04T00:00:00Z');
   const hour = 3600_000;
@@ -473,7 +473,7 @@ t('★ the "today" boundary survives both DST transitions', () => {
   // Each case pins a run that lands in the ONE hour the naive boundary gets
   // wrong; the wall-clock subtraction answers the opposite of every line below.
   const cases = [
-    // [label, now (UTC), the run (UTC), is it today in New York?]
+    // [label, now (UTC), the run (UTC), is it today in Toronto?]
     ['a normal day, an hour ago', '2026-09-04T00:00:00Z', '2026-09-03T23:00:00Z', true],
     ['a normal day, yesterday evening', '2026-09-04T00:00:00Z', '2026-09-03T03:00:00Z', false],
     // 2027-03-14 is the US spring forward: 02:00 EST jumps to 03:00 EDT, so the
@@ -494,7 +494,7 @@ t('★ the "today" boundary survives both DST transitions', () => {
 t('a run started exactly at local midnight counts as today', () => {
   // en-CA hour12:false renders midnight as hour "24", which would push the
   // boundary a whole day back if it were not taken modulo 24.
-  const now = Date.parse('2026-09-04T04:00:00Z'); // 00:00 in New York
+  const now = Date.parse('2026-09-04T04:00:00Z'); // 00:00 in Toronto
   const tally = tallyCodexRuns([{ startedAt: now, mode: 'ask', inputTokens: 1, outputTokens: 0 }], { now, timeZone: TZ });
   eq(tally.today.runs, 1);
 });
@@ -532,7 +532,7 @@ t('the spend line is null until something has run this week', () => {
 // 6. The rendered block, character for character
 // ---------------------------------------------------------------------------
 
-const NOW = Date.parse('2026-09-03T23:30:00Z'); // 19:30 in New York
+const NOW = Date.parse('2026-09-03T23:30:00Z'); // 19:30 in Toronto
 
 t('the full block renders exactly as it will be read on the phone', () => {
   const usage = normalizeCodexRateLimits({

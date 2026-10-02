@@ -132,7 +132,7 @@ export function outcomeGlyph(status) {
   const s = String(status || '').toLowerCase();
   if (s === 'finished') return '✅';
   if (s === 'failed') return '❌';
-  // A job HE stopped is not a warning: 🛑 is the stop glyph everywhere else in
+  // A job THEY stopped is not a warning: 🛑 is the stop glyph everywhere else in
   // this surface, and reading their own /stop as "something went wrong" is the
   // one outcome that should never look like a surprise.
   if (s === 'stopped') return '🛑';
@@ -197,7 +197,7 @@ export const WORKER_IDLE_MS = 60_000;
 // carries its own ceiling. Past this the repo drops to its own line rather than
 // the model: "which engine, which model, at what effort" is the question the
 // head was widened to answer, and the repo is already in the brief title under
-// it. 60 is where his phone stops showing a third fact on one row.
+// it. 60 is where their phone stops showing a third fact on one row.
 export const HEAD_MAX = 60;
 
 /**
@@ -297,7 +297,7 @@ export function workerLine({
     // is this on Codex" is the only question a Codex notice raises, and the
     // card is three lines on a phone. Offering a steer a one-shot run cannot
     // take would be a lie that gets acked as delivered; withholding one from a
-    // job that CAN take it costs him the reach the app-server was built for.
+    // job that CAN take it costs them the reach the app-server was built for.
     if (isCodex) {
       const reach = steerable ? `/steer ${runId || lane || 'the job'} <instruction>` : 'not steerable';
       lines.push(`🧠 codex${engineNote ? ` · ${engineNote}` : ''} · ${reach}`);

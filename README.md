@@ -788,7 +788,7 @@ Cannot be reached from this sandbox (outside /Users/you/work/x): /Users/you/work
 ```
 
 **The ladder, highest rung first.** The whole point is that a handoff NEVER requires a model call,
-because the owner is usually switching because something is wrong with the engine he is leaving:
+because the owner is usually switching because something is wrong with the engine they are leaving:
 
 1. `/engine <x> fresh` was typed. Nothing is injected; the stored handoff is left alone ("skip it
    this once" and "forget it" are different requests, and `/new` is the second one).
@@ -835,7 +835,7 @@ above (the snapshot is already cached for 60s, so it is free).
 **What the switch itself LOOKS like.** It used to be a five-line paragraph carrying a token count and
 a rung name, followed up to 25 seconds later by a SECOND message when the capture turn landed. It is
 now one message, scannable, with the same icon/label/value line style as `/engine` itself, and the
-capture line is edited in place on the message he is already looking at:
+capture line is edited in place on the message they are already looking at:
 
 ```
 🧠 Codex is on.
@@ -887,7 +887,7 @@ exists.
 
 
 **One residual worth knowing:** Codex writes em dashes. That violates the owner's standing rule for
-his own copy, so anything a Codex turn drafts for publication needs a pass before it ships.
+their own copy, so anything a Codex turn drafts for publication needs a pass before it ships.
 
 ## Security
 

@@ -454,7 +454,7 @@ const linesFit = (str, where) => {
   }
 };
 // Tokens stay banned everywhere. MODEL NAMES are banned everywhere BUT the
-// head, where naming the engine's model is now the point (Zalo, 2026-09-05:
+// head, where naming the engine's model is now the point (the owner, 2026-09-05:
 // two running cards that said "Claude" and "Codex" and nothing about what
 // either was thinking with). Keeping the ban on every other line is what stops
 // a model id drifting into the title or the step line, where it would be noise.
@@ -569,7 +569,7 @@ t('workerLine: everything unknown is omitted rather than guessed', () => {
 // ---------------------------------------------------------------------------
 // The head names the ENGINE: lane, repo, model, effort.
 //
-// Zalo, 2026-09-05, with a screenshot of two running cards: "🌙 bg · delta-agents"
+// The owner, 2026-09-05, with a screenshot of two running cards: "🌙 bg · delta-agents"
 // and "🧠 bg3 · repo" answered "Claude or Codex" and nothing else, so a worker
 // on the wrong model, or one thinking at a lower effort than its sibling, was
 // invisible on the one surface whose job is saying what the job is.
@@ -600,8 +600,8 @@ t('workerLine: a Codex run on the CLI\'s own settings says "default" rather than
   // sets one; the bridge then omits --model and the CLI picks. "default" is
   // what /account and /engine already print for exactly that state.
   eq(
-    workerLine({ lane: 'bg3', repo: 'zalo-os', engine: 'codex', model: 'default', effort: 'default', phase: 'running', elapsedSec: 1 }).split('\n')[0],
-    '🧠 bg3 · zalo-os · default · default',
+    workerLine({ lane: 'bg3', repo: 'web-app', engine: 'codex', model: 'default', effort: 'default', phase: 'running', elapsedSec: 1 }).split('\n')[0],
+    '🧠 bg3 · web-app · default · default',
   );
 });
 
@@ -618,7 +618,7 @@ t('workerLine: ★ a re-attached worker shows NOTHING rather than a guess', () =
   // Survived a daemon restart: the pipe is gone, the spawn record may predate
   // the field, and today's pool pin is not necessarily the one it started on.
   // The failure this locks down is the literal strings "null"/"undefined"
-  // reaching his phone, which is what an unguarded template does.
+  // reaching their phone, which is what an unguarded template does.
   const s = workerLine({ lane: 'bg', repo: 'delta-agents', title: 'A long job', phase: 'running', elapsedSec: 900, steps: 40 });
   eq(s.split('\n')[0], '🌙 bg · delta-agents');
   ok(!/null|undefined/.test(s), s);
@@ -1102,7 +1102,7 @@ t('★ a scheduled run that did NOT land on the Claude lane names no model at al
 t('★ an every-N-days run names its cadence on the card, and only fires on its day', () => {
   // The harness clock is 2026-09-05 08:30. Anchored on the 3rd, an every-3d
   // item is not due; anchored on the 2nd it is, and the card says "every 3d"
-  // rather than "daily", which is the one word telling him why it is quiet on
+  // rather than "daily", which is the one word telling them why it is quiet on
   // the days in between.
   B.reset([{}]);
   B.setSchedules([{ id: 26, kind: 'daily', every: 3, at: '08:30', run: true, lastFired: '2026-09-03', text: 'BU ads check' }]);
@@ -1303,7 +1303,7 @@ t('★ /codex off means the wall is HELD OUT, not spawned into', () => {
   eq(B.CODEX_STARTED.length, 0, 'the setting is the whole point of the setting');
   // IT USED TO DISPATCH HERE, onto a Claude lane with no account that could
   // answer: a limit death, a 90 second salvage and a handback per job. Two of
-  // those reached him on 2026-09-11. "Waited out" is now literal.
+  // those reached the owner on 2026-09-11. "Waited out" is now literal.
   eq(B.DISPATCHED.length, 0, 'spawning into the wall is a death, not a wait');
   eq(B.readHeldBgJobs().length, 1, 'held as the queue item it arrived as');
   eq(B.WALLS_RAISED.length, 1, 'ONE notice for the wall, not a bubble per job');
@@ -1608,7 +1608,7 @@ await t('★ a stopped worker reaches a terminal state, and it reads as stopped'
   // What the close handler's wasStopped arm now does.
   eq(B.editWorkerNotice(runId, { phase: 'done', status: 'stopped', elapsedSec: 252 }), true);
   const last = B.EDITS[B.EDITS.length - 1];
-  ok(last.html.startsWith('🛑 bg · '), `his own /stop must not read as a warning: ${last.html}`);
+  ok(last.html.startsWith('🛑 bg · '), `their own /stop must not read as a warning: ${last.html}`);
   ok(/Stopped · 4m 12s/.test(last.html), last.html);
   eq(B.workerNotices.size, 0, 'the line was left ticking after /stop');
 });

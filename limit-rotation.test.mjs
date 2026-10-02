@@ -117,7 +117,7 @@ export const reset = () => {
   limitRecheck = createRecheckLimiter(); CONFIG_WALL_UNTIL = 0; LANES.main.current = null; bgLanes.length = 0;
   walledSweepInflight = null; lastWalledActiveSweep = 0; pendingOps.clear(); ALL_SNAPSHOT = null; probeGate = null;
   USAGE_ROW = null; usageThrows = false; usageHangs = false; NEXT = { name: 'free-slot' }; swapOk = true; swapWait = null;
-  LIST = []; PROBES = {}; ACTIVE = 'gjgkabche@gmail.com'; probeThrows = false; probeHangs = false;
+  LIST = []; PROBES = {}; ACTIVE = 'a@example.com'; probeThrows = false; probeHangs = false;
   if (wallResumeTimer) clearTimeout(wallResumeTimer);
   wallResumeTimer = null;
   try { unlinkSync(WALL_WAKE_FILE); } catch {}
@@ -283,7 +283,7 @@ const accountUsage = {
     return PROBES[name] ?? null;
   },
 };
-export let ACTIVE = 'gjgkabche@gmail.com';
+export let ACTIVE = 'a@example.com';
 export const setActive = (v) => { ACTIVE = v; };
 export let probeThrows = false;
 export const setProbeThrows = (v) => { probeThrows = v; };
@@ -333,7 +333,7 @@ const withDeadline = (p, ms, fallback = null) =>
 const raiseWall = async (kind, cfg) => { CALLS.push({ raiseWall: kind }); RENDERS.push(cfg?.render ? cfg.render() : null); };
 const limitWallResolved = () => 'resolved';
 const fmtUntil = () => 'a clock';
-const OWNER_TZ = 'America/New_York';
+const OWNER_TZ = 'America/Toronto';
 const codexTakingChat = () => false;
 const parkedCodexChats = [];
 // /usage (gatherUsage), reduced to the one fact the test reads: which account
@@ -379,16 +379,16 @@ const B = await import(
 );
 
 const win = (percent, resetsAt) => ({ percent, resetsAt, severity: null, locked: null });
-const row = (usage, name = 'gjgkabche@gmail.com') => ({ name, state: 'ok', usage });
+const row = (usage, name = 'a@example.com') => ({ name, state: 'ok', usage });
 // A slot as accounts.json holds one. `limitedUntil` is epoch SECONDS.
 const slot = (name, extra = {}) => ({ name, claudeAiOauth: { accessToken: 'a', refreshToken: 'r' }, ...extra });
 // The real store on 2026-09-11 12:46 ET: the account that walled, the one that
 // had been out of usage credits since the night before with NOTHING in the
 // ledger saying so, and a healthy one.
 const THREE = () => [
-  slot('gjgkabche@gmail.com'),
-  slot('zalo@blackumbrella.app'),
-  slot('hello@blackumbrella.app'),
+  slot('a@example.com'),
+  slot('c@example.com'),
+  slot('b@example.com'),
 ];
 // The probe reading of an account with headroom.
 const HEALTHY = (name) => row({ fiveHour: win(13, iso(4 * HOUR)), sevenDay: win(18, iso(100 * HOUR)), scoped: [], extraUsage: null }, name);
@@ -402,7 +402,7 @@ B.setUsageRow(
   row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: win(100, iso(50 * HOUR)), scoped: [], extraUsage: null }),
 );
 await t('the LATEST exhausted window wins, not the soonest', async () => {
-  const r = await B.usageResetFor('gjgkabche@gmail.com');
+  const r = await B.usageResetFor('a@example.com');
   eq(r.resetsAt, Math.floor((NOW + 50 * HOUR) / 1000), 'a 5h window back in 2h is worth nothing under a full week');
   eq(r.guessed, false, 'a reading is not a guess');
 });
@@ -412,7 +412,7 @@ B.setUsageRow(
   row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: win(40, iso(90 * HOUR)), scoped: [], extraUsage: null }),
 );
 await t('a window with headroom is ignored however late it resets', async () => {
-  const r = await B.usageResetFor('gjgkabche@gmail.com');
+  const r = await B.usageResetFor('a@example.com');
   eq(r.resetsAt, Math.floor((NOW + 2 * HOUR) / 1000), 'only the exhausted window is the wall');
 });
 
@@ -421,7 +421,7 @@ B.setUsageRow(
   row({ fiveHour: win(99, iso(3 * HOUR)), sevenDay: win(96, iso(20 * HOUR)), scoped: [], extraUsage: null }),
 );
 await t('★ the 95 tier takes the SOONEST reset, not the latest', async () => {
-  const r = await B.usageResetFor('gjgkabche@gmail.com');
+  const r = await B.usageResetFor('a@example.com');
   eq(
     r.resetsAt,
     Math.floor((NOW + 3 * HOUR) / 1000),
@@ -434,7 +434,7 @@ B.setUsageRow(
   row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: win(96, iso(80 * HOUR)), scoped: [], extraUsage: null }),
 );
 await t('100 beats 95: a merely-nearly-full window must not extend a real one', async () => {
-  const r = await B.usageResetFor('gjgkabche@gmail.com');
+  const r = await B.usageResetFor('a@example.com');
   eq(r.resetsAt, Math.floor((NOW + 2 * HOUR) / 1000), 'the 96% weekly window is not what walled the account');
 });
 
@@ -448,7 +448,7 @@ B.setUsageRow(
   }),
 );
 await t('★ a locked window is exhausted whatever percent it reports', async () => {
-  const r = await B.usageResetFor('gjgkabche@gmail.com');
+  const r = await B.usageResetFor('a@example.com');
   eq(r.resetsAt, Math.floor((NOW + 4 * HOUR) / 1000), "the server's own reason string beats a rounded percent");
 });
 
@@ -457,14 +457,14 @@ B.setUsageRow(
   row({ fiveHour: win(30, iso(2 * HOUR)), sevenDay: win(41, iso(90 * HOUR)), scoped: [], extraUsage: null }),
 );
 await t('no window near its ceiling yields null, and the guess stands', async () => {
-  eq(await B.usageResetFor('gjgkabche@gmail.com'), null);
+  eq(await B.usageResetFor('a@example.com'), null);
 });
 
 B.reset();
 B.setUsageRow(row({ fiveHour: win(100, iso(-HOUR)), sevenDay: null, scoped: [], extraUsage: null }));
 await t('★ a reset already in the past is refused', async () => {
   eq(
-    await B.usageResetFor('gjgkabche@gmail.com'),
+    await B.usageResetFor('a@example.com'),
     null,
     'limitedUntil in the past is not a limit: it would hand the dead account straight back',
   );
@@ -473,7 +473,7 @@ await t('★ a reset already in the past is refused', async () => {
 B.reset();
 B.setUsageRow(row({ fiveHour: win(100, iso(9 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }, 'someone-else'));
 await t("★ a row for another slot is refused: another account's numbers are not this window", async () => {
-  eq(await B.usageResetFor('gjgkabche@gmail.com'), null);
+  eq(await B.usageResetFor('a@example.com'), null);
 });
 
 B.reset();
@@ -483,19 +483,19 @@ await t('an unreachable usage API degrades to null rather than throwing inside a
   // !row guard and not in the catch. Asserted as the null it really returns:
   // the earlier version of this test stubbed withDeadline WITHOUT the .catch
   // and then asserted an error log that production never writes.
-  eq(await B.usageResetFor('gjgkabche@gmail.com'), null);
+  eq(await B.usageResetFor('a@example.com'), null);
 });
 
 B.reset();
 B.setUsageHangs(true);
 await t('a hanging usage API is bounded by the deadline, not waited on forever', async () => {
-  eq(await B.usageResetFor('gjgkabche@gmail.com'), null);
+  eq(await B.usageResetFor('a@example.com'), null);
 });
 
 B.reset();
 B.setUsageRow(row({ fiveHour: win(100, iso(5 * HOUR)), sevenDay: null, scoped: [win(100, iso(30 * HOUR))], extraUsage: null }));
 await t('scoped per-model windows count too', async () => {
-  const r = await B.usageResetFor('gjgkabche@gmail.com');
+  const r = await B.usageResetFor('a@example.com');
   eq(r.resetsAt, Math.floor((NOW + 30 * HOUR) / 1000));
 });
 
@@ -505,13 +505,13 @@ console.log('\n2. rotateOffLimitedAccount: the clockless wall end to end');
 
 B.reset();
 B.setList(THREE());
-B.setProbes({ 'zalo@blackumbrella.app': HEALTHY('zalo@blackumbrella.app'), 'hello@blackumbrella.app': HEALTHY('hello@blackumbrella.app') });
+B.setProbes({ 'c@example.com': HEALTHY('c@example.com'), 'b@example.com': HEALTHY('b@example.com') });
 B.setUsageRow(row({ fiveHour: win(100, iso(6 * HOUR)), sevenDay: win(100, iso(40 * HOUR)), scoped: [], extraUsage: null }));
 let rot = await B.rotateOffLimitedAccount(WALL);
 await t('★ the wall with no clock marks the account until the API window, not one hour out', () => {
   eq(rot.outcome, 'swapped');
   eq(B.marked.length, 1, 'exactly one account marked');
-  eq(B.marked[0].name, 'gjgkabche@gmail.com');
+  eq(B.marked[0].name, 'a@example.com');
   eq(
     B.marked[0].resetsAt,
     Math.floor((NOW + 40 * HOUR) / 1000),
@@ -527,7 +527,7 @@ await t('★ the wall with no clock marks the account until the API window, not 
 
 B.reset();
 B.setList(THREE());
-B.setProbes({ 'zalo@blackumbrella.app': HEALTHY('zalo@blackumbrella.app'), 'hello@blackumbrella.app': HEALTHY('hello@blackumbrella.app') });
+B.setProbes({ 'c@example.com': HEALTHY('c@example.com'), 'b@example.com': HEALTHY('b@example.com') });
 B.setUsageRow(row({ fiveHour: win(20, iso(HOUR)), sevenDay: win(30, iso(HOUR)), scoped: [], extraUsage: null }));
 rot = await B.rotateOffLimitedAccount(WALL);
 await t('when the API cannot better it, the guess still marks and still swaps', () => {
@@ -538,7 +538,7 @@ await t('when the API cannot better it, the guess still marks and still swaps', 
 
 B.reset();
 B.setList(THREE());
-B.setProbes({ 'zalo@blackumbrella.app': HEALTHY('zalo@blackumbrella.app'), 'hello@blackumbrella.app': HEALTHY('hello@blackumbrella.app') });
+B.setProbes({ 'c@example.com': HEALTHY('c@example.com'), 'b@example.com': HEALTHY('b@example.com') });
 B.setUsageRow(row({ fiveHour: win(100, iso(6 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }));
 rot = await B.rotateOffLimitedAccount("You've hit your session limit · resets 6:30pm (America/Caracas)");
 await t('★ a wall that DOES carry a clock never asks the usage API', () => {
@@ -551,9 +551,9 @@ B.reset();
 // Every other slot already known limited in the ledger: nothing to move to,
 // and nothing to probe either.
 B.setList([
-  slot('gjgkabche@gmail.com'),
-  slot('zalo@blackumbrella.app', { limitedUntil: Math.floor((NOW + 3 * HOUR) / 1000) }),
-  slot('hello@blackumbrella.app', { limitedUntil: Math.floor((NOW + 9 * HOUR) / 1000) }),
+  slot('a@example.com'),
+  slot('c@example.com', { limitedUntil: Math.floor((NOW + 3 * HOUR) / 1000) }),
+  slot('b@example.com', { limitedUntil: Math.floor((NOW + 9 * HOUR) / 1000) }),
 ]);
 B.setUsageRow(row({ fiveHour: win(100, iso(6 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }));
 rot = await B.rotateOffLimitedAccount(WALL);
@@ -578,7 +578,7 @@ await t('the enrichment still runs when nothing is free to swap to', () => {
 // ---------------------------------------------------------------------------
 console.log('\n3. THE 12:46 INCIDENT: the rotation asks before it hops');
 // ---------------------------------------------------------------------------
-// hello@ hit its session limit, the rotation swapped onto gjgkabche@ (out of
+// b@ hit its session limit, the rotation swapped onto a@ (out of
 // usage credits since the night before, and NOT walled in the ledger, because
 // nothing had died on it yet), the retry died, the chat lane showed the raw
 // "You're out of usage credits" card and two workers died the same way.
@@ -599,29 +599,29 @@ const OUT_OF_CREDITS = (name) =>
   );
 
 B.reset();
-B.setActive('hello@blackumbrella.app');
+B.setActive('b@example.com');
 B.setList(THREE());
 B.setProbes({
   // rotation order is least-recently-active, and nothing here has ever run, so
-  // gjgkabche@ is asked first: exactly the account the old code hopped onto.
-  'gjgkabche@gmail.com': OUT_OF_CREDITS('gjgkabche@gmail.com'),
-  'zalo@blackumbrella.app': HEALTHY('zalo@blackumbrella.app'),
+  // a@ is asked first: exactly the account the old code hopped onto.
+  'a@example.com': OUT_OF_CREDITS('a@example.com'),
+  'c@example.com': HEALTHY('c@example.com'),
 });
-B.setUsageRow(row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: win(54, iso(100 * HOUR)), scoped: [], extraUsage: null }, 'hello@blackumbrella.app'));
+B.setUsageRow(row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: win(54, iso(100 * HOUR)), scoped: [], extraUsage: null }, 'b@example.com'));
 rot = await B.rotateOffLimitedAccount(WALL);
 
 await t('★ the out-of-credits account is SKIPPED, not swapped onto', () => {
   eq(rot.outcome, 'swapped');
-  eq(rot.nextName, 'zalo@blackumbrella.app', 'it kept going until it found one with headroom');
+  eq(rot.nextName, 'c@example.com', 'it kept going until it found one with headroom');
   eq(B.CALLS.filter((c) => c.swapTo).length, 1, 'and only swapped once');
-  eq(B.CALLS.find((c) => c.swapTo).swapTo, 'zalo@blackumbrella.app');
+  eq(B.CALLS.find((c) => c.swapTo).swapTo, 'c@example.com');
 });
 
 await t('★ the skip is because of the SCOPED window, which the obvious rule misses', () => {
   // fiveHour 0% and sevenDay 97%: a check of "5h or weekly at 100" calls this
   // account healthy and reproduces the incident exactly.
-  ok(B.probeCalls.includes('gjgkabche@gmail.com'), `it asked: ${B.probeCalls.join(', ')}`);
-  const m = B.marked.find((x) => x.name === 'gjgkabche@gmail.com');
+  ok(B.probeCalls.includes('a@example.com'), `it asked: ${B.probeCalls.join(', ')}`);
+  const m = B.marked.find((x) => x.name === 'a@example.com');
   ok(m, `the skipped account is walled in the ledger: ${JSON.stringify(B.marked)}`);
   eq(m.resetsAt, Math.floor((NOW + 12 * HOUR) / 1000), 'until the window the API named');
   eq(m.source, 'probe', 'and the ledger records that this wall was learned by asking, not by dying');
@@ -631,43 +631,43 @@ await t('the decision log names every step', () => {
   const log = B.LOGS.join('\n');
   ok(log.includes('account_walled'), log);
   ok(log.includes('account_selected'), log);
-  ok(log.includes('account=zalo@blackumbrella.app'), log);
+  ok(log.includes('account=c@example.com'), log);
 });
 
 await t('the handback note tells M which account was skipped and why', () => {
   const note = rot.lines.join('\n');
-  ok(note.includes('Skipped "gjgkabche@gmail.com"'), note);
+  ok(note.includes('Skipped "a@example.com"'), note);
   ok(note.includes('weekly Fable window is spent'), note);
 });
 
 // An account the ledger ALREADY knows is walled costs no round trip at all.
 B.reset();
-B.setActive('hello@blackumbrella.app');
+B.setActive('b@example.com');
 B.setList([
-  slot('gjgkabche@gmail.com', { limitedUntil: Math.floor((NOW + 12 * HOUR) / 1000) }),
-  slot('zalo@blackumbrella.app'),
-  slot('hello@blackumbrella.app'),
+  slot('a@example.com', { limitedUntil: Math.floor((NOW + 12 * HOUR) / 1000) }),
+  slot('c@example.com'),
+  slot('b@example.com'),
 ]);
-B.setProbes({ 'zalo@blackumbrella.app': HEALTHY('zalo@blackumbrella.app') });
+B.setProbes({ 'c@example.com': HEALTHY('c@example.com') });
 B.setUsageRow(null);
 rot = await B.rotateOffLimitedAccount(WALL);
 
 await t('★ a known-walled account is never probed and never hopped onto', () => {
-  eq(rot.nextName, 'zalo@blackumbrella.app');
-  ok(!B.probeCalls.includes('gjgkabche@gmail.com'), `no round trip for a known wall: ${B.probeCalls.join(', ')}`);
+  eq(rot.nextName, 'c@example.com');
+  ok(!B.probeCalls.includes('a@example.com'), `no round trip for a known wall: ${B.probeCalls.join(', ')}`);
   ok(B.LOGS.join('\n').includes('account_skipped_known_walled'), B.LOGS.join('\n'));
 });
 
 // EVERY ACCOUNT SPENT: the cycle ends, it does not loop, and the wall clock is
 // the earliest of the three.
 B.reset();
-B.setActive('hello@blackumbrella.app');
+B.setActive('b@example.com');
 B.setList(THREE());
 B.setProbes({
-  'gjgkabche@gmail.com': OUT_OF_CREDITS('gjgkabche@gmail.com'),
-  'zalo@blackumbrella.app': row({ fiveHour: win(100, iso(3 * HOUR)), sevenDay: win(40, iso(90 * HOUR)), scoped: [], extraUsage: null }, 'zalo@blackumbrella.app'),
+  'a@example.com': OUT_OF_CREDITS('a@example.com'),
+  'c@example.com': row({ fiveHour: win(100, iso(3 * HOUR)), sevenDay: win(40, iso(90 * HOUR)), scoped: [], extraUsage: null }, 'c@example.com'),
 });
-B.setUsageRow(row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }, 'hello@blackumbrella.app'));
+B.setUsageRow(row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }, 'b@example.com'));
 rot = await B.rotateOffLimitedAccount(WALL);
 
 await t('★ with every account spent it cycles through all of them exactly once, then walls', () => {
@@ -685,7 +685,7 @@ await t('★ with every account spent it cycles through all of them exactly once
 // A PROBE THAT CANNOT BE READ IS NOT A WALL. Walling every account on a network
 // blip would be worse than the behaviour this replaced.
 B.reset();
-B.setActive('hello@blackumbrella.app');
+B.setActive('b@example.com');
 B.setList(THREE());
 B.setProbeThrows(true);
 B.setUsageRow(null);
@@ -699,7 +699,7 @@ await t('★ an unreachable usage API takes the candidate anyway, and says so', 
 });
 
 B.reset();
-B.setActive('hello@blackumbrella.app');
+B.setActive('b@example.com');
 B.setList(THREE());
 B.setProbeHangs(true);
 B.setUsageRow(null);
@@ -713,14 +713,14 @@ await t('a probe that never answers is deadlined, not waited on', () => {
 // The wall notice's rows come off the ledger.
 B.reset();
 B.setList([
-  slot('gjgkabche@gmail.com', { limitedUntil: Math.floor((NOW + 12 * HOUR) / 1000) }),
-  slot('zalo@blackumbrella.app', { limitedUntil: Math.floor((NOW + 2 * HOUR) / 1000) }),
-  slot('hello@blackumbrella.app'),
+  slot('a@example.com', { limitedUntil: Math.floor((NOW + 12 * HOUR) / 1000) }),
+  slot('c@example.com', { limitedUntil: Math.floor((NOW + 2 * HOUR) / 1000) }),
+  slot('b@example.com'),
 ]);
 await t('claudeWallFacts reads the earliest reset and one row per account', () => {
   const f = B.claudeWallFacts(NOW);
   eq(f.rows.length, 3);
-  eq(f.earliest, Math.floor((NOW + 2 * HOUR) / 1000), 'the soonest wall, so the clock is the one he waits on');
+  eq(f.earliest, Math.floor((NOW + 2 * HOUR) / 1000), 'the soonest wall, so the clock is the one they wait on');
   eq(f.rows.filter((r) => r.walled).length, 2);
 });
 

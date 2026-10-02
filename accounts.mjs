@@ -757,7 +757,7 @@ export function createAccountStore({
   // `refuseFlagged`: the rotation's swaps pass it, so a slot flagged as needing
   // a login WHILE the swap waited (a refusal that answered after the probe's
   // deadline) is refused rather than installed. A swap the owner asks for by
-  // hand does not: he can see something the daemon cannot.
+  // hand does not: they can see something the daemon cannot.
   async function swapTo(name, { refuseFlagged = false } = {}) {
     // A refresh in flight for the TARGET is spending the refresh token its slot
     // holds right now. Installing that blob would hand the live session a

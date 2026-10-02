@@ -142,7 +142,7 @@ t('★ a delivered result with nothing promised is not', () => {
 
 t('the shapes the assistant actually uses', () => {
   for (const s of [
-    'Telling Zalo, then reading the full report before dispatching wave 4 and starting ship point 1.',
+    'Telling Alex, then reading the full report before dispatching wave 4 and starting ship point 1.',
     "Reading the full report, verifying the commit and suites, then running the refresh and firing today's outreach.",
     'Worker report landed. I will read it and report back.',
     "I'll dispatch the remaining three once this one lands.",
@@ -329,7 +329,7 @@ t('the clause names the heading the parser looks for, and the word none', () => 
 });
 
 t('★ pending work, in the shape the prompt asks for', () => {
-  const summary = `Zalo is the owner. Active projects: voice-live wave 4.\n\nUnfinished work\n\`\`\`\n- dispatch the five wave 4 briefs in /tmp/brief-voice-*.md\n- run SP1 once wave 4 is green\n\`\`\`\n`;
+  const summary = `Alex is the owner. Active projects: voice-live wave 4.\n\nUnfinished work\n\`\`\`\n- dispatch the five wave 4 briefs in /tmp/brief-voice-*.md\n- run SP1 once wave 4 is green\n\`\`\`\n`;
   const p = parseUnfinishedWork(summary);
   eq(p.status, 'pending');
   eq(p.items.length, 2);

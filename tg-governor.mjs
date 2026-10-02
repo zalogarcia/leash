@@ -96,7 +96,7 @@ export const DEFAULTS = Object.freeze({
   windowMs: 10 * 60_000, // the /status summary window
   dropLogEveryMs: 30_000, // one ledger line per method per this for repeated drops; the window still counts every one
   fallbackRetryAfterSec: 5, // a 429 with no retry_after
-  noticeEveryMs: 15 * 60_000, // at most one "held until" notice per this, and only when he writes
+  noticeEveryMs: 15 * 60_000, // at most one "held until" notice per this, and only when they write
 });
 
 const MSG_LIMIT = 4000;
@@ -474,7 +474,7 @@ export function createGovernor(o) {
   // ---- the one thing that may spend into a penalty ---------------------------
   // On 2026-09-19 about half of the SHORT sends slipped through the wall while
   // every answer bounced, and the owner saw a silent bot, restarted it twice and
-  // stopped it once. When he writes during a cooldown, one plain line saying
+  // stopped it once. When they write during a cooldown, one plain line saying
   // what is happening and until when is worth one request per quarter hour; if
   // Telegram refuses it the deadline is simply refreshed. The gate is bypassed
   // on purpose, and only here.

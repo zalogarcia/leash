@@ -548,7 +548,7 @@ t('a transcription that ERRORED is not described as a missing key', () => {
   ok(!err.includes('no OPENAI_API_KEY'), err);
   ok(err.includes('transcription failed'), err);
   // Both lines still say the fix, because a failed whisper call and a missing
-  // key leave him in the same place: the words never arrived.
+  // key leave them in the same place: the words never arrived.
   ok(err.includes('OPENAI_API_KEY'), err);
 });
 
@@ -576,7 +576,7 @@ t('and refused everywhere it would mean something else', () => {
 
 t('★ canProduceHandoff drops to rung 3 for each skip condition on its own', () => {
   // Every one of these is a way the switch could have hung. The owner is
-  // usually switching BECAUSE something is wrong with the engine he is leaving,
+  // usually switching BECAUSE something is wrong with the engine they are leaving,
   // which is exactly when asking it for a favour fails.
   const clear = { engine: 'codex', available: true, pausedUntil: 0, authState: 'chatgpt', laneBusy: false };
   eq(canProduceHandoff(clear).rung, 2, JSON.stringify(canProduceHandoff(clear)));

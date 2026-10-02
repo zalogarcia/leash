@@ -31,10 +31,10 @@ const ok = (cond, msg) => {
   if (!cond) throw new Error(msg);
 };
 
-const TZ = 'America/New_York';
+const TZ = 'America/Toronto';
 const BOT = 777;
 const OWNER = 111;
-// 2026-09-08 16:11 America/New_York, the minute the gap was observed.
+// 2026-09-08 16:11 America/Toronto, the minute the gap was observed.
 const AT_1611 = 1757362260;
 
 /** An inbound text message, optionally a reply. */
@@ -328,7 +328,7 @@ t('the time is the chat\'s local time, not UTC', () => {
 });
 
 t('midnight is 00:0x on a 24 hour clock, never 24:0x', () => {
-  // 2026-09-08 00:05 America/New_York
+  // 2026-09-08 00:05 America/Toronto
   const midnight = { message_id: 406, from: { id: BOT, is_bot: true }, date: 1757304300, text: 'overnight run done' };
   const q = build(inbound('nice', midnight));
   ok(q.block.includes('from 00:05'), q.block);

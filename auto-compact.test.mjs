@@ -3,7 +3,7 @@
 //
 // The decision is one AND over a dozen facts, and the failure that matters is
 // a compaction firing while the owner is mid-conversation: a summary turn
-// that his next message has to queue behind. So every clause gets its own
+// that their next message has to queue behind. So every clause gets its own
 // case, in both directions, and the cooldown boundary and the unmeasurable
 // percentage get theirs, because those two are where an off-by-one turns
 // "compact when idle" into "compact every turn".
@@ -145,10 +145,10 @@ t('★ the run that just finished was itself the compaction', () => {
   eq(decideAutoCompact(ready({ wasCompaction: true })).reason, 'was_compaction');
 });
 
-t('★ a run he cut short with /stop never compacts: he is about to redirect, not done', () => {
+t('★ a run they cut short with /stop never compacts: they are about to redirect, not done', () => {
   // The QA pass on this change: with the queue emptied by /stop, every other
-  // clause passed, so the correction he typed next queued behind a summary
-  // of the task he had just aborted.
+  // clause passed, so the correction they typed next queued behind a summary
+  // of the task they had just aborted.
   eq(decideAutoCompact(ready({ stopped: true })).reason, 'stopped');
   eq(decideAutoCompact(ready({ stopped: true, pct: 99 })).reason, 'stopped');
 });

@@ -1054,12 +1054,12 @@ export function limitWallLine({ resetClock = null, leftText = null, codexTaking 
     lines.push(`${STATUS_INDENT}${next.moved ? 'Login already on it · I pick up then' : 'I switch to it and pick up then'}`);
   }
   // ONE ROW PER ACCOUNT, soonest first, so the ⏳ clock above is visibly the
-  // first row rather than a number he has to trust. Before this the notice said
+  // first row rather than a number they have to trust. Before this the notice said
   // only the earliest reset, which answers "when can I work again" and not
   // "which of my three subscriptions is actually down". On 2026-09-11 the
   // answer to the second was the whole complaint: the rotation had hopped onto
   // an account that had been out of usage credits since the night before, and
-  // nothing he could read said so.
+  // nothing they could read said so.
   for (const r of sortLedger(accounts, now)) {
     // A dead login is the fact that matters on that row, clock or no clock.
     const clock = r.needsLogin ? 'needs login' : ledgerClock(r, { timeZone, now });
@@ -1126,7 +1126,7 @@ function sortLedger(rows = [], now = Date.now()) {
 }
 
 /**
- * One row: `⛔ gjgkabche@gmail.com · Sat 1:00am`.
+ * One row: `⛔ a@example.com · Sat 1:00am`.
  *
  * Takes the accounts.mjs describe() shape plus a `live` flag:
  * { name, walled, until, captured, live }.
@@ -1156,7 +1156,7 @@ export function accountLedgerRow(r = {}, { timeZone = undefined, now = Date.now(
  * it: a Codex-first install has no Claude accounts and does not need a line
  * about it on every /status for the rest of the daemon's life.
  *
- * The head row carries the count because that is the fact he actually wants
+ * The head row carries the count because that is the fact they actually want
  * from this block: not which accounts exist, but whether the daemon has
  * anywhere to go when the live one walls.
  */
@@ -1195,7 +1195,7 @@ export function limitWallResolved({ clock = null, codexAnswered = 0, resumed = 0
  * THE WALL HOLD IS FULL, so this message was not taken (ACC-04).
  *
  * It used to be silence: past the bound the message was neither parked nor
- * answered nor acknowledged, on exactly the afternoon he keeps re-asking
+ * answered nor acknowledged, on exactly the afternoon they keep re-asking
  * because nothing is happening. Deliberately NOT queueFull, whose second line
  * offers `/stop <lane>`: nothing is running, so there is nothing to stop, and
  * the only thing that helps is sending it again once the wall lifts.
@@ -1383,7 +1383,7 @@ export function compactDiscardedLine() {
 // and the lane is idle (auto-compact.mjs holds the rule). It is the SAME model
 // turn as /compact and lands on the same shaped message, so the four builders
 // here mirror the four above one for one; what differs is the label, because
-// a compaction he did not ask for has to say so, and the percentage, because
+// a compaction they did not ask for has to say so, and the percentage, because
 // that is the reason it happened.
 
 /** The wait. Carries the percentage that triggered it, and a clock once there is one. */

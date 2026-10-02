@@ -690,7 +690,7 @@ t('the phone line drops what a phone cannot read or type', () => {
   const phone = steerAckLine(res, { verbose: false });
   eq(phone, '➡️ Steered into bg2 · 17:02:11Z', 'with no timezone it stays honestly UTC');
   ok(!phone.includes('1788453512237'), 'an unreadable, untypeable run id');
-  ok(!phone.includes('4123'), 'and a pid he would do nothing with');
+  ok(!phone.includes('4123'), 'and a pid they would do nothing with');
   for (const line of phone.split('\n')) ok(line.length <= 44, `${line.length} chars: ${line}`);
 });
 

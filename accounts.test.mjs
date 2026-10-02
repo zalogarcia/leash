@@ -213,10 +213,10 @@ await t('an unrecognised timezone falls back to local instead of throwing', () =
 });
 
 await t('parsing survives a DST boundary in a zone that has one', () => {
-  // 2026-11-01 02:00 local is when US Eastern falls back. Asking for 3am on the
+  // 2026-11-01 02:00 local is when Eastern time falls back. Asking for 3am on the
   // day of the shift must still produce a real instant in the future.
   const eve = Date.UTC(2026, 10, 1, 4, 0, 0);
-  const r = parseResetTime('resets 3am (America/New_York)', { now: eve });
+  const r = parseResetTime('resets 3am (America/Toronto)', { now: eve });
   ok(r.resetsAt * 1000 > eve, 'a DST-day reset must still be in the future');
   ok(r.resetsAt * 1000 - eve < 30 * 3600 * 1000, 'and within a day, not a year out');
 });
@@ -1140,7 +1140,7 @@ await t('★ a rotation swap refuses a slot flagged while it waited; a hand swap
   ok(/needs a fresh login/.test(r.error), r.error);
   eq(fingerprint(kc.blob.claudeAiOauth), fingerprint(LIVE_BLOB.claudeAiOauth), 'a refused swap must change nothing');
   const byHand = await store.swapTo('dead');
-  ok(byHand.ok, 'a swap he asks for by hand is his call');
+  ok(byHand.ok, 'a swap they ask for by hand is their call');
 });
 
 await t('a spent refresh token is remembered per slot, by digest', async () => {
@@ -1197,7 +1197,7 @@ await t('★ a capture into a flagged slot clears the flag, and a later dead log
   store.markNeedsLogin('main', 'login refused (invalid_grant)');
   const r = await store.captureCurrent('main');
   ok(r.ok, r.error);
-  eq(store.describe()[0].needsLogin, null, 'the capture he was asked for must answer the flag');
+  eq(store.describe()[0].needsLogin, null, 'the capture they were asked for must answer the flag');
   ok(logs.some((l) => l.includes('cleared by the capture')), 'the clear must be logged');
   eq(store.markNeedsLogin('main', 'login refused (HTTP 401)').changed, true, 'a new dead login is a new flag');
   eq(store.clearNeedsLogin('main').changed, true);

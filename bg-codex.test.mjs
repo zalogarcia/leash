@@ -515,13 +515,13 @@ t('token formatting, or null when there is nothing to report', () => {
 });
 
 t('the reset clock renders in the owner timezone', () => {
-  // 2026-09-03T21:40:00Z is 17:40 in Miami.
-  eq(fmtUntil(Date.parse('2026-09-03T21:40:00Z'), { timeZone: 'America/New_York' }), '17:40');
+  // 2026-09-03T21:40:00Z is 17:40 in Toronto.
+  eq(fmtUntil(Date.parse('2026-09-03T21:40:00Z'), { timeZone: 'America/Toronto' }), '17:40');
   eq(fmtUntil(0), null);
 });
 
 t('the reason text names the wall and the clock', () => {
-  const s = codexReasonText('claude_limited', Date.parse('2026-09-03T21:40:00Z'), { timeZone: 'America/New_York' });
+  const s = codexReasonText('claude_limited', Date.parse('2026-09-03T21:40:00Z'), { timeZone: 'America/Toronto' });
   ok(s.includes('every Claude account is limited until 17:40'), s);
   eq(codexReasonText(null, 0), null);
 });
@@ -543,7 +543,7 @@ t('the start notice explains a fallback run', () => {
     runId: 'codex-1',
     reason: 'claude_limited',
     pausedUntil: Date.parse('2026-09-03T21:40:00Z'),
-    timeZone: 'America/New_York',
+    timeZone: 'America/Toronto',
   });
   ok(s.includes('because every Claude account is limited until 17:40'), s);
 });
@@ -568,13 +568,13 @@ t('an ask-mode handback does not claim it wrote anything', () => {
 });
 
 t('the handback says why it was on Codex when it was a fallback', () => {
-  const h = codexHandbackHeader({ reason: 'claude_limited', pausedUntil: Date.parse('2026-09-03T21:40:00Z'), timeZone: 'America/New_York' });
+  const h = codexHandbackHeader({ reason: 'claude_limited', pausedUntil: Date.parse('2026-09-03T21:40:00Z'), timeZone: 'America/Toronto' });
   ok(h.includes('every Claude account is limited until 17:40'), h);
 });
 
 t('the degraded chat answer is prefixed with the wall and the clock', () => {
   eq(
-    codexFallbackPrefix(Date.parse('2026-09-03T21:40:00Z'), { timeZone: 'America/New_York' }),
+    codexFallbackPrefix(Date.parse('2026-09-03T21:40:00Z'), { timeZone: 'America/Toronto' }),
     '🧠 Codex fallback · Claude back at 17:40',
   );
   ok(codexFallbackPrefix(0).includes('Codex fallback'), 'still prefixed with no known reset');

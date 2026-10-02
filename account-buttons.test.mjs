@@ -646,7 +646,7 @@ await t('a successful swap sends its OWN message, not only a toast and an edit',
   );
   ok(calls.notes[0].split('\n').length <= 3, 'the confirmation grew past three lines');
   // In ADDITION to, never instead of: the edit is what re-renders the button
-  // rows so the account he just moved to loses its swap button.
+  // rows so the account they just moved to loses its swap button.
   eq(calls.refreshes.length, 1, 'the in-place refresh was dropped');
 });
 
@@ -693,7 +693,7 @@ await t('a usage reader with no peek() at all does not break the swap', async ()
 });
 
 await t('a FAILED swap gets its own message too, and keeps routine apart from urgent', async () => {
-  // Routine: the rollback took, nothing moved. He can just try again.
+  // Routine: the rollback took, nothing moved. They can just try again.
   const routine = harness({ swapResult: { ok: false, error: 'keychain write failed; the previous account is still active and nothing changed' } });
   await routine.handle(tapOn(ROWS, 1));
   eq(routine.calls.notes.length, 1, 'a failed swap sent no standalone message');
@@ -701,7 +701,7 @@ await t('a FAILED swap gets its own message too, and keeps routine apart from ur
   ok(routine.calls.notes[0].includes('The live account is unchanged.'), routine.calls.notes[0]);
 
   // Urgent: the keychain holds a blob with no claudeAiOauth and NOTHING will
-  // run until he logs in. This must not read like the routine one — that is the
+  // run until they log in. This must not read like the routine one: that is the
   // whole reason it gets a message instead of a five-second toast.
   const urgent = harness({ swapResult: { ok: false, error: 'keychain write failed AND the rollback did not take. Run: claude /login' } });
   await urgent.handle(tapOn(ROWS, 1));

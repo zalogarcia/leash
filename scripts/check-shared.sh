@@ -81,7 +81,7 @@ SHARED_MODULES=(
 # the same way, but they have DIVERGED and cannot be byte-identical. Two
 # separate reasons, kept apart because only the first one is ever going away:
 #
-# (a) The private copies name the owner and his machine, and a public repo
+# (a) The private copies name the owner and their machine, and a public repo
 #     cannot repeat that. Byte-identity waits on the private side being
 #     genericized, not on anything here:
 #

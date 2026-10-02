@@ -2645,7 +2645,7 @@ function runClaude(
         // thing that edits the 🌙 line to a terminal state, so the line used to
         // sit at "⏳ 4m 12s · 23 steps" for the life of the chat: the reader's
         // only object for that job, frozen mid-sentence, on the one outcome they
-        // caused himself. inflight was already cleared above, so the watchdog
+        // caused themselves. inflight was already cleared above, so the watchdog
         // will not resolve it either.
         if (isBg && logPath) {
           editWorkerNotice(path.basename(logPath, '.jsonl'), { phase: 'done', status: 'stopped', elapsedSec: elapsed });
@@ -4195,7 +4195,7 @@ function flagLoginsFromRows(rows, { via = null } = {}) {
  *
  * What this replaced was one line: `accounts.nextAvailable({ activeName })`,
  * which returns the first account nothing has walled IN THE LEDGER. On
- * 2026-09-11 12:46 ET that was gjgkabche@gmail.com, out of usage credits since
+ * 2026-09-11 12:46 ET that was an account out of usage credits since
  * the night before and never yet walled by this daemon, so the chat lane
  * swapped onto it, died with the raw "You're out of usage credits" card, and
  * two background workers died the same way. Each bad account cost a run to
@@ -4368,8 +4368,8 @@ let lastWalledActiveSweep = 0;
  * guard can revert the credential store to the outgoing account mid-rotation;
  * and a manual /account swap onto a walled slot is one tap.
  *
- * In every one of those the next message he types spawns into a wall we already
- * knew about, dies, and costs him a failed run to learn nothing new. This moves
+ * In every one of those the next message they type spawns into a wall we already
+ * knew about, dies, and costs them a failed run to learn nothing new. This moves
  * first instead, on the ledger alone.
  *
  * DELIBERATELY NARROW. It moves only when a move is needed AND possible (the
@@ -5075,7 +5075,7 @@ function chatLimitRetryPlan(rot, { priority = false, retried = false, wake = fal
   // THE WALL PATH ALWAYS RE-DISPATCHES NOW, whether or not Codex can take it.
   //
   // It used to bail here when Codex was missing or the fallback was off, and
-  // the message got the raw ❌ instead: on 2026-09-11 that is the card he saw.
+  // the message got the raw ❌ instead: on 2026-09-11 that is the card they saw.
   // The bail existed because resolveEngine hands a walled Claude lane back to
   // Claude, so a re-dispatch under those conditions would fail, rotate, plan,
   // re-dispatch and never stop.
@@ -8144,7 +8144,7 @@ function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = f
     drainQueue(lane);
   };
 
-  // Same rule as the Claude lane: HIS words, at spawn, so a turn that dies
+  // Same rule as the Claude lane: THEIR words, at spawn, so a turn that dies
   // still leaves the question. The retry below re-sends the same rawText, and
   // recordChatTurn is cheap enough that one duplicate row beats the
   // bookkeeping needed to avoid it.
@@ -8735,7 +8735,7 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
       });
   };
 
-  // HIS words, at spawn, so a turn that dies still leaves the question behind.
+  // THEIR words, at spawn, so a turn that dies still leaves the question behind.
   recordChatTurn({ engine: 'codex', role: 'user', text: rawText });
 
   (async () => {
@@ -8967,7 +8967,7 @@ function flushParkedWalledChats({ fold = null } = {}) {
     // THE LANE GOES BACK WITH IT. dispatchPrompt strips the `bg:` prefix before
     // it builds the item, so re-dispatching with no lane sends a held
     // background job through pickLane, which sees a plain brief and puts it on
-    // the CHAT lane: a long job blocking the one lane he talks to. A fresh
+    // the CHAT lane: a long job blocking the one lane they talk to. A fresh
     // bg lane rather than the original object, because the one it was parked
     // from may be busy now.
     // The wake-up note goes in FRONT of whatever the item already carried.
@@ -9223,7 +9223,7 @@ function drainBgHandoff() {
     // over, or the job was pinned to Claude by name. Both mean "there is no
     // engine for this right now", and what used to happen next was a spawn into
     // the wall, a limit death, a 90 second salvage and a handback. Two of those
-    // reached him on 2026-09-11.
+    // reached the owner on 2026-09-11.
     //
     // Held as the QUEUE ITEM it arrived as and written back to bg-queue.json
     // when the wall lifts, so it resumes through this same drain: its worker

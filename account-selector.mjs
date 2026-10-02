@@ -8,9 +8,9 @@
 // ---------------------------------------------------------------------------
 // THE INCIDENT THIS EXISTS FOR (2026-09-11 12:46 ET)
 //
-// hello@blackumbrella.app hit its session limit. The rotation marked it, asked
+// One account hit its session limit. The rotation marked it, asked
 // accounts.mjs for the next account that was not limited IN THE LEDGER, and
-// swapped straight onto gjgkabche@gmail.com, which had been out of usage
+// swapped straight onto a second one, which had been out of usage
 // credits since the night before. The retry died on it, the chat lane showed
 // the raw "You're out of usage credits" card, two background workers died the
 // same way, and only the death of that run taught the ledger anything.
@@ -453,7 +453,7 @@ export async function selectAccount({
         row = null; // a probe that threw keeps the wall, see limitClearVerdict
       }
       // A refused login keeps the wall AND is said, so the owner learns the
-      // account needs him before its wall even ends.
+      // account needs them before its wall even ends.
       const dead = row && row.name === a.name ? rowLoginProblem(row) : null;
       if (dead) {
         probed.push({ name: a.name, state: 'needs-login', reason: dead });

@@ -102,11 +102,11 @@ const BOOL_FLAGS = new Set(['run', 'allow-write']);
 // write guard in ~/.claude holds, so it must not be able to grant itself the
 // approval: refused here, on add and on update. Revoking is always allowed. A
 // tmux pane is the owner's own session (its env can carry LEASH_LANE from the
-// tmux server), and the chat lane is where he asks for it.
+// tmux server), and the chat lane is where they ask for it.
 const grantFromUnattended = () =>
   !process.env.TMUX && (process.env.LEASH_LANE === 'bg' || !!process.env.LEASH_TRIGGER);
 const REFUSE_GRANT =
-  "--allow-write is the owner's approval for database writes and migrations, and a background worker or a scheduled run cannot grant it (that is the run the write guard holds). Nothing was changed. Put the write in your report for Zalo; he approves it from his own chat.";
+  "--allow-write is the owner's approval for database writes and migrations, and a background worker or a scheduled run cannot grant it (that is the run the write guard holds). Nothing was changed. Put the write in your report for the owner; they approve it from their own chat.";
 const takesValue = (tok, next) => {
   if (!tok?.startsWith('--')) return false;
   const name = tok.slice(2);

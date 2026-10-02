@@ -83,9 +83,14 @@ happens — and when it finds credentials it cannot identify (say you ran
 
 ### When every account is limited: the Codex fallback
 
-The pause above is the honest end of what a *Claude* multi-account setup can do:
-every subscription you own is walled, so there is nothing left to rotate to, and
-work waits for the earliest reset.
+At a wall Leash first moves to the next account that still has room. The pause
+above is what happens when every subscription you own is walled: a typed message
+and a handed-off background job are held and re-run by themselves at the
+earliest reset, a walled account is asked about again (at most once every five
+minutes), and the login moves to the account with the earliest known reset.
+When the wall lifts (at its clock, on an early re-check, or because you chose a
+login by hand) the chat is woken once, and only once, with the live account and
+every background worker that ended during the wall.
 
 If you also have OpenAI's Codex CLI installed, Leash has one more move, on
 billing that has nothing to do with Anthropic. While the pause is in effect:

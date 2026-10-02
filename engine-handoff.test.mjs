@@ -510,7 +510,7 @@ t('★ a handoff is built from the ring with no model call at all', () => {
     ringEntry({ chat: '1', role: 'user', text: 'what about the timeout' }),
   ];
   const h = buildHandoff({ from: 'claude', ring, cwd: '/x', sandbox: 'full access' });
-  eq(h.goal, 'what about the timeout', 'the goal is his own last message');
+  eq(h.goal, 'what about the timeout', 'the goal is their own last message');
   ok(h.decisions.some((d) => d.includes('no queue')), JSON.stringify(h.decisions));
   ok(h.paths.includes('/x/foo.ts'), JSON.stringify(h.paths));
   ok(h.tools.includes('Edit'), JSON.stringify(h.tools));

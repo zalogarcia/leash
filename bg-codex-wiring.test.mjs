@@ -859,7 +859,7 @@ await t('the held message raises the Claude wall notice, naming every account', 
   // machine with the fallback off has no Codex wall to report, and saying
   // "Both engines are out" about an engine that was never asked is a lie in a
   // message whose whole job is to be trusted for hours.
-  ok(P.wallNotices.has('claude'), 'the wall he is waiting on has a live message');
+  ok(P.wallNotices.has('claude'), 'the wall they are waiting on has a live message');
   ok(!P.wallNotices.has('both'), 'nothing is walled on the Codex side');
   ok(P.SENT.some((t) => String(t).includes('Every Claude account is limited')), P.SENT.join(' | '));
 });
@@ -967,22 +967,22 @@ const CREDITS_WALL =
   "You're out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.";
 
 P.reset();
-P.setAccounts({ active: 'gjgkabche@gmail.com', free: ['hello@blackumbrella.app'] });
+P.setAccounts({ active: 'a@example.com', free: ['b@example.com'] });
 P.USAGE_RESET.value = { resetsAt: Math.floor(Date.now() / 1000) + 7 * 3600, guessed: false, note: 'usage api' };
 const creditsPlan = await P.handleChatLimitFailure(CREDITS_WALL, chatCtx());
 creditsPlan?.dispatch();
 
 await t('★ the clockless wall rotates the chat lane and takes its reset from the usage API', () => {
   eq(P.ACC.marked.length, 1, 'the wall that marked nothing on 2026-09-10 now marks');
-  eq(P.ACC.marked[0].name, 'gjgkabche@gmail.com');
+  eq(P.ACC.marked[0].name, 'a@example.com');
   eq(P.USAGE_RESET.calls, 1, 'the API is asked exactly once, only because the message carried no clock');
   eq(P.ACC.marked[0].resetsAt, P.USAGE_RESET.value.resetsAt, 'and its answer is what gets banked');
-  eq(P.ACC.swapped[0], 'hello@blackumbrella.app', 'and the free account takes over');
+  eq(P.ACC.swapped[0], 'b@example.com', 'and the free account takes over');
   eq(P.CLAUDE.length, 1, 'and the message that was waiting on it is retried');
 });
 
 P.reset();
-P.setAccounts({ active: 'zalo@blackumbrella.app', free: ['gjgkabche@gmail.com'] });
+P.setAccounts({ active: 'c@example.com', free: ['a@example.com'] });
 await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx());
 await t('a wall that DOES carry a clock never asks the usage API', () => {
   eq(P.USAGE_RESET.calls, 0, 'no network on the common path');
@@ -1484,7 +1484,7 @@ await t('★ a mixed hold releases the ordinary message and keeps the command', 
   eq(P.parkedWalledChats[0].text, '/goal ship the thing');
 });
 
-// THE BOUND: past it, he is told, rather than the message vanishing.
+// THE BOUND: past it, they are told, rather than the message vanishing.
 P.reset();
 P.setWall(Date.now() + 3600_000, false);
 for (let i = 0; i < P.PARKED_WALLED_MAX + 2; i++) {
@@ -1500,7 +1500,7 @@ await t('★ past the hold bound the message is refused OUT LOUD, not dropped', 
 
 // A `bg:` MESSAGE GOES BACK TO A BG LANE. dispatchPrompt strips the prefix
 // before it builds the item, so re-dispatching with no lane sends a long job
-// through pickLane onto the CHAT lane, blocking the one lane he talks to.
+// through pickLane onto the CHAT lane, blocking the one lane they talk to.
 P.reset();
 P.setWall(Date.now() + 3600_000, false);
 P.dispatchPrompt('bg: write the long report', undefined, { allowCodexFallback: true });
@@ -1521,7 +1521,7 @@ P.dispatchPrompt('is the deploy green', undefined, { allowCodexFallback: true })
 
 await t('★ with NO claude on the machine the message is refused, not held forever', () => {
   eq(P.parkedWalledChats.length, 0, 'no reset is coming, so holding it is dropping it');
-  ok(P.SENT.length > 0, 'he is told');
+  ok(P.SENT.length > 0, 'they are told');
 });
 
 // --- the swap could not be written -----------------------------------------
@@ -1547,7 +1547,7 @@ await t('chatLimitRetryPlan: every outcome maps to exactly one behaviour', () =>
   eq(P.chatLimitRetryPlan({ ...P0, outcome: 'paused' }, opts).retry.allowCodexFallback, true);
   eq(P.chatLimitRetryPlan({ ...P0, outcome: 'swapped' }, { ...opts, retried: true }), null, 'the cap');
   eq(P.chatLimitRetryPlan({ ...P0, outcome: 'swapped' }, { ...opts, priority: true }), null, 'internal traffic');
-  // THE LOOP GUARD MOVED. It used to bail here and hand him the raw failure;
+  // THE LOOP GUARD MOVED. It used to bail here and hand them the raw failure;
   // dispatchPrompt parks the re-dispatch instead, so the plan is the same on
   // both sides of it and the message survives the wall.
   eq(
@@ -2195,7 +2195,7 @@ await t('★ the chat turn claims LANES.main, so a message sent mid-turn QUEUES'
 await chatSettled();
 
 await t('★ no token count on the EXEC chat bubble either', () => {
-  // This is the bubble the owner was actually looking at when he said the in
+  // This is the bubble the owner was actually looking at when they said the in
   // and out tokens should not be there, so the fallback path has to be clean
   // too, not just the app-server one.
   const said = [...C.PROGRESS, ...C.SENT, ...C.RESULTS].join('\n');
@@ -2203,7 +2203,7 @@ await t('★ no token count on the EXEC chat bubble either', () => {
 });
 
 await t('★ the answer goes back as a CHAT reply, not as a worker handback', () => {
-  eq(C.RESULTS.length, 1, 'the owner gets his answer through sendResult');
+  eq(C.RESULTS.length, 1, 'the owner gets their answer through sendResult');
   ok(C.RESULTS[0].includes('what is in this repo'), C.RESULTS[0]);
   eq(C.HANDBACKS.length, 0, 'a chat answer routed through the handback arrives as somebody else’s report');
 });
@@ -2683,7 +2683,7 @@ await t('the wiring for a Codex-first machine keeps every internal turn delivera
   ok(/function deliverWithoutClaude\(text\)/.test(src), 'there is nowhere for an unsummarised note to go');
 });
 
-await t('a voice note takes the engine like every other thing he sends', () => {
+await t('a voice note takes the engine like every other thing they send', () => {
   const src = SRC.join('\n');
   // The assertion is on the FLAG, not on the whole options object: a voice note
   // that is also a reply carries `replyQuote` beside it, and pinning the exact
@@ -2751,13 +2751,13 @@ P.dispatchPrompt('is the deploy green', undefined, { allowCodexFallback: true })
 await t('★ with BOTH engines out the message is parked, not spun against two walls', () => {
   eq(P.CLAUDE.length, 0);
   eq(P.CODEX.length, 0);
-  eq(P.CHAT_FALLBACK.length, 0, 'the Codex fallback IS the wall he just hit');
+  eq(P.CHAT_FALLBACK.length, 0, 'the Codex fallback IS the wall they just hit');
   eq(P.parkedWalledChats.length, 1, 'the message was dropped, which is worse than either failure');
 });
 
 await t('and ONE line names both reset clocks', () => {
-  // Told only about Claude he waits for a reset that will not help, and told
-  // only about Codex he does the same.
+  // Told only about Claude they wait for a reset that will not help, and told
+  // only about Codex they do the same.
   const said = P.SENT.join('\n');
   ok(/Both engines are out/.test(said), said);
   ok(/Claude/.test(said) && /Codex/.test(said), said);
@@ -2784,7 +2784,7 @@ await t('★ whichever engine returns first runs the parked message, by itself',
 await t('★ the wall notice BECOMES the back line rather than being followed by one', () => {
   // One message per event. A second "an engine is back" under a notice still
   // saying "both engines are out" is two objects for one wait, and the stale
-  // one is the one he scrolls to first.
+  // one is the one they scroll to first.
   eq(P.SENT.length, 1, `a second message was sent:\n${P.SENT.join('\n---\n')}`);
   const last = P.EDITS[P.EDITS.length - 1];
   ok(last, 'the notice was never resolved at all');
@@ -2964,7 +2964,7 @@ P.setWall(WALL);
 P.dispatchPrompt('[Report from your own background worker: it finished.]', P.LANES.main, { priority: true });
 
 await t('but a WALL still never diverts internal traffic: priority ignores it by construction', () => {
-  // The rate-limit fallback is a degraded answer for a message he is waiting
+  // The rate-limit fallback is a degraded answer for a message they are waiting
   // on. A report diverted there would be handed to a thread-less Codex run
   // that has never heard of this bridge, and parked for an M who already has it.
   eq(P.CHAT_FALLBACK.length, 0);
@@ -3006,7 +3006,7 @@ await t('★ the handoff is prepended to the FIRST message and to nothing after 
   eq(P.CODEX_CHAT[1].carriesHandoff, false);
 });
 
-await t('and what he TYPED is still what the turn is described by', () => {
+await t('and what they TYPED is still what the turn is described by', () => {
   // /status, the chat ring and the archive all read the raw text: a turn
   // labelled with a page of injected context is unreadable in every one of them.
   eq(P.CODEX_CHAT[0].text, 'what is the open question');
@@ -3028,7 +3028,7 @@ P.HANDOFF.pending = true;
 P.HANDOFF.block = 'BLOCK';
 P.dispatchPrompt('[Report from your own background worker: it finished.]', P.LANES.main, { priority: true });
 
-await t('internal traffic never consumes the handoff: it is for HIS next message', () => {
+await t('internal traffic never consumes the handoff: it is for THEIR next message', () => {
   eq(P.CODEX_CHAT.length, 1);
   eq(P.CODEX_CHAT[0].prompt, null, 'a worker report ate the context meant for the owner');
   eq(P.HANDOFF.pending, true, 'and it must still be waiting');
@@ -3523,7 +3523,7 @@ await t('★ a dash inside a code span is left alone: it is a flag, not prose', 
   eq(S.readChatRing().at(-1).text, DASHFIX.codeSpan.out, 'a copyable command was rewritten');
 });
 
-await t('the user half goes through the same rule, so his own words match too', () => {
+await t('the user half goes through the same rule, so their own words match too', () => {
   S.reset();
   S.recordChatTurn({ engine: 'claude', role: 'user', text: DASHFIX.range.in });
   eq(S.readChatRing().at(-1).text, DASHFIX.range.out);
@@ -4514,7 +4514,7 @@ await t('★ a lane that drains before the ack lands still resolves it', () => {
   ok(edit, `the ack was stranded at "Queued": ${JSON.stringify(P.EDITS)}`);
 });
 
-await t('a full queue says so, and offers the two things he can do', () => {
+await t('a full queue says so, and offers the two things they can do', () => {
   P.reset();
   P.LANES.main.current = { engine: 'claude', prompt: 'x', steer: () => false };
   for (let i = 0; i < P.QUEUE_MAX + 1; i++) P.dispatchPrompt(`msg ${i}`, undefined, { allowCodexFallback: true });
@@ -4739,7 +4739,7 @@ const BRIDGE_NAME = 'Leash';
 const codexSettingsNow = () => ({ model: null, effort: 'high' });
 const DEFAULT_CWD = ${JSON.stringify(BGAS_DIR)};
 const HOME = ${JSON.stringify(BGAS_DIR)};
-const OWNER_TZ = 'America/New_York';
+const OWNER_TZ = 'America/Toronto';
 let codexAppServerInitFailed = false;
 // Read by the test: the latch is PERMANENT, so which caller may set it is the
 // whole question. A background job's child must never reach it.
@@ -5088,7 +5088,7 @@ await t("the early steer is accepted rather than refused", () => {
   eq(
     tookEarly,
     true,
-    "the job is alive; a refusal here would send him to re-fire a running job",
+    "the job is alive; a refusal here would send them to re-fire a running job",
   );
 });
 
@@ -5767,7 +5767,7 @@ await t("★ a refused question resolves its own ⏳ instead of ticking until th
   delete process.env.FAKE_REFUSE_STEER;
   const ending = BGJ.BTW_NOTICES[0];
   eq(ending.state, "refused", `"ended" would claim the job's report may still carry it: ${JSON.stringify(BGJ.BTW_NOTICES)}`);
-  ok(ending.why, "the line has to say WHY, or he cannot tell it from a worker that ignored him");
+  ok(ending.why, "the line has to say WHY, or they cannot tell it from a worker that ignored them");
   ok(!BGJ.SENT.some((s) => s.startsWith("❌ Not steered")), "a question resolves its own line and must not also get a steer correction");
   await asReported();
   eq(BGJ.BTW_NOTICES.filter((n) => n.id === ending.id).length, 1, "★ and it is not resolved a SECOND time when the job ends");
@@ -5986,7 +5986,7 @@ await t("★ both handed-off dispatch paths go through the router, not straight 
 await t("★ the live card reads the transport off the run, for both facts it changes", () => {
   // The dispatch card and the bubble under it. Both were written for a one-shot
   // run and both are SILENT when wrong: a card that says "not steerable" over a
-  // job that takes a steer costs him the reach, and a bubble with no steps sits
+  // job that takes a steer costs them the reach, and a bubble with no steps sits
   // at "⏳ 18m" over a job doing work, which is the silence the live-message
   // pass existed to remove. bg-notify.test.mjs owns what the line then renders.
   const notice = BRIDGE_SRC.slice(

@@ -11,7 +11,7 @@
 // working." Every clause of `decideAutoCompact` is one reading of "done with
 // working": nothing queued, nothing steered in, nothing asked and unanswered,
 // the lane idle, and the run that just ended not itself a compaction. The
-// cooldown is the one clause he did not ask for: a compaction whose summary
+// cooldown is the one clause they did not ask for: a compaction whose summary
 // is itself heavy, or one that fails, must not re-fire on the very next turn.
 
 export const AUTO_COMPACT_DEFAULTS = Object.freeze({

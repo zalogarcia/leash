@@ -900,7 +900,7 @@ rec = { id: 41, lane: 'codex', askedAt: Date.now() };
 await B.startBtwNotice(rec, 'codex');
 rec.resolve('refused', { why: 'the Codex turn had already finished' });
 await t('★ a refusal resolves it as not delivered, carrying the reason', () => {
-  // The sixth state, and the one an app-server job needs: `ended` would tell him
+  // The sixth state, and the one an app-server job needs: `ended` would tell them
   // the report may still carry an answer to a question the job never received.
   ok(lastText().includes('not delivered'), lastText());
   ok(lastText().includes('the Codex turn had already finished'), lastText());
@@ -1191,9 +1191,9 @@ const LANES = { main: { current: null, queue: [] } };
 export const lanes = LANES;
 let mediaGroup = null;
 const BRIDGE_NAME = 'M';
-const OWNER_NAME = 'Zalo';
+const OWNER_NAME = 'Alex';
 const BOOT_AT = Date.parse('2026-09-11T14:23:07Z');
-const OWNER_TZ = 'America/New_York';
+const OWNER_TZ = 'America/Toronto';
 export const DISPATCHED = [];
 const dispatchPrompt = (prompt, lane, opts) => { DISPATCHED.push({ prompt, lane, opts }); };
 export const reset = () => { DISPATCHED.length = 0; RING = []; ENGINE = 'claude'; WALLED = false; ownerMessageSinceBoot = false; LANES.main.current = null; LANES.main.queue.length = 0; delete STATE.chats['1'].lastWakeUp; delete STATE.chats['1'].chatTurnInFlight; delete STATE.chats['1'].lastAnswer; STATE.chats['1'].sessionId = 'abc12345'; };
@@ -1237,7 +1237,7 @@ await t('★ a cut turn wakes the session: one priority dispatch, tagged, stampe
   const d = W.DISPATCHED[0];
   eq(d.lane, W.lanes.main);
   eq(d.opts.priority, true, 'never dropped, runs before anything queued');
-  ok(d.prompt.startsWith('[Bridge wake-up, daemon authored, not Zalo.]'), d.prompt.split('\n')[0]);
+  ok(d.prompt.startsWith('[Bridge wake-up, daemon authored, not Alex.]'), d.prompt.split('\n')[0]);
   ok(d.prompt.includes('🔄 M restarted at 10:23am'), d.prompt);
   ok(d.prompt.includes('✂️ Last turn was cut mid turn'), d.prompt);
   ok(d.prompt.includes('🕐 It began at 10:15am, answering:'), d.prompt);
