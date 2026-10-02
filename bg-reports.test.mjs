@@ -71,7 +71,7 @@ const M = await import(
     encodeURIComponent(
       [
         `import path from 'node:path';`,
-        `import { writeFileSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';`,
+        `import { writeFileSync, mkdirSync, readdirSync, unlinkSync, statSync } from 'node:fs';`,
         // A data: module has no base URL, so a bare absolute path will not resolve.
         `import { clip, oneLine } from ${JSON.stringify(pathToFileURL(path.join(DIR, 'progress-render.mjs')).href)};`,
         // handBackToChat renders the bridge's own record of what it steered in.
@@ -630,18 +630,89 @@ t('★ drafts never evict reports: they are counted and pruned in their own buck
   eq(left.filter((f) => f.endsWith('.draft.md')).length, 50, 'drafts under their own cap were pruned');
 });
 
-t('drafts past their own cap are pruned oldest first', () => {
+t('drafts past their own cap are pruned oldest first, across lanes', () => {
   const dir = REPORTS;
   mkdirSync(dir, { recursive: true });
   for (const f of readdirSync(dir)) rmSync(path.join(dir, f), { recursive: true, force: true });
   for (let i = 0; i < BG_REPORTS_KEEP + 5; i++) {
-    writeFileSync(path.join(dir, `bg-${1780000000000 + i * 1000}.draft.md`), 'x');
+    writeFileSync(path.join(dir, `bg${(i % 3) + 2}-${1780000000000 + i * 1000}.draft.md`), 'x');
   }
   M.pruneBgReports();
   const left = readdirSync(dir).filter((f) => f.endsWith('.draft.md'));
   eq(left.length, BG_REPORTS_KEEP, 'wrong number of drafts kept');
-  ok(!left.includes('bg-1780000000000.draft.md'), 'the oldest draft survived');
-  ok(left.includes(`bg-${1780000000000 + (BG_REPORTS_KEEP + 4) * 1000}.draft.md`), 'the newest draft was pruned');
+  ok(!left.includes('bg2-1780000000000.draft.md'), 'the oldest draft survived');
+  ok(left.includes(`bg${((BG_REPORTS_KEEP + 4) % 3) + 2}-${1780000000000 + (BG_REPORTS_KEEP + 4) * 1000}.draft.md`), 'the newest draft was pruned');
+});
+
+t('★ at the cap, the newest DRAFT survives even when its lane sorts first', () => {
+  // A draft is the one record of a worker that may still be running: pruning
+  // it because its lane name sorts first would lose exactly the report the
+  // draft exists to save.
+  const dir = REPORTS;
+  mkdirSync(dir, { recursive: true });
+  for (const f of readdirSync(dir)) rmSync(path.join(dir, f), { recursive: true, force: true });
+  const oldest = 'bg2-1780000000000.draft.md';
+  writeFileSync(path.join(dir, oldest), 'x');
+  for (let i = 1; i < BG_REPORTS_KEEP; i++) {
+    writeFileSync(path.join(dir, `bg${(i % 12) + 2}-${1780000000000 + i * 1000}.draft.md`), 'x');
+  }
+  const newest = 'bg-1789999999999.draft.md';
+  writeFileSync(path.join(dir, newest), 'x');
+  M.pruneBgReports();
+  const left = readdirSync(dir).filter((f) => f.endsWith('.draft.md'));
+  eq(left.length, BG_REPORTS_KEEP, 'wrong number of drafts kept');
+  ok(left.includes(newest), 'the newest draft was pruned because its lane sorts first');
+  ok(!left.includes(oldest), 'pruning did not start from the genuinely oldest draft');
+});
+
+t('★ at the cap, the newest report survives even when its lane sorts first', () => {
+  // Ids are <lane>-<epoch-ms>, and lexical order over them is not
+  // chronological: the LANE dominates, and "-" sorts below every digit, so
+  // "bg-<epoch>.md" (the default lane, the one every first handoff uses)
+  // sorted ahead of bg2, bg10 and the rest, and at the cap the just-written
+  // report was the one deleted.
+  const dir = REPORTS;
+  mkdirSync(dir, { recursive: true });
+  for (const f of readdirSync(dir)) rmSync(path.join(dir, f), { recursive: true, force: true });
+  const oldest = 'bg2-1780000000000.md';
+  writeFileSync(path.join(dir, oldest), 'x');
+  for (let i = 1; i < BG_REPORTS_KEEP; i++) {
+    writeFileSync(path.join(dir, `bg${(i % 12) + 2}-${1780000000000 + i * 1000}.md`), 'x');
+  }
+  const newest = 'bg-1789999999999.md';
+  writeFileSync(path.join(dir, newest), 'x');
+  M.pruneBgReports();
+  const left = readdirSync(dir).filter((f) => f.endsWith('.md'));
+  eq(left.length, BG_REPORTS_KEEP, 'wrong number of reports kept');
+  ok(left.includes(newest), 'the newest report was pruned because its lane sorts first');
+  ok(!left.includes(oldest), 'pruning did not start from the genuinely oldest report');
+});
+
+t('a report whose name carries no epoch is ordered by mtime, not deleted first', () => {
+  const dir = REPORTS;
+  mkdirSync(dir, { recursive: true });
+  for (const f of readdirSync(dir)) rmSync(path.join(dir, f), { recursive: true, force: true });
+  // bgReportId always yields an epoch, so this is a foreign file: it must not
+  // be treated as infinitely old just because the regex misses it.
+  writeFileSync(path.join(dir, 'notes.md'), 'x');
+  for (let i = 0; i < BG_REPORTS_KEEP; i++) {
+    writeFileSync(path.join(dir, `bg7-${1780000000000 + i * 1000}.md`), 'x');
+  }
+  M.pruneBgReports();
+  const left = readdirSync(dir).filter((f) => f.endsWith('.md'));
+  eq(left.length, BG_REPORTS_KEEP, 'wrong number of reports kept');
+  ok(left.includes('notes.md'), 'the epoch-less file was pruned ahead of reports older than it');
+});
+
+t('under the cap, pruning deletes nothing at all', () => {
+  const dir = REPORTS;
+  mkdirSync(dir, { recursive: true });
+  for (const f of readdirSync(dir)) rmSync(path.join(dir, f), { recursive: true, force: true });
+  for (let i = 0; i < BG_REPORTS_KEEP; i++) {
+    writeFileSync(path.join(dir, `bg-${1780000000000 + i * 1000}.md`), 'x');
+  }
+  M.pruneBgReports();
+  eq(readdirSync(dir).filter((f) => f.endsWith('.md')).length, BG_REPORTS_KEEP, 'pruning fired at the cap instead of past it');
 });
 
 t('pruning a missing directory is a no-op, not a crash', () => {

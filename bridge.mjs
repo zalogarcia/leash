@@ -5478,13 +5478,38 @@ function pruneBgReports() {
 }
 
 function pruneReportBucket(files) {
-  const sorted = files.slice().sort(); // ids are <lane>-<epoch-ms>, so lexical order is chronological
-  for (const f of sorted.slice(0, Math.max(0, sorted.length - BG_REPORTS_KEEP))) {
-    try {
-      unlinkSync(path.join(BG_REPORTS_DIR, f));
-    } catch {
-      /* already gone */
+  try {
+    if (files.length <= BG_REPORTS_KEEP) return;
+    // Ids are <lane>-<epoch-ms>, and lexical order over them is NOT
+    // chronological: the LANE dominates, and "-" sorts below every digit, so
+    // every default-lane report ("bg-<epoch>.md") sorted ahead of bg2, bg10 and
+    // the rest. Once the directory reached the cap that made the just-written
+    // default-lane report the one deleted, every time (measured on a live
+    // install: 200 reports kept, 0 of them default-lane, and a long report came
+    // back as its excerpt with the path beside it pointing at nothing). Sort on
+    // the epoch in the name, and fall back to mtime for a name that carries
+    // none. A draft (<id>.draft.md) carries the same epoch before its suffix.
+    const stamp = (f) => {
+      const m = /-(\d{10,})(?:\.draft)?\.md$/.exec(f);
+      if (m) return Number(m[1]);
+      try {
+        return statSync(path.join(BG_REPORTS_DIR, f)).mtimeMs;
+      } catch {
+        return 0;
+      }
+    };
+    const oldestFirst = files
+      .map((f) => ({ f, at: stamp(f) }))
+      .sort((a, b) => a.at - b.at || (a.f < b.f ? -1 : a.f > b.f ? 1 : 0));
+    for (const { f } of oldestFirst.slice(0, oldestFirst.length - BG_REPORTS_KEEP)) {
+      try {
+        unlinkSync(path.join(BG_REPORTS_DIR, f));
+      } catch {
+        /* already gone */
+      }
     }
+  } catch {
+    /* a racing delete; the next write prunes again */
   }
 }
 

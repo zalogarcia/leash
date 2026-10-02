@@ -49,6 +49,9 @@ limit in its verifier, and the account fixes that sit under both.**
   the cap a job waits in the drop box in arrival order, `bg.mjs ps` lists it under QUEUED, and
   `bg.mjs --now` starts one past the cap.
 - **A capped report chain resumes on its own** after ten quiet minutes, within a per message budget.
+- **Report pruning keeps the newest report.** `bg-reports/` is pruned by the epoch in each name, not
+  lexically: across lanes the default lane's `bg-<epoch>` sorted first, so at the 200 report cap the
+  report just written was the one deleted. Drafts are pruned in their own bucket, the same way.
 - **`bg.mjs steer` or `btw` with an empty target refuses** ("no target given") instead of queueing
   the steer text as a new job.
 
