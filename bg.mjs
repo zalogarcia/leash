@@ -156,6 +156,16 @@ if (argv[0] === 'ps' && argv.length === 1) {
 // apply"` would then silently pick a worker for a scripted caller that named
 // none, and a side question sent to the wrong job reads as an answer about the
 // right one. The CLI prints the usage line instead.
+//
+// A STEER WITH NO TARGET IS NEVER A BRIEF. `bg.mjs steer "$RUN" --file x` with
+// an empty $RUN (the worker had not left the queue yet) failed the shape test
+// above and queued the steer text as a brand new background job (2026-09-30).
+// A prose brief never has a missing, empty or flag-shaped second word, so
+// refuse before any daemon call instead of dispatching.
+if ((argv[0] === 'steer' || argv[0] === 'btw') && (!String(argv[1] ?? '').trim() || String(argv[1]).trim().startsWith('-'))) {
+  process.stderr.write(`bg.mjs ${argv[0]}: no target given (a lane, runId, pid or latest), nothing was dispatched; list targets with: node bg.mjs ps\n`);
+  process.exit(1);
+}
 if ((argv[0] === 'steer' || argv[0] === 'btw') && TARGET_SHAPE.test(String(argv[1] ?? '').trim())) {
   const op = argv[0];
   const target = argv[1].trim();

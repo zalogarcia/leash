@@ -10,7 +10,7 @@
 //
 //   node bg-steer.test.mjs
 
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -618,6 +618,27 @@ await at('ps against a cold socket also exits 2, never a fake empty list', async
   });
   eq(r.code, 2, r.stdout + r.stderr);
   ok(!/no background workers running/.test(r.stdout), 'an unreachable daemon must not read as an idle one');
+  rmSync(cold, { recursive: true, force: true });
+});
+
+// A STEER WITH NO TARGET IS NEVER A BRIEF. `bg.mjs steer "$RUN" --file x` with
+// an empty $RUN queued the steer text as a new job (2026-09-30). Cold socket on
+// purpose: the refusal must come before any daemon call.
+await at('★ steer or btw with a missing, empty or flag-shaped target refuses and dispatches nothing', async () => {
+  const cold = mkdtempSync(path.join(tmpdir(), 'bg-steer-empty-'));
+  copyFileSync(path.join(DIR, 'bg.mjs'), path.join(cold, 'bg.mjs'));
+  writeFileSync(path.join(cold, 'steer.md'), 'one more instruction');
+  for (const args of [['steer', '', '--file', 'steer.md'], ['steer', '  ', 'do this'], ['steer', '--file', 'steer.md'], ['steer'], ['btw', '', 'did it apply']]) {
+    const r = await new Promise((resolve) => {
+      execFile(process.execPath, [path.join(cold, 'bg.mjs'), ...args], { cwd: cold }, (err, stdout, stderr) =>
+        resolve({ code: err ? (err.code ?? 1) : 0, stdout: String(stdout), stderr: String(stderr) }),
+      );
+    });
+    eq(r.code, 1, JSON.stringify(args) + ' ' + r.stdout + r.stderr);
+    ok(/no target given/.test(r.stderr), JSON.stringify(args) + ' ' + r.stderr);
+    ok(!/handed to (the )?background lane/.test(r.stdout), JSON.stringify(args) + ' must NOT dispatch');
+    ok(!existsSync(path.join(cold, 'bg-queue.json')), JSON.stringify(args) + ' must not write the queue');
+  }
   rmSync(cold, { recursive: true, force: true });
 });
 

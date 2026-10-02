@@ -1038,7 +1038,10 @@ await at('the same refusal for a bare btw and for --file with no target', async 
   for (const args of [['btw'], ['btw', '--file', '/tmp/nope.md'], ['btw', 'the', 'release', 'thing']]) {
     const r = await run(args);
     eq(r.code, 1, args.join(' '));
-    ok(r.stderr.includes('btw needs a target'), `${args.join(' ')}: ${r.stderr}`);
+    // An empty or flag-shaped target is refused one arm earlier, with the
+    // shared steer/btw wording; a non-target word still reaches the btw-only
+    // arm. Either way nothing is dispatched.
+    ok(r.stderr.includes('btw needs a target') || r.stderr.includes('no target given'), `${args.join(' ')}: ${r.stderr}`);
   }
   eq(received.length, 0);
   let queued = [];
