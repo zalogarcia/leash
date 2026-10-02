@@ -76,6 +76,7 @@ import {
   captureConfirmation,
   captureFailure,
   fetchProfile,
+  rowLoginProblem,
 } from './account-usage.mjs';
 import { buildAccountKeyboard, createAccountCallbacks } from './account-buttons.mjs';
 import {
@@ -160,6 +161,7 @@ import {
   limitWallLine,
   limitWallResolved,
   swapFailedLine,
+  needsLoginNotice,
   chatRotatedLine,
   chatWalledRetryLine,
   bothWalledLine,
@@ -4141,6 +4143,54 @@ function logAccountDecision(d) {
 }
 
 /**
+ * AN ACCOUNT WHOSE LOGIN IS DEAD, persisted and said ONCE (2026-09-30).
+ *
+ * That day the rotation's probe of one account came back
+ * "token refresh rejected: HTTP 400 (invalid_grant)" and the selector took the
+ * account anyway (`verified=false`). The selector now refuses such a candidate
+ * (account-selector.mjs); this is the host half: the flag goes into the slot
+ * (accounts.mjs markNeedsLogin), where every rotation path reads it, and the user
+ * gets one message naming the account and the fix. markNeedsLogin says
+ * `changed` only for a NEW flag, so a second probe, a second view or a restart
+ * sends nothing. The flag is cleared by the capture the message asks for.
+ */
+function flagNeedsLogin(name, reason, { via = null } = {}) {
+  if (!name) return false;
+  let r;
+  try {
+    r = accounts.markNeedsLogin(name, reason);
+  } catch (e) {
+    console.error(`[bridge] could not flag "${name}" as needing a login: ${e.message}`);
+    return false;
+  }
+  if (!r?.changed) return false;
+  logAccountDecision({ decision: 'account_flagged_needs_login', account: name, reason, via });
+  send(needsLoginNotice({ account: name, reason }), { markdown: false }).catch((e) =>
+    console.error(`[bridge] needs-login notice for "${name}" not delivered: ${e.message}`),
+  );
+  return true;
+}
+
+/**
+ * The display paths (/account, /usage) read every slot anyway; a slot whose own
+ * read shows a dead login is flagged from it, the same as from a probe. Never
+ * the live row: rowLoginProblem returns null for it.
+ */
+function flagLoginsFromRows(rows, { via = null } = {}) {
+  const out = [];
+  for (const row of rows || []) {
+    // A CACHED row is not new evidence: it was offered here (or to the probe's
+    // flag) when it was fresh, and its `live` predates any login move since. A
+    // flag cleared by a fresh login in the meantime must not come back from it
+    // with a second notice (QA, 2026-09-30).
+    if (!row || row.cached) continue;
+    const reason = rowLoginProblem(row);
+    if (reason && flagNeedsLogin(row.name, reason, { via })) out.push(row.name);
+  }
+  return out;
+}
+
+/**
  * THE ROTATION TARGET, VERIFIED BEFORE IT IS USED.
  *
  * What this replaced was one line: `accounts.nextAvailable({ activeName })`,
@@ -4170,7 +4220,21 @@ async function pickHealthyAccount({ activeName = null, lines = [], quiet = false
     accounts: list,
     activeName,
     now: Date.now(),
-    probe: (name) => withDeadline(accountUsage.one(name), PROBE_TIMEOUT_MS, null),
+    // A refusal that answers AFTER the deadline is still flagged and said: the
+    // selector has already read the probe as unreadable by then, and without
+    // this the account would be tried once on a login known dead (QA,
+    // 2026-09-30). The rotation's swap refuses a slot flagged meanwhile.
+    probe: (name) => {
+      const p = accountUsage.one(name);
+      let late = false;
+      p.then((row) => {
+        if (late) flagLoginsFromRows([row], { via: 'late probe' });
+      }).catch(() => {});
+      return withDeadline(p, PROBE_TIMEOUT_MS, null).then((row) => {
+        if (row === null) late = true;
+        return row;
+      });
+    },
     // With nothing ledger-free left, the walls themselves are asked about again
     // (rate limited), so a paid reset is not invisible until the ledger's clock.
     recheck: limitRecheck,
@@ -4192,6 +4256,10 @@ async function pickHealthyAccount({ activeName = null, lines = [], quiet = false
         lines.push(`Could not read usage for "${d.account}" (${d.reason}); trying it anyway.`);
       } else if (d.decision === 'account_limit_cleared_by_probe') {
         lines.push(`Re-checked "${d.account}", marked limited: its usage now reads ${d.reason}, so its limit was cleared.`);
+      } else if (d.decision === 'account_needs_login') {
+        lines.push(`Skipped "${d.account}": its login needs renewing (${d.reason}), so it was not tried. ${OWNER_NAME} has been told.`);
+      } else if (d.decision === 'account_skipped_needs_login') {
+        lines.push(`Skipped "${d.account}": it needs a fresh login (${d.reason || 'refused'}).`);
       }
     },
   });
@@ -4204,6 +4272,8 @@ async function pickHealthyAccount({ activeName = null, lines = [], quiet = false
   // And the walls a re-check lifted, through the store's own clearLimit, which
   // takes the source and timestamp with the wall.
   for (const c of res.cleared || []) accounts.clearLimit(c.name);
+  // And the logins it found dead: flagged in the slot, said once.
+  for (const d of res.needsLogin || []) flagNeedsLogin(d.name, d.reason, { via: 'probe' });
   return res;
 }
 
@@ -4220,8 +4290,11 @@ function claudeWallFacts(now = Date.now()) {
     until: r.limitedUntil,
     walled: r.limited,
     captured: r.captured,
+    needsLogin: !!r.needsLogin,
   }));
-  const times = rows.filter((r) => r.walled && Number(r.until) > 0).map((r) => Number(r.until));
+  // A slot that needs a login frees nothing when its wall ends, so its clock is
+  // not the one work resumes at.
+  const times = rows.filter((r) => r.walled && !r.needsLogin && Number(r.until) > 0).map((r) => Number(r.until));
   return { rows, earliest: times.length ? Math.min(...times) : null };
 }
 
@@ -4326,7 +4399,8 @@ async function sweepWalledActiveAccount() {
   // nothing free means nowhere to go. Either way the read below is a shell out
   // to `security` for an answer that cannot change what happens next.
   const walled = rows.filter((r) => r.limited);
-  const free = rows.filter((r) => !r.limited && r.captured);
+  // A slot that needs a login is not somewhere to go (2026-09-30).
+  const free = rows.filter((r) => !r.limited && r.captured && !r.needsLogin);
   if (!walled.length || !free.length) return { checked: true, moved: false };
 
   const active = await accounts.activeAccount();
@@ -4347,7 +4421,7 @@ async function sweepWalledActiveAccount() {
   if (claudeRunInFlight()) {
     return { checked: true, moved: false, reason: 'a run started while this was probing' };
   }
-  const res = await accounts.swapTo(pick.name);
+  const res = await accounts.swapTo(pick.name, { refuseFlagged: true });
   if (!res.ok) {
     console.error(`[bridge] pre-emptive swap off the walled account "${name}" failed: ${res.error}`);
     return { checked: true, moved: false, error: res.error };
@@ -4386,7 +4460,9 @@ async function recheckDuringWall() {
   if (CONFIG_WALL_UNTIL > 0 && rotationPausedUntil === CONFIG_WALL_UNTIL) {
     return { checked: false, reason: 'wall is up (a rehearsal wall from config)' };
   }
-  const rows = accounts.describe(now).filter((r) => r.captured);
+  // A slot that needs a login is neither free nor worth a re-check: its wall
+  // ending frees nothing until someone signs into it again.
+  const rows = accounts.describe(now).filter((r) => r.captured && !r.needsLogin);
   const free = rows.some((r) => !r.limited);
   const due = rows.some((r) => r.limited && limitRecheck.due(r.name, now, { since: r.limitedVerifiedAt }));
   if (!free && !due) {
@@ -4420,7 +4496,7 @@ async function recheckDuringWall() {
   // sweep above keeps). The wall still comes down: a run that dies on that
   // login rotates onto the account this just found.
   if (liveName && liveName !== pick.name) {
-    const res = await accounts.swapTo(pick.name);
+    const res = await accounts.swapTo(pick.name, { refuseFlagged: true });
     if (!res.ok) {
       console.error(`[bridge] swap onto the re-checked account "${pick.name}" failed: ${res.error}`);
       return { checked: true, moved: false, error: res.error };
@@ -4526,7 +4602,7 @@ async function moveLoginToNextAtWall() {
     logAccountDecision({ ...decision, reason: 'earliest known reset; the login is already on it' });
     return { moved: false, already: true, to: next.name };
   }
-  const res = await accounts.swapTo(next.name);
+  const res = await accounts.swapTo(next.name, { refuseFlagged: true });
   if (!res.ok) {
     console.error(`[bridge] wall-time swap onto "${next.name}" failed: ${res.error}`);
     logAccountDecision({ ...decision, reason: `swap failed (${res.error}); the lift moves the login instead` });
@@ -4569,7 +4645,9 @@ function wallVouched() {
  */
 function ledgerAllWalled(now = Date.now()) {
   const rows = accounts.describe(now).filter((r) => r.captured);
-  return rows.length > 0 && rows.every((r) => r.limited);
+  // A slot that needs a login is not free either, so it counts with the walls:
+  // waking the chat onto it would wake it into a dead login (2026-09-30).
+  return rows.length > 0 && rows.every((r) => r.limited || r.needsLogin);
 }
 
 /** Bounds the lift's own sweep: every candidate probed once, plus a swap. */
@@ -4829,9 +4907,19 @@ async function rotateOffLimitedAccount(detail) {
   // before giving up. This is the fix for 12:46: `nextAvailable` alone hands
   // back the first account nothing has walled YET, which is not the same as an
   // account with headroom. See pickHealthyAccount.
-  const pick = await pickHealthyAccount({ activeName, lines });
-  if (pick.name) {
-    const res = await accounts.swapTo(pick.name);
+  let pick = await pickHealthyAccount({ activeName, lines });
+  // ONE MORE SELECTION when the store refuses the pick because it was flagged
+  // as needing a login while the swap waited (a refusal that answered after
+  // the probe's deadline). That is not the keychain failing, so the reasoning
+  // below does not apply: the flagged slot is skipped now, and the next healthy
+  // account, or the wall, is the answer (QA, 2026-09-30).
+  for (let retries = 1; pick.name; retries--) {
+    const res = await accounts.swapTo(pick.name, { refuseFlagged: true });
+    if (res.needsLogin && retries > 0) {
+      lines.push(`"${pick.name}" turned out to need a fresh login, so it was not swapped onto.`);
+      pick = await pickHealthyAccount({ activeName, lines });
+      continue;
+    }
     if (res.ok) {
       rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS;
       // An automatic rotation changes which account is live just as much as
@@ -5191,9 +5279,11 @@ async function renderAccountView(status = null) {
   const snapshot = await withDeadline(accountUsage.all(), 6_000, null);
   // A walled slot that now reads with room is freed BEFORE the view renders,
   // so the view does not say "limited" next to a 0% bar (2026-09-30). `rows`
-  // is re-read only when something changed; clearLimit never reorders the
-  // list, so the keyboard's indexes are unaffected.
+  // is re-read when a wall clears or a login is flagged; neither clearLimit
+  // nor markNeedsLogin reorders the list, so the keyboard's indexes hold.
   const cleared = clearLimitsFromRows(snapshot?.rows, { via: '/account' });
+  // A slot whose own read shows a dead login is flagged here as from a probe.
+  const flagged = flagLoginsFromRows(snapshot?.rows, { via: '/account' });
   let live =
     snapshot?.active || (await withDeadline(accountUsage.resolveActive(), 2_000)) || { liveFingerprint: 'none' };
   // DURING A WALL that clear kicked the sweep that moves the login and lifts
@@ -5206,7 +5296,7 @@ async function renderAccountView(status = null) {
     const swept = await withDeadline(walledSweepInflight, PROBE_TIMEOUT_MS + 1_000, null);
     if (swept?.moved) live = (await withDeadline(accountUsage.resolveActive(), 2_000)) || live;
   }
-  const ledgerRows = cleared.length ? accounts.describe() : rows;
+  const ledgerRows = cleared.length || flagged.length ? accounts.describe() : rows;
   // The body is rendered by account-usage.mjs so the exact strings they read have
   // a unit test; this half stays what it always was — fetch, render, attach the
   // keyboard. The keyboard is still built from the UNORDERED describe() list,
@@ -9660,6 +9750,7 @@ async function gatherUsage() {
     // Same rule as /account: a walled slot whose own fresh reading shows room
     // everywhere is freed from the reading this view already made.
     const cleared = clearLimitsFromRows(snapshot.rows, { via: '/usage' });
+    flagLoginsFromRows(snapshot.rows, { via: '/usage' });
     // DURING A WALL, the same wait /account makes: the clear kicked the sweep
     // that moves the login, so the report names where the login went rather
     // than the walled one it is leaving (QA, 2026-09-30).
@@ -10218,6 +10309,7 @@ async function handleCommand(text, msg = null) {
                 walled: r.limited,
                 until: r.limitedUntil,
                 captured: r.captured,
+                needsLogin: !!r.needsLogin,
                 live: !!liveUsage?.active?.name && r.name === liveUsage.active.name,
               })),
               { timeZone: OWNER_TZ },
@@ -11735,6 +11827,12 @@ async function pollLoop() {
         lastDriftCheck = Date.now();
         const op = accounts
           .checkDrift()
+          .then((r) => {
+            // A drift re-assert or re-bank moved the live login: the cached
+            // usage rows predate the move, and one of them may carry a
+            // dead-login verdict about the login that just landed.
+            if (r?.drifted) invalidateUsageCache();
+          })
           .catch((e) => console.error('[bridge] account drift check failed:', e.message));
         pendingOps.add(op);
         op.finally(() => pendingOps.delete(op));

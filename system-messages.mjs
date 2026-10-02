@@ -1061,7 +1061,8 @@ export function limitWallLine({ resetClock = null, leftText = null, codexTaking 
   // an account that had been out of usage credits since the night before, and
   // nothing he could read said so.
   for (const r of sortLedger(accounts, now)) {
-    const clock = ledgerClock(r, { timeZone, now });
+    // A dead login is the fact that matters on that row, clock or no clock.
+    const clock = r.needsLogin ? 'needs login' : ledgerClock(r, { timeZone, now });
     lines.push(`${STATUS_INDENT}${clip(oneLine(r.name || '?'), LEDGER_NAME_MAX)}${clock ? ` · ${clock}` : ''}`);
   }
   // WHAT THE WALL IS HOLDING. A handed-off job that waits for a reset is
@@ -1140,6 +1141,9 @@ function sortLedger(rows = [], now = Date.now()) {
  */
 export function accountLedgerRow(r = {}, { timeZone = undefined, now = Date.now() } = {}) {
   const clock = ledgerClock(r, { timeZone, now });
+  // NEEDS LOGIN outranks a wall: a wall ends by itself, a dead login does not
+  // (2026-09-30), so it is the one fact the row must carry.
+  if (r.needsLogin && r.captured !== false) return `🔑 ${clip(oneLine(r.name || '?'), LEDGER_NAME_MAX)} · needs login`;
   const state = r.walled ? clock || 'walled' : r.captured === false ? 'no login' : 'ok';
   const glyph = r.walled ? '⛔' : r.captured === false ? '⚠️' : r.live ? '▶︎' : '✅';
   return `${glyph} ${clip(oneLine(r.name || '?'), LEDGER_NAME_MAX)} · ${state}`;
@@ -1159,7 +1163,7 @@ export function accountLedgerRow(r = {}, { timeZone = undefined, now = Date.now(
 export function accountLedgerBlock(rows = [], { timeZone = undefined, now = Date.now() } = {}) {
   const list = (rows || []).filter((r) => r && r.name);
   if (!list.length) return '';
-  const free = list.filter((r) => !r.walled && r.captured !== false).length;
+  const free = list.filter((r) => !r.walled && r.captured !== false && !r.needsLogin).length;
   return [
     `🗂 Accounts · ${free} free of ${list.length}`,
     ...sortLedger(list, now).map((r) => `${STATUS_INDENT}${accountLedgerRow(r, { timeZone, now })}`),
@@ -1211,6 +1215,30 @@ export function swapFailedLine({ error = '', account = '' } = {}) {
   const detail = clip(oneLine(error), 80);
   if (detail) lines.push(detail);
   if (account) lines.push(`👤 Still on ${account}`);
+  return lines.join('\n');
+}
+
+/**
+ * AN ACCOUNT'S LOGIN IS DEAD, said ONCE (2026-09-30).
+ *
+ * A refresh the server refused, a token it refused, or a login past its own
+ * expiry: the account cannot take a run until someone signs into it again, and no
+ * amount of waiting fixes that, which is what separates this from a limit wall.
+ * The rotation now skips such an account (account-selector.mjs), and this is
+ * the one message that says so and says what to do. It is sent when the flag is
+ * RAISED (accounts.mjs markNeedsLogin `changed`), never per probe, and the fix
+ * line is the capture accounts.mjs documents, which is also what clears it.
+ *
+ * The name is never clipped on the capture line: that is the line the user copies.
+ */
+export function needsLoginNotice({ account = '', reason = '' } = {}) {
+  const name = oneLine(account) || 'an account';
+  const lines = [`🔑 Login needed · ${clip(name, 28)}`];
+  const why = clip(oneLine(reason), 36);
+  if (why) lines.push(`Why · ${why}`);
+  lines.push('Skipped by the rotation until then');
+  lines.push('Fix · /login in Claude Code as that account');
+  lines.push(`Then · /account capture ${name}`);
   return lines.join('\n');
 }
 

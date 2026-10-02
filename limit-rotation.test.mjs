@@ -78,17 +78,17 @@ const WALL =
   "You're out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.";
 
 const HARNESS = `
-import { parseResetTime, isLimited, earliestReset as earliestResetReal } from ${url('accounts.mjs')};
+import { parseResetTime, isLimited, earliestReset as earliestResetReal, loginFlag } from ${url('accounts.mjs')};
 // THE REAL SELECTION RULE. The whole point of this block is that a candidate is
 // verified before it is swapped onto, so a stub of it here would prove nothing.
 import { selectAccount, PROBE_TIMEOUT_MS, createRecheckLimiter, limitClearVerdict } from ${url('account-selector.mjs')};
-import { resetsAtToMs, invalidateUsageCache } from ${url('account-usage.mjs')};
+import { resetsAtToMs, invalidateUsageCache, rowLoginProblem } from ${url('account-usage.mjs')};
 import { fmtLeft } from ${url('usage-limits.mjs')};
 // THE WALL WAKE-UP (2026-09-30): the real episode store, the real next-account
 // rule and the real prompt and notice builders, so what the tests read is what
 // the chat session and its user would.
 import { createWallWake, pickNextAccount } from ${url('wall-wake.mjs')};
-import { wallWakePrompt, limitWallLine } from ${url('system-messages.mjs')};
+import { wallWakePrompt, limitWallLine, needsLoginNotice } from ${url('system-messages.mjs')};
 import { unlinkSync } from 'node:fs';
 
 // The clock is frozen at the incident, so a "one hour out" guess is a value a
@@ -116,7 +116,7 @@ export const reset = () => {
   rotationPausedUntil = 0; rotationCooldownUntil = 0;
   limitRecheck = createRecheckLimiter(); CONFIG_WALL_UNTIL = 0; LANES.main.current = null; bgLanes.length = 0;
   walledSweepInflight = null; lastWalledActiveSweep = 0; pendingOps.clear(); ALL_SNAPSHOT = null; probeGate = null;
-  USAGE_ROW = null; usageThrows = false; usageHangs = false; NEXT = { name: 'free-slot' }; swapOk = true;
+  USAGE_ROW = null; usageThrows = false; usageHangs = false; NEXT = { name: 'free-slot' }; swapOk = true; swapWait = null;
   LIST = []; PROBES = {}; ACTIVE = 'gjgkabche@gmail.com'; probeThrows = false; probeHangs = false;
   if (wallResumeTimer) clearTimeout(wallResumeTimer);
   wallResumeTimer = null;
@@ -125,7 +125,13 @@ export const reset = () => {
   DISPATCHED.length = 0; PARKED_CHATS.length = 0; CODEX_PARKED = 0; RENDERS.length = 0;
   parkedHandbacks.length = 0; handbackStreak = 0; handbackCapNotified = false; lastParkedAt = 0;
   CHAT_ENGINE = 'claude'; wallLiftInflight = null; wallNotices.clear();
+  NOTICES.length = 0; flagged.length = 0;
 };
+// THE NEEDS-LOGIN NOTICE (2026-09-30): what send() was asked to deliver, and
+// every flag the store was asked to raise (raised or not).
+export const NOTICES = [];
+export const flagged = [];
+const send = async (text, opts) => { NOTICES.push(text); return { ok: true }; };
 const WALL_WAKE_FILE = ${JSON.stringify(WALL_WAKE_FILE)};
 export let wallWake = createWallWake({ file: WALL_WAKE_FILE });
 // A daemon restart: a fresh store over the same file, as main() would build.
@@ -151,6 +157,8 @@ export const setChain = (v) => { handbackStreak = v.handbackStreak ?? handbackSt
 export let NEXT = { name: 'free-slot' };
 export const setNext = (v) => { NEXT = v; };
 export let swapOk = true;
+export let swapWait = null;
+export const setSwapWait = (p) => { swapWait = p; };
 export const setSwapOk = (v) => { swapOk = v; };
 export const pausedUntil = () => rotationPausedUntil;
 export const setCooldownUntil = (v) => { rotationCooldownUntil = v; };
@@ -192,7 +200,20 @@ const accounts = {
       limited: isLimited(a, now),
       limitedVerifiedAt: a.limitedVerifiedAt || null,
       limitedSource: a.limitedSource || null,
+      needsLogin: loginFlag(a) ? { reason: a.needsLogin.reason || null, at: a.needsLogin.at || null } : null,
     })),
+  // The real store's contract (accounts.mjs markNeedsLogin): written through,
+  // and \`changed\` only when the slot did not already carry a flag, which is
+  // what the host keys its one notice on. accounts.test.mjs holds the real
+  // store to the same contract.
+  markNeedsLogin: (name, reason) => {
+    flagged.push({ name, reason });
+    const i = LIST.findIndex((a) => a.name === name);
+    if (i === -1) return { ok: false, changed: false, error: 'no slot' };
+    if (loginFlag(LIST[i])) return { ok: true, changed: false };
+    LIST[i] = { ...LIST[i], needsLogin: { reason, at: new Date(Date.now()).toISOString(), fingerprint: 'fp' } };
+    return { ok: true, changed: true };
+  },
   markLimited: (name, resetsAt, opts) => {
     marked.push({ name, resetsAt, source: opts?.source || null });
     // Written through, so the selector's next pass and earliestReset see it,
@@ -211,7 +232,18 @@ const accounts = {
   },
   nextAvailable: () => NEXT,
   // Written through on success, so a later resolveActive names the new login.
-  swapTo: async (name) => { CALLS.push({ swapTo: name }); if (swapOk) ACTIVE = name; return swapOk ? { ok: true } : { ok: false, error: 'keychain said no' }; },
+  // The real store's two refusals: a keychain that says no, and (with
+  // refuseFlagged) a target flagged as needing a login, after waiting for the
+  // target's refresh flight (\`swapWait\` stands in for it).
+  swapTo: async (name, opts = {}) => {
+    CALLS.push({ swapTo: name, refuseFlagged: !!opts.refuseFlagged });
+    if (swapWait) await swapWait;
+    if (opts.refuseFlagged && loginFlag(LIST.find((a) => a.name === name))) {
+      return { ok: false, needsLogin: true, error: \`slot "\${name}" needs a fresh login\` };
+    }
+    if (swapOk) ACTIVE = name;
+    return swapOk ? { ok: true } : { ok: false, error: 'keychain said no' };
+  },
   describeUnclaimed: () => null,
   earliestReset: () => earliestResetReal(LIST, Date.now()),
 };
@@ -226,7 +258,7 @@ export const setAll = (v) => { ALL_SNAPSHOT = v; };
 // the view names as live, the ledger it shows, and the keyboard's live name.
 const renderAccountList = ({ rows, live }) => JSON.stringify({ live: live?.name || null, rows: rows.map((r) => [r.name, r.limited]) });
 const tightenAccountView = (t) => t;
-const buildAccountKeyboard = (rows, { activeName }) => ({ activeName });
+const buildAccountKeyboard = (rows, { activeName }) => ({ activeName, needsLogin: rows.filter((r) => r.needsLogin).map((r) => r.name) });
 const codexAccount = { snapshot: async () => null };
 const codexAccountBlock = () => '';
 const codexFallbackOn = () => false;
@@ -320,6 +352,8 @@ const B = await import(
         HARNESS,
         grab('usageResetFor'),
         grab('logAccountDecision'),
+        grab('flagNeedsLogin'),
+        grab('flagLoginsFromRows'),
         grab('pickHealthyAccount'),
         grab('claudeWallFacts'),
         grab('raiseClaudeWall'),
@@ -339,7 +373,7 @@ const B = await import(
         grab('WALL_LIFT_SWEEP_WAIT_MS', 'const'),
         grab('liftClaudeWall'),
         grab('ownerLiftedWall'),
-        'export { usageResetFor, pickHealthyAccount, rotateOffLimitedAccount, claudeWallFacts, sweepWalledActiveAccount, recheckDuringWall, kickWalledSweep, clearLimitsFromRows, renderAccountView, gatherUsage, moveLoginToNextAtWall, wallWakeDue, liftClaudeWall, ownerLiftedWall, armWallResume };',
+        'export { flagNeedsLogin, flagLoginsFromRows, ledgerAllWalled, usageResetFor, pickHealthyAccount, rotateOffLimitedAccount, claudeWallFacts, sweepWalledActiveAccount, recheckDuringWall, kickWalledSweep, clearLimitsFromRows, renderAccountView, gatherUsage, moveLoginToNextAtWall, wallWakeDue, liftClaudeWall, ownerLiftedWall, armWallResume };',
       ].join('\n'),
     )
 );
@@ -1400,6 +1434,249 @@ B.setPausedUntil(0);
 await t('★ with nothing captured the ledger walls nothing, so the wake-up is due when the wall ends', () => {
   eq(B.wallWake.pending(), true);
   eq(B.wallWakeDue(), true);
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n6. A DEAD LOGIN: never selected, never moved onto, said once (2026-09-30)');
+// ---------------------------------------------------------------------------
+// The user captured a fresh login into three@, whose weekly wall the capture kept,
+// so the sweep moved off it. Its probe of four@example.com came back "token
+// refresh rejected: HTTP 400 (invalid_grant)" (the refresh token a concurrent
+// /account read had just spent), and the selector swapped onto it with
+// verified=false. The real bridge functions, the real selector and the real
+// wall-move rule; the store is the harness's, whose markNeedsLogin keeps the
+// real store's contract (accounts.test.mjs holds the real one to it).
+
+const ME = 'four@example.com';
+const REFUSED_ROW = (name = ME) => ({
+  name,
+  state: 'refresh-failed',
+  error: 'token refresh rejected: HTTP 400 (invalid_grant)',
+  usage: null,
+  loginProblem: 'login refused (invalid_grant)',
+});
+const incidentSetup = () => {
+  B.reset();
+  B.setActive('three@example.com');
+  B.setList([
+    walledSlot('one@example.com', { limitedUntil: Math.floor((NOW + 60 * HOUR) / 1000) }),
+    slot('two@example.com', { lastActiveAt: new Date(NOW - HOUR).toISOString() }),
+    walledSlot('three@example.com', { limitedUntil: Math.floor((NOW + 16 * HOUR) / 1000) }),
+    // Least recently active, so the selector asks it FIRST, exactly as at 18:22.
+    slot(ME, { lastActiveAt: new Date(NOW - 5 * HOUR).toISOString() }),
+  ]);
+  B.setProbes({ [ME]: REFUSED_ROW(), 'two@example.com': HEALTHY('two@example.com') });
+};
+const meRow = () => B.LIST.find((a) => a.name === ME);
+
+incidentSetup();
+let swept = await B.sweepWalledActiveAccount();
+await t('★ THE 18:22 SWEEP: the refused login is skipped and the login moves to the healthy account', () => {
+  eq(swept.moved, true, JSON.stringify(swept));
+  eq(swaps(), 'two@example.com', 'the sweep swapped onto the account whose refresh was refused');
+  ok(!B.LOGS.some((l) => l.includes(`account_selected · account=${ME}`)), `a dead login was selected:\n${B.LOGS.join('\n')}`);
+  ok(B.LOGS.some((l) => l.includes(`account_needs_login · account=${ME}`)), B.LOGS.join('\n'));
+});
+await t('★ ...the slot is flagged, and the user is told ONCE, naming the account and the fix', () => {
+  ok(meRow().needsLogin, 'the flag must be persisted in the slot');
+  eq(B.NOTICES.length, 1, `notices: ${JSON.stringify(B.NOTICES)}`);
+  ok(B.NOTICES[0].includes(`🔑 Login needed · ${ME}`), B.NOTICES[0]);
+  ok(B.NOTICES[0].includes(`/account capture ${ME}`), B.NOTICES[0]);
+  ok(B.LOGS.some((l) => l.includes(`account_flagged_needs_login · account=${ME}`)), B.LOGS.join('\n'));
+});
+// The next minute: three@ is live and walled again, the flag is on disk.
+B.setCooldownUntil(0);
+B.setActive('three@example.com');
+B.probeCalls.length = 0;
+swept = await B.sweepWalledActiveAccount();
+await t('★ the next sweep skips the flagged slot WITHOUT a probe, and sends no second notice', () => {
+  ok(!B.probeCalls.includes(ME), `the flagged slot was probed again: ${B.probeCalls.join(',')}`);
+  eq(B.NOTICES.length, 1, 'the notice was repeated on the next probe');
+  eq(swaps(), 'two@example.com,two@example.com');
+});
+await t('the same dead login found twice in one pass, or by a later probe, still says it once', () => {
+  B.flagNeedsLogin(ME, 'login refused (HTTP 401)');
+  eq(B.NOTICES.length, 1);
+});
+
+incidentSetup();
+// Only the dead login is free: the old selector took it with verified=false.
+B.setList(B.LIST.map((a) => (a.name === 'two@example.com' ? { ...a, limitedUntil: Math.floor((NOW + 3 * HOUR) / 1000), limitedSource: 'probe', limitedVerifiedAt: new Date(NOW).toISOString() } : a)));
+swept = await B.sweepWalledActiveAccount();
+await t('★ with the dead login the only free account, the sweep does NOT move onto it', () => {
+  eq(swaps(), '', `swapped onto ${swaps()}`);
+  eq(swept.moved, false);
+  ok(meRow().needsLogin, 'but it is flagged');
+  eq(B.NOTICES.length, 1);
+});
+
+incidentSetup();
+B.setList(B.LIST.map((a) => {
+  if (a.name === 'two@example.com') return { ...a, limitedUntil: Math.floor((NOW + 3 * HOUR) / 1000), limitedSource: 'probe', limitedVerifiedAt: new Date(NOW).toISOString() };
+  if (a.name === ME) return { ...a, needsLogin: { reason: 'login refused (invalid_grant)', at: 'then' } };
+  return a;
+}));
+swept = await B.sweepWalledActiveAccount();
+await t('★ with an ALREADY flagged slot the only unwalled one, the sweep has nowhere to go and does not go selecting', () => {
+  eq(JSON.stringify(swept), JSON.stringify({ checked: true, moved: false }), 'a dead login counted as somewhere to move to');
+  ok(!B.LOGS.some((l) => l.includes('account_skipped_needs_login')), `the sweep ran a selection over a dead login:\n${B.LOGS.join('\n')}`);
+  eq(swaps(), '');
+});
+
+incidentSetup();
+B.setActive('two@example.com');
+B.setUsageRow(row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }, 'two@example.com'));
+rot = await B.rotateOffLimitedAccount(WALL);
+await t('★ THE ALL-WALLED FALLBACK: a rotation whose only free candidate is a dead login walls, it does not swap', () => {
+  eq(rot.outcome, 'exhausted', `outcome ${rot.outcome} next ${rot.nextName}`);
+  ok(!swaps().split(',').includes(ME), `the rotation swapped onto the dead login: ${swaps()}`);
+  ok(B.pausedUntil() > NOW, 'the wall must go up');
+  eq(B.NOTICES.length, 1);
+  ok(rot.lines.join('\n').includes(`Skipped "${ME}": its login needs renewing`), rot.lines.join('\n'));
+});
+await t('★ THE WALL-TIME MOVE never lands on the dead login', () => {
+  ok(!swaps().split(',').includes(ME), swaps());
+  eq(B.wallWake.current()?.movedTo === ME, false);
+});
+
+B.reset();
+B.setActive('two@example.com');
+B.setList([
+  slot('two@example.com'),
+  // The dead login frees FIRST: the wall-time move and the resume clock would
+  // both have picked it.
+  walledSlot(ME, { limitedUntil: Math.floor((NOW + 10 * MIN) / 1000), needsLogin: { reason: 'login refused (invalid_grant)', at: 'then' } }),
+  walledSlot('three@example.com', { limitedUntil: Math.floor((NOW + 90 * MIN) / 1000) }),
+]);
+B.setUsageRow(row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }, 'two@example.com'));
+rot = await B.rotateOffLimitedAccount(WALL);
+await t('★ a flagged account with the EARLIEST reset is neither the next account nor the resume clock', () => {
+  eq(rot.outcome, 'exhausted');
+  eq(swaps(), 'three@example.com', 'the wall-time move went to the dead login');
+  eq(B.pausedUntil(), Math.floor((NOW + 90 * MIN) / 1000) * 1000, 'the wall would lift at the dead login\'s clock and free nothing');
+  eq(B.NOTICES.length, 0, 'an already flagged slot is not announced again');
+});
+await t('★ the ledger counts a dead login with the walls, so the lift does not wake the chat onto it', () => {
+  B.setList(B.LIST.map((a) => (a.name === 'three@example.com' ? a : { ...a, limitedUntil: null })));
+  // two@ and the dead login are "free" in the ledger; only two@ really is.
+  eq(B.ledgerAllWalled(), false);
+  B.setList(B.LIST.map((a) => (a.name === 'two@example.com' ? { ...a, limitedUntil: Math.floor((NOW + HOUR) / 1000) } : a)));
+  eq(B.ledgerAllWalled(), true, 'a free dead login made the ledger read as free');
+});
+
+B.reset();
+B.setActive('two@example.com');
+B.setList([
+  walledSlot('two@example.com', { limitedUntil: Math.floor((NOW + 2 * HOUR) / 1000), limitedVerifiedAt: new Date(NOW).toISOString() }),
+  slot(ME, { needsLogin: { reason: 'login refused (invalid_grant)', at: 'then' } }),
+]);
+B.setPausedUntil(NOW + 2 * HOUR);
+const during = await B.recheckDuringWall();
+await t('★ DURING A WALL a free-looking dead login is not free: no move, no lift, no selection run over it', () => {
+  eq(swaps(), '', swaps());
+  ok(B.pausedUntil() > NOW, `the wall was lifted onto a dead login: ${JSON.stringify(during)}`);
+  eq(during.checked, false, `the sweep treated the dead login as a free account: ${JSON.stringify(during)}`);
+  ok(!B.LOGS.some((l) => l.includes('account_skipped_needs_login')), B.LOGS.join('\n'));
+});
+
+B.reset();
+B.setActive('two@example.com');
+B.setList([slot('two@example.com'), slot(ME), slot('three@example.com')]);
+B.setAll({
+  active: { name: 'two@example.com' },
+  rows: [
+    { name: 'two@example.com', live: true, state: 'unavailable', failure: { kind: 'refused', status: 401 }, usage: null, loginProblem: 'login refused (HTTP 401)' },
+    { ...REFUSED_ROW(), live: false },
+    HEALTHY('three@example.com'),
+  ],
+});
+const flagView = await B.renderAccountView();
+await t('★ the /account view flags a dead login from its own rows, and never the live one', () => {
+  ok(meRow().needsLogin, 'the view read a refused refresh and did not flag it');
+  eq(JSON.stringify(flagView.markup.needsLogin), JSON.stringify([ME]), 'the keyboard was built from rows read before the flag, so it offered the dead login as a plain swap (QA)');
+  ok(!B.LIST.find((a) => a.name === 'two@example.com').needsLogin, 'the LIVE row was flagged: its session refreshes its own token');
+  eq(B.NOTICES.length, 1, `notices: ${JSON.stringify(B.NOTICES)}`);
+});
+await B.renderAccountView();
+await B.gatherUsage();
+await t('★ a second view and a /usage read of the same dead login say nothing more', () => {
+  eq(B.NOTICES.length, 1, `notices: ${JSON.stringify(B.NOTICES)}`);
+});
+B.setList(B.LIST.map((a) => (a.name === ME ? slot(ME) : a)));
+B.NOTICES.length = 0;
+await B.gatherUsage();
+await t('★ /usage flags a dead login from its own rows too', () => {
+  ok(meRow().needsLogin, '/usage read a refused refresh and did not flag it');
+  eq(B.NOTICES.length, 1);
+});
+
+// The user did what the notice said: a fresh login landed and cleared the flag. The
+// next view inside the usage cache's minute is served the OLD row (cached, and
+// `live: false` from before the login moved). It must not raise the flag again.
+B.setList(B.LIST.map((a) => (a.name === ME ? slot(ME) : a)));
+B.NOTICES.length = 0;
+B.setAll({ active: { name: ME }, rows: [{ ...REFUSED_ROW(), live: false, cached: true }, HEALTHY('three@example.com')] });
+await B.renderAccountView();
+await t('★ a CACHED dead-login row after a fresh login neither re-flags the account nor sends a second notice (QA)', () => {
+  ok(!meRow().needsLogin, 'a cached row re-flagged the login that just landed');
+  eq(B.NOTICES.length, 0, `notices: ${JSON.stringify(B.NOTICES)}`);
+});
+
+// A refusal that answers AFTER the probe's deadline (the harness fuse is 20ms).
+incidentSetup();
+B.setList(B.LIST.filter((a) => a.name !== 'two@example.com'));
+let releaseLate;
+B.setProbeGate(new Promise((r) => (releaseLate = r)));
+const lateSweep = await B.sweepWalledActiveAccount();
+await t('★ a LATE refusal: the selector read it as unreadable, so the rotation swap is told to refuse a flagged slot (QA)', () => {
+  const sw = B.CALLS.filter((c) => c.swapTo);
+  eq(sw.length, 1, JSON.stringify(lateSweep));
+  eq(sw[0].swapTo, ME);
+  eq(sw[0].refuseFlagged, true, 'the rotation swap did not ask the store to refuse a slot flagged while it waited');
+});
+releaseLate();
+await new Promise((r) => setTimeout(r, 30));
+await t('★ ...and the late refusal is still flagged and said, once (QA)', () => {
+  ok(meRow().needsLogin, 'a refusal that answered after the deadline was never flagged');
+  eq(B.NOTICES.length, 1, `notices: ${JSON.stringify(B.NOTICES)}`);
+  ok(B.LOGS.some((l) => l.includes('via=late probe')), B.LOGS.join('\n'));
+});
+B.setProbeGate(null);
+
+// THE SAME LATE REFUSAL inside a ROTATION, with a healthy account there: the
+// store refuses the dead login once its flight has answered, and the rotation
+// must select again rather than end as a failed swap (QA round 3).
+incidentSetup();
+B.setActive('two@example.com');
+B.setList(B.LIST.map((a) => (a.name === 'three@example.com' ? slot('three@example.com', { lastActiveAt: new Date(NOW - 2 * HOUR).toISOString() }) : a)));
+B.setProbes({ [ME]: REFUSED_ROW(), 'three@example.com': HEALTHY('three@example.com') });
+B.setUsageRow(row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }, 'two@example.com'));
+let releaseRot;
+const rotGate = new Promise((r) => (releaseRot = r));
+B.setProbeGate(rotGate);
+B.setSwapWait(rotGate.then(() => new Promise((r) => setTimeout(r, 5))));
+// Released once the swap onto the dead login is WAITING, not on a clock: on a
+// loaded machine the rotation reached its probe after a fixed 40ms, the probe
+// answered inside its deadline, and the late refusal under test never formed.
+const releaseOnSwap = setInterval(() => {
+  if (B.CALLS.some((c) => c.swapTo === ME)) {
+    clearInterval(releaseOnSwap);
+    releaseRot();
+  }
+}, 2);
+setTimeout(() => {
+  clearInterval(releaseOnSwap);
+  releaseRot();
+}, 5_000).unref();
+rot = await B.rotateOffLimitedAccount(WALL);
+B.setProbeGate(null);
+B.setSwapWait(null);
+await t('★ a rotation whose pick is refused as a dead login selects again and swaps to the healthy account (QA)', () => {
+  eq(rot.outcome, 'swapped', `outcome ${rot.outcome}: ${rot.error || ''}`);
+  eq(rot.nextName, 'three@example.com');
+  eq(swaps(), `${ME},three@example.com`, 'the dead login was tried, refused, and the healthy one taken');
+  ok(rot.lines.join('\n').includes(`"${ME}" turned out to need a fresh login`), rot.lines.join('\n'));
+  eq(B.NOTICES.length, 1, 'the late refusal is said once');
 });
 
 rmSync(TMP, { recursive: true, force: true });

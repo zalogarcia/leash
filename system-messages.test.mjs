@@ -91,6 +91,7 @@ import {
   LEDGER_NAME_MAX,
   holdFullLine,
   swapFailedLine,
+  needsLoginNotice,
   chatRotatedLine,
   chatWalledRetryLine,
   bothWalledLine,
@@ -1144,6 +1145,34 @@ t('wall: ★ every ⏳ line here has a ✅ some other builder produces', () => {
   eq(limitWallResolved({ clock: '14:01', codexAnswered: 4 }), '✅ Claude is back · 14:01\n🧠 Codex answered 4 messages');
   ok(!limitWallResolved({ clock: '14:01', codexAnswered: 0 }).includes('Codex'), 'nothing to report, no line');
   eq(limitWallResolved({ clock: '14:01', codexAnswered: 1 }).split('\n')[1], '🧠 Codex answered 1 message');
+});
+
+t('wall: ★ a dead login is said once, in house style, with the fix to copy (2026-09-30)', () => {
+  const s = needsLoginNotice({ account: 'four@example.com', reason: 'login refused (invalid_grant)' });
+  eq(
+    s,
+    [
+      '🔑 Login needed · four@example.com',
+      'Why · login refused (invalid_grant)',
+      'Skipped by the rotation until then',
+      'Fix · /login in Claude Code as that account',
+      'Then · /account capture four@example.com',
+    ].join('\n'),
+  );
+  houseStyle(s, 'needsLoginNotice');
+  // The capture line is the one the user copies, so a long name is never cut there.
+  const long = 'a-very-long-account-name-for-this@example-company.com';
+  const l = needsLoginNotice({ account: long, reason: 'x'.repeat(200) });
+  ok(l.split('\n').at(-1).endsWith(long), 'the capture line clipped the name the user has to type');
+  ok(l.split('\n')[1].length <= 44, 'a long reason must be clipped, not wrapped');
+  ok(!needsLoginNotice({ account: 'a@b.c' }).includes('Why'), 'no reason, no reason line');
+});
+
+t('wall: a dead login reads as "needs login" on the ledger and the wall notice, and is not counted free', () => {
+  eq(accountLedgerRow({ name: 'four@example.com', captured: true, needsLogin: true }), '🔑 four@example.com · needs login');
+  eq(accountLedgerRow({ name: 'x@y', captured: true, walled: true, until: 1, needsLogin: true }), '🔑 x@y · needs login', 'a dead login outranks its wall');
+  ok(accountLedgerBlock([{ name: 'a', captured: true }, { name: 'b', captured: true, needsLogin: true }]).startsWith('🗂 Accounts · 1 free of 2'));
+  ok(limitWallLine({ accounts: [{ name: 'four@example.com', walled: false, needsLogin: true }] }).includes('four@example.com · needs login'));
 });
 
 t('wall: the swap failure says which account he is still on', () => {
