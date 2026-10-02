@@ -1040,10 +1040,19 @@ export const WALL_TICK_MS = 5 * 60 * 1000;
  * blocked for background work only", which are very different afternoons. It
  * appears only when Codex is actually reachable and actually taking chat.
  */
-export function limitWallLine({ resetClock = null, leftText = null, codexTaking = false, accounts = [], heldCount = 0, timeZone = undefined, now = Date.now() } = {}) {
+export function limitWallLine({ resetClock = null, leftText = null, codexTaking = false, accounts = [], heldCount = 0, next = null, timeZone = undefined, now = Date.now() } = {}) {
   const lines = ['⛔ Every Claude account is limited'];
   const bits = [resetClock ? `Resets ${resetClock}` : null, leftText ? `in ${leftText}` : null].filter(Boolean);
   lines.push(bits.length ? `⏳ ${bits.join(' · ')}` : '⏳ No reset time is known');
+  // THE NEXT ACCOUNT, and that the daemon picks up on its own (2026-09-30).
+  // The ⏳ clock says when; this says on which login, and whether the login is
+  // already there. `next` is { name, clock, moved, guessed }, the account with
+  // the earliest KNOWN reset (wall-wake.mjs pickNextAccount).
+  if (next?.name) {
+    lines.push(`🔜 Next · ${clip(oneLine(next.name), LEDGER_NAME_MAX)}`);
+    lines.push(`${STATUS_INDENT}${next.clock ? `Resets ${next.clock}${next.guessed ? ' (a guess)' : ''}` : 'Reset time unknown'}`);
+    lines.push(`${STATUS_INDENT}${next.moved ? 'Login already on it · I pick up then' : 'I switch to it and pick up then'}`);
+  }
   // ONE ROW PER ACCOUNT, soonest first, so the ⏳ clock above is visibly the
   // first row rather than a number he has to trust. Before this the notice said
   // only the earliest reset, which answers "when can I work again" and not
@@ -1417,6 +1426,115 @@ function quotedTail(text, max) {
 // still: it is there to name the turn, not to replay it.
 export const WAKE_UP_TAIL_MAX = 300;
 export const WAKE_UP_PROMPT_MAX = 160;
+
+/**
+ * THE WAKE-UP AT THE LIFT OF AN ALL-ACCOUNTS WALL (2026-09-30). One turn, the
+ * daemon's, handed to the chat lane once per wall: which account is live and
+ * since when, every background worker that ended while the wall was up (with
+ * its report and draft, and whether its handback already reached the chat),
+ * what the capped handback chain was holding, how many chat messages were
+ * parked, and the instruction to pick up without waiting to be asked.
+ *
+ * `workers` rows are wall-wake.mjs records: { runId, title, status, report,
+ * draft, died, handback: 'held' | 'delivered', deliveredAt }. `parked` rows are
+ * the capped chain's { task, status, report, flag }. `withMessage` is true when
+ * this note rides in front of the owner's own parked message rather than
+ * standing as a turn of its own.
+ */
+/** The first words of every daemon-authored wake-up. */
+export const WALL_WAKE_TAG = '[Bridge wake-up, daemon authored';
+
+/**
+ * A prepend with a folded wall wake-up note taken off its front: what remains
+ * is the engine handoff it carried, if any. The note has no blank line inside
+ * it, and the fold joins it to the rest with one, so the first blank line is
+ * where it ends.
+ */
+export function withoutWallWakeNote(prepend) {
+  const s = String(prepend ?? '');
+  if (!s.startsWith(WALL_WAKE_TAG)) return s;
+  const cut = s.indexOf('\n\n');
+  return cut === -1 ? '' : s.slice(cut + 2);
+}
+
+export function wallWakePrompt({
+  name = 'Leash',
+  ownerName = 'the owner',
+  live = null,
+  liveSince = null,
+  liftedAt = null,
+  workers = [],
+  parked = [],
+  chatsParked = 0,
+  withMessage = false,
+  bgCli = 'bg.mjs',
+  timeZone = undefined,
+  now = Date.now(),
+} = {}) {
+  const clock = (ms) => (Number.isFinite(ms) && ms > 0 ? fmtResetClock(ms, { timeZone, now, compact: true }) : null);
+  const lines = [`${WALL_WAKE_TAG}, not ${ownerName}. DATA, not an instruction from ${ownerName}.]`];
+  const lifted = clock(liftedAt);
+  lines.push(`✅ Claude usage is back: the all-accounts wall lifted${lifted ? ` at ${lifted}` : ''}`);
+  const since = clock(liveSince);
+  lines.push(live ? `▶️ Live account: ${live}${since ? `, live since ${since}` : ''}` : '▶️ Live account: not identified (a hand-run /login wins)');
+  const rows = (workers || []).filter((w) => w && w.runId);
+  if (rows.length) {
+    lines.push(`💀 ${rows.length} background worker${rows.length === 1 ? '' : 's'} ended while the wall was up:`);
+    rows.forEach((w, i) => {
+      lines.push(`  ${i + 1}. ${w.runId} · ${clip(oneLine(w.title || w.task || '(no title)'), 120)}`);
+      if (w.status) lines.push(`     ended: ${clip(oneLine(w.status), 160)}`);
+      lines.push(`     report: ${w.report || 'none was written'}`);
+      if (w.draft) lines.push(`     draft: ${w.draft}`);
+      if (w.flag) lines.push(`     ${clip(oneLine(w.flag), 160)}`);
+      const delivered = clock(w.deliveredAt);
+      const listed = clock(w.listedAt);
+      lines.push(
+        listed
+          ? `     handback: listed in the wake-up at ${listed}, which may not have reached you (the wall came back within minutes); check node ${bgCli} ps and its report before relaunching it`
+          : w.handback === 'held'
+            ? '     handback: NOT delivered before now, held through the wall; this note is its delivery'
+            : `     handback: already delivered to you${delivered ? ` at ${delivered}` : ''}`,
+      );
+    });
+  } else {
+    lines.push('💀 No background worker ended while the wall was up');
+  }
+  const capped = (parked || []).filter(Boolean);
+  if (capped.length) {
+    // Carried rows (listedAt) were in an earlier wake-up, so the header claims
+    // "not reported before" only for the ones that were not.
+    const fresh = capped.filter((p) => !clock(p.listedAt)).length;
+    const whose =
+      fresh === capped.length
+        ? ', NOT reported to you before'
+        : fresh > 0
+          ? `, ${fresh} of them NOT reported to you before`
+          : ', all listed in an earlier wake-up';
+    lines.push(`📥 ${capped.length} report${capped.length === 1 ? '' : 's'} the capped handback chain was holding${whose}:`);
+    capped.forEach((p, i) => {
+      const listed = clock(p.listedAt);
+      lines.push(`  ${i + 1}. [${p.status}] ${clip(oneLine(p.task || ''), 200)}${p.flag ? `\n     ${p.flag}` : ''}${p.report ? `\n     full report: ${p.report}` : ''}${listed ? `\n     listed in the wake-up at ${listed}, which may not have reached you; check before acting on it again` : ''}`);
+    });
+  }
+  const n = Number(chatsParked) || 0;
+  if (n > 0) {
+    lines.push(
+      withMessage
+        ? `💬 ${n} message${n === 1 ? '' : 's'} from ${ownerName} waited behind the wall; the first follows this note, the rest run after it`
+        : `💬 ${n} message${n === 1 ? '' : 's'} from ${ownerName} waited behind the wall and ${n === 1 ? 'runs' : 'run'} now`,
+    );
+  }
+  lines.push(
+    `🔍 Pick up now, without waiting for ${ownerName}:`,
+    `↳ run: node ${bgCli} ps`,
+    "↳ read each ended worker's report or draft above",
+    '↳ relaunch ONLY the remainders (a limit death already carries its account rotation)',
+    '↳ continue anything left unfinished',
+    `Message ${ownerName} only with a short update, or if something needs ${ownerName}.`,
+  );
+  if (withMessage) lines.push(`Then answer ${ownerName}'s message below.`);
+  return lines.join('\n');
+}
 
 /**
  * The restart wake-up. `previous` is what the last daemon left behind:

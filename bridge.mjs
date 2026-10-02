@@ -150,6 +150,9 @@ import {
   autoCompactFailedLine,
   autoCompactStatusLine,
   restartWakeUpPrompt,
+  wallWakePrompt,
+  withoutWallWakeNote,
+  WALL_WAKE_TAG,
   compactPrimeHeader,
   wakeUpStatusLine,
   WAKE_UP_PROMPT_MAX,
@@ -302,6 +305,7 @@ import {
 import { codexAccountBlock, createCodexAccount, fetchCodexRateLimits, readCodexRuns } from './codex-account.mjs';
 import { normalizeDashes } from './dash-normalize.mjs';
 import { describeWhen, isDailyDue } from './schedule-due.mjs';
+import { createWallWake, pickNextAccount } from './wall-wake.mjs';
 import {
   CODEX_EFFORTS,
   canProduceHandoff,
@@ -2919,6 +2923,13 @@ const BG_QUEUE_FILE = path.join(SCRIPT_DIR, 'bg-queue.json'); // handoff drop-bo
 // because every Claude account was walled. ON DISK, not in memory: see
 // flushParkedWalledJobs.
 const BG_HELD_FILE = path.join(SCRIPT_DIR, 'bg-held.json');
+// THE WAKE-UP AT THE LIFT OF AN ALL-ACCOUNTS WALL: one episode per wall, on disk
+// beside the held jobs, so a restart mid wall still wakes the chat session once
+// at the lift and a lift that already woke it does not wake it again. See
+// wall-wake.mjs and liftClaudeWall.
+const WALL_WAKE_FILE = path.join(SCRIPT_DIR, 'wall-wake.json');
+const wallWake = createWallWake({ file: WALL_WAKE_FILE, log: (m) => console.error(`[bridge] wall wake-up: ${m}`) });
+const BG_CLI = path.join(SCRIPT_DIR, 'bg.mjs');
 const BG_RESULTS_FILE = path.join(SCRIPT_DIR, 'bg-results.jsonl'); // background outcomes the chat lane can read back
 // THE CHAT RING: the last ten turns of THIS conversation, both engines, on
 // disk. Its own file, deliberately not state.json (which is rewritten on every
@@ -3970,8 +3981,10 @@ function armWallResume(earliestSecs) {
   wallResumeTimer = setTimeout(() => {
     wallResumeTimer = null;
     logAccountDecision({ decision: 'resume_after_reset', until: Math.floor(at / 1000), reason: 'wall resume timer' });
-    flushParkedWalledChats();
-    flushParkedWalledJobs();
+    // The flushes, and the one wake-up this wall owes the chat, after the login is
+    // moved off anything still walled (liftClaudeWall). With no wall episode
+    // pending this is the two flushes it always was.
+    liftClaudeWall('reset', { sweep: true });
   }, delay);
   wallResumeTimer.unref?.();
   return wallResumeTimer;
@@ -4231,11 +4244,23 @@ function raiseClaudeWall() {
   return raiseWall('claude', {
     render: () => {
       const { rows, earliest } = claudeWallFacts();
+      // THE NEXT ACCOUNT, and whether the login is already on it: read from the
+      // ledger and the wall episode at every render, so the line turns from
+      // "I switch to it" to "already on it" when the move lands.
+      const next = wallWake.pending() ? pickNextAccount(accounts.describe()) : null;
       return limitWallLine({
         resetClock: earliest ? fmtUntil(earliest * 1000, { timeZone: OWNER_TZ }) : null,
         leftText: earliest ? fmtLeft(earliest) : null,
         codexTaking: codexTakingChat(),
         accounts: rows,
+        next: next
+          ? {
+              name: next.name,
+              clock: fmtUntil(next.until * 1000, { timeZone: OWNER_TZ }),
+              guessed: next.guessed,
+              moved: wallWake.current()?.movedTo === next.name,
+            }
+          : null,
         // Counted at RENDER time, so the number on screen is what is held now:
         // a second message parked behind the same wall edits this line rather
         // than sending a bubble of its own.
@@ -4289,7 +4314,11 @@ async function sweepWalledActiveAccount() {
   // rate limited: see recheckDuringWall.
   if (now < rotationPausedUntil) return recheckDuringWall();
   if (now < rotationCooldownUntil) return { checked: false, reason: 'rotated moments ago' };
-  if (LANES.main.current || bgLanes.some((l) => l.current)) {
+  // A CLAUDE run, not any run: a Codex turn never touches a Claude login, and
+  // right after a wall the Codex fallback is exactly what is running, so the
+  // any-lane guard left the login on a walled account through the lift (QA,
+  // 2026-09-30).
+  if (claudeRunInFlight()) {
     return { checked: false, reason: 'something is running' };
   }
   const rows = accounts.describe(now);
@@ -4315,7 +4344,7 @@ async function sweepWalledActiveAccount() {
   // that arrived in that window is running on the live account, and swapping
   // credentials under it is the residual race this function claims to avoid.
   // The run will rotate for itself when it dies.
-  if (LANES.main.current || bgLanes.some((l) => l.current)) {
+  if (claudeRunInFlight()) {
     return { checked: true, moved: false, reason: 'a run started while this was probing' };
   }
   const res = await accounts.swapTo(pick.name);
@@ -4360,7 +4389,13 @@ async function recheckDuringWall() {
   const rows = accounts.describe(now).filter((r) => r.captured);
   const free = rows.some((r) => !r.limited);
   const due = rows.some((r) => r.limited && limitRecheck.due(r.name, now, { since: r.limitedVerifiedAt }));
-  if (!free && !due) return { checked: false, reason: 'wall is up' };
+  if (!free && !due) {
+    // Nothing to ask the walls about: the minute is spent moving the login to
+    // the account that frees first, if the wall went up while a Claude run was
+    // in flight and it has ended since. No keychain read once that was tried.
+    const next = await moveLoginToNextAtWall();
+    return { checked: false, reason: 'wall is up', ...(next.moved ? { movedToNext: next.to } : {}) };
+  }
   // Nothing to re-check, only a free account waiting for a Claude run to end:
   // asked BEFORE the probe, or the free slot is looked up every minute until it
   // does.
@@ -4404,8 +4439,9 @@ async function recheckDuringWall() {
     account: pick.name,
     reason: moved ? `a re-check found room during the wall; moved from ${liveName}` : 'a re-check found room during the wall',
   });
-  flushParkedWalledChats();
-  flushParkedWalledJobs();
+  // The flushes and the wake-up, with the login already on the account this
+  // found (liftClaudeWall does not sweep again).
+  await liftClaudeWall('recheck', { live: liveName ? pick.name : null, movedNow: moved });
   return { checked: true, moved, from: liveName, to: pick.name, lifted: true };
 }
 
@@ -4446,6 +4482,233 @@ function kickWalledSweep({ fresh = false } = {}) {
     if (walledSweepInflight === op) walledSweepInflight = null;
   });
   return op;
+}
+
+/**
+ * AT AN ALL-ACCOUNTS WALL, MOVE THE LOGIN TO THE ACCOUNT THAT FREES FIRST.
+ *
+ * Asked for on 2026-09-30: "find out which one is the next account that's
+ * going to be available, switch to it". The next account is the one with the
+ * earliest KNOWN reset (pickNextAccount in wall-wake.mjs, which never picks a
+ * guessed clock over a known one). Moving now rather than at the lift means the
+ * lift finds the login already there, so nothing it releases starts on an
+ * account still walled.
+ *
+ * Only when no Claude run is in flight (swapping under a live run is the
+ * residual race accounts.mjs documents), only during a real wall episode (a
+ * rehearsal wall from config has none), and tried ONCE per account per wall, so
+ * a keychain that refuses is not asked again every minute: the lift's sweep
+ * moves the login instead. A run in flight is not a try; the one minute sweep
+ * (recheckDuringWall) asks again once it has ended.
+ */
+async function moveLoginToNextAtWall() {
+  if (!(Date.now() < rotationPausedUntil)) return { moved: false, reason: 'no wall' };
+  if (!wallWake.pending()) return { moved: false, reason: 'no wall episode' };
+  const next = pickNextAccount(accounts.describe());
+  if (!next) return { moved: false, reason: 'no walled account carries a reset clock' };
+  if (wallWake.current()?.moveTried === next.name) return { moved: false, reason: 'already tried for this account' };
+  if (claudeRunInFlight()) return { moved: false, reason: 'a Claude run is in flight; the move waits for it' };
+  const active = await accounts.activeAccount();
+  const liveName = active?.account?.name || null;
+  // RE-CHECKED after the keychain read, which shells out: a run that started
+  // meanwhile is on the live login now, and a lift means the wall is gone.
+  if (claudeRunInFlight()) return { moved: false, reason: 'a Claude run started while reading the login' };
+  if (!(Date.now() < rotationPausedUntil)) return { moved: false, reason: 'the wall lifted while reading the login' };
+  wallWake.moveTried(next.name, next);
+  const decision = { decision: 'wall_next_account_selected', account: next.name, until: next.until, guessed: next.guessed };
+  // An unidentified live login is never swapped off: /login wins (accounts.mjs).
+  if (!liveName) {
+    logAccountDecision({ ...decision, reason: 'the live login is unidentified, so it stays' });
+    return { moved: false, reason: 'live account unidentified' };
+  }
+  if (liveName === next.name) {
+    wallWake.moved(next.name, null);
+    logAccountDecision({ ...decision, reason: 'earliest known reset; the login is already on it' });
+    return { moved: false, already: true, to: next.name };
+  }
+  const res = await accounts.swapTo(next.name);
+  if (!res.ok) {
+    console.error(`[bridge] wall-time swap onto "${next.name}" failed: ${res.error}`);
+    logAccountDecision({ ...decision, reason: `swap failed (${res.error}); the lift moves the login instead` });
+    return { moved: false, error: res.error };
+  }
+  invalidateUsageCache();
+  wallWake.moved(next.name, Date.now());
+  logAccountDecision({ ...decision, reason: `earliest known reset; moved from ${liveName}` });
+  // The notice on screen said "I switch to it and pick up then": re-render on
+  // its next tick instead of five minutes from now.
+  const notice = wallNotices.get('claude');
+  if (notice && !notice.done) notice.nextAt = 0;
+  return { moved: true, from: liveName, to: next.name, until: next.until };
+}
+
+/**
+ * DOES THIS WALL OWE THE CHAT ITS WAKE-UP NOW? A wall episode whose wake has
+ * not run, the rate wall down, and an account the ledger shows free. The last
+ * term is what keeps a restart mid wall from waking the chat into accounts still
+ * walled: the wall itself lives in memory and is gone after a restart, the
+ * ledger is not.
+ */
+function wallWakeDue(now = Date.now()) {
+  if (!wallWake.pending() || claudeRateWalled(now)) return false;
+  // OR the user chose a login by hand (ownerLiftedWall): the ledger still walls
+  // every account, and that choice stands in for the free one it cannot show.
+  return !ledgerAllWalled(now) || wallVouched();
+}
+
+/** The user chose a login by hand during this wall episode (wall-wake.mjs vouched). */
+function wallVouched() {
+  return Number(wallWake.current()?.vouchedAt) > 0;
+}
+
+/**
+ * Every captured account walled in the LEDGER, which outlives a restart. At
+ * least one: with nothing captured (a fresh install) there is no ledger wall to
+ * wait for, and reading an empty list as "all walled" held every handback
+ * forever (QA round 3).
+ */
+function ledgerAllWalled(now = Date.now()) {
+  const rows = accounts.describe(now).filter((r) => r.captured);
+  return rows.length > 0 && rows.every((r) => r.limited);
+}
+
+/** Bounds the lift's own sweep: every candidate probed once, plus a swap. */
+const WALL_LIFT_SWEEP_WAIT_MS = 30_000;
+let wallLiftInflight = null;
+
+/**
+ * THE LIFT OF AN ALL-ACCOUNTS WALL. Every path that lifts one ends here: the
+ * resume timer (`reset`), the early re-check (`recheck`, which also covers a
+ * clear from /account or /usage, since that clear lifts through the re-check),
+ * and the poll loop (`poll`), which is the backstop for everything else: a
+ * manual /account swap, a daemon restart mid wall, a timer that never fired.
+ *
+ * With no wake-up owed it is the two flushes the lift always ran. With one owed
+ * (wallWakeDue), in this order:
+ *
+ *   1. `sweep`: the login moves off anything still walled first (the ordinary
+ *      walled-active sweep, now that the wall is down), so what the lift
+ *      releases does not start on a walled account.
+ *   2. The wake-up is CLAIMED (wall-wake.mjs, persisted before any dispatch):
+ *      once per wall, across restarts.
+ *   3. The parked chats and jobs flush, then the Codex catch-up.
+ *   4. ONE turn in the chat lane carries the wake-up: folded in front of the
+ *      first parked chat message when one starts a turn here, or into the Codex
+ *      catch-up note, and only otherwise dispatched as its own turn. Priority,
+ *      so a busy lane queues it behind the running turn rather than losing it.
+ *
+ * Single flight: a second caller while one runs gets the same promise, and the
+ * poll loop skips its own flushes meanwhile, so nothing is flushed ahead of the
+ * fold.
+ */
+function liftClaudeWall(via, { live = null, movedNow = false, sweep = false } = {}) {
+  if (wallLiftInflight) return wallLiftInflight;
+  if (!wallWakeDue()) {
+    flushParkedWalledChats();
+    flushParkedWalledJobs();
+    return Promise.resolve(null);
+  }
+  const op = (async () => {
+    let liveName = live;
+    let movedAt = movedNow ? Date.now() : null;
+    if (sweep) {
+      const swept = await withDeadline(kickWalledSweep(), WALL_LIFT_SWEEP_WAIT_MS, null);
+      if (swept?.moved) {
+        liveName = swept.to;
+        movedAt = Date.now();
+      }
+    }
+    if (!liveName) liveName = (await withDeadline(accounts.activeAccount(), 3_000, null))?.account?.name || null;
+    // RE-CHECKED after the awaits: the account the sweep probed may have walled.
+    // And the wake turn runs on the LIVE login, so it is claimed only once that
+    // login is one the ledger shows free: a wake-up spawned onto a walled
+    // account dies unretried (a priority turn) and wakes nobody. Not yet: the
+    // flushes run as always and the poll loop tries again next cycle. An
+    // unidentified login (a hand-run /login) is the user's choice and is not
+    // second guessed, and neither is a login picked by hand during the wall.
+    const liveWalled = liveName && !wallVouched() ? accounts.describe().some((r) => r.name === liveName && r.limited) : false;
+    // The capped handback chain's reports ride in the wake-up turn; persisted
+    // with the claim so a wake-up that dies on a limit carries them forward.
+    // Read HERE, after the awaits, and taken out below with nothing awaited in
+    // between: a message typed during the sweep already flushed the chain
+    // itself, and a snapshot from before it would deliver those reports twice
+    // (QA round 3).
+    const parked = parkedHandbacks.slice();
+    const ep = wallWakeDue() && !liveWalled ? wallWake.claim({ via, now: Date.now(), parked }) : null;
+    if (!ep) {
+      flushParkedWalledChats();
+      flushParkedWalledJobs();
+      return null;
+    }
+    const now = Date.now();
+    // Taken out of the chain now that they ride this turn: a second turn for
+    // them is the duplicate this exists to avoid (flushParkedHandbacks's
+    // bookkeeping, since this is where the chain resumes).
+    parkedHandbacks.splice(0, parked.length);
+    if (parked.length) {
+      handbackStreak = 0;
+      handbackCapNotified = false;
+      lastParkedAt = 0;
+    }
+    const note = (count, withMessage) =>
+      wallWakePrompt({
+        name: BRIDGE_NAME,
+        ownerName: OWNER_NAME,
+        live: liveName,
+        liveSince: movedAt || (ep.movedTo && ep.movedTo === liveName ? ep.movedAt : null),
+        liftedAt: Number(ep.until) > 0 && ep.until <= now ? ep.until : now,
+        workers: ep.workers,
+        parked: [...(ep.carried?.parked || []), ...parked],
+        chatsParked: count,
+        withMessage,
+        bgCli: BG_CLI,
+        timeZone: OWNER_TZ,
+        now,
+      });
+    // A Codex chat lane ignores a prepend, so the note is folded only where it
+    // will be read.
+    const chats = flushParkedWalledChats({ fold: chatLaneEngine() === 'codex' ? null : (count) => note(count, true) });
+    flushParkedWalledJobs();
+    let carrier = chats.folded ? 'a parked chat message' : null;
+    if (!carrier && flushParkedCodexChats({ fold: note(chats.count, false) })) carrier = 'the Codex catch-up';
+    if (!carrier) {
+      dispatchPrompt(note(chats.count, false), LANES.main, { priority: true });
+      carrier = 'its own turn';
+    }
+    logAccountDecision({
+      decision: 'wall_wake_up',
+      account: liveName,
+      count: ep.workers.length + parked.length,
+      via,
+      reason: `delivered with ${carrier}; ${chats.count} parked chat(s)`,
+    });
+    return { woke: true, via, live: liveName, carrier, workers: ep.workers.length, parked: parked.length, chats: chats.count };
+  })().catch((e) => {
+    console.error('[bridge] wall lift failed:', e.message);
+    return null;
+  });
+  wallLiftInflight = op;
+  pendingOps.add(op);
+  op.finally(() => {
+    pendingOps.delete(op);
+    if (wallLiftInflight === op) wallLiftInflight = null;
+  });
+  return op;
+}
+
+/**
+ * THE USER LIFTED THE WALL BY HAND: /account <name>, the account button, or a
+ * capture, each of which zeroes the stand-down without touching a ledger row.
+ * With a wall episode pending, that choice is recorded as vouched for (so the
+ * lift does not wait for a ledger clock that may be a day out, and handbacks
+ * stop being held) and the lift runs now. No sweep: moving the login off the
+ * account just picked would overrule the user. Call it AFTER the stand-down is
+ * zeroed, or the lift still sees the wall.
+ */
+function ownerLiftedWall(name = null) {
+  if (!wallWake.pending()) return null;
+  wallWake.vouched({ name, now: Date.now() });
+  return liftClaudeWall('manual', { live: name || null, movedNow: Boolean(name) });
 }
 
 /**
@@ -4539,7 +4802,11 @@ async function rotateOffLimitedAccount(detail) {
         source = 'the usage API';
       }
     }
-    accounts.markLimited(activeName, reset.resetsAt);
+    // The provenance goes into the ledger too: a GUESSED clock must never be
+    // the one the wall-time move picks over a known one (wall-wake.mjs
+    // pickNextAccount), and a mark with no source kept whatever an older wall
+    // had written there.
+    accounts.markLimited(activeName, reset.resetsAt, { source });
     // WHERE THE CLOCK CAME FROM, said out loud in both places. A guess and a
     // reading are worth different amounts to whoever reads this afterwards,
     // and the daemon log is where "why was it retried an hour early" is
@@ -4595,6 +4862,13 @@ async function rotateOffLimitedAccount(detail) {
   const earliest = pick.earliest || accounts.earliestReset();
   rotationPausedUntil = earliest ? earliest * 1000 : Date.now() + 3600_000;
   lines.push(`No account is available, all of them are limited. Rotation is paused until the earliest reset.`);
+  // THE WALL EPISODE (wall-wake.mjs): what the lift will wake the chat with. Then the
+  // login moves to the account that frees first, now if nothing Claude is
+  // running, so the lift finds it already there; before the notice goes up, so
+  // the notice can say so.
+  wallWake.raised({ until: rotationPausedUntil, now: Date.now() });
+  const nextMove = await moveLoginToNextAtWall().catch((e) => ({ moved: false, error: e.message }));
+  if (nextMove.moved) lines.push(`Moved the login to "${nextMove.to}", the account that frees first; the bridge wakes you when it does.`);
   raiseClaudeWall().catch(() => {});
   // A TIMER AS WELL AS THE POLL. The poll loop long polls for 50s, so the held
   // messages would resume up to a minute after the reset; this wakes the flush
@@ -4655,6 +4929,9 @@ async function handleLimitDeath(task, outcome, runId, steers = [], draft = null)
     // of the rotation block, which moves below it in the report.
     {
       draft,
+      // Died ON the wall (the death that raised it, or one while it stood): the
+      // lift's wake-up lists it whether or not this handback is held.
+      wallDeath: rot.outcome === 'exhausted' || rot.outcome === 'paused',
       endingNote: `${BRIDGE_NAME.toUpperCase()} NOTE: this worker died on a session limit. The account rotation ALREADY RAN; its output is below the draft, under the "HOW THE WORKER ENDED" rule in the full report file. Read that section before relaunching anything.`,
     },
   );
@@ -4678,19 +4955,24 @@ async function handleLimitDeath(task, outcome, runId, steers = [], draft = null)
  *     no path from either branch back into this function. It used to bail
  *     instead, which is how a walled message reached the phone as a raw ❌.
  */
-function chatLimitRetryPlan(rot, { priority = false, retried = false, codexTaking = false, codexCanTake = false } = {}) {
+function chatLimitRetryPlan(rot, { priority = false, retried = false, wake = false, codexTaking = false, codexCanTake = false } = {}) {
   // Nothing was rotated, or the credentials would not write: either way there
   // is no new account to try, so the failure stands as it is.
   if (!rot || rot.outcome === 'no_claude' || rot.outcome === 'swap_failed') return null;
 
+  const walled = rot.outcome === 'exhausted' || rot.outcome === 'paused';
   // INTERNAL TRAFFIC KEEPS ITS OWN FAILURE. A worker handback, a scheduled
   // task and a compaction each own live messages this function knows nothing
   // about (the "reading it now…" line, the compact notice), and a silent
   // re-run underneath them settles the wrong one. The rotation already
   // happened, which is the half that was missing; only the retry is theirs.
-  if (priority) return null;
+  //
+  // EXCEPT THE WALL WAKE-UP (liftClaudeWall), claimed once per wall: dead on
+  // an account that walled under it and rotated onto a free one, it gets the
+  // same one retry a typed message would, or nothing re-delivers it. On a wall
+  // the episode carries it forward instead (WALL_WAKE_CARRY_MS).
+  if (priority && !(wake && !walled)) return null;
 
-  const walled = rot.outcome === 'exhausted' || rot.outcome === 'paused';
   if (!walled) {
     if (retried) return null; // it has already had its second account
     return {
@@ -4742,6 +5024,9 @@ async function handleChatLimitFailure(detail, ctx = {}) {
   const plan = chatLimitRetryPlan(rot, {
     priority,
     retried,
+    // The wake-up leads its own turn and the Codex catch-up it folds into; in
+    // front of a parked message it is a prepend, and that message retries anyway.
+    wake: priority && String(text).startsWith(WALL_WAKE_TAG),
     codexTaking: codexTakingChat(),
     codexCanTake: codexCanTakeChat(),
   });
@@ -4762,7 +5047,11 @@ async function handleChatLimitFailure(detail, ctx = {}) {
       // carried-over context on a turn that never happened. The Claude retry
       // carries the rendered block verbatim; the Codex and parked routes have
       // nowhere to put it, so the flag goes back and the next turn takes it.
-      if (toCodex && prepend) {
+      // A wall wake-up note folded in front of a parked message is NOT a
+      // handoff: only what follows it is (liftClaudeWall). If this death raised
+      // the wall again, the episode carries the note's content forward.
+      const handoff = withoutWallWakeNote(prepend);
+      if (toCodex && handoff) {
         const st = chatState();
         st.handoffPending = true;
         saveState();
@@ -5039,10 +5328,11 @@ const handleAccountCallback = createAccountCallbacks({
   // A tap is the same act as a typed /account <name>, so it takes the same side
   // effects: they are choosing an account by hand, which overrides the
   // everything-is-limited stand-down, and the cached usage rows are stale.
-  onSwapped: () => {
+  onSwapped: (res) => {
     rotationPausedUntil = 0;
     rotationCooldownUntil = 0;
     invalidateUsageCache();
+    ownerLiftedWall(res?.to || null);
   },
   // A fresh capture can end a rotation pause (the newly banked account may be
   // the one with headroom), and the cached row for that slot is now about
@@ -5056,6 +5346,7 @@ const handleAccountCallback = createAccountCallbacks({
     rotationPausedUntil = 0;
     rotationCooldownUntil = 0;
     invalidateUsageCache();
+    ownerLiftedWall(null);
   },
   log: (msg) => console.log(`[bridge] ${msg}`),
 });
@@ -5276,13 +5567,58 @@ function maybeAutoResumeHandbacks(now = Date.now()) {
   return flushParkedHandbacks('quiet');
 }
 
+/**
+ * A HANDBACK THAT WOULD START A TURN INTO THE WALL. Held for the lift instead.
+ *
+ * A handback is a priority turn, and a priority turn ignores the wall (it must:
+ * compaction and scheduled runs are Claude's), so during an all-accounts wall
+ * every worker report spawned a chat turn on an account already known walled,
+ * which died there and was never retried; enough of them tripped the handback
+ * cap (2026-09-30). While a wall episode is pending and the chat lane is
+ * Claude's, the report is recorded in the episode (wall-wake.mjs) and the lift's
+ * one wake-up delivers it. A Codex chat lane can still read it, so it goes as
+ * always, and a worker that died ON the wall is still recorded, as delivered.
+ *
+ * Returns true when the handback was held (the caller stops there).
+ */
+function holdHandbackForWall({ runId, task, status, report = null, draft = null, flag = null, wallDeath = false } = {}) {
+  if (!runId || !wallWake.pending()) return false;
+  // The in-memory wall OR the ledger: after a restart mid wall the first is
+  // gone and the second still walls every account. Not the ledger once the
+  // user has chosen a login by hand: chat turns run on it, so a report held
+  // then would wait hours for a ledger clock.
+  const hold = (claudeRateWalled() || (ledgerAllWalled() && !wallVouched())) && chatLaneEngine() !== 'codex';
+  if (!hold && !wallDeath) return false;
+  const recorded = wallWake.worker({
+    runId,
+    title: briefTitle(stripLaneRules(String(task || ''))),
+    status: String(status || ''),
+    report,
+    draft,
+    flag: flag || null,
+    died: Boolean(wallDeath),
+    handback: hold ? 'held' : 'delivered',
+    deliveredAt: hold ? null : Date.now(),
+    at: Date.now(),
+  });
+  // Past the episode's bound nothing would deliver it: dispatched as always
+  // (into the wall, the behaviour before the wake-up existed) rather than held
+  // into nowhere.
+  if (!recorded) {
+    if (hold) console.error(`[bridge] wall episode is full; handback for ${runId} dispatched, not held`);
+    return false;
+  }
+  if (hold) console.log(`[bridge] handback for ${runId} held for the wall's wake-up`);
+  return hold;
+}
+
 // `draft` is the worker's draft report (bg-draft.mjs), passed only for a Claude
 // worker that ended WITHOUT a final report and left a non-empty one, and
 // `endingNote` is one line the bridge keeps above the markers when a draft is
 // in front. Kept on ONE line, like every other declaration here: the suites
 // extract these functions by source and stop at the first column-0 line, so a
 // wrapped signature's closing `) {` truncates the extraction.
-function handBackToChat(task, output, status, runId, steers = [], { engine = 'claude', codex = null, draft = null, endingNote = null } = {}) {
+function handBackToChat(task, output, status, runId, steers = [], { engine = 'claude', codex = null, draft = null, endingNote = null, wallDeath = false } = {}) {
   // THE DRAFT REPORT. The draft becomes the report: its first line says exactly
   // what it is, the draft follows whole, and whatever the bridge had to say
   // about the ending (the failure detail, or the limit rotation block) moves
@@ -5295,6 +5631,10 @@ function handBackToChat(task, output, status, runId, steers = [], { engine = 'cl
   // Written FIRST, before any cap can apply and before the streak guard can
   // return early: a capped chain must still leave the full report on disk.
   const full = writeFullReport(runId, task, output, status);
+  // DURING AN ALL-ACCOUNTS WALL the report waits for the lift's wake-up rather
+  // than starting a Claude turn that dies on the same wall (see
+  // holdHandbackForWall). The report file above is already written.
+  if (holdHandbackForWall({ runId, task, status, report: full?.file || null, draft: draft?.file || null, wallDeath })) return;
   handbackStreak++;
   if (handbackStreak > HANDBACK_STREAK_MAX) {
     // Chain capped. Stop feeding the assistant, and do NOT dump the worker's raw report to
@@ -8459,8 +8799,13 @@ const noEngineForChat = () =>
 // Once a wall lifts, run what neither engine could take. Called from the poll
 // loop and from the reset timer, so it happens whether or not the owner says
 // anything next.
-function flushParkedWalledChats() {
-  if (!parkedWalledChats.length) return;
+//
+// `fold(count)` is the lift's wake-up note (liftClaudeWall): when given, it
+// rides in front of the FIRST released message that goes to the chat lane, so
+// the lift starts one turn rather than the user's message plus a note. Returns
+// { count, folded }: how many messages were released and whether the note went.
+function flushParkedWalledChats({ fold = null } = {}) {
+  if (!parkedWalledChats.length) return { count: 0, folded: false };
   // PER ITEM, and the ones that still cannot run STAY HELD. A mixed hold is
   // normal: the Codex wall lifting frees the ordinary messages while a Claude
   // slash command in the same list still has nothing that will take it.
@@ -8468,7 +8813,7 @@ function flushParkedWalledChats() {
   for (let i = parkedWalledChats.length - 1; i >= 0; i--) {
     if (canRunHeldItem(parkedWalledChats[i])) items.unshift(...parkedWalledChats.splice(i, 1));
   }
-  if (!items.length) return;
+  if (!items.length) return { count: 0, folded: false };
   logAccountDecision({
     decision: 'resume_after_reset',
     count: items.length,
@@ -8497,6 +8842,7 @@ function flushParkedWalledChats() {
     // No notice on screen at all (a failed send, or a daemon restart since).
     send(enginesBackLine({ engine: back, count: items.length }), { markdown: false }).catch(() => {});
   }
+  let folded = false;
   for (const it of items) {
     // Back through the front door, so the engine is resolved against the state
     // that exists NOW rather than the one that parked it. EVERY field the item
@@ -8509,15 +8855,23 @@ function flushParkedWalledChats() {
     // the CHAT lane: a long job blocking the one lane he talks to. A fresh
     // bg lane rather than the original object, because the one it was parked
     // from may be busy now.
+    // The wake-up note goes in FRONT of whatever the item already carried.
+    // ONLY INTO AN IDLE CHAT LANE. On a busy one the message is steered into
+    // the running turn, and a steer carries no prepend, so the note would be
+    // claimed and never read (QA round 2). The lift sends it as its own
+    // priority turn instead, queued behind the running one.
+    const note = fold && !folded && !it.heldOnBg && !LANES.main.current ? fold(items.length) : null;
+    if (note) folded = true;
     dispatchPrompt(it.text, it.heldOnBg ? getBgLane() : undefined, {
       allowCodexFallback: true,
       images: it.images,
       kinds: it.kinds || [],
       retried: Boolean(it.retried),
-      prepend: it.prepend ?? null,
+      prepend: note ? [note, it.prepend].filter(Boolean).join('\n\n') : (it.prepend ?? null),
       replyQuote: it.replyQuote ?? null,
     });
   }
+  return { count: items.length, folded };
 }
 
 /**
@@ -8582,9 +8936,13 @@ function flushParkedWalledJobs() {
 
 // Once the wall lifts, hand the assistant what it missed. Called from the poll loop, so it
 // happens whether or not the owner says anything next.
-function flushParkedCodexChats() {
-  if (!parkedCodexChats.length) return;
-  if (Date.now() < rotationPausedUntil) return;
+//
+// `fold` is the lift's wake-up note, carried in front of this catch-up so the
+// lift starts ONE turn (liftClaudeWall). Returns whether a catch-up was
+// dispatched.
+function flushParkedCodexChats({ fold = null } = {}) {
+  if (!parkedCodexChats.length) return false;
+  if (Date.now() < rotationPausedUntil) return false;
   const items = parkedCodexChats.splice(0);
   // The wall notice resolves with the count of what Codex actually answered.
   // Left here rather than read at resolve time because this splice is what
@@ -8595,7 +8953,9 @@ function flushParkedCodexChats() {
   // without it the flush is a bubble with no cause, the assistant thinking about nothing
   // minutes after the last thing either of them said.
   send(codexCatchUpLine(items.length, { name: BRIDGE_NAME }), { markdown: false }).catch(() => {});
-  dispatchPrompt(codexParkedNote({ ownerName: OWNER_NAME, items }), LANES.main, { priority: true });
+  const catchUp = codexParkedNote({ ownerName: OWNER_NAME, items });
+  dispatchPrompt(fold ? `${fold}\n\n${catchUp}` : catchUp, LANES.main, { priority: true });
+  return true;
 }
 
 /**
@@ -10262,6 +10622,7 @@ async function handleCommand(text, msg = null) {
           rotationCooldownUntil = 0;
         }
         if (r.ok) invalidateUsageCache();
+        if (r.ok) ownerLiftedWall(name);
         // Same builders as the button path, so the typed rail and the tapped
         // rail cannot say the same thing two different ways — and so the email
         // is code-wrapped here too, which is what stops Telegram turning it
@@ -10289,6 +10650,7 @@ async function handleCommand(text, msg = null) {
           // A swap changes which account is live, so the cached "active"
           // answer and every cached row are stale the moment it lands.
           invalidateUsageCache();
+          ownerLiftedWall(r.to || parts[0]);
         }
         await send(
           r.ok
@@ -11347,9 +11709,18 @@ async function pollLoop() {
       // up on THIS cycle rather than waiting out another 50 second long poll:
       // flushParkedWalledJobs writes the held briefs back into the queue file
       // that drainBgHandoff reads.
-      flushParkedCodexChats(); // hand the assistant what Codex answered while it was walled
-      flushParkedWalledChats(); // and run what NEITHER engine could take
-      flushParkedWalledJobs(); // and the handed-off jobs that had no account
+      // AN ALL-ACCOUNTS WALL THAT LIFTED AND STILL OWES THE CHAT ITS WAKE-UP: the
+      // lift runs these flushes itself, after moving the login, with the
+      // wake-up folded into the first turn it starts (liftClaudeWall). The
+      // backstop for every lift the timer did not catch: a restart mid wall, a
+      // hand swap.
+      if (wallLiftInflight || wallWakeDue()) {
+        liftClaudeWall('poll', { sweep: true });
+      } else {
+        flushParkedCodexChats(); // hand the assistant what Codex answered while it was walled
+        flushParkedWalledChats(); // and run what NEITHER engine could take
+        flushParkedWalledJobs(); // and the handed-off jobs that had no account
+      }
       drainBgHandoff();
       // A LIVE ACCOUNT THAT IS ALREADY KNOWN DOWN. Cheap (one ledger read) and
       // on the same slow cadence as the drift check, because the expensive half
@@ -11467,6 +11838,16 @@ async function main() {
     );
   }
   restartWakeUp = { pending: true, cut: cutTurn, deferred: null, sessionAtBoot: chatState().sessionId || null };
+  // AN ALL-ACCOUNTS WALL THAT WAS STILL UP WHEN THE LAST DAEMON WENT DOWN. The
+  // wall itself was in memory and is gone; its episode is on disk. The lift is
+  // re-armed from the ledger's earliest reset, so the chat is woken at it and
+  // not a poll later; wallWakeDue keeps the poll loop from waking it before any
+  // account is actually free.
+  if (wallWake.pending()) {
+    const at = accounts.earliestReset();
+    armWallResume(at);
+    console.log(`[bridge] wall wake-up pending from before the restart; lift re-armed for ${at ? new Date(at * 1000).toISOString() : 'the next free account'}`);
+  }
   const inFlight = chatState().codexTurnInFlight;
   if (inFlight) {
     delete chatState().codexTurnInFlight;

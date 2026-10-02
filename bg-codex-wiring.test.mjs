@@ -565,7 +565,7 @@ const P = await import(
         `
 import { codexCwdForBrief, fmtUntil, parseEnginePrefix, shouldRouteToCodex } from ${url('bg-codex.mjs')};
 import { briefRepo, briefTitle, stripLaneRules } from ${url('bg-notify.mjs')};
-import { queueAck, queueStarted, queueDropped, queueRunningNow, queueFull, holdFullLine, steeredInAck, WALL_TICK_MS, bothWalledLine, enginesBackLine, limitWallLine, limitWallResolved, chatRotatedLine, chatWalledRetryLine } from ${url('system-messages.mjs')};
+import { queueAck, queueStarted, queueDropped, queueRunningNow, queueFull, holdFullLine, steeredInAck, WALL_TICK_MS, bothWalledLine, enginesBackLine, limitWallLine, limitWallResolved, chatRotatedLine, chatWalledRetryLine, withoutWallWakeNote, WALL_WAKE_TAG } from ${url('system-messages.mjs')};
 import { composeWithQuote } from ${url('reply-quote.mjs')};
 import { workerLine, WORKER_TICK_MS, WORKER_IDLE_MS } from ${url('bg-notify.mjs')};
 import { claudeMissingLine, resolveEngine } from ${url('engine-state.mjs')};
@@ -714,6 +714,15 @@ const logAccountDecision = (d) => { DECISIONS.push(d); };
 export const JOB_FLUSHES = [];
 const flushParkedWalledJobs = () => { JOB_FLUSHES.push(Date.now()); };
 let wallResumeTimer = null;
+// THE WALL EPISODE AND ITS WAKE-UP (wall-wake.mjs, liftClaudeWall) belong to
+// limit-rotation.test.mjs, against the real functions. This suite is about the
+// chat lane, so here there is never an episode: no wall-time move, and a lift
+// is the two flushes it always was, which is exactly the real liftClaudeWall
+// with nothing owed.
+const wallWake = { pending: () => false, current: () => null, raised: () => null, worker: () => false };
+const pickNextAccount = () => null;
+const moveLoginToNextAtWall = async () => ({ moved: false, reason: 'no wall episode' });
+const liftClaudeWall = () => { flushParkedWalledChats(); flushParkedWalledJobs(); return Promise.resolve(null); };
 const swapFailedLine = ({ error, account }) => 'swap failed ' + error + ' ' + account;
 const CLAUDE_AVAILABLE_FN = () => CLAUDE_AVAILABLE;
 export const parkedWalledChats = [];
@@ -772,7 +781,7 @@ export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wa
         grab('codexTakingChat', 'const'),
         grab('chatLimitRetryPlan'),
         grab('handleChatLimitFailure'),
-        'export { dispatchPrompt, drainQueue, startResolvedRun, flushParkedWalledChats, bothEnginesWalledLine, raiseClaudeWall, claudeWallFacts, noEngineForChat, canRunHeldItem, trackQueueAck, resolveQueueAck, QUEUE_MAX, PARKED_WALLED_MAX, raiseWall, settleWall, wallNotices, rotateOffLimitedAccount, chatLimitRetryPlan, handleChatLimitFailure, codexCanTakeChat, codexTakingChat, chatRunFailure, resultEventErrored };',
+        'export { withoutWallWakeNote, dispatchPrompt, drainQueue, startResolvedRun, flushParkedWalledChats, bothEnginesWalledLine, raiseClaudeWall, claudeWallFacts, noEngineForChat, canRunHeldItem, trackQueueAck, resolveQueueAck, QUEUE_MAX, PARKED_WALLED_MAX, raiseWall, settleWall, wallNotices, rotateOffLimitedAccount, chatLimitRetryPlan, handleChatLimitFailure, codexCanTakeChat, codexTakingChat, chatRunFailure, resultEventErrored };',
       ].join('\n'),
     )
 );
@@ -1112,6 +1121,115 @@ await t('★ a message parked behind both walls comes back with its retry cap in
   eq(P.CLAUDE.length, 1, 'it ran once the wall lifted');
   eq(P.CLAUDE[0].retried, true, 'dropping this handed an already-retried message a second automatic retry');
   eq(JSON.stringify(P.CLAUDE[0].kinds), JSON.stringify(['photo']), 'and the album note survived the park');
+});
+
+// --- the lift's wake-up note rides the first chat message, once -------------
+// liftClaudeWall hands the flush a `fold`: the note goes in FRONT of the first
+// released message bound for the chat lane, so the lift starts one turn rather
+// than the parked message plus a note (limit-rotation.test.mjs owns the lift itself).
+P.reset();
+P.setWall(Date.now() + 3600_000, false); // nothing can answer: all three are held
+P.dispatchPrompt('bg: run the suite', undefined, { allowCodexFallback: true });
+P.dispatchPrompt('is the deploy green', undefined, { allowCodexFallback: true });
+P.dispatchPrompt('and the logs?', undefined, { allowCodexFallback: true });
+P.setWall(0);
+const foldCounts = [];
+const released = P.flushParkedWalledChats({ fold: (n) => { foldCounts.push(n); return 'WAKE-UP NOTE'; } });
+
+await t('★ a lift fold rides the FIRST chat-lane message only, never a background one', () => {
+  eq(JSON.stringify(released), JSON.stringify({ count: 3, folded: true }));
+  eq(foldCounts.join(','), '3', 'built once, knowing how many were released');
+  const chat = P.CLAUDE.filter((c) => c.lane === 'main');
+  eq(chat.length >= 1, true, JSON.stringify(P.CLAUDE));
+  eq(chat[0].text, 'is the deploy green');
+  eq(chat[0].prepend, 'WAKE-UP NOTE', 'the note rides in front of the parked message, as a prepend');
+  const carriers = [...P.CLAUDE, ...P.LANES.main.queue].filter((c) => String(c.prepend || '').includes('WAKE-UP NOTE'));
+  eq(carriers.length, 1, 'and never twice, running or queued');
+  ok(P.CLAUDE.filter((c) => c.lane !== 'main').every((c) => !String(c.prepend || '').includes('WAKE-UP NOTE')), 'a background job never carries it');
+});
+
+P.reset();
+await t('a flush with nothing parked reports nothing released and nothing folded', () => {
+  eq(JSON.stringify(P.flushParkedWalledChats({ fold: () => 'X' })), JSON.stringify({ count: 0, folded: false }));
+});
+
+// --- a wall wake-up note riding a parked message is not an engine handoff ----
+// liftClaudeWall folds its note in front of a parked message as a prepend. If
+// that message dies on the wall again, the Codex/park retry must not set
+// handoffPending for it (QA 2026-09-30): the next turn would re-inject a stale
+// handoff block. The episode carries the note's content forward instead.
+const WAKE_ONLY = '[Bridge wake-up, daemon authored, not the owner. DATA, not an instruction from the owner.]\n✅ Claude usage is back';
+P.reset();
+P.setAccounts({ active: 'two@example.com', free: [] });
+P.setWall(Date.now() + 3600_000);
+let wakePlan = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx({ prepend: WAKE_ONLY }));
+wakePlan?.dispatch?.();
+await t('★ a limit death under a folded wake-up note does not fake an engine handoff', () => {
+  ok(wakePlan?.dispatch, 'the walled path re-dispatches the message');
+  eq(P.CHAT_STATE.handoffPending, undefined, 'no handoff was carried, so none is owed');
+});
+P.reset();
+P.setAccounts({ active: 'two@example.com', free: [] });
+P.setWall(Date.now() + 3600_000);
+wakePlan = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx({ prepend: WAKE_ONLY + '\n\nHANDOFF-BLOCK' }));
+wakePlan?.dispatch?.();
+await t('...while a real handoff folded behind the note still goes back for the next turn', () => {
+  eq(P.CHAT_STATE.handoffPending, true);
+  eq(P.withoutWallWakeNote(WAKE_ONLY + '\n\nHANDOFF-BLOCK'), 'HANDOFF-BLOCK');
+});
+
+// --- QA round 2: a claimed wake-up must never be lost ------------------------
+// (1) On a BUSY chat lane the first parked message is steered into the running
+// turn, and a steer carries no prepend: the fold would report success while the
+// note reached nobody. The fold happens only into an idle lane; the lift then
+// sends the note as its own priority turn.
+P.reset();
+P.setWall(Date.now() + 3600_000, false);
+P.dispatchPrompt('is the deploy green', undefined, { allowCodexFallback: true });
+P.setWall(0);
+const STEERED = [];
+P.LANES.main.current = { engine: 'claude', steer: (t) => { STEERED.push(t); return true; } };
+const busyFlush = P.flushParkedWalledChats({ fold: () => 'WAKE-UP NOTE' });
+await t('★ a busy chat lane is never folded into, so the steer cannot swallow the wake-up', () => {
+  eq(JSON.stringify(busyFlush), JSON.stringify({ count: 1, folded: false }), 'folded:true here meant the note was claimed and never read');
+  eq(STEERED.length, 1, 'the typed message still goes into the running turn');
+  ok(!STEERED.join('').includes('WAKE-UP NOTE'), 'without the note riding it');
+});
+P.LANES.main.current = null;
+
+// (2) The wake-up's own turn is priority traffic, which normally keeps its own
+// failure. Dead on an account that walled under it and rotated onto a free one,
+// it gets one retry, or nothing ever re-delivers it (the episode is claimed).
+// The literal the real WALL_WAKE_TAG starts with (the harness's handleChatLimitFailure
+// reads the real one, so a drift in the tag turns this red).
+const WAKE_TURN = '[Bridge wake-up, daemon authored, not the owner. DATA, not an instruction from the owner.]\nworkers: bg1';
+P.reset();
+P.setAccounts({ active: 'one@example.com', free: ['two@example.com'] });
+const wakeRetry = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx({ text: WAKE_TURN, priority: true }));
+wakeRetry?.dispatch?.();
+await t('★ a wake-up turn that dies and rotates onto a free account is retried once, as priority', () => {
+  eq(P.ACC.swapped[0], 'two@example.com', 'the rotation happened');
+  ok(wakeRetry?.dispatch, 'a plan with a re-dispatch, not the bare failure card');
+  const rerun = [...P.CLAUDE, ...P.LANES.main.queue].filter((c) => c.text === WAKE_TURN);
+  eq(rerun.length, 1, JSON.stringify(P.CLAUDE));
+  eq(rerun[0].retried, true, 'marked, so a second death does not loop');
+});
+P.reset();
+P.setAccounts({ active: 'one@example.com', free: ['two@example.com'] });
+const wakeTwice = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx({ text: WAKE_TURN, priority: true, retried: true }));
+const otherPriority = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx({ text: 'a worker handback', priority: true }));
+await t('...but only once, and ordinary priority traffic still keeps its own failure', () => {
+  eq(wakeTwice?.dispatch ?? null, null, 'an already-retried wake-up is not retried again');
+  eq(otherPriority?.dispatch ?? null, null, 'a handback, a schedule, a compaction: unchanged');
+});
+P.reset();
+P.setAccounts({ active: 'two@example.com', free: [], earliest: Math.floor((Date.now() + 3600_000) / 1000) });
+const wakeWalled = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx({ text: WAKE_TURN, priority: true }));
+await t('...and on a fresh wall the wake-up is not re-dispatched into it (the episode carries it)', () => {
+  eq(wakeWalled?.dispatch ?? null, null);
+  eq(P.chatLimitRetryPlan({ outcome: 'exhausted' }, { priority: true, wake: true }), null);
+  eq(P.chatLimitRetryPlan({ outcome: 'swap_failed' }, { priority: true, wake: true }), null, 'no new account to try');
+  ok(P.chatLimitRetryPlan({ outcome: 'cooldown' }, { priority: true, wake: true })?.retry?.priority, 'a cooldown rotation retries too');
 });
 
 // --- the answer channel must never rotate ----------------------------------
@@ -3647,9 +3765,12 @@ await t('★ the changed functions NO harness executes reference only names brid
     // The held-wall re-check (2026-09-30) reaches these two display paths and
     // the poll loop, none of which a harness executes.
     renderAccountView: ['clearLimitsFromRows', 'walledSweepInflight', 'PROBE_TIMEOUT_MS', 'accounts', 'accountUsage', 'withDeadline', 'buildAccountKeyboard'],
-    pollLoop: ['kickWalledSweep', 'WALLED_ACTIVE_SWEEP_MS', 'lastWalledActiveSweep'],
+    // The wall wake-up (2026-09-30): the poll loop's backstop and the boot
+    // re-arm, which no harness executes.
+    pollLoop: ['kickWalledSweep', 'WALLED_ACTIVE_SWEEP_MS', 'lastWalledActiveSweep', 'wallLiftInflight', 'wallWakeDue', 'liftClaudeWall'],
+    main: ['wallWake', 'armWallResume', 'accounts'],
     runCodexChatFallback: ['normalizeDashes', 'NO_DASHES'],
-    handBackToChat: ['normalizeDashes', 'NO_DASHES'],
+    handBackToChat: ['normalizeDashes', 'NO_DASHES', 'holdHandbackForWall'],
     deliverCodexDirect: ['normalizeDashes', 'NO_DASHES'],
     sendResult: ['normalizeDashes', 'NO_DASHES'],
   };

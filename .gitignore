@@ -30,3 +30,5 @@ tg-throttle.json
 tg-throttle.json.tmp
 tg-ledger.jsonl
 tg-ledger.jsonl.tmp
+wall-wake.json
+wall-wake.json.*.tmp

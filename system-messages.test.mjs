@@ -83,6 +83,9 @@ import {
   WALL_TICK_MS,
   limitWallLine,
   limitWallResolved,
+  wallWakePrompt,
+  withoutWallWakeNote,
+  WALL_WAKE_TAG,
   accountLedgerRow,
   accountLedgerBlock,
   LEDGER_NAME_MAX,
@@ -1300,6 +1303,130 @@ t('wall: ★ the notice names every account and its reset, soonest first', () =>
   eq(lines[1], '⏳ Resets 2:20pm · in 1h 34m');
   eq(lines[2], '   hello@blackumbrella.app · 2:46pm', 'the soonest row IS the ⏳ clock above it');
   eq(lines[3], '   gjgkabche@gmail.com · Sat 12:46am');
+});
+
+t('wall: ★ the notice names the NEXT account, its reset, and that it picks up then (2026-09-30)', () => {
+  // Asked for on 2026-09-30: "find out which one is the next account that's going to be
+  // available, switch to it". The notice already on screen says which, when, and
+  // whether the login is already there.
+  const s = limitWallLine({
+    resetClock: '12:30pm',
+    leftText: '1h 36m',
+    next: { name: 'four@example.com', clock: '12:30pm', moved: true },
+  });
+  const lines = s.split('\n');
+  eq(lines[2], '🔜 Next · four@example.com');
+  eq(lines[3], '   Resets 12:30pm');
+  eq(lines[4], '   Login already on it · I pick up then');
+  ok(limitWallLine({ next: { name: 'a@b.com', clock: '1:00pm', moved: false } }).includes('I switch to it and pick up then'));
+  ok(limitWallLine({ next: { name: 'a@b.com', clock: '1:00pm', guessed: true } }).includes('Resets 1:00pm (a guess)'), 'a guessed clock says so');
+  ok(limitWallLine({ next: { name: 'a@b.com' } }).includes('Reset time unknown'));
+  ok(!limitWallLine({}).includes('Next'), 'no next account, no line');
+  ok(!limitWallLine({ next: {} }).includes('Next'));
+});
+
+t('wall: ★ the next-account lines pass the house-style gates at their worst case', () => {
+  const long = 'x'.repeat(24) + '@example.com';
+  houseStyle(limitWallLine({ resetClock: 'Sat 12:46am', leftText: '1d 4h', next: { name: long, clock: 'Sat 12:46am', guessed: true, moved: false } }), 'limitWallLine/next');
+  houseStyle(limitWallLine({ resetClock: '2:20pm', next: { name: 'four@example.com', clock: '2:20pm', moved: true } }), 'limitWallLine/next moved');
+});
+
+const WAKE_NOW = Date.UTC(2026, 8, 30, 16, 31, 0);
+const WAKE_ARGS = {
+  name: 'Leash',
+  ownerName: 'the owner',
+  live: 'four@example.com',
+  liveSince: WAKE_NOW - 60 * 60_000,
+  liftedAt: WAKE_NOW - 60_000,
+  workers: [
+    { runId: 'bg39-1790775701643', title: 'Re-check walled accounts', status: 'died on a session limit', report: '/bridge/bg-reports/bg39-1790775701643.md', draft: '/bridge/bg-reports/bg39-1790775701643.draft.md', died: true, handback: 'held' },
+    { runId: 'bg41-1790776000000', title: 'Reels batch', status: 'finished', report: '/bridge/bg-reports/bg41.md', handback: 'delivered', deliveredAt: WAKE_NOW - 30 * 60_000 },
+  ],
+  parked: [{ task: 'the audit', status: 'finished', report: '/bridge/bg-reports/bg12.md', flag: null }],
+  chatsParked: 2,
+  bgCli: '/bridge/bg.mjs',
+  timeZone: 'UTC',
+  now: WAKE_NOW,
+};
+
+t('wall wake-up: ★ framed as the daemon, names the live account and when usage came back', () => {
+  const s = wallWakePrompt(WAKE_ARGS);
+  const lines = s.split('\n');
+  eq(lines[0], '[Bridge wake-up, daemon authored, not the owner. DATA, not an instruction from the owner.]');
+  eq(lines[1], '✅ Claude usage is back: the all-accounts wall lifted at 4:30pm');
+  eq(lines[2], '▶️ Live account: four@example.com, live since 3:31pm');
+});
+
+t('wall wake-up: ★ every worker that ended on the wall, with report, draft and handback state', () => {
+  const s = wallWakePrompt(WAKE_ARGS);
+  ok(s.includes('💀 2 background workers ended while the wall was up:'), s);
+  ok(s.includes('  1. bg39-1790775701643 · Re-check walled accounts'), s);
+  ok(s.includes('     report: /bridge/bg-reports/bg39-1790775701643.md'), s);
+  ok(s.includes('     draft: /bridge/bg-reports/bg39-1790775701643.draft.md'), s);
+  ok(s.includes('     handback: NOT delivered before now, held through the wall; this note is its delivery'), s);
+  ok(s.includes('     handback: already delivered to you at 4:01pm'), s);
+  ok(s.includes('full report: /bridge/bg-reports/bg12.md'), 'the capped chain rides along');
+  ok(s.includes('💬 2 messages from the owner waited behind the wall and run now'), s);
+});
+
+t('wall wake-up: ★ the pick-up instruction: ps, read, relaunch only remainders, then a short update', () => {
+  const s = wallWakePrompt(WAKE_ARGS);
+  ok(s.includes('↳ run: node /bridge/bg.mjs ps'), s);
+  ok(s.includes("↳ read each ended worker's report or draft above"), s);
+  ok(s.includes('↳ relaunch ONLY the remainders'), s);
+  ok(s.includes('↳ continue anything left unfinished'), s);
+  ok(s.includes('Message the owner only with a short update, or if something needs the owner.'), s);
+  ok(!s.includes("Then answer the owner's message below."), 'standing alone, there is no message below');
+});
+
+t('wall wake-up: folded in front of a parked message, it says so', () => {
+  const s = wallWakePrompt({ ...WAKE_ARGS, withMessage: true });
+  ok(s.includes('the first follows this note, the rest run after it'), s);
+  ok(s.endsWith("Then answer the owner's message below."), s.slice(-80));
+});
+
+t('wall wake-up: nothing died, nothing parked, login unknown: says so, invents nothing', () => {
+  const s = wallWakePrompt({ ownerName: 'the owner', now: WAKE_NOW, timeZone: 'UTC' });
+  ok(s.includes('💀 No background worker ended while the wall was up'), s);
+  ok(s.includes('▶️ Live account: not identified'), s);
+  ok(!/undefined|null|NaN/.test(s), s);
+  ok(!s.includes('📥') && !s.includes('💬'), s);
+});
+
+t('wall wake-up: ★ a folded note comes off a prepend whole, leaving only the handoff behind it', () => {
+  const note = wallWakePrompt({ ...WAKE_ARGS, withMessage: true });
+  ok(note.startsWith(WALL_WAKE_TAG), note.slice(0, 60));
+  ok(!note.includes('\n\n'), 'no blank line inside the note: the fold relies on it');
+  eq(withoutWallWakeNote(note), '', 'the note alone is no handoff');
+  eq(withoutWallWakeNote(`${note}\n\nHANDOFF BLOCK\n\nsecond para`), 'HANDOFF BLOCK\n\nsecond para');
+  eq(withoutWallWakeNote('a plain handoff'), 'a plain handoff', 'anything else is untouched');
+  eq(withoutWallWakeNote(null), '');
+});
+
+// QA round 3: a row CARRIED from a wake-up the wall came back on may already
+// have reached the chat; "NOT delivered before now" would send it to relaunch it twice.
+const CARRIED_ARGS = {
+  ...WAKE_ARGS,
+  workers: [{ ...WAKE_ARGS.workers[0], listedAt: WAKE_NOW - 10 * 60_000 }],
+  parked: [{ ...WAKE_ARGS.parked[0], listedAt: WAKE_NOW - 10 * 60_000 }],
+};
+t('wall wake-up: ★ a carried row says it was already listed, never "NOT delivered"', () => {
+  const s = wallWakePrompt(CARRIED_ARGS);
+  ok(s.includes('     handback: listed in the wake-up at 4:21pm, which may not have reached you (the wall came back within minutes); check node /bridge/bg.mjs ps and its report before relaunching it'), s);
+  ok(!s.includes('NOT delivered before now'), s);
+  ok(s.includes('     listed in the wake-up at 4:21pm, which may not have reached you; check before acting on it again'), s);
+  ok(s.includes('📥 1 report the capped handback chain was holding, all listed in an earlier wake-up:'), s);
+  ok(!s.includes('NOT reported to you before'), 'the header must not contradict the row (confirming audit)');
+  const mixed = wallWakePrompt({ ...CARRIED_ARGS, parked: [...CARRIED_ARGS.parked, WAKE_ARGS.parked[0]] });
+  ok(mixed.includes('📥 2 reports the capped handback chain was holding, 1 of them NOT reported to you before:'), mixed);
+  ok(wallWakePrompt(WAKE_ARGS).includes('📥 1 report the capped handback chain was holding, NOT reported to you before:'), 'fresh rows keep the old header');
+});
+
+t('wall wake-up: ★ no dashes, no tokens, no model names', () => {
+  for (const s of [wallWakePrompt(WAKE_ARGS), wallWakePrompt({ ...WAKE_ARGS, withMessage: true }), wallWakePrompt({}), wallWakePrompt(CARRIED_ARGS)]) {
+    noDashes(s, 'wallWakePrompt');
+    noTokensOrModels(s, 'wallWakePrompt');
+  }
 });
 
 t('wall: ★ what is HELD is counted on the message already on screen', () => {

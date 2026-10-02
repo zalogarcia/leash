@@ -96,6 +96,24 @@ const M = await import(
         // The limit-death discriminator reportBgOutcome branches on. Real, so the
         // limit path below is taken for the reason the daemon would take it.
         `import { isLimitSignal } from ${JSON.stringify(pathToFileURL(path.join(DIR, 'accounts.mjs')).href)};`,
+        // THE WALL EPISODE (wall-wake.mjs), real and on a scratch file: what a
+        // held handback records is exactly what the lift's wake-up reads.
+        `import { createWallWake } from ${JSON.stringify(pathToFileURL(path.join(DIR, 'wall-wake.mjs')).href)};`,
+        `import { briefTitle, stripLaneRules } from ${JSON.stringify(pathToFileURL(path.join(DIR, 'bg-notify.mjs')).href)};`,
+        `const WALL_WAKE_FILE = ${JSON.stringify(path.join(TMP, 'wall-wake.json'))};`,
+        `export let wallWake = createWallWake({ file: WALL_WAKE_FILE });`,
+        `export const resetWallWake = () => { try { unlinkSync(WALL_WAKE_FILE); } catch {} wallWake = createWallWake({ file: WALL_WAKE_FILE }); };`,
+        `let WALLED = false;`,
+        `export const setWalled = (v) => { WALLED = v; };`,
+        `const claudeRateWalled = () => WALLED;`,
+        // The ledger's view of the wall, which outlives a restart (bridge.mjs ledgerAllWalled).
+        `let LEDGER_ALL_WALLED = false;`,
+        `export const setLedgerAllWalled = (v) => { LEDGER_ALL_WALLED = v; };`,
+        `const ledgerAllWalled = () => LEDGER_ALL_WALLED;`,
+        `let CHAT_ENGINE = 'claude';`,
+        `export const setChatEngine = (v) => { CHAT_ENGINE = v; };`,
+        `const chatLaneEngine = () => CHAT_ENGINE;`,
+        `export const ROT = { outcome: 'swapped' };`,
         `let NO_DASHES = false;`,
         `export const setNoDashes = (v) => { NO_DASHES = v; };`,
         `const BG_REPORTS_DIR = ${JSON.stringify(REPORTS)};`,
@@ -134,6 +152,8 @@ const M = await import(
         `export const noticeEdits = [];`,
         `const editWorkerNotice = (runId, patch, opts) => { noticeEdits.push({ runId, patch, opts }); return true; };`,
         `export const readingNotices = new Set();`,
+        grab('wallVouched'),
+        grab('holdHandbackForWall'),
         grab('handBackToChat'),
         // The outcome path a Claude worker takes into handBackToChat, and the
         // limit-death composer beside it. Real, extracted; everything they call
@@ -144,7 +164,7 @@ const M = await import(
         `const notifyOwnerBgFinished = (task, status, runId) => { PINGS.push({ task, status, runId }); };`,
         `const pendingOps = new Set();`,
         `export const settleOps = () => Promise.all([...pendingOps]);`,
-        `const rotateOffLimitedAccount = async () => ({ outcome: 'swapped', lines: ['Swapped to the next account. The account is live.'], activeName: 'a', nextName: 'b' });`,
+        `const rotateOffLimitedAccount = async () => ({ outcome: ROT.outcome, lines: ['Swapped to the next account. The account is live.'], activeName: 'a', nextName: 'b' });`,
         `const swapFailedLine = () => 'swap failed';`,
         grab('bgDraftPath'),
         grab('bgRunLogPath'),
@@ -668,6 +688,139 @@ t('with the flag off the report is passed through unchanged', () => {
   const note = M.dispatched[M.dispatched.length - 1];
   ok(note.includes('It shipped \u2014 and it passed.'), note);
 });
+
+// ---------- the all-accounts wall: a handback waits for the lift ----------
+// 2026-09-30: during an all-accounts wall every worker report started a
+// priority chat turn on an account already known walled, which died there and
+// was never retried, until enough of them tripped the handback cap. With a wall
+// episode pending and a Claude chat lane, the report is written, recorded in
+// the episode and held for the lift's one wake-up (limit-rotation.test.mjs).
+const WALL_TASK = 'LANE RULES (you are a background worker: headless).\n--- TASK ---\n# Ship the parser fix\n\nthe body';
+M.resetChain();
+M.resetWallWake();
+M.wallWake.raised({ until: Date.now() + 3600_000 });
+M.setWalled(true);
+M.setChatEngine('claude');
+let beforeHold = M.dispatched.length;
+M.handBackToChat(WALL_TASK, 'HELD-REPORT-BODY', 'finished', 'bg7-1790000000200');
+t('★ WALL UP, Claude chat lane: the handback is HELD for the lift, not dispatched into the wall', () => {
+  eq(M.dispatched.length, beforeHold, 'a priority turn into the wall dies there, unretried');
+  const ep = M.wallWake.current();
+  eq(ep.workers.length, 1, JSON.stringify(ep.workers));
+  const w = ep.workers[0];
+  eq(w.runId, 'bg7-1790000000200');
+  eq(w.handback, 'held');
+  eq(w.died, false, 'a worker that FINISHED during the wall is held too, but it did not die on it');
+  eq(w.title, 'Ship the parser fix', 'the brief title, not the lane rules');
+  eq(w.report, M.bgReportPath('bg7-1790000000200'), 'the full report is still written, and named');
+  ok(readFileSync(w.report, 'utf8').includes('HELD-REPORT-BODY'), 'the report file carries the body');
+});
+
+// Six more held reports: past HANDBACK_STREAK_MAX, none of them trips the cap,
+// because none of them fed the chat lane.
+for (let i = 0; i < HANDBACK_STREAK_MAX + 1; i++) M.handBackToChat(WALL_TASK, `r${i}`, 'finished', `bg7-17900000003${i}`);
+M.setWalled(false);
+M.handBackToChat('after the lift', 'plain output', 'finished', 'bg7-1790000000400');
+t('★ held handbacks never count toward the handback cap', () => {
+  eq(M.parkedHandbacks.length, 0, 'nothing was parked by the cap');
+  ok(body().includes(`Attempt 1 of ${HANDBACK_STREAK_MAX}`), body().slice(0, 300));
+});
+
+// A LIMIT death during the wall: recorded as died on the wall, with its draft.
+M.resetChain();
+M.resetWallWake();
+M.wallWake.raised({ until: Date.now() + 3600_000 });
+M.setWalled(true);
+M.ROT.outcome = 'paused';
+writeDraft('bg8-1790000000500', DRAFT_TEXT);
+beforeHold = M.dispatched.length;
+M.reportBgOutcome(WALL_TASK, { status: 'failed', answer: "The worker FAILED: You've hit your session limit", record: "FAILED: You've hit your session limit" }, 'bg8-1790000000500');
+await M.settleOps();
+t('★ a worker that DIES on the wall: held, marked died, draft and report both named', () => {
+  eq(M.dispatched.length, beforeHold);
+  const w = M.wallWake.current().workers.find((x) => x.runId === 'bg8-1790000000500');
+  ok(w, JSON.stringify(M.wallWake.current().workers));
+  eq(w.died, true);
+  eq(w.handback, 'held');
+  eq(w.draft, M.bgDraftPath('bg8-1790000000500'));
+  eq(w.report, M.bgReportPath('bg8-1790000000500'));
+  ok(/died on a session limit/.test(w.status), w.status);
+});
+
+// A Codex chat lane can read a report during a Claude wall: it goes as always,
+// and a wall death is still recorded, as delivered.
+M.resetChain();
+M.setChatEngine('codex');
+beforeHold = M.dispatched.length;
+M.reportBgOutcome(WALL_TASK, { status: 'failed', answer: "The worker FAILED: You've hit your session limit", record: "FAILED: You've hit your session limit" }, 'bg8-1790000000600');
+await M.settleOps();
+t('★ WALL UP, Codex chat lane: the handback goes as always; the wall death is recorded as delivered', () => {
+  eq(M.dispatched.length, beforeHold + 1);
+  const w = M.wallWake.current().workers.find((x) => x.runId === 'bg8-1790000000600');
+  eq(w?.handback, 'delivered');
+  eq(w?.died, true);
+  ok(Number(w?.deliveredAt) > 0);
+});
+
+// No wall episode (a rehearsal wall from config, or none at all): today's
+// behaviour exactly, whatever the wall says.
+M.resetChain();
+M.resetWallWake();
+M.setChatEngine('claude');
+M.ROT.outcome = 'swapped';
+beforeHold = M.dispatched.length;
+M.handBackToChat(WALL_TASK, 'no episode', 'finished', 'bg9-1790000000700');
+t('with no wall episode a handback is dispatched even while walled (nothing would wake it)', () => {
+  eq(M.dispatched.length, beforeHold + 1);
+  eq(M.wallWake.current(), null);
+});
+M.setWalled(false);
+
+// A RESTART MID WALL (QA 2026-09-30): the in-memory wall is gone, the ledger
+// still walls every account. The first handback must still be held.
+M.resetChain();
+M.resetWallWake();
+M.wallWake.raised({ until: Date.now() + 3600_000 });
+M.setWalled(false);
+M.setLedgerAllWalled(true);
+beforeHold = M.dispatched.length;
+M.handBackToChat(WALL_TASK, 'after the restart', 'finished', 'bg10-1790000000800');
+t('★ after a restart mid wall the LEDGER still holds a handback the forgotten wall would not', () => {
+  eq(M.dispatched.length, beforeHold, 'dispatched into a wall the daemon forgot');
+  eq(M.wallWake.current().workers.find((x) => x.runId === 'bg10-1790000000800')?.handback, 'held');
+});
+M.setLedgerAllWalled(false);
+
+// THE USER CHOSE A LOGIN BY HAND (QA round 2): /account <name> zeroes the stand-down
+// and touches no ledger row, so the ledger still walls everything while chat
+// turns run on that pick. A report held then waited hours for a ledger clock.
+M.resetChain();
+M.resetWallWake();
+M.wallWake.raised({ until: Date.now() + 3600_000 });
+M.wallWake.vouched({ name: 'two@example.com' });
+M.setWalled(false);
+M.setLedgerAllWalled(true);
+beforeHold = M.dispatched.length;
+M.handBackToChat(WALL_TASK, 'after a manual swap', 'finished', 'bg12-1790000001000');
+t('★ after a manual /account swap during the wall a handback is delivered, not held for hours', () => {
+  eq(M.dispatched.length, beforeHold + 1, 'held behind a ledger the user overrode');
+  eq(M.wallWake.current().workers.find((x) => x.runId === 'bg12-1790000001000'), undefined, 'not a wall death, so not recorded');
+});
+M.setLedgerAllWalled(false);
+
+// THE EPISODE'S BOUND: past it a handback is dispatched as always rather than
+// held into nowhere.
+M.resetChain();
+M.resetWallWake();
+M.wallWake.raised({ until: Date.now() + 3600_000 });
+M.setWalled(true);
+for (let i = 0; i < 20; i++) M.wallWake.worker({ runId: `filler-${i}` });
+beforeHold = M.dispatched.length;
+M.handBackToChat(WALL_TASK, 'one too many', 'finished', 'bg11-1790000000900');
+t('★ a full wall episode never swallows a handback: it is dispatched, not held', () => {
+  eq(M.dispatched.length, beforeHold + 1);
+});
+M.setWalled(false);
 
 rmSync(TMP, { recursive: true, force: true });
 
