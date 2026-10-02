@@ -20,9 +20,9 @@ runtime requirement (verified against node v22.16.0).
 - syntax gate (everything): `for f in *.mjs scripts/probes/*.mjs; do node --check "$f" || echo "FAIL $f"; done` (81 files, 0 failures)
 - shell syntax gate: `for f in *.sh scripts/*.sh; do bash -n "$f" || echo "FAIL $f"; done` (5 files, 0 failures)
 - offline suites: `for f in test.mjs *.test.mjs; do node "$f" >/dev/null 2>&1 || echo "FAIL $f"; done`
-  (42 suites: `test.mjs` plus 41 `*.test.mjs`. 2518 assertions passed, 0 failed.
-  40 of the 42 print a pass count (`lane-marker.test.mjs` as `N/N`); `detached-workers.test.mjs`
-  and `watchdog.test.mjs` report by exit code only.)
+  (42 suites: `test.mjs` plus 41 `*.test.mjs`. 2633 assertions passed, 0 failed,
+  summed from each suite's last pass count: 39 print `N passed, M failed`, and
+  `lane-marker.test.mjs`, `detached-workers.test.mjs` and `watchdog.test.mjs` print `N/N`.)
 - shared module gate: `./scripts/check-shared.sh` (38 of 38 identical, exit 0)
 - installer rehearsal: `./install.sh --dry-run` (exit 0, changes nothing)
 - typecheck / lint: none exist. There is no tsconfig, no eslint and no
