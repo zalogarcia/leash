@@ -3642,7 +3642,12 @@ await t('★ the changed functions NO harness executes reference only names brid
     gatherUsage: [
       'renderUsageReport', 'accountUsage', 'codexAccount', 'codexAccountBlock', 'codexFallbackOn',
       'codexSettingsNow', 'withDeadline', 'chatLaneEngine', 'bgLaneEngine', 'CODEX_AVAILABLE', 'OWNER_TZ',
+      'clearLimitsFromRows', 'walledSweepInflight', 'PROBE_TIMEOUT_MS',
     ],
+    // The held-wall re-check (2026-09-30) reaches these two display paths and
+    // the poll loop, none of which a harness executes.
+    renderAccountView: ['clearLimitsFromRows', 'walledSweepInflight', 'PROBE_TIMEOUT_MS', 'accounts', 'accountUsage', 'withDeadline', 'buildAccountKeyboard'],
+    pollLoop: ['kickWalledSweep', 'WALLED_ACTIVE_SWEEP_MS', 'lastWalledActiveSweep'],
     runCodexChatFallback: ['normalizeDashes', 'NO_DASHES'],
     handBackToChat: ['normalizeDashes', 'NO_DASHES'],
     deliverCodexDirect: ['normalizeDashes', 'NO_DASHES'],

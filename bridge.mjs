@@ -62,7 +62,7 @@ import {
   unfinishedWorkClause,
 } from './wake-up.mjs';
 import { createAccountStore, fingerprint, isLimitSignal, parseResetTime } from './accounts.mjs';
-import { selectAccount, PROBE_TIMEOUT_MS } from './account-selector.mjs';
+import { selectAccount, PROBE_TIMEOUT_MS, createRecheckLimiter, limitClearVerdict } from './account-selector.mjs';
 import {
   createAccountUsage,
   invalidateUsageCache,
@@ -3791,7 +3791,16 @@ const ROTATION_COOLDOWN_MS = 90_000; // one wall kills several workers at once
 const DRIFT_CHECK_MS = 60_000; // see accounts.mjs, the residual-race guard
 let rotationCooldownUntil = 0;
 let rotationPausedUntil = 0; // set when every account is limited
+// A wall seeded at boot, remembered: a rehearsal wall is not a wall a usage
+// re-check may lift (recheckDuringWall), or the rehearsal ends a minute in.
+// This copy seeds none, so it is 0 and that guard never fires here.
+const CONFIG_WALL_UNTIL = rotationPausedUntil;
 let lastDriftCheck = 0;
+// THE RE-CHECK OF A WALL THE LEDGER HOLDS. One limiter for the whole daemon, so
+// every rotation path together asks about a walled account at most once per
+// RECHECK_INTERVAL_MS (account-selector.mjs), however many messages, deaths and
+// sweeps arrive in between. In memory: a restart costs one early re-check.
+const limitRecheck = createRecheckLimiter();
 
 // ---------------------------------------------------------------------------
 // THE CODEX WALL, the ChatGPT-side twin of rotationPausedUntil.
@@ -4098,15 +4107,19 @@ async function usageResetFor(name) {
  * The 12:46 incident left no trace of the choice it made: the log said which
  * account was marked and which one was swapped to, and nothing about why the
  * second one was believed to be healthy (nothing had walled it yet, which is
- * not the same thing). These are the six decisions that answer that question,
+ * not the same thing). These are the decisions that answer that question,
  * named so they can be grepped: account_walled, account_skipped_known_walled,
  * account_probe_failed, account_selected, all_accounts_walled_until,
- * resume_after_reset.
+ * resume_after_reset, and for a wall the ledger held that a re-check looked at
+ * again, account_limit_cleared_by_probe (with the numbers that freed it and
+ * `via`, the path that read them) and account_limit_kept.
  */
 function logAccountDecision(d) {
   const bits = [d.decision];
   if (d.account) bits.push(`account=${d.account}`);
   if (Number(d.until) > 0) bits.push(`until=${new Date(Number(d.until) * 1000).toISOString()}`);
+  if (Number(d.wasUntil) > 0) bits.push(`was_until=${new Date(Number(d.wasUntil) * 1000).toISOString()}`);
+  if (d.via) bits.push(`via=${d.via}`);
   if (d.count != null) bits.push(`count=${d.count}`);
   if (d.guessed) bits.push('until_guessed=true');
   if (d.verified === false) bits.push('verified=false');
@@ -4135,7 +4148,7 @@ function logAccountDecision(d) {
  * every account on this machine the moment the network blinked. The worst case
  * of a timeout is exactly the behaviour that shipped before this existed.
  */
-async function pickHealthyAccount({ activeName = null, lines = [] } = {}) {
+async function pickHealthyAccount({ activeName = null, lines = [], quiet = false } = {}) {
   // READ AFTER THE MARK. The caller has already written the wall for the
   // account that just died, and this list is what the selector filters and what
   // the earliest-reset clock is computed from.
@@ -4145,8 +4158,14 @@ async function pickHealthyAccount({ activeName = null, lines = [] } = {}) {
     activeName,
     now: Date.now(),
     probe: (name) => withDeadline(accountUsage.one(name), PROBE_TIMEOUT_MS, null),
+    // With nothing ledger-free left, the walls themselves are asked about again
+    // (rate limited), so a paid reset is not invisible until the ledger's clock.
+    recheck: limitRecheck,
     onDecision: (d) => {
-      logAccountDecision(d);
+      // `quiet` is the wall sweep: it runs every minute while a wall is up, and
+      // a skip line per walled account per minute says nothing the wall notice
+      // does not already say.
+      if (!(quiet && d.decision === 'account_skipped_known_walled')) logAccountDecision(d);
       // The worker handback note gets the skips too, so M can see WHY the job
       // landed where it landed and does not re-fire onto an account the daemon
       // already knows is down.
@@ -4158,6 +4177,8 @@ async function pickHealthyAccount({ activeName = null, lines = [] } = {}) {
         );
       } else if (d.decision === 'account_probe_failed') {
         lines.push(`Could not read usage for "${d.account}" (${d.reason}); trying it anyway.`);
+      } else if (d.decision === 'account_limit_cleared_by_probe') {
+        lines.push(`Re-checked "${d.account}", marked limited: its usage now reads ${d.reason}, so its limit was cleared.`);
       }
     },
   });
@@ -4167,6 +4188,9 @@ async function pickHealthyAccount({ activeName = null, lines = [] } = {}) {
   for (const w of res.walls || []) {
     accounts.markLimited(w.name, w.until, { source: w.guessed ? 'probe (no reset clock)' : 'probe' });
   }
+  // And the walls a re-check lifted, through the store's own clearLimit, which
+  // takes the source and timestamp with the wall.
+  for (const c of res.cleared || []) accounts.clearLimit(c.name);
   return res;
 }
 
@@ -4261,7 +4285,9 @@ let lastWalledActiveSweep = 0;
 async function sweepWalledActiveAccount() {
   if (!CLAUDE_AVAILABLE) return { checked: false, reason: 'no claude' };
   const now = Date.now();
-  if (now < rotationPausedUntil) return { checked: false, reason: 'wall is up' };
+  // The wall being up used to end the sweep here. It now asks the walls again,
+  // rate limited: see recheckDuringWall.
+  if (now < rotationPausedUntil) return recheckDuringWall();
   if (now < rotationCooldownUntil) return { checked: false, reason: 'rotated moments ago' };
   if (LANES.main.current || bgLanes.some((l) => l.current)) {
     return { checked: false, reason: 'something is running' };
@@ -4306,6 +4332,158 @@ async function sweepWalledActiveAccount() {
   // would be the daemon narrating its own housekeeping. /status shows the
   // ledger, and the daemon log carries the decision lines.
   return { checked: true, moved: true, from: name, to: pick.name };
+}
+
+/**
+ * WHILE THE WALL IS UP, ASK THE WALLS AGAIN.
+ *
+ * The wall goes up when every account is walled, and from then on nothing
+ * selected anything: rotateOffLimitedAccount stands down and the sweep above
+ * returned. So a usage reset bought during a wall (2026-09-30) stayed
+ * invisible until the ledger's earliest clock, a day out, and was cleared by
+ * hand. This runs from the same sweep on the same one minute cadence, and costs
+ * one ledger read and no network unless there is something to ask: a walled
+ * account due for its re-check (limitRecheck, at most once per five minutes
+ * each), or an account the ledger already shows free (cleared from /account,
+ * or by hand).
+ *
+ * When one can run, the live login is moved onto it BEFORE the wall comes
+ * down, so nothing parked resumes on a walled account; then the wall lifts and
+ * the parked chats and jobs flush, exactly as at a reset. No message of its
+ * own: the wall notice resolves itself once rotationPausedUntil has passed.
+ */
+async function recheckDuringWall() {
+  const now = Date.now();
+  if (CONFIG_WALL_UNTIL > 0 && rotationPausedUntil === CONFIG_WALL_UNTIL) {
+    return { checked: false, reason: 'wall is up (a rehearsal wall from config)' };
+  }
+  const rows = accounts.describe(now).filter((r) => r.captured);
+  const free = rows.some((r) => !r.limited);
+  const due = rows.some((r) => r.limited && limitRecheck.due(r.name, now, { since: r.limitedVerifiedAt }));
+  if (!free && !due) return { checked: false, reason: 'wall is up' };
+  // Nothing to re-check, only a free account waiting for a Claude run to end:
+  // asked BEFORE the probe, or the free slot is looked up every minute until it
+  // does.
+  if (!due && claudeRunInFlight()) return { checked: false, reason: 'a run is in flight; the move waits for the next sweep' };
+  // activeName null: during a wall the live account is walled like the rest,
+  // and a reset bought for IT is as good as one bought for any other.
+  const pick = await pickHealthyAccount({ activeName: null, quiet: true });
+  if (!pick.name) return { checked: true, moved: false, reason: 'wall is up, every re-check kept its wall' };
+  // RE-CHECKED after the probes: a hand swap or a capture lifts the wall
+  // itself, and moving the login after that would overrule the user's choice.
+  if (!(Date.now() < rotationPausedUntil)) return { checked: true, moved: false, reason: 'the wall lifted while this was probing' };
+  if (claudeRunInFlight()) {
+    // The clear (if any) is already in the ledger, so the next sweep finds a
+    // free account and finishes this; swapping under a live run is the
+    // residual race accounts.mjs documents.
+    return { checked: true, moved: false, reason: 'a run is in flight; the move waits for the next sweep' };
+  }
+  const active = await accounts.activeAccount();
+  const liveName = active?.account?.name || null;
+  let moved = false;
+  // An unidentified live login is never swapped off (/login wins, the rule the
+  // sweep above keeps). The wall still comes down: a run that dies on that
+  // login rotates onto the account this just found.
+  if (liveName && liveName !== pick.name) {
+    const res = await accounts.swapTo(pick.name);
+    if (!res.ok) {
+      console.error(`[bridge] swap onto the re-checked account "${pick.name}" failed: ${res.error}`);
+      return { checked: true, moved: false, error: res.error };
+    }
+    moved = true;
+    rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS;
+    invalidateUsageCache();
+  }
+  rotationPausedUntil = 0;
+  // The timer armed for the wall's original clock would otherwise log a second
+  // resume_after_reset hours from now, for a lift that already happened here.
+  if (wallResumeTimer) clearTimeout(wallResumeTimer);
+  wallResumeTimer = null;
+  logAccountDecision({
+    decision: 'resume_after_reset',
+    account: pick.name,
+    reason: moved ? `a re-check found room during the wall; moved from ${liveName}` : 'a re-check found room during the wall',
+  });
+  flushParkedWalledChats();
+  flushParkedWalledJobs();
+  return { checked: true, moved, from: liveName, to: pick.name, lifted: true };
+}
+
+/**
+ * IS A CLAUDE RUN ON THE LIVE CREDENTIALS RIGHT NOW? A Codex turn claims its
+ * lane too (`engine: 'codex'`), but never touches a Claude login, and during a
+ * wall the Codex fallback is exactly what is running: counting it would hold
+ * the lift until the fallback's own answer ended.
+ */
+function claudeRunInFlight() {
+  return [LANES.main, ...bgLanes].some((l) => l?.current && (l.current.engine || 'claude') !== 'codex');
+}
+
+/**
+ * ONE SWEEP AT A TIME. The poll loop runs it every minute, and a clear from
+ * /account kicks it at once; two concurrent sweeps could both swap.
+ *
+ * `fresh` is the /account kick: a clear has just landed in the ledger, and a
+ * sweep already in flight chose its account BEFORE that, so riding it could
+ * end "every re-check kept its wall" with a free account sitting there. A
+ * fresh kick queues one more sweep behind it instead. Resolves to the sweep's
+ * own result, or null if it threw.
+ */
+let walledSweepInflight = null;
+function kickWalledSweep({ fresh = false } = {}) {
+  if (walledSweepInflight && !fresh) return walledSweepInflight;
+  lastWalledActiveSweep = Date.now();
+  const op = (walledSweepInflight || Promise.resolve())
+    .then(() => sweepWalledActiveAccount())
+    .catch((e) => {
+      console.error('[bridge] walled-account sweep failed:', e.message);
+      return null;
+    });
+  walledSweepInflight = op;
+  pendingOps.add(op);
+  op.finally(() => {
+    pendingOps.delete(op);
+    if (walledSweepInflight === op) walledSweepInflight = null;
+  });
+  return op;
+}
+
+/**
+ * A READING THAT FREES A WALL, on the display paths.
+ *
+ * /account and /usage already read every slot's usage. When a slot the ledger
+ * holds walled reads with room on every window (limitClearVerdict in
+ * account-selector.mjs: its own fresh lookup, never a live session reading,
+ * every window below CLEAR_BELOW_PERCENT, and a wall older than the re-check
+ * interval), the wall is cleared here rather than shown next to a 0% bar for
+ * a day. No extra probe, so nothing to rate limit: the reading was already
+ * made for the view. Weaker readings keep the wall and say nothing, because
+ * this runs on every view. Returns the names cleared.
+ */
+function clearLimitsFromRows(rows, { via = null } = {}) {
+  const now = Date.now();
+  const walled = new Map(
+    accounts
+      .describe(now)
+      .filter((r) => r.limited)
+      .map((r) => [r.name, r]),
+  );
+  if (!walled.size) return [];
+  const cleared = [];
+  for (const row of rows || []) {
+    const w = row && walled.get(row.name);
+    if (!w) continue;
+    const v = limitClearVerdict(row, { name: w.name, now, wallSetAt: w.limitedVerifiedAt });
+    if (!v.clear) continue;
+    if (!accounts.clearLimit(w.name)?.ok) continue;
+    logAccountDecision({ decision: 'account_limit_cleared_by_probe', account: w.name, wasUntil: w.limitedUntil, reason: v.reason, via });
+    cleared.push(w.name);
+  }
+  // A wall that is UP stays up until something lifts it, and during one
+  // nothing selects anything. The sweep that moves the login and lifts it runs
+  // now rather than on its next minute.
+  if (cleared.length && Date.now() < rotationPausedUntil) kickWalledSweep({ fresh: true });
+  return cleared;
 }
 
 async function rotateOffLimitedAccount(detail) {
@@ -4722,8 +4900,24 @@ async function renderAccountView(status = null) {
   // The three accounts are read CONCURRENTLY inside all(); deadlined here so
   // an unreachable API costs the usage lines, not the /account reply.
   const snapshot = await withDeadline(accountUsage.all(), 6_000, null);
-  const live =
+  // A walled slot that now reads with room is freed BEFORE the view renders,
+  // so the view does not say "limited" next to a 0% bar (2026-09-30). `rows`
+  // is re-read only when something changed; clearLimit never reorders the
+  // list, so the keyboard's indexes are unaffected.
+  const cleared = clearLimitsFromRows(snapshot?.rows, { via: '/account' });
+  let live =
     snapshot?.active || (await withDeadline(accountUsage.resolveActive(), 2_000)) || { liveFingerprint: 'none' };
+  // DURING A WALL that clear kicked the sweep that moves the login and lifts
+  // the wall. Waited for, bounded by one probe and a swap, so this view names
+  // the account that is live once it lands instead of the walled one it is
+  // leaving (with a button to swap to where the login already went).
+  if (cleared.length && walledSweepInflight) {
+    // One probe and a swap is what it waits on; the poll loop (and /stop)
+    // waits with it, so no longer than that.
+    const swept = await withDeadline(walledSweepInflight, PROBE_TIMEOUT_MS + 1_000, null);
+    if (swept?.moved) live = (await withDeadline(accountUsage.resolveActive(), 2_000)) || live;
+  }
+  const ledgerRows = cleared.length ? accounts.describe() : rows;
   // The body is rendered by account-usage.mjs so the exact strings they read have
   // a unit test; this half stays what it always was — fetch, render, attach the
   // keyboard. The keyboard is still built from the UNORDERED describe() list,
@@ -4733,7 +4927,7 @@ async function renderAccountView(status = null) {
   // byte-identical with the public repo, so the bold header and the em dash
   // subtitle come off here rather than at source. The bars are untouched.
   const body = tightenAccountView(
-    renderAccountList({ rows, live, usageRows: snapshot?.rows || [], unclaimed }, { timeZone: OWNER_TZ }),
+    renderAccountList({ rows: ledgerRows, live, usageRows: snapshot?.rows || [], unclaimed }, { timeZone: OWNER_TZ }),
   );
   // The Codex section is APPENDED rather than spliced into the middle: the body
   // above comes from a SHARED module this repo must not edit, and reaching into
@@ -4747,7 +4941,7 @@ async function renderAccountView(status = null) {
     : body;
   return {
     text: status ? `${status}\n\n${body2}` : body2,
-    markup: buildAccountKeyboard(rows, { activeName: live.name || null }),
+    markup: buildAccountKeyboard(ledgerRows, { activeName: live.name || null }),
     markdown: true,
   };
 }
@@ -9103,7 +9297,19 @@ async function gatherUsage() {
   const pending = await pendingMessage('Reading plan usage');
   try {
     const snapshot = await accountUsage.all();
-    const claudeHalf = tightenAccountView(renderUsageReport(snapshot, { now: Date.now(), timeZone: OWNER_TZ }));
+    // Same rule as /account: a walled slot whose own fresh reading shows room
+    // everywhere is freed from the reading this view already made.
+    const cleared = clearLimitsFromRows(snapshot.rows, { via: '/usage' });
+    // DURING A WALL, the same wait /account makes: the clear kicked the sweep
+    // that moves the login, so the report names where the login went rather
+    // than the walled one it is leaving (QA, 2026-09-30).
+    let view = snapshot;
+    if (cleared.length && walledSweepInflight) {
+      const swept = await withDeadline(walledSweepInflight, PROBE_TIMEOUT_MS + 1_000, null);
+      const active = swept?.moved ? await withDeadline(accountUsage.resolveActive(), 2_000) : null;
+      if (active) view = { ...snapshot, active };
+    }
+    const claudeHalf = tightenAccountView(renderUsageReport(view, { now: Date.now(), timeZone: OWNER_TZ }));
     // THE CODEX HALF. /usage was a view of the three Claude accounts only, so on
     // a Codex chat lane the answer to "how much have I used" was about an engine
     // that had not run anything. Appended rather than spliced, for the same
@@ -11148,14 +11354,7 @@ async function pollLoop() {
       // A LIVE ACCOUNT THAT IS ALREADY KNOWN DOWN. Cheap (one ledger read) and
       // on the same slow cadence as the drift check, because the expensive half
       // only runs when it has somewhere to move to.
-      if (Date.now() - lastWalledActiveSweep > WALLED_ACTIVE_SWEEP_MS) {
-        lastWalledActiveSweep = Date.now();
-        const op = sweepWalledActiveAccount().catch((e) =>
-          console.error('[bridge] walled-account sweep failed:', e.message),
-        );
-        pendingOps.add(op);
-        op.finally(() => pendingOps.delete(op));
-      }
+      if (Date.now() - lastWalledActiveSweep > WALLED_ACTIVE_SWEEP_MS) kickWalledSweep();
       // The account swapper's residual-race guard (see accounts.mjs). A worker
       // still running on the OUTGOING account can refresh its token and write
       // its blob back over a swap we just made; this notices and re-asserts.
