@@ -63,6 +63,8 @@ const HANDBACK_AUTO_RESUMES_MAX = expression('HANDBACK_AUTO_RESUMES_MAX');
 
 const TMP = mkdtempSync(path.join(tmpdir(), 'bg-reports-test-'));
 const REPORTS = path.join(TMP, 'bg-reports');
+const RUNS = path.join(TMP, 'runs');
+mkdirSync(RUNS, { recursive: true });
 
 const M = await import(
   'data:text/javascript,' +
@@ -86,9 +88,18 @@ const M = await import(
         // below is about what that message does and does NOT contain (never the
         // worker's raw report), and a stub would prove nothing about it.
         `import { chainPausedLine } from ${JSON.stringify(pathToFileURL(path.join(DIR, 'system-messages.mjs')).href)};`,
+        // THE DRAFT REPORT. Imported, never stubbed: what the section below
+        // asserts is the exact first line and where the draft lands relative to
+        // the markers and the report file, and a stub would prove neither.
+        `import { DRAFT_SUFFIX, draftRunId, readDraftReport, endedWithoutFinalReport, draftHandbackOutput, draftStatus, draftPointerLine, isFinalReportEvent, logHadFinalReport } from ${JSON.stringify(pathToFileURL(path.join(DIR, 'bg-draft.mjs')).href)};`,
+        `import { isFatalResultText } from ${JSON.stringify(pathToFileURL(path.join(DIR, 'detached-workers.mjs')).href)};`,
+        // The limit-death discriminator reportBgOutcome branches on. Real, so the
+        // limit path below is taken for the reason the daemon would take it.
+        `import { isLimitSignal } from ${JSON.stringify(pathToFileURL(path.join(DIR, 'accounts.mjs')).href)};`,
         `let NO_DASHES = false;`,
         `export const setNoDashes = (v) => { NO_DASHES = v; };`,
         `const BG_REPORTS_DIR = ${JSON.stringify(REPORTS)};`,
+        `const RUNS_DIR = ${JSON.stringify(RUNS)};`,
         `const BG_REPORTS_KEEP = ${BG_REPORTS_KEEP};`,
         `const HANDBACK_INLINE_LIMIT = ${HANDBACK_INLINE_LIMIT};`,
         `const HANDBACK_STREAK_MAX = ${HANDBACK_STREAK_MAX};`,
@@ -112,6 +123,7 @@ const M = await import(
         grab('flushParkedHandbacks'),
         grab('maybeAutoResumeHandbacks'),
         grab('pruneBgReports'),
+        grab('pruneReportBucket'),
         grab('bgReportId'),
         grab('bgReportPath'),
         grab('writeFullReport'),
@@ -123,7 +135,24 @@ const M = await import(
         `const editWorkerNotice = (runId, patch, opts) => { noticeEdits.push({ runId, patch, opts }); return true; };`,
         `export const readingNotices = new Set();`,
         grab('handBackToChat'),
-        `export { bgReportId, bgReportPath, writeFullReport, pruneBgReports, handBackToChat, flushParkedHandbacks, maybeAutoResumeHandbacks };`,
+        // The outcome path a Claude worker takes into handBackToChat, and the
+        // limit-death composer beside it. Real, extracted; everything they call
+        // that is not the subject here records instead of acting.
+        `export const RESULTS = [];`,
+        `const recordBgResult = (task, record, file) => { RESULTS.push({ task, record, file }); };`,
+        `export const PINGS = [];`,
+        `const notifyOwnerBgFinished = (task, status, runId) => { PINGS.push({ task, status, runId }); };`,
+        `const pendingOps = new Set();`,
+        `export const settleOps = () => Promise.all([...pendingOps]);`,
+        `const rotateOffLimitedAccount = async () => ({ outcome: 'swapped', lines: ['Swapped to the next account. The account is live.'], activeName: 'a', nextName: 'b' });`,
+        `const swapFailedLine = () => 'swap failed';`,
+        grab('bgDraftPath'),
+        grab('bgRunLogPath'),
+        grab('isWorkerDeathText'),
+        grab('fileDeadWorkerDraft'),
+        grab('handleLimitDeath'),
+        grab('reportBgOutcome'),
+        `export { bgReportId, bgReportPath, writeFullReport, pruneBgReports, handBackToChat, flushParkedHandbacks, maybeAutoResumeHandbacks, bgDraftPath, fileDeadWorkerDraft, reportBgOutcome };`,
       ].join('\n'),
     )
 );
@@ -330,6 +359,222 @@ t('the quiet resume is bounded per human message; his message restores the budge
   eq(M.parkedHandbacks.length, 0);
 });
 
+// ---------- the draft report ----------
+//
+// A worker's final message is its only report. When a usage limit kills it
+// inside its verifier dispatch, the most token heavy step, that report never
+// happens and the whole deliverable used to be lost. The worker now keeps a
+// draft at $BG_REPORT_DRAFT; when the run ends WITHOUT a final report the
+// bridge delivers the draft instead of nothing, and says so on its first line.
+
+const DRAFT_LINE_RE = /^DRAFT REPORT: this worker ended without a final report; below is the last draft it wrote \(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\)\.$/;
+const writeDraft = (runId, text) => {
+  mkdirSync(REPORTS, { recursive: true });
+  writeFileSync(M.bgDraftPath(runId), text);
+};
+const inner = (note) => note.split('<<<WORKER_OUTPUT_START>>>')[1].split('<<<WORKER_OUTPUT_END>>>')[0].replace(/^\n/, '');
+const DRAFT_TEXT = '# Report so far\n\nBuilt the parser fix; 41 of 41 unit tests pass. Verifier not run yet.\nDRAFT-BODY-MARKER';
+
+t('the draft path is the report path with .draft.md, under the reports dir', () => {
+  eq(M.bgDraftPath('bg2-1790000000000'), path.join(REPORTS, 'bg2-1790000000000.draft.md'));
+});
+
+t('★ a re-attached worker id (with its pid tail) resolves to the draft its spawn named', () => {
+  eq(M.bgDraftPath('bg2-1790000000000-48213'), path.join(REPORTS, 'bg2-1790000000000.draft.md'));
+});
+
+t('a draft id that could escape the reports dir is sanitised like a report id', () => {
+  eq(path.dirname(M.bgDraftPath('../../etc/passwd')), REPORTS);
+});
+
+t('★ a FAILED worker with a draft on disk: the handback carries the draft, first line first', () => {
+  M.resetChain();
+  writeDraft('bg-1790000000101', DRAFT_TEXT);
+  M.reportBgOutcome('ship the parser fix', { status: 'failed', answer: 'The worker FAILED: exit code null', record: 'FAILED: exit code null' }, 'bg-1790000000101');
+  const out = inner(body());
+  ok(DRAFT_LINE_RE.test(out.split('\n')[0]), `the first line must say exactly what it is:\n${out.split('\n')[0]}`);
+  ok(out.includes('DRAFT-BODY-MARKER'), 'the draft itself did not travel');
+  ok(out.includes('The worker FAILED: exit code null'), 'how it ended must survive beside the draft');
+  ok(out.indexOf('DRAFT-BODY-MARKER') < out.indexOf('The worker FAILED'), 'the draft leads, the ending follows');
+});
+
+t('★ the bg-reports file holds the draft too, under a status that says it is one', () => {
+  const disk = readFileSync(M.bgReportPath('bg-1790000000101'), 'utf8');
+  ok(/- status: failed.*DRAFT/.test(disk), `the status must make the draft origin visible:\n${disk.slice(0, 300)}`);
+  const output = disk.split('## Output\n\n')[1];
+  ok(DRAFT_LINE_RE.test(output.split('\n')[0]), `the report file must open with the draft line:\n${output.slice(0, 200)}`);
+  ok(output.includes('DRAFT-BODY-MARKER'), 'the draft is not on disk');
+});
+
+t('the header the assistant reads names the draft too, outside the untrusted markers', () => {
+  const note = body();
+  const head = note.split('<<<WORKER_OUTPUT_START>>>')[0];
+  ok(head.includes('DRAFT'), head);
+});
+
+t('★ a worker that ended with NO OUTPUT and left a draft: the draft is delivered, and recorded', () => {
+  M.resetChain();
+  M.RESULTS.length = 0;
+  writeDraft('bg3-1790000000102', DRAFT_TEXT);
+  M.reportBgOutcome('ship it', { status: 'finished', answer: 'The worker ended with no output.', record: null }, 'bg3-1790000000102');
+  const out = inner(body());
+  ok(DRAFT_LINE_RE.test(out.split('\n')[0]), out.slice(0, 200));
+  ok(out.includes('DRAFT-BODY-MARKER'), out);
+  eq(M.RESULTS.length, 1, 'an empty ending used to leave no row; a delivered draft is worth one');
+  ok(M.RESULTS[0].record.includes('DRAFT'), M.RESULTS[0].record);
+  eq(M.RESULTS[0].file, M.bgReportPath('bg3-1790000000102'));
+});
+
+t('★ a FINAL report wins: the draft is ignored even when it is on disk', () => {
+  M.resetChain();
+  M.RESULTS.length = 0;
+  writeDraft('bg-1790000000103', 'STALE-DRAFT-MARKER');
+  M.reportBgOutcome('ship it', { status: 'finished', answer: 'The final report.', record: 'The final report.' }, 'bg-1790000000103');
+  const note = body();
+  ok(!note.includes('STALE-DRAFT-MARKER'), 'a draft leaked over a final report');
+  ok(!note.includes('DRAFT REPORT'), note);
+  eq(inner(note).trim(), 'The final report.');
+  ok(!readFileSync(M.bgReportPath('bg-1790000000103'), 'utf8').includes('DRAFT'), 'the report file claims a draft');
+  eq(M.RESULTS[0].record, 'The final report.');
+});
+
+t('no draft on disk: a failure is handed back exactly as before', () => {
+  M.resetChain();
+  M.reportBgOutcome('ship it', { status: 'failed', answer: 'The worker FAILED: boom', record: 'FAILED: boom' }, 'bg-1790000000104');
+  const out = inner(body());
+  eq(out.trim(), 'The worker FAILED: boom');
+  ok(!body().includes('DRAFT'), body().slice(0, 300));
+});
+
+t('an empty draft file is treated as no draft', () => {
+  M.resetChain();
+  writeDraft('bg-1790000000105', '   \n');
+  M.reportBgOutcome('ship it', { status: 'failed', answer: 'The worker FAILED: boom', record: 'FAILED: boom' }, 'bg-1790000000105');
+  ok(!body().includes('DRAFT REPORT'), body().slice(0, 300));
+});
+
+t('★ a re-attached worker (id with a pid tail) gets ITS draft delivered', () => {
+  M.resetChain();
+  writeDraft('bg4-1790000000106', DRAFT_TEXT);
+  M.reportBgOutcome('ship it', { status: 'failed', answer: 'The worker FAILED: exit code 1', record: 'FAILED: exit code 1' }, 'bg4-1790000000106-9911');
+  ok(DRAFT_LINE_RE.test(inner(body()).split('\n')[0]), inner(body()).slice(0, 200));
+});
+
+// The limit death is THE case the draft exists for: the verifier dispatch is
+// the most expensive step, so it is where a session limit most often lands.
+M.resetChain();
+M.RESULTS.length = 0;
+writeDraft('bg2-1790000000108', DRAFT_TEXT);
+M.reportBgOutcome('ship it', { status: 'failed', answer: "The worker FAILED: You've hit your session limit · resets 3pm", record: "FAILED: You've hit your session limit" }, 'bg2-1790000000108');
+await M.settleOps();
+const limitNote = body();
+
+t('★ a LIMIT death with a draft: the rotation handback carries the draft first', () => {
+  const out = inner(limitNote);
+  ok(DRAFT_LINE_RE.test(out.split('\n')[0]), `first line:\n${out.split('\n')[0]}`);
+  ok(out.includes('DRAFT-BODY-MARKER'), 'the draft did not ride the limit handback');
+  ok(out.includes("You've hit your session limit"), 'the limit detail was lost');
+  ok(out.includes('--- LEASH ACCOUNT ROTATION ---'), 'the rotation lines were lost');
+  ok(out.indexOf('DRAFT-BODY-MARKER') < out.indexOf('--- LEASH ACCOUNT ROTATION ---'), 'the draft leads');
+});
+
+t('the limit death status keeps its own words and names the draft', () => {
+  const disk = readFileSync(M.bgReportPath('bg2-1790000000108'), 'utf8');
+  ok(/- status: died on a session limit.*DRAFT/.test(disk), disk.slice(0, 300));
+});
+
+// With a long draft in front, the rotation block falls past the inline
+// excerpt. A one-line bridge note ABOVE the markers says the rotation already
+// ran, so it is not re-done blind.
+M.resetChain();
+writeDraft('bg2-1790000000130', DRAFT_TEXT + '\n' + 'x'.repeat(8000));
+M.reportBgOutcome('ship it', { status: 'failed', answer: "The worker FAILED: You've hit your session limit", record: "FAILED: You've hit your session limit" }, 'bg2-1790000000130');
+await M.settleOps();
+const bigLimitNote = body();
+t('★ a long draft on a limit death: the note says, outside the markers, that the rotation already ran', () => {
+  const before = bigLimitNote.split('<<<WORKER_OUTPUT_START>>>')[0];
+  ok(/ALREADY RAN/.test(before) && /HOW THE WORKER ENDED/.test(before), before.slice(-600));
+  ok(!inner(bigLimitNote).includes('--- LEASH ACCOUNT ROTATION ---'), 'the rotation block is past the excerpt in this case, which is why the note exists');
+});
+
+M.resetChain();
+M.reportBgOutcome('ship it', { status: 'failed', answer: "The worker FAILED: You've hit your session limit", record: "FAILED: You've hit your session limit" }, 'bg2-1790000000109');
+await M.settleOps();
+
+t('a limit death with no draft keeps the old shape: no draft line, the daemon text first', () => {
+  const out = inner(body());
+  ok(out.startsWith("The worker FAILED: You've hit your session limit"), out.slice(0, 200));
+  ok(!body().includes('DRAFT'), body().slice(0, 300));
+  // no extra bridge note either: the rotation block already leads the excerpt
+  ok(!/ALREADY RAN/.test(body().split('<<<WORKER_OUTPUT_START>>>')[0]), body().slice(0, 300));
+});
+
+t('★ a draft path that throws never costs the handback', () => {
+  // A directory squatting on the draft path makes the read fail; the report
+  // must still reach the assistant.
+  M.resetChain();
+  mkdirSync(M.bgDraftPath('bg-1790000000110'), { recursive: true });
+  M.reportBgOutcome('ship it', { status: 'failed', answer: 'The worker FAILED: boom', record: 'FAILED: boom' }, 'bg-1790000000110');
+  ok(inner(body()).includes('The worker FAILED: boom'), body().slice(0, 300));
+  rmSync(M.bgDraftPath('bg-1790000000110'), { recursive: true, force: true });
+});
+
+t('★ a worker that died while the daemon was DOWN: its draft is filed and pointed at', () => {
+  writeDraft('bg5-1790000000111', DRAFT_TEXT);
+  const line = M.fileDeadWorkerDraft('bg5-1790000000111-777', 'the nightly batch');
+  ok(line && line.startsWith('DRAFT REPORT: this worker ended without a final report'), String(line));
+  ok(line.includes(M.bgReportPath('bg5-1790000000111-777')), line);
+  const disk = readFileSync(M.bgReportPath('bg5-1790000000111-777'), 'utf8');
+  ok(disk.includes('DRAFT-BODY-MARKER'), 'the draft was not filed');
+  ok(/- status: .*DRAFT/.test(disk), disk.slice(0, 300));
+});
+
+t('a dead worker with no draft gets no pointer', () => {
+  eq(M.fileDeadWorkerDraft('bg6-1790000000112', 'x'), null);
+});
+
+// bgOutcome says "failed" for a worker that DID write its final report when
+// that report quotes a fatal phrase ("401 invalid api key", the bug it fixed)
+// or a later steered turn errored. A final report always wins: the draft must
+// not replace it.
+const FINAL = '## VERIFICATION PASSED\nFINAL-REPORT-MARKER. Fixed the 401 invalid api key path. ' + 'Evidence line. '.repeat(40);
+const runLog = (runId, events) => {
+  mkdirSync(RUNS, { recursive: true });
+  writeFileSync(path.join(RUNS, `${runId}.jsonl`), events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+};
+t('★ a final report seen in the run beats the draft even when the outcome says failed', () => {
+  M.resetChain();
+  writeDraft('bg-1790000000120', DRAFT_TEXT);
+  M.reportBgOutcome('fix the auth path', { status: 'failed', answer: `The worker FAILED: ${FINAL}`, record: `FAILED: ${FINAL}` }, 'bg-1790000000120', { finalReportSeen: true });
+  const out = inner(body());
+  ok(!out.includes('DRAFT REPORT'), out.slice(0, 200));
+  ok(!out.includes('DRAFT-BODY-MARKER'), 'the stale draft travelled over the final report');
+  ok(out.includes('FINAL-REPORT-MARKER'), 'the final report must be the handback');
+});
+t('★ the re-attach path (no live flag) reads the run log: a clean report there wins', () => {
+  M.resetChain();
+  writeDraft('bg-1790000000121', DRAFT_TEXT);
+  runLog('bg-1790000000121', [
+    { type: 'result', subtype: 'success', is_error: false, result: FINAL },
+    { type: 'result', is_error: true, result: "You've hit your session limit" },
+  ]);
+  M.reportBgOutcome('fix the auth path', { status: 'failed', answer: `The worker FAILED: ${FINAL}`, record: `FAILED: ${FINAL}` }, 'bg-1790000000121-4242');
+  ok(!inner(body()).includes('DRAFT-BODY-MARKER'), inner(body()).slice(0, 200));
+});
+t('★ a log whose only text is the CLI dying still gets the draft', () => {
+  M.resetChain();
+  writeDraft('bg-1790000000122', DRAFT_TEXT);
+  runLog('bg-1790000000122', [{ type: 'result', is_error: false, result: 'Invalid API key · Please run /login' }]);
+  M.reportBgOutcome('ship it', { status: 'failed', answer: 'The worker FAILED: Invalid API key · Please run /login', record: 'FAILED: Invalid API key' }, 'bg-1790000000122');
+  ok(inner(body()).includes('DRAFT-BODY-MARKER'), inner(body()).slice(0, 200));
+});
+t('★ the watchdog files no draft for a dead worker whose log holds its final report', () => {
+  writeDraft('bg7-1790000000123', DRAFT_TEXT);
+  runLog('bg7-1790000000123', [{ type: 'result', subtype: 'success', is_error: false, result: FINAL }]);
+  eq(M.fileDeadWorkerDraft('bg7-1790000000123-55', 'x', path.join(RUNS, 'bg7-1790000000123.jsonl')), null);
+  eq(M.fileDeadWorkerDraft('bg7-1790000000123-55', 'x'), null); // derived from the id when the registry has no log
+});
+
 // ---------- pruning ----------
 t('pruning keeps the newest BG_REPORTS_KEEP reports and no more', () => {
   const dir = REPORTS;
@@ -345,6 +590,38 @@ t('pruning keeps the newest BG_REPORTS_KEEP reports and no more', () => {
   eq(left.length, BG_REPORTS_KEEP, 'wrong number of reports kept');
   eq(left[left.length - 1], `bg-${1000000 + BG_REPORTS_KEEP + 4}.md`, 'the newest report was pruned');
   eq(left[0], `bg-${1000000 + 5}.md`, 'pruning did not start from the oldest');
+});
+
+t('★ drafts never evict reports: they are counted and pruned in their own bucket', () => {
+  // Every Claude worker now leaves a .draft.md beside its report. Counted in
+  // the same bucket, they would halve how many real reports survive the cap.
+  const dir = REPORTS;
+  mkdirSync(dir, { recursive: true });
+  for (const f of readdirSync(dir)) rmSync(path.join(dir, f), { recursive: true, force: true });
+  for (let i = 0; i < BG_REPORTS_KEEP; i++) {
+    writeFileSync(path.join(dir, `bg-${1780000000000 + i * 1000}.md`), 'x');
+  }
+  for (let i = 0; i < 50; i++) {
+    writeFileSync(path.join(dir, `bg-${1790000000000 + i * 1000}.draft.md`), 'x');
+  }
+  M.pruneBgReports();
+  const left = readdirSync(dir);
+  eq(left.filter((f) => !f.endsWith('.draft.md')).length, BG_REPORTS_KEEP, 'a report was pruned to make room for drafts');
+  eq(left.filter((f) => f.endsWith('.draft.md')).length, 50, 'drafts under their own cap were pruned');
+});
+
+t('drafts past their own cap are pruned oldest first', () => {
+  const dir = REPORTS;
+  mkdirSync(dir, { recursive: true });
+  for (const f of readdirSync(dir)) rmSync(path.join(dir, f), { recursive: true, force: true });
+  for (let i = 0; i < BG_REPORTS_KEEP + 5; i++) {
+    writeFileSync(path.join(dir, `bg-${1780000000000 + i * 1000}.draft.md`), 'x');
+  }
+  M.pruneBgReports();
+  const left = readdirSync(dir).filter((f) => f.endsWith('.draft.md'));
+  eq(left.length, BG_REPORTS_KEEP, 'wrong number of drafts kept');
+  ok(!left.includes('bg-1780000000000.draft.md'), 'the oldest draft survived');
+  ok(left.includes(`bg-${1780000000000 + (BG_REPORTS_KEEP + 4) * 1000}.draft.md`), 'the newest draft was pruned');
 });
 
 t('pruning a missing directory is a no-op, not a crash', () => {

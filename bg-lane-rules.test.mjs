@@ -48,9 +48,14 @@ const ok = (cond, msg) => {
   if (!cond) throw new Error(msg);
 };
 
-function queue(args) {
+// Hermetic: the scheduled run mark bg.mjs copies from its env must come from
+// the test, never from whatever run happens to be executing the suite.
+const MARK_KEYS = ['LEASH_TRIGGER', 'LEASH_SCHEDULE_ID', 'LEASH_ALLOW_WRITE', 'TMUX'];
+function queue(args, extraEnv = {}) {
   rmSync(QUEUE, { force: true });
-  execFileSync(process.execPath, [BG, ...args], { stdio: 'pipe' });
+  const env = { ...process.env, ...extraEnv };
+  for (const k of MARK_KEYS) if (!(k in extraEnv)) delete env[k];
+  execFileSync(process.execPath, [BG, ...args], { stdio: 'pipe', env });
   return JSON.parse(readFileSync(QUEUE, 'utf8'));
 }
 function brief(text) {
@@ -176,6 +181,75 @@ t('--engine claude is explicit and keeps the rules', () => {
   const [item] = queue(['--engine', 'claude', '--file', brief('run the suite')]);
   eq(item.engine, 'claude');
   ok(item.text.startsWith(HEADER));
+});
+
+// ---------------------------------------------------------------------------
+// Rule 6: the draft report. A worker's final message is its only report, and a
+// usage limit that lands inside the verifier dispatch (the most expensive step)
+// used to take the whole deliverable with it. The worker now writes its report
+// so far to $BG_REPORT_DRAFT first, and the bridge delivers that draft when the
+// run ends without a final report.
+// ---------------------------------------------------------------------------
+
+t('★ rule 6 follows rule 5 and names the draft file, the Write tool and why', () => {
+  const [item] = queue(['--file', brief('x')]);
+  const lines = item.text.split('\n');
+  const five = lines.findIndex((l) => l.startsWith('5. '));
+  ok(five > 0, 'rule 5 was not found');
+  const six = lines[five + 1];
+  ok(six && six.startsWith('6. '), `rule 6 must follow rule 5 directly:\n${six}`);
+  ok(six.includes('$BG_REPORT_DRAFT'), 'the env var the bridge sets');
+  ok(/verifier/.test(six), 'when to write it');
+  ok(six.includes('Write tool'), 'how to write it');
+  ok(/full text, not a summary/.test(six), 'a summary is not a report');
+  ok(/rewrite it whenever it changes/.test(six), 'a stale draft delivers stale work');
+  ok(/usage limit/.test(six), 'the why');
+  ok(!/[\u2013\u2014]/.test(six), 'no em or en dash in the rule');
+  eq(lines[five + 2], '', 'a blank line after rule 6');
+  eq(lines[five + 3], '--- TASK ---', 'the anchor stripLaneRules splits on');
+});
+
+t('a Codex brief still gets no rules at all, rule 6 included', () => {
+  const [item] = queue(['--engine', 'codex', '--file', brief('review it')]);
+  ok(!item.text.includes('BG_REPORT_DRAFT'), 'Codex has no draft env and no Claude verifier agents');
+});
+
+// ---------------------------------------------------------------------------
+// The scheduled run mark. A worker a schedule started that hands work off
+// through bg.mjs must not launder the child into an attended worker: bg.mjs
+// copies the mark from its env onto the item, and the daemon's drain turns it
+// back into LEASH_TRIGGER / LEASH_SCHEDULE_ID. The write approval never rides
+// this way, because the run itself can set its own env.
+// ---------------------------------------------------------------------------
+
+t('★ a handoff from inside a scheduled run carries the schedule mark', () => {
+  const [item] = queue(['do the thing'], { LEASH_TRIGGER: 'schedule', LEASH_SCHEDULE_ID: '42' });
+  eq(item.scheduleId, '42', 'scheduleId');
+  eq(item.allowWrite, undefined, 'allowWrite');
+});
+
+t('★ the write approval never rides a handoff, even from an approved run', () => {
+  const [item] = queue(['do the thing'], { LEASH_TRIGGER: 'schedule', LEASH_SCHEDULE_ID: '42', LEASH_ALLOW_WRITE: '1' });
+  eq(item.scheduleId, '42', 'scheduleId');
+  eq(item.allowWrite, undefined, 'allowWrite came from an env the run itself can set');
+});
+
+t('a scheduled run with no id still marks the child (unknown id)', () => {
+  const [item] = queue(['do the thing'], { LEASH_TRIGGER: 'schedule' });
+  eq(item.scheduleId, 'unknown', 'scheduleId');
+});
+
+t('a handoff from the chat or an ordinary worker carries no mark', () => {
+  const [item] = queue(['do the thing']);
+  eq(item.scheduleId, undefined, 'scheduleId');
+  const [item2] = queue(['do the thing'], { LEASH_ALLOW_WRITE: '1' });
+  eq(item2.scheduleId, undefined, 'scheduleId with only the approval set');
+  eq(item2.allowWrite, undefined, 'allowWrite with only the approval set');
+});
+
+t('a handoff typed in a tmux pane carries no mark, whatever the pane env says', () => {
+  const [item] = queue(['do the thing'], { LEASH_TRIGGER: 'schedule', LEASH_SCHEDULE_ID: '42', TMUX: '/tmp/tmux-501/default,1,0' });
+  eq(item.scheduleId, undefined, 'scheduleId');
 });
 
 t('an unknown engine is refused rather than silently defaulted', () => {

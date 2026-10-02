@@ -275,6 +275,28 @@ day it lands on (`list` prints the next one). Messages sent while a lane is busy
 steered into the running task; anything that can't be steered queues (max 5) and
 runs in order.
 
+A `--run` entry's worker is marked as a scheduled, unattended run in its env
+(`LEASH_TRIGGER=schedule`, `LEASH_SCHEDULE_ID=<id>`), on the direct path and when
+it waited in the drop box for a free slot, so a Claude Code hook can tell it from
+a worker you asked for. A job that scheduled run hands off through `bg.mjs`
+carries the same mark, because it is just as unattended. `--allow-write` (valid
+only with `--run`) is your approval for database writes and migrations in that
+entry's unattended runs: it adds `LEASH_ALLOW_WRITE=1`, the add and update
+confirmations say so in words, and `list` marks the entry `run (writes approved)`.
+The approval is yours alone: `schedule.mjs` refuses to grant it from a background
+worker or a scheduled run, a `bg.mjs` handoff never carries it, and the drain
+re-reads it from `schedules.json` instead of trusting a queued job. Leash only
+sets these variables; holding the writes is the job of a hook you install.
+
+Every Claude background worker is also given `BG_REPORT_DRAFT`, the path of a
+draft report beside its final one (`bg-reports/<runId>.draft.md`), and
+`BG_RUN_STARTED_AT`. Lane rule 6 tells it to write its report so far there before
+any verifier dispatch. When a worker ends without a final report (a usage limit
+inside the verifier, a crash, a kill, an empty ending), the handback carries that
+draft instead, first line `DRAFT REPORT: this worker ended without a final
+report; ...`. A final report always wins, even one written in an earlier turn of
+a run that later failed.
+
 `/compact` is Leash's own implementation, not the interactive built-in: it
 asks the current session for a handoff summary, archives that session, and opens
 a fresh one primed with the summary. With `autoCompact` enabled in `config.json`
@@ -913,6 +935,9 @@ node watchdog.test.mjs           # dead workers get reaped, live ones don't
 node bg-steer.test.mjs           # steering: target resolution, framing, the real CLI
 node bg-btw.test.mjs             # side questions: framing, marker detection, id matching, the CLI
 node bg-lane-rules.test.mjs      # the preamble bg.mjs prepends, and stripping it back off
+node bg-draft.test.mjs           # the draft report: when it is delivered, and that reading it never throws
+node worker-env.test.mjs         # the env each lane's Claude child gets, key for key
+node lane-marker.test.mjs        # the one spawn site hands that env the right inputs
 node bg-codex.test.mjs           # the second engine's pure half: argv, routing, parsing
 node bg-codex-wiring.test.mjs    # the real runCodex against a fake codex binary
 node codex-account.test.mjs      # the Codex block on /account

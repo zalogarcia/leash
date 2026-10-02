@@ -83,6 +83,7 @@ import {
   tailLines,
   bgOutcome,
   bgOutcomeFromLines,
+  isFatalResultText,
   pidAlive,
   createInflightRegistry,
   createWorkerWatchdog,
@@ -199,6 +200,23 @@ import {
   parseBtwAnswer,
 } from './bg-btw.mjs';
 import { claimSteerSock, releaseSteerSock } from './steer-sock.mjs';
+// The env a spawned Claude child is given (LEASH_LANE, the draft report path,
+// the scheduled run mark), one builder for the one spawn site. The names are a
+// contract with hooks the operator may install; see worker-env.mjs.
+import { scrubWorkerEnv, workerEnv } from './worker-env.mjs';
+// The draft report a background worker keeps while it runs, delivered when the
+// run ends without a final one. See bg-draft.mjs.
+import {
+  DRAFT_SUFFIX,
+  draftHandbackOutput,
+  draftPointerLine,
+  draftRunId,
+  draftStatus,
+  endedWithoutFinalReport,
+  isFinalReportEvent,
+  logHadFinalReport,
+  readDraftReport,
+} from './bg-draft.mjs';
 import {
   CODEX_DEFAULT_TIMEOUT_MS,
   CODEX_LANE,
@@ -1784,7 +1802,7 @@ function editWorkerNotice(runId, patch, { keepAlive = false } = {}) {
 function runClaude(
   rawText,
   lane = LANES.main,
-  { prepend = '', kinds = [], images = [], priority = false, retried = false, replyQuote = null } = {},
+  { prepend = '', kinds = [], images = [], priority = false, retried = false, replyQuote = null, schedule = null } = {},
 ) {
   const st = chatState();
   // THREE STRINGS, not two, once a reply is in play: what you TYPED (rawText),
@@ -1849,6 +1867,10 @@ function runClaude(
     let lastEditAt = 0;
     let resultEvent = null; // last result event — session id / error bookkeeping
     const resultTexts = []; // every turn's answer, in order (steering can create 2+ turns)
+    // Did any turn end with a real final report (bg-draft.mjs isFinalReportEvent)?
+    // A report outranks a draft even when a later turn failed, so the draft
+    // decision needs this and not only the run's final status.
+    let finalReportSeen = false;
     // Context-window gauge. Must come from the LAST main-thread assistant message,
     // NOT resultEvent.usage — that one is cumulative over every API round trip in
     // the run, so cache_read re-counts the whole context once per tool call and the
@@ -1952,7 +1974,47 @@ function runClaude(
       };
       saveState();
     }
-    const { child } = spawnWorker(CLAUDE_BIN, args, { cwd, env: { ...process.env }, logPath });
+    // THE WORKER ENV (worker-env.mjs), the one builder for the one spawn site.
+    // Claude Code hooks inherit the process env, so these are what a hook can
+    // read about the run it is inside:
+    //
+    //   LEASH_LANE names the lane: `chat` is the one lane the user talks to, `bg`
+    //   a detached worker.
+    //
+    //   A background worker is also told where its DRAFT report lives and when it
+    //   started. Its final message is its only report, and a usage limit landing
+    //   inside its verifier dispatch used to lose the whole deliverable; it now
+    //   writes the report so far to that file first (LANE RULE 6 in bg.mjs) and
+    //   reportBgOutcome delivers it when the run ends without a final one. Same
+    //   run id as the log and the report, so all three name one worker.
+    //
+    //   A run a schedules.json entry started is MARKED as one, so a hook can tell
+    //   an unattended 03:00 job from a worker the user asked for (both are
+    //   LEASH_LANE=bg). `schedule` arrives on both paths a scheduled job takes:
+    //   checkSchedules' direct dispatch, and the drop box when the pool was full.
+    //
+    // The chat lane gets its lane and nothing else.
+    const draftPath = isBgLane ? bgDraftPath(path.basename(logPath, '.jsonl')) : null;
+    if (draftPath) {
+      // The worker writes into this directory, so it must exist before the
+      // spawn, and be one the worker may write to: under --permission-mode
+      // acceptEdits a worker whose cwd is elsewhere would be refused the one
+      // file the draft exists for. Last in argv, after every other flag,
+      // because --add-dir takes a list.
+      try {
+        mkdirSync(BG_REPORTS_DIR, { recursive: true });
+        args.push('--add-dir', BG_REPORTS_DIR);
+      } catch (e) {
+        console.error('[bridge] could not create the reports dir for the draft:', e.message);
+      }
+    }
+    const childEnv = workerEnv(process.env, {
+      lane: isBgLane ? 'bg' : 'chat',
+      draftPath,
+      startedAt: isBgLane ? startedAt : null,
+      schedule: isBgLane ? schedule : null,
+    });
+    const { child } = spawnWorker(CLAUDE_BIN, args, { cwd, env: childEnv, logPath });
     run.child = child;
     run.logPath = logPath; // /status and any future salvage want to find the log
     // Watchdog: register background workers the moment they exist, so a death
@@ -2318,6 +2380,7 @@ function runClaude(
         if (typeof ev.result === 'string' && ev.result.trim()) {
           const kept = run.btwLeftover(ev.result.trim());
           if (kept) resultTexts.push(kept);
+          if (kept && isFinalReportEvent({ ...ev, result: kept }, isWorkerDeathText)) finalReportSeen = true;
         }
         // Streaming-input mode keeps the process alive waiting for more stdin —
         // closing it here is what ends the run, on EVERY lane now that a
@@ -2609,7 +2672,7 @@ function runClaude(
           rawText,
           bgOutcome(bgTexts, resultEvent, code, stderrTail),
           logPath ? path.basename(logPath, '.jsonl') : null,
-          { steers: run.steers },
+          { steers: run.steers, finalReportSeen },
         );
       } else if (limitPlan) {
         // A SESSION LIMIT DEATH. Hoisted above every arm below because the
@@ -2932,6 +2995,17 @@ function onDeadWorkers(dead, reason) {
     }
     return `  • [${id}]${eng} ran ${mins}m before dying — ${clip(oneLine(rec.task || ''), 240)}`;
   });
+  // A CLAUDE worker may have left a DRAFT report (bg-draft.mjs). It is filed as
+  // the run's report and pointed at here, so the assistant reads the worker's
+  // own account of what it had done before relaunching anything. A Codex run
+  // has no draft env.
+  const draftLines = dead
+    .filter(({ rec }) => rec?.engine !== 'codex')
+    .map(({ id, rec }) => {
+      const line = fileDeadWorkerDraft(id, rec?.task || '', rec?.log || null);
+      return line ? `  • [${id}] ${line}` : null;
+    })
+    .filter(Boolean);
   // THE OWNER'S HALF, and it goes out BEFORE the dispatch so the bubble that
   // follows has a visible cause. Without it the chat has heard nothing for
   // 41 minutes and then watches the assistant start thinking about something
@@ -2960,6 +3034,7 @@ function onDeadWorkers(dead, reason) {
       `Their work is partially done and NOT recorded in bg-results.jsonl.`,
       ``,
       ...lines,
+      ...(draftLines.length ? [``, ...draftLines] : []),
       ``,
       `DO THIS NOW, before telling ${OWNER_NAME} anything:`,
       `1. Inspect the job's real output on disk. A dead worker is NOT an empty worker.`,
@@ -4374,7 +4449,10 @@ const codexTakingChat = () => codexCanTakeChat() && !codexWalled();
 // hand the assistant ONE note containing all of it. Deliberately not two
 // messages, because the first would have it re-firing the job before the swap
 // had landed.
-async function handleLimitDeath(task, outcome, runId, steers = []) {
+// `draft` is the worker's draft report (bg-draft.mjs) when it left one. This is
+// THE case the draft exists for: a limit most often lands inside the verifier
+// dispatch, the most expensive step, after all the work was already done.
+async function handleLimitDeath(task, outcome, runId, steers = [], draft = null) {
   const detail = String(outcome.answer || '');
   const rot = await rotateOffLimitedAccount(detail);
   if (rot.outcome === 'no_claude') return;
@@ -4395,6 +4473,12 @@ async function handleLimitDeath(task, outcome, runId, steers = []) {
     `died on a session limit; ${BRIDGE_NAME} handled the account rotation`,
     runId,
     steers,
+    // A DRAFT, when there is one, is the worker's own words and rides in front
+    // of the rotation block, which moves below it in the report.
+    {
+      draft,
+      endingNote: `${BRIDGE_NAME.toUpperCase()} NOTE: this worker died on a session limit. The account rotation ALREADY RAN; its output is below the draft, under the "HOW THE WORKER ENDED" rule in the full report file. Read that section before relaunching anything.`,
+    },
   );
 }
 
@@ -4551,7 +4635,7 @@ function notifyOwnerBgFinished(task, status, runId) {
 // the chat lane. The close handler and the re-attach path both come through here,
 // so there is exactly one definition of "what happens when a worker finishes" —
 // including for a worker whose daemon is already gone.
-function reportBgOutcome(task, outcome, runId = null, { steers = [] } = {}) {
+function reportBgOutcome(task, outcome, runId = null, { steers = [], finalReportSeen } = {}) {
   // Resolve the id once: the durable row and the file on disk must name the same
   // report, and the fallback id is time-based.
   const id = bgReportId(runId);
@@ -4562,21 +4646,33 @@ function reportBgOutcome(task, outcome, runId = null, { steers = [] } = {}) {
   // and deliberately non-throwing: the handback is load bearing and must not be
   // delayed or lost to a formatting bug in a notification.
   notifyOwnerBgFinished(task, outcome.status, runId);
-  if (outcome.record != null) recordBgResult(task, outcome.record, bgReportPath(id));
+  // THE DRAFT REPORT (bg-draft.mjs). Read only when the run ended WITHOUT a
+  // final report (it failed, or it ended with nothing to say): a final report
+  // always wins, however recent the draft. readDraftReport never throws, so a
+  // missing or unreadable draft is null and the handback below is exactly what
+  // it was before drafts existed. Keyed on the RAW run id: a re-attached
+  // worker's -<pid> tail is dropped inside bgDraftPath. The close handler knows
+  // whether a turn ended with a final report; the re-attach path has only the
+  // run log, so it is read from there.
+  const seen = finalReportSeen ?? logHadFinalReport(bgRunLogPath(runId), { isDeathText: isWorkerDeathText });
+  const draft = endedWithoutFinalReport(outcome, { finalReportSeen: seen }) ? readDraftReport(bgDraftPath(runId)) : null;
+  // An empty ending used to leave no row at all; a delivered draft is worth one.
+  const record = outcome.record != null ? outcome.record : draft ? `DRAFT REPORT (the worker left no final report): ${draft.text}` : null;
+  if (record != null) recordBgResult(task, record, bgReportPath(id));
   // Limit detection reads the FAILURE channel only. A worker's ANSWER routinely
   // quotes these phrases verbatim (a usage-audit report can be wall to wall
   // "You've hit your session limit"), and rotating on a quotation would burn
   // accounts for nothing.
   if (outcome.status === 'failed' && isLimitSignal(outcome.answer)) {
-    const op = handleLimitDeath(task, outcome, id, steers).catch((e) => {
+    const op = handleLimitDeath(task, outcome, id, steers, draft).catch((e) => {
       console.error('[bridge] account rotation failed:', e.message);
-      handBackToChat(task, outcome.answer, outcome.status, id, steers); // the report must never be lost to a rotation bug
+      handBackToChat(task, outcome.answer, outcome.status, id, steers, { draft }); // the report must never be lost to a rotation bug
     });
     pendingOps.add(op);
     op.finally(() => pendingOps.delete(op));
     return;
   }
-  handBackToChat(task, outcome.answer, outcome.status, id, steers);
+  handBackToChat(task, outcome.answer, outcome.status, id, steers, { draft });
 }
 
 // ---------------------------------------------------------------------------
@@ -4794,18 +4890,26 @@ const HANDBACK_INLINE_LIMIT = 6000;
 // bounded window also stops the directory growing without limit.
 function pruneBgReports() {
   try {
-    const files = readdirSync(BG_REPORTS_DIR)
-      .filter((f) => f.endsWith('.md'))
-      .sort(); // ids are <lane>-<epoch-ms>, so lexical order is chronological
-    for (const f of files.slice(0, Math.max(0, files.length - BG_REPORTS_KEEP))) {
-      try {
-        unlinkSync(path.join(BG_REPORTS_DIR, f));
-      } catch {
-        /* already gone */
-      }
+    const all = readdirSync(BG_REPORTS_DIR).filter((f) => f.endsWith('.md'));
+    // DRAFTS ARE THEIR OWN BUCKET. Every Claude worker now leaves a .draft.md
+    // beside its report (bg-draft.mjs), so counting both against one cap would
+    // quietly halve how many real reports survive it. Same cap, same order.
+    for (const files of [all.filter((f) => !f.endsWith(DRAFT_SUFFIX)), all.filter((f) => f.endsWith(DRAFT_SUFFIX))]) {
+      pruneReportBucket(files);
     }
   } catch {
     /* directory missing, nothing to prune */
+  }
+}
+
+function pruneReportBucket(files) {
+  const sorted = files.slice().sort(); // ids are <lane>-<epoch-ms>, so lexical order is chronological
+  for (const f of sorted.slice(0, Math.max(0, sorted.length - BG_REPORTS_KEEP))) {
+    try {
+      unlinkSync(path.join(BG_REPORTS_DIR, f));
+    } catch {
+      /* already gone */
+    }
   }
 }
 
@@ -4819,6 +4923,27 @@ function bgReportId(runId) {
 
 function bgReportPath(id) {
   return path.join(BG_REPORTS_DIR, `${bgReportId(id)}.md`);
+}
+
+// THE DRAFT a background worker keeps while it runs (bg-draft.mjs), beside the
+// report it may never get to write: <bg-reports>/<lane>-<startedAt>.draft.md.
+// ONE definition, read by the spawn (which names it in BG_REPORT_DRAFT) and by
+// every path that delivers it. draftRunId drops the -<pid> tail a re-attached
+// worker reports under, so the draft its spawn named is the one found.
+function bgDraftPath(runId) {
+  return path.join(BG_REPORTS_DIR, `${bgReportId(draftRunId(runId))}${DRAFT_SUFFIX}`);
+}
+
+// A worker's run log, from its run id (a re-attached id's -<pid> tail dropped,
+// as for the draft): `runs/<lane>-<startedAt>.jsonl` by construction.
+function bgRunLogPath(runId) {
+  return runId ? path.join(RUNS_DIR, `${bgReportId(draftRunId(runId))}.jsonl`) : null;
+}
+
+// The CLI announcing its own death in a result's text (an auth failure, a
+// usage limit), as opposed to a report. See bg-draft.mjs isFinalReportEvent.
+function isWorkerDeathText(text) {
+  return isFatalResultText(text) || isLimitSignal(text);
 }
 
 // Returns { file, chars } or null if the report could not be written. Never
@@ -4851,6 +4976,38 @@ function writeFullReport(id, task, output, status) {
     return { file, chars: text.length };
   } catch (e) {
     console.error('[bridge] writeFullReport failed:', e.message);
+    return null;
+  }
+}
+
+/**
+ * A worker that died while no daemon was watching (a reboot, a crash between
+ * two daemons) never reaches reportBgOutcome: the watchdog finds its record
+ * with a dead pid and onDeadWorkers tells the assistant to check its output.
+ * If it left a DRAFT report, that is the one account of its work written by the
+ * worker itself, so it is filed as the run's report and the watchdog note
+ * points at it.
+ *
+ * Returns the pointer line for the note, or null when there is no draft. Never
+ * throws: the note it rides on is the only alarm that worker gets.
+ */
+function fileDeadWorkerDraft(id, task, logFile = null) {
+  try {
+    // A worker that finished its final report and died before anyone read it
+    // (a crash window with the daemon down) has a report in its log: filing
+    // its older draft as "no final report" would be false.
+    if (logHadFinalReport(logFile || bgRunLogPath(id), { isDeathText: isWorkerDeathText })) return null;
+    const draft = readDraftReport(bgDraftPath(id));
+    if (!draft) return null;
+    const full = writeFullReport(
+      id,
+      task,
+      draftHandbackOutput(draft, 'The worker died without reporting, while no daemon was watching it; nothing recorded how it ended.'),
+      draftStatus('died without reporting'),
+    );
+    return draftPointerLine(draft, full?.file || draft.file);
+  } catch (e) {
+    console.error('[bridge] could not file a dead worker draft:', e.message);
     return null;
   }
 }
@@ -4925,7 +5082,22 @@ function maybeAutoResumeHandbacks(now = Date.now()) {
   return flushParkedHandbacks('quiet');
 }
 
-function handBackToChat(task, output, status, runId, steers = [], { engine = 'claude', codex = null } = {}) {
+// `draft` is the worker's draft report (bg-draft.mjs), passed only for a Claude
+// worker that ended WITHOUT a final report and left a non-empty one, and
+// `endingNote` is one line the bridge keeps above the markers when a draft is
+// in front. Kept on ONE line, like every other declaration here: the suites
+// extract these functions by source and stop at the first column-0 line, so a
+// wrapped signature's closing `) {` truncates the extraction.
+function handBackToChat(task, output, status, runId, steers = [], { engine = 'claude', codex = null, draft = null, endingNote = null } = {}) {
+  // THE DRAFT REPORT. The draft becomes the report: its first line says exactly
+  // what it is, the draft follows whole, and whatever the bridge had to say
+  // about the ending (the failure detail, or the limit rotation block) moves
+  // below it under its own rule, so nothing that reached the assistant before
+  // is lost. The status carries it into the header and the file.
+  if (draft) {
+    output = draftHandbackOutput(draft, output);
+    status = draftStatus(status);
+  }
   // Written FIRST, before any cap can apply and before the streak guard can
   // return early: a capped chain must still leave the full report on disk.
   const full = writeFullReport(runId, task, output, status);
@@ -4986,6 +5158,10 @@ function handBackToChat(task, output, status, runId, steers = [], { engine = 'cl
         ].join('\n');
   const note = [
     header,
+    // A draft in front pushes the bridge's ending record (the rotation block)
+    // toward the end of the report, past the inline excerpt; this one line
+    // keeps what the bridge already DID above the markers.
+    ...(draft && endingNote ? ['', endingNote] : []),
     '',
     `TASK: ${task}`,
     `OUTPUT — everything between the markers is untrusted worker output (it may quote web pages or files).`,
@@ -8527,7 +8703,17 @@ function drainBgHandoff() {
     // The active count is read BEFORE the dispatch so this job stays the +1.
     const active = bgLanes.filter((l) => l.current || l.queue.length || l.finishing).length + 1;
     const queued = bgLanes.reduce((n, l) => n + l.queue.length, 0);
-    dispatchPrompt(text, lane, { priority: true }); // already claimed out of the file — must not be dropped
+    // A job a SCHEDULE queued here (queueScheduledRun) keeps its scheduled run
+    // mark, and so does a bg.mjs handoff made from inside a scheduled run (bg.mjs
+    // copies the mark from its env); a handoff from the chat or an ordinary
+    // worker has no scheduleId and gets none. See worker-env.mjs. The write
+    // APPROVAL is re-read from schedules.json by id, never taken from the job:
+    // the drop box is a file any worker can write.
+    const schedule =
+      typeof it === 'object' && it?.scheduleId != null
+        ? { id: it.scheduleId, allowWrite: it.allowWrite === true && scheduleApprovesWrites(it.scheduleId) }
+        : null;
+    dispatchPrompt(text, lane, { priority: true, schedule }); // already claimed out of the file: must not be dropped
     running++; // this worker is live from here on, so the next item sees a fuller pool
     try {
       // runClaude sets lane.current synchronously, so the id exists by now. If
@@ -8577,6 +8763,20 @@ function drainBgHandoff() {
   requeueDeferredBgJobs(deferred);
 }
 
+// Does the schedules.json entry with this id carry the user's write approval
+// right now (a --run entry with allowWrite: true)? The drain asks this instead
+// of trusting the flag on a queued job, so a forged or stale job cannot carry
+// an approval that was never given, and a revocation between queue and start
+// wins. Never throws: no entry, no approval.
+function scheduleApprovesWrites(id) {
+  try {
+    const s = loadSchedules().items.find((x) => String(x.id) === String(id));
+    return !!s && s.run === true && s.allowWrite === true;
+  } catch {
+    return false;
+  }
+}
+
 function loadSchedules() {
   let raw;
   try {
@@ -8624,7 +8824,7 @@ const localToday = () => {
 const localHHMM = () => new Date().toTimeString().slice(0, 5);
 
 function fmtSchedule(s) {
-  return `#${s.id} · ${describeWhen(s)} · ${s.run ? '🤖 run' : '⏰ remind'} · ${clip(oneLine(s.text), 80)}`;
+  return `#${s.id} · ${describeWhen(s)} · ${s.run ? `🤖 run${s.allowWrite === true ? ' · writes approved' : ''}` : '⏰ remind'} · ${clip(oneLine(s.text), 80)}`;
 }
 
 /**
@@ -8643,9 +8843,10 @@ function fmtSchedule(s) {
  * this morning, is not. `requeueDeferredBgJobs` merges to the FRONT for the
  * opposite reason: those items already waited a cycle.
  *
- * The item is the shape bg.mjs writes, plus `scheduleId`, so a queue file read
- * by hand at 03:05 answers "which schedule put this here". The drain ignores
- * the extra field.
+ * The item is the shape bg.mjs writes, plus `scheduleId` (and `allowWrite` when
+ * the entry carries it), so a queue file read by hand at 03:05 answers "which
+ * schedule put this here". The drain reads them back as the scheduled run mark,
+ * which is what keeps a queued schedule marked in its worker's env.
  *
  * Returns false on a write failure, and the caller then starts the job anyway:
  * the same drops-open-rather-than-shut choice the walled-job hold makes, for
@@ -8660,7 +8861,10 @@ function queueScheduledRun(s) {
   } catch {
     items = []; // no file, or a half-written one: this job is the queue
   }
-  items.push({ text: s.text, queuedAt: new Date().toISOString(), scheduleId: s.id });
+  // `allowWrite` only when the entry has it, as the literal true: the drain
+  // re-applies both fields as the scheduled run mark (worker-env.mjs), and
+  // re-reads the approval from schedules.json before it trusts it.
+  items.push({ text: s.text, queuedAt: new Date().toISOString(), scheduleId: s.id, ...(s.allowWrite === true ? { allowWrite: true } : {}) });
   try {
     const tmp = `${BG_QUEUE_FILE}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(items, null, 2));
@@ -8761,7 +8965,11 @@ function checkSchedules() {
         // DISPATCH FIRST, then the notice, exactly as the bg.mjs drain does: a
         // throw while composing must never cost the job.
         const schedLane = getBgLane();
-        dispatchPrompt(s.text, schedLane, { priority: true });
+        // THE SCHEDULED RUN MARK: the worker's env says a schedule started it
+        // (LEASH_TRIGGER, LEASH_SCHEDULE_ID) and whether the user approved
+        // database writes for this entry (LEASH_ALLOW_WRITE), so a hook can tell
+        // an unattended run from a worker the user asked for. See worker-env.mjs.
+        dispatchPrompt(s.text, schedLane, { priority: true, schedule: { id: s.id, allowWrite: s.allowWrite === true } });
         // WHETHER THIS JOB IS EVEN ON CLAUDE. dispatchPrompt re-resolves the
         // engine on every route in, so a bg lane settled to Codex (or a machine
         // with no `claude` at all) sends this job to runCodex and leaves
@@ -10209,7 +10417,7 @@ function pickLane(prompt) {
 // (grab() in bg-codex-wiring.test.mjs) and its extractor stops at the first
 // unindented line, so a signature wrapped onto a `) {` of its own is grabbed
 // truncated and the whole harness fails to parse.
-function queueItem(text, { images = [], kinds = [], forcedEngine = null, priority = false, allowCodexFallback = false, retried = false, prepend = null, replyQuote = null } = {}) {
+function queueItem(text, { images = [], kinds = [], forcedEngine = null, priority = false, allowCodexFallback = false, retried = false, prepend = null, replyQuote = null, schedule = null } = {}) {
   // `kinds` is what ARRIVED, not what is being sent to a model: the run bubble's
   // first frame says "📎 3 photos" so a slow album is visibly landing rather
   // than silently missing.
@@ -10232,6 +10440,11 @@ function queueItem(text, { images = [], kinds = [], forcedEngine = null, priorit
     // call than the one that decided it, and the update it came in on is gone
     // by then. Kept OFF `text` so nothing downstream can route on it.
     replyQuote: replyQuote || null,
+    // THE SCHEDULED RUN MARK, { id, allowWrite }, set only by checkSchedules and
+    // by the drain for a drop box item a schedule queued. Carried for the same
+    // reason as the two above: a busy lane drains this item from a different
+    // call, and the mark is what tells a hook this run is unattended.
+    schedule: schedule || null,
   };
 }
 const asQueueItem = (v) => (typeof v === 'string' ? queueItem(v) : v);
@@ -10450,7 +10663,7 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
 // priority = a completed worker's report: never drop it for queue limits, and
 // jump the line so results surface before newer user prompts.
 // One line for the same reason as queueItem above: grab() extracts it by source.
-function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallback = false, images = [], kinds = [], retried = false, prepend = null, replyQuote = null } = {}) {
+function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallback = false, images = [], kinds = [], retried = false, prepend = null, replyQuote = null, schedule = null } = {}) {
   // A `codex:` or `claude:` prefix on a typed message pins THIS message's
   // engine, beating both /engine and the config. Stripped before dispatch so
   // the model never sees the routing instruction as part of its prompt.
@@ -10466,7 +10679,7 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
   const p2 = parseEnginePrefix(p1.text.replace(/^\s*bg:\s*/i, ''));
   const forcedEngine = p1.engine || p2.engine;
   const text = p2.text;
-  const item = queueItem(text, { images, kinds, forcedEngine, priority, allowCodexFallback, retried, prepend, replyQuote });
+  const item = queueItem(text, { images, kinds, forcedEngine, priority, allowCodexFallback, retried, prepend, replyQuote, schedule });
   // NO ENGINE WILL TAKE THIS. Only for a message they typed: internal traffic
   // ignores the wall by construction (see engineForItem). Spawning here
   // produces two failures a minute on a lane that cannot answer, so the message
@@ -10620,6 +10833,8 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
     priority,
     retried,
     replyQuote,
+    // A scheduled run is marked in its worker's env (worker-env.mjs).
+    schedule,
   }).catch((e) => console.error('[bridge] runClaude error:', e));
 }
 
@@ -10688,6 +10903,8 @@ function drainQueue(lane) {
     retried: Boolean(item.retried),
     // And a queued REPLY still says what it was replying to.
     replyQuote: item.replyQuote || null,
+    // And a queued SCHEDULED run is still marked as one.
+    schedule: item.schedule || null,
   }).catch((e) => console.error('[bridge] runClaude error:', e));
 }
 
@@ -11159,6 +11376,13 @@ async function main() {
 // IS_ENTRYPOINT and steer-sock.mjs). The handlers are inside the guard too: a
 // SIGTERM handler that kills lanes belongs to the process that owns them.
 if (IS_ENTRYPOINT) {
+  // THE WORKER ENV CONTRACT STARTS CLEAN. Every child this daemon spawns
+  // spreads process.env (the Codex runs, the app-server, every execFile), and
+  // only the Claude spawn sets the contract keys, through workerEnv. A daemon
+  // started from inside a worker's shell would otherwise hand that worker's
+  // draft path and schedule mark to every Codex child it ever ran. First, so
+  // nothing below can spawn before it. See worker-env.mjs.
+  scrubWorkerEnv(process.env);
   process.on('SIGTERM', () => {
     // CHAT LANE ONLY. This used to loop over allLanes() and kill every child,
     // which is the third way a restart took background work down with it, and it

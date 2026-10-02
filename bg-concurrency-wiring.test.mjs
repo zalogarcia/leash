@@ -124,14 +124,16 @@ export const finishFakeWorker = () => {
   if (lane) lane.current = null;
   return lane;
 };
-export const resetPool = () => { bgLanes.length = 0; laneSeq = 0; DISPATCHED.length = 0; CODEX.length = 0; HELD.length = 0; SENT.length = 0; RESULTS.length = 0; NOTICES.length = 0; SAVED.length = 0; SCHEDULES = { nextId: 1, items: [] }; FAIL_WRITE = false; };
+export const resetPool = () => { bgLanes.length = 0; laneSeq = 0; DISPATCHED.length = 0; CODEX.length = 0; HELD.length = 0; SENT.length = 0; RESULTS.length = 0; DISPATCH_OPTS.length = 0; NOTICES.length = 0; SAVED.length = 0; SCHEDULES = { nextId: 1, items: [] }; FAIL_WRITE = false; };
 
 // runningBgWorkers reads this, so the real counter is under test too.
 function bgWorkerDescriptors() {
   return bgLanes.filter((l) => l.isBg && l.current).map((l) => ({ runId: l.name + '-' + l.current.startedAt, lane: l.name, engine: 'claude' }));
 }
 const getBgLane = () => startFakeWorker('(pending)');
-const dispatchPrompt = (text, lane) => { DISPATCHED.push(text); if (lane) lane.current.prompt = text; };
+// The options ride along too: the scheduled run mark is threaded through them.
+export const DISPATCH_OPTS = [];
+const dispatchPrompt = (text, lane, opts = {}) => { DISPATCHED.push(text); DISPATCH_OPTS.push(opts); if (lane) lane.current.prompt = text; };
 
 // Engine resolution, driven by the test rather than by the daemon's state.
 export let ENGINE = (forced) => ({ engine: forced || 'claude', reason: forced ? 'explicit' : 'default' });
@@ -188,6 +190,7 @@ const B = await import(
         grab('requeueDeferredBgJobs'),
         grab('queuedBgJobRows'),
         grab('drainBgHandoff'),
+        grab('scheduleApprovesWrites'),
         grab('queueScheduledRun'),
         grab('checkSchedules'),
         'export { drainBgHandoff, runningBgWorkers, requeueDeferredBgJobs, queuedBgJobRows, queueScheduledRun, checkSchedules };',
@@ -629,6 +632,164 @@ t('★ a drop box that cannot be written STARTS the job rather than losing it', 
   B.setFailWrite(false);
   eq(B.DISPATCHED.length, 1, 'one worker over the cap is a pacing miss; a lost nightly job is lost work');
   eq(B.DISPATCHED[0], 'nightly report');
+  writeQueue([]);
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n12. ★ a scheduled run is MARKED as one, on both paths it can take');
+// ---------------------------------------------------------------------------
+// A hook must be able to tell an unattended scheduled run from a worker the
+// user asked for. The mark is `schedule: { id, allowWrite }` on the dispatch,
+// which runClaude turns into LEASH_TRIGGER / LEASH_SCHEDULE_ID /
+// LEASH_ALLOW_WRITE (worker-env.test.mjs pins that half). A scheduled job
+// reaches runClaude either DIRECTLY or through the drop box when the pool is
+// full, and the mark has to survive both.
+
+t('★ the direct path marks the dispatch with the entry id', () => {
+  B.resetPool();
+  B.setCap(3);
+  writeQueue([]);
+  B.setSchedules([schedule({ id: 8 })]);
+  B.checkSchedules();
+  eq(B.DISPATCHED.length, 1);
+  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 8, allowWrite: false }));
+  eq(B.DISPATCH_OPTS[0].priority, true, 'the scheduled run keeps its priority');
+});
+
+t('★ the direct path carries the write approval when the entry has it', () => {
+  B.resetPool();
+  B.setCap(3);
+  writeQueue([]);
+  B.setSchedules([schedule({ id: 9, allowWrite: true })]);
+  B.checkSchedules();
+  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 9, allowWrite: true }));
+});
+
+t('only a literal true is approval: a truthy string is not', () => {
+  B.resetPool();
+  B.setCap(3);
+  writeQueue([]);
+  B.setSchedules([schedule({ id: 10, allowWrite: 'yes' })]);
+  B.checkSchedules();
+  eq(B.DISPATCH_OPTS[0].schedule.allowWrite, false);
+});
+
+t('★ the QUEUED path stores the mark on the drop box item', () => {
+  B.resetPool();
+  B.setCap(1);
+  B.startFakeWorker('busy');
+  writeQueue([]);
+  B.setSchedules([schedule({ id: 23, allowWrite: true })]);
+  B.checkSchedules();
+  const q = readQueue();
+  eq(q.length, 1);
+  eq(q[0].scheduleId, 23);
+  eq(q[0].allowWrite, true, 'the approval has to survive the wait in the drop box');
+});
+
+t('★ ...and the drain that starts it later re-applies the mark', () => {
+  B.finishFakeWorker();
+  B.drainBgHandoff();
+  eq(B.DISPATCHED.length, 1);
+  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 23, allowWrite: true }));
+});
+
+t('a queued entry WITHOUT approval stores no allowWrite field at all', () => {
+  B.resetPool();
+  B.setCap(1);
+  B.startFakeWorker('busy');
+  writeQueue([]);
+  B.setSchedules([schedule({ id: 24 })]);
+  B.checkSchedules();
+  ok(!('allowWrite' in readQueue()[0]), JSON.stringify(readQueue()[0]));
+  B.finishFakeWorker();
+  B.drainBgHandoff();
+  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 24, allowWrite: false }));
+});
+
+// The drop box is a file any worker can write, so the approval on a queued job
+// is only honoured when schedules.json still says so.
+t('★ a FORGED queued approval (no such schedule) starts without it', () => {
+  B.resetPool();
+  B.setCap(3);
+  B.setSchedules([]);
+  writeQueue([{ text: 'apply it', queuedAt: 'x', scheduleId: 'forged', allowWrite: true }]);
+  B.drainBgHandoff();
+  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 'forged', allowWrite: false }));
+});
+t('★ an approval on the job for an entry that has none starts without it', () => {
+  B.resetPool();
+  B.setCap(3);
+  B.setSchedules([schedule({ id: 8 })]);
+  writeQueue([{ text: 'nightly', queuedAt: 'x', scheduleId: 8, allowWrite: true }]);
+  B.drainBgHandoff();
+  eq(B.DISPATCH_OPTS[0].schedule.allowWrite, false);
+});
+t('★ a revocation between queueing and starting wins', () => {
+  B.resetPool();
+  B.setCap(1);
+  B.startFakeWorker('busy');
+  writeQueue([]);
+  B.setSchedules([schedule({ id: 31, allowWrite: true })]);
+  B.checkSchedules();
+  eq(readQueue()[0].allowWrite, true);
+  B.setSchedules([schedule({ id: 31 })]); // the user ran: update 31 --allow-write false
+  B.finishFakeWorker();
+  B.drainBgHandoff();
+  eq(B.DISPATCH_OPTS[0].schedule.allowWrite, false);
+});
+t('a string id from bg.mjs matches the numeric schedule id', () => {
+  B.resetPool();
+  B.setCap(3);
+  B.setSchedules([schedule({ id: 42, allowWrite: true })]);
+  writeQueue([{ text: 'child', queuedAt: 'x', scheduleId: '42', allowWrite: true }]);
+  B.drainBgHandoff();
+  eq(B.DISPATCH_OPTS[0].schedule.allowWrite, true);
+});
+
+t('★ a scheduled item deferred AGAIN by a full pool keeps its mark on the way back', () => {
+  B.resetPool();
+  B.setCap(1);
+  B.startFakeWorker('busy');
+  writeQueue([{ text: 'nightly', queuedAt: 'x', scheduleId: 8, allowWrite: true }]);
+  B.drainBgHandoff(); // pool full: deferred, written back
+  const q = readQueue();
+  eq(q.length, 1);
+  eq(q[0].scheduleId, 8);
+  eq(q[0].allowWrite, true);
+  writeQueue([]);
+});
+
+t('★ a scheduled item held behind a wall keeps its mark in the hold', () => {
+  B.resetPool();
+  B.setCap(3);
+  B.setEngine(() => ({ engine: 'claude', reason: 'default', pausedUntil: Date.now() + 3600_000 }));
+  writeQueue([{ text: 'nightly', queuedAt: 'x', scheduleId: 8, allowWrite: true }]);
+  B.drainBgHandoff();
+  B.setEngine((forced) => ({ engine: forced || 'claude', reason: forced ? 'explicit' : 'default' }));
+  eq(B.HELD.length, 1);
+  eq(B.HELD[0].scheduleId, 8);
+  eq(B.HELD[0].allowWrite, true);
+  writeQueue([]);
+});
+
+t('★ a bg.mjs handoff is NOT marked, even beside a scheduled one', () => {
+  B.resetPool();
+  B.setCap(3);
+  writeQueue([job('handed off'), { text: 'nightly', queuedAt: 'x', scheduleId: 8 }]);
+  B.drainBgHandoff();
+  eq(B.DISPATCHED.length, 2);
+  eq(B.DISPATCH_OPTS[0].schedule, null, 'a worker the user asked for is not an unattended run');
+  eq(B.DISPATCH_OPTS[1].schedule.id, 8);
+});
+
+t('a hand-written allowWrite with no scheduleId marks nothing', () => {
+  // The approval only means something alongside the trigger.
+  B.resetPool();
+  B.setCap(3);
+  writeQueue([job('handed off', { allowWrite: true })]);
+  B.drainBgHandoff();
+  eq(B.DISPATCH_OPTS[0].schedule, null);
   writeQueue([]);
 });
 

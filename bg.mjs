@@ -323,6 +323,7 @@ const LANE_RULES = [
   '3. Your final message IS your report, and it is handed to the chat session as it stands. Do not compress, truncate or summarise it to fit a message limit; the bridge excerpts it if it has to.',
   '4. A message that starts with [STEER from the orchestrator] can arrive mid-run. It is an instruction for your CURRENT task from the session that dispatched you: fold it in at your next step, and quote it under a "Steered in" heading in your final report.',
   '5. A message that starts with [BTW #N from the orchestrator] is the OPPOSITE of a steer: a side question, not an instruction, not approval, and not a new task. Answer it immediately in ONE message whose first line is exactly `BTW-ANSWER #N:`, in ONE paragraph (plain text, under 1500 characters, no em or en dashes), then continue exactly where you were with your plan unchanged. If your task is already finished when the question arrives, put the answer first, leave one blank line, and write your report below it. Add one line per side question under a "Side questions" heading in your final report.',
+  '6. Before you dispatch any verifier subagent (a QA, review or live test agent), write your report as it stands to the file named in $BG_REPORT_DRAFT with the Write tool (the full text, not a summary), and rewrite it whenever it changes. A usage limit can end your run inside the verifier, the most expensive step; the draft is what gets delivered then instead of nothing.',
   '',
   '--- TASK ---',
   '',
@@ -349,6 +350,19 @@ const TMP = `${FILE}.${process.pid}.tmp`;
 // FIFO the admission queue depends on. It is also this item's identity in
 // `bg.mjs ps`, which is how a queued job is told apart from its neighbours.
 const queuedAt = new Date().toISOString();
+// A handoff made from INSIDE a scheduled run keeps that run's mark: the child is
+// just as unattended as its parent, and a hook can hold database writes in
+// unattended runs. The daemon's drain turns scheduleId back into
+// LEASH_TRIGGER / LEASH_SCHEDULE_ID (worker-env.mjs). The write APPROVAL never
+// travels this way: it is read from this process's env, which the run itself
+// can set (`LEASH_ALLOW_WRITE=1 node bg.mjs ...`), so a child of an approved
+// run is held like any other and its writes go in its report. Not inside tmux:
+// a pane's env can carry LEASH_TRIGGER from the tmux server (it keeps whatever
+// the process that started it had), and a handoff typed there is the user's own.
+const scheduled =
+  process.env.LEASH_TRIGGER === 'schedule' && !process.env.TMUX
+    ? { scheduleId: String(process.env.LEASH_SCHEDULE_ID || '').trim() || 'unknown' }
+    : {};
 let pending = 0;
 let lastErr;
 
@@ -360,7 +374,7 @@ for (let attempt = 0; attempt < 5; attempt++) {
   } catch {
     /* missing or mid-rename — treat as empty and retry on failure */
   }
-  items.push({ text, queuedAt, ...(engine ? { engine } : {}), ...(now ? { now: true } : {}) });
+  items.push({ text, queuedAt, ...(engine ? { engine } : {}), ...(now ? { now: true } : {}), ...scheduled });
   try {
     writeFileSync(TMP, JSON.stringify(items, null, 2));
     renameSync(TMP, FILE);
