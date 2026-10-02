@@ -71,6 +71,10 @@ SHARED_MODULES=(
   tg-governor.mjs
   tg-governor.test.mjs
   bg-admission.test.mjs
+  bg-draft.mjs
+  bg-draft.test.mjs
+  worker-env.mjs
+  worker-env.test.mjs
 )
 
 # NOT LISTED, and why. These modules came from the private sibling and behave
@@ -100,6 +104,14 @@ SHARED_MODULES=(
 #       bg-concurrency-wiring.test.mjs   (its harness stubs this repo's own
 #                                        drain dependencies, and its schedule
 #                                        fixtures are generic here)
+#       wall-wake.mjs       + its test   (the private header and comments name
+#                                        the owner and the chat assistant, and
+#                                        its fixtures are real addresses; the
+#                                        code is the same, the prose and the
+#                                        fixtures here are generic)
+#       lane-marker.test.mjs             (the private header tells the owner's
+#                                        own hook story; the assertions are the
+#                                        same, the header here is generic)
 #
 # (b) This repo carries fixes the private one does not, found by the QA pass on
 #     the port (2026-09-04). Listing these would make the gate demand that the

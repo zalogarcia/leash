@@ -369,6 +369,23 @@ live notice covers the wall: each account with its reset clock, the earliest one
 held, and a "Claude is back" ending when the first window returns. `/status` shows the same ledger,
 one row per account.
 
+**A wall is re-checked, and the chat is woken once when it lifts.** With nothing else free, a walled
+account is asked about again (at most once every five minutes), and `/account` and `/usage` clear a
+wall from the reading they already made, so a paid usage reset is not invisible until the ledger's
+clock. At wall time the login moves to the account with the earliest known reset, and the notice
+names it. When the wall lifts (at its clock, on an early re-check, or because you chose a login by
+hand) the chat session gets ONE turn from the daemon: the live account, every background worker that
+ended during the wall with its report, draft and whether its handback reached you, what the capped
+handback chain was holding, and the instruction to pick up. Worker reports that arrive during the
+wall are held for that turn instead of dying on the same wall. The episode lives in `wall-wake.json`
+(gitignored), so a restart mid wall still wakes the chat once, and only once.
+
+**A dead login is flagged, never rotated onto.** When a slot's token refresh is refused
+(`invalid_grant`) or its login has expired, Leash flags the slot and says so once, with the fix:
+`/login` in Claude Code as that account, then `/account capture <name>`, which clears the flag. Every
+automatic path skips a flagged slot, and `/account` marks it `🔑 <name> (needs login)` and refuses
+its button.
+
 **Credentials never leave your machine.** Enrolled accounts live in
 `accounts.json` next to `bridge.mjs` (chmod 600, gitignored — see
 [accounts.example.json](accounts.example.json) for the shape); the live login
@@ -952,6 +969,8 @@ node bg-admission.test.mjs       # the concurrency cap's pure half: slots, FIFO,
 node bg-concurrency-wiring.test.mjs  # the real drain and schedule path at a real cap
 node bg-reports.test.mjs         # the full report on disk, and the handback that names it
 node accounts.test.mjs           # the account store and the rotation rules
+node limit-rotation.test.mjs     # the rotation, the wall, its re-check and the wake-up at the lift
+node wall-wake.test.mjs          # the wall episode on disk and the next-account rule
 node account-usage.test.mjs      # live plan usage per account
 node account-buttons.test.mjs    # the one-tap swap keyboard
 node credential-store.test.mjs   # the keychain / file store behind a swap

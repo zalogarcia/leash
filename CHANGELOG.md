@@ -2,6 +2,83 @@
 
 All notable changes to Leash. Dates are release dates.
 
+## Unreleased
+
+**An all-accounts wall that wakes the chat once when it lifts, a worker report that survives a usage
+limit in its verifier, and the account fixes that sit under both.**
+
+### The all-accounts wall
+
+- **A wall is re-checked.** With nothing ledger free left, a walled account is asked about again (at
+  most once every five minutes, one limiter for the whole daemon), and `/account` and `/usage` clear
+  a wall from the reading they already made: the account's own fresh lookup, every window below 90%,
+  a wall older than the re-check interval. A paid usage reset no longer stays invisible until the
+  ledger's clock. During a wall the minute sweep moves the login onto a cleared account (only when no
+  Claude run is in flight; a Codex turn does not count), lifts the wall and flushes what was parked.
+- **At wall time the login moves to the account that frees first,** the one with the earliest KNOWN
+  reset (never a guessed clock over a known one), and the wall notice names it, its reset and whether
+  the login is already on it.
+- **The chat is woken once at the lift.** Every lift (the resume timer, an early re-check, an
+  `/account` or `/usage` clear, a login chosen by hand, the poll backstop after a restart) claims a
+  persisted episode (`wall-wake.json`, gitignored) once and gives the chat ONE daemon authored turn:
+  the live account and since when, every background worker that ended during the wall with its
+  report, draft and handback state, what the capped handback chain held, the parked chat count, and
+  the instruction to pick up. It rides in front of a parked message on an idle lane or in the Codex
+  catch-up, and is its own priority turn otherwise. Worker reports that arrive during the wall are
+  held for it instead of dying on the same wall.
+- **A dead login is flagged, said once and never rotated onto.** A refresh the server refuses
+  (`invalid_grant`), or a login past its expiry, flags the slot and sends one notice naming the
+  account and the fix (`/login`, then `/account capture <name>`, which clears it). Every automatic
+  path skips a flagged slot, and the `/account` keyboard marks it and refuses its tap. Token refresh
+  is single flight per slot, so two readers never present the same single use refresh token.
+
+### Background workers
+
+- **The draft report.** Every Claude background worker is given `BG_REPORT_DRAFT`
+  (`bg-reports/<runId>.draft.md`) and `BG_RUN_STARTED_AT`, and lane rule 6 tells it to write its
+  report so far there before any verifier dispatch. When a run ends without a final report (a usage
+  limit inside the verifier, a crash, a kill, an empty ending) the handback carries the draft, first
+  line `DRAFT REPORT: ...`. A final report seen in any turn always wins. A worker reaped while the
+  daemon was down has its draft filed and pointed at in the watchdog note.
+- **The worker env contract.** Every Claude child now carries `LEASH_LANE` (`chat` or `bg`), and a
+  run a `--run` schedule started carries `LEASH_TRIGGER=schedule`, `LEASH_SCHEDULE_ID` and, with
+  `schedule.mjs --allow-write`, `LEASH_ALLOW_WRITE=1`, on the direct path and through the drop box.
+  A handoff from inside a scheduled run keeps the mark but never the approval, and the drain re-reads
+  the approval from `schedules.json`. The keys are scrubbed from the daemon's own env at boot.
+- **A concurrency cap.** At most `maxConcurrentWorkers` Claude workers run at once (default 3); past
+  the cap a job waits in the drop box in arrival order, `bg.mjs ps` lists it under QUEUED, and
+  `bg.mjs --now` starts one past the cap.
+- **A capped report chain resumes on its own** after ten quiet minutes, within a per message budget.
+- **`bg.mjs steer` or `btw` with an empty target refuses** ("no target given") instead of queueing
+  the steer text as a new job.
+
+### Accounts and usage
+
+- **The rotation asks an account before it moves onto it:** one usage call per candidate, a five
+  second deadline, every window counted.
+- Walls worded "out of usage credits" and weekly limits ("resets Sep 17 at 10am") are recognised.
+- `/account` and `/usage` say why usage is unavailable, and a 429 is held until its Retry-After clock
+  instead of re-polled; the plan numbers can come from the live sessions' `rate_limit_event`.
+
+### Chat and Telegram
+
+- **Auto compact:** the chat compacts itself past a threshold once it is idle (`autoCompact`).
+- **The wake-up:** after a restart or a compaction the chat is asked to finish unfinished work.
+- **A governor for every Telegram write:** a token bucket, a cooldown that honours `retry_after`, and
+  an outbox instead of a dropped answer; a bubble's opening and ending are never shed.
+- `/status` draws the usage and context gauges as bars.
+- Voice notes transcribe with `gpt-4o-mini-transcribe` by default (`transcribeModel` in
+  `config.json`).
+- Schedules gain an every N days cadence (`add every 3d 12:00`, `update --anchor`).
+
+### Maintenance
+
+- `.claude/VERIFY.md` and `.claude/verify.sh`: a verification manifest and its runnable projection.
+- `scripts/check-shared.sh` enforces 38 modules byte identical with the private sibling, now
+  including `bg-draft.mjs`, `worker-env.mjs` and their suites; `wall-wake.mjs` is genericized here
+  and not shared.
+- The probes carry the helpers their sliced code calls, and a failed probe exits non zero.
+
 ## 1.8.0 (2026-09-09)
 
 **A background Codex job you can reach while it is running, and that survives the restart that kills

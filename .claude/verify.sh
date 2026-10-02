@@ -10,7 +10,7 @@
 #   ./.claude/verify.sh probes-live     the two probes that spawn the real codex and SPEND MONEY
 #   ./.claude/verify.sh --list          what is available
 #
-#   VERIFY_QUICK=1   skip the 38 offline suites, keep the fast gates
+#   VERIFY_QUICK=1   skip the 42 offline suites, keep the fast gates
 #
 # One PASS / FAIL / SKIP line per check. Exit 0 only when nothing FAILed.
 # A check that cannot run where it is run SKIPs and names the real command; it
@@ -91,7 +91,7 @@ local_gate() {
   # which is not a failure of this repo. Only exit 1 is drift.
   ./scripts/check-shared.sh >/tmp/verify-shared.$$ 2>&1
   case $? in
-    0) pass "shared modules identical to the sibling repo (34)" ;;
+    0) pass "shared modules identical to the sibling repo ($(sed -n 's/^All \([0-9]*\) shared modules match.*/\1/p' /tmp/verify-shared.$$))" ;;
     2) skip "shared modules" "sibling repo not found; run: BRIDGE_SIBLING_REPO=/path/to/sibling ./scripts/check-shared.sh" ;;
     *) fail "shared modules drifted"; grep '^DRIFT' /tmp/verify-shared.$$ | sed 's/^/     /' ;;
   esac
@@ -179,7 +179,7 @@ probes_live() {
 usage() {
   cat <<'USAGE'
 local checks (default):
-  syntax bridge.mjs · syntax all .mjs · syntax all .sh · offline suites (38)
+  syntax bridge.mjs · syntax all .mjs · syntax all .sh · offline suites (42)
   probe steer-probe · shared modules · installer rehearsal
 deploy surfaces:
   daemon · docs · all
