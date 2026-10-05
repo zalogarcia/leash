@@ -149,6 +149,19 @@ t('a NUL sentinel in the input cannot smuggle a protected region out', () => {
   eq(countDashes(out), 0);
 });
 
+t('code is located by the renderer\'s own parser: no span shape escapes it', () => {
+  // The two regexes this replaced could not see a span delimited by two
+  // backticks or a fence of four, so a dash inside either was rewritten.
+  const EM = EM_DASH;
+  const twin = `Use \`\` echo \`a ${EM} b\` \`\` here ${EM} not there.`;
+  eq(normalizeDashes(twin), `Use \`\` echo \`a ${EM} b\` \`\` here, not there.`);
+  const four = `Text ${EM} then:\n\n\`\`\`\`\n\`\`\`\nx ${EM} y\n\`\`\`\n\`\`\`\`\n\nAfter ${EM} done.`;
+  eq(normalizeDashes(four), `Text, then:\n\n\`\`\`\`\n\`\`\`\nx ${EM} y\n\`\`\`\n\`\`\`\`\n\nAfter, done.`);
+  const nested = `1. Run ${EM} once:\n   \`\`\`\n   git log --oneline ${EM} 5\n   \`\`\``;
+  eq(normalizeDashes(nested), `1. Run, once:\n   \`\`\`\n   git log --oneline ${EM} 5\n   \`\`\``);
+  eq(normalizeDashes(`\`a ${EM} b\` and https://x.io/a${EM}b ${EM} ok`), `\`a ${EM} b\` and https://x.io/a${EM}b, ok`);
+});
+
 // ---------------------------------------------------------------------------
 console.log('\n4. the config flag');
 // ---------------------------------------------------------------------------

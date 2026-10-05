@@ -42,7 +42,7 @@
 // message goes rich BECAUSE it found a table, and the HTML fallback has to find
 // the same one. Two copies of this predicate could disagree and route a message
 // to a renderer that then declines to draw the table that caused the routing.
-import { isTableSep, isTableRow, splitCells } from './md-format.mjs';
+import { isTableSep, isTableRow, splitCells, fencedLines, mdToTelegramHtml, chunks, copyButtons, escHtml } from './md-format.mjs';
 
 // Telegram accepted size:1 in probing. Deeper levels are clamped rather than
 // guessed at — an unsupported size rejects the WHOLE message, and a heading
@@ -73,6 +73,56 @@ export function stripModeMarkers(md) {
   return String(md).replace(RICH_MARKER, '').replace(PLAIN_MARKER, '').replace(/^\n+/, '');
 }
 
+/**
+ * Cut a reply into the tables that can go out as real grids and the markdown
+ * around them, in order. A table is found the same way the HTML path finds it
+ * (header row, separator row, body rows), and never inside a fenced block: a
+ * fence that merely SHOWS a table used to send the whole reply down the rich
+ * rail.
+ *
+ * A table with code in a cell is NOT handed to the rich rail (unless the author
+ * asked for the grid with <!--rich-->): a rich cell is plain text, so a command
+ * in it could not be copied with a tap, and one holding a pipe was cut in two
+ * by the cell splitter. It stays in the markdown and the HTML path draws it as
+ * stacked rows, where the code is a real code entity.
+ * @returns {Array<{md: string}|{table: string}>}
+ */
+export function tableSegments(md, { codeCells = false } = {}) {
+  const lines = String(md).split('\n');
+  const fenced = fencedLines(md);
+  const segs = [];
+  let buf = [];
+  let inDetails = false;
+  const flush = () => {
+    // The blank lines around a table belong to neither side of the cut.
+    while (buf.length && !buf[0].trim()) buf.shift();
+    while (buf.length && !buf[buf.length - 1].trim()) buf.pop();
+    if (buf.length) segs.push({ md: buf.join('\n') });
+    buf = [];
+  };
+  for (let i = 0; i < lines.length; i++) {
+    if (!fenced[i]) {
+      // A table inside ::: details stays with its section, on the HTML path.
+      if (/^:::\s*details\b/.test(lines[i])) inDetails = true;
+      else if (inDetails && /^:::\s*$/.test(lines[i])) inDetails = false;
+    }
+    if (!fenced[i] && !inDetails && !fenced[i + 1] && isTableRow(lines[i]) && isTableSep(lines[i + 1])) {
+      let j = i + 2;
+      while (j < lines.length && !fenced[j] && isTableRow(lines[j])) j++;
+      const rows = lines.slice(i, j);
+      if (j > i + 2 && (codeCells || !rows.some((l) => l.includes('`')))) {
+        flush();
+        segs.push({ table: rows.join('\n') });
+        i = j - 1;
+        continue;
+      }
+    }
+    buf.push(lines[i]);
+  }
+  flush();
+  return segs;
+}
+
 export function shouldUseRich(md) {
   const t = String(md);
   if (PLAIN_MARKER.test(t)) return false;
@@ -80,13 +130,50 @@ export function shouldUseRich(md) {
   // NOTE: `::: details` deliberately does NOT force rich any more. The HTML
   // path renders it as <blockquote expandable>, which collapses just as well
   // AND keeps inline bold/code. A real table is now the only thing HTML
-  // genuinely cannot express, so it is the only automatic trigger.
-  // A real table needs a header row followed by a separator row.
-  const lines = t.split('\n');
-  for (let i = 0; i < lines.length - 1; i++) {
-    if (isTableRow(lines[i]) && isTableSep(lines[i + 1])) return true;
+  // genuinely cannot express, so it is the only automatic trigger: a header
+  // row followed by a separator row, outside any fenced block.
+  return tableSegments(t, { codeCells: true }).some((s) => s.table);
+}
+
+/**
+ * THE PLAN FOR ONE REPLY: every message to send, in order.
+ *
+ * Only a table goes out as rich blocks. Everything else, the prose around a
+ * table included, goes out as HTML, because a rich paragraph is plain text:
+ * the old rich path sent the WHOLE reply as blocks, so every inline command in
+ * a reply that happened to contain a table reached the phone with nothing to
+ * tap (184 of 188 code spans across the 23 such replies of one month).
+ *
+ *   { kind: 'html', html, markup }           one sendMessage, parse_mode HTML
+ *   { kind: 'rich', blocks, fallback: [...] } one sendRichMessage; `fallback`
+ *       is the same table as HTML parts, for when the rich rail is off or
+ *       Telegram refuses it, so a refusal costs one grid and not the reply
+ *
+ * `markup` carries the Copy buttons of the blocks in THAT message.
+ * @param {string} md
+ * @param {{limit: number, rich?: boolean}} opts  `limit` is the caller's
+ *        message size; `rich: false` keeps every table on the HTML path
+ */
+export function planReply(md, { limit, rich = true } = {}) {
+  const src = String(md);
+  const clean = stripModeMarkers(src);
+  const plain = PLAIN_MARKER.test(src);
+  const segs = rich && !plain ? tableSegments(clean, { codeCells: RICH_MARKER.test(src) }) : [{ md: clean }];
+  const buttons = copyButtons(clean).map((b) => ({ ...b, used: false }));
+  const htmlParts = (text) =>
+    chunks(detailsToHtml(text, mdToTelegramHtml), limit, { closePre: true })
+      .filter((h) => h.trim())
+      .map((html) => {
+        const mine = buttons.filter((b) => !b.used && html.includes(`>${escHtml(b.code)}</code></pre>`));
+        for (const b of mine) b.used = true;
+        return { kind: 'html', html, markup: mine.length ? { inline_keyboard: mine.map((b) => [b.button]) } : null };
+      });
+  const out = [];
+  for (const s of segs) {
+    if (s.table) out.push({ kind: 'rich', blocks: mdToRichBlocks(s.table), fallback: htmlParts(s.table) });
+    else out.push(...htmlParts(s.md));
   }
-  return false;
+  return out;
 }
 
 /**
@@ -185,13 +272,23 @@ export function mdToRichBlocks(md, inlineHtml, { nested = false } = {}) {
     // the WHOLE message rejected, so the sender ships this block on the HTML
     // rail instead, as <pre><code class="language-x"> — the same tag md-format
     // has always produced, and what the clients make copyable at ANY length.
-    if (/^```/.test(line)) {
+    const fm = /^([ \t]*)(`{3,})([^`]*)$/.exec(line);
+    if (fm) {
       flushPara();
-      const lang = /^```([\w-]*)/.exec(line)[1] || '';
+      // Same fence rules as md-format's splitFences: any indentation (a fence
+      // nested in a list item), closed by at least as many backticks, the
+      // opener's indentation removed from every line of the body.
+      const lang = (/^[\w+#.-]+/.exec(fm[3].trim()) || [''])[0];
+      const closeRe = new RegExp('^[ \\t]*`{' + fm[2].length + ',}[ \\t]*$');
+      const dedent = (l) => {
+        let k = 0;
+        while (k < fm[1].length && (l[k] === ' ' || l[k] === '\t')) k++;
+        return l.slice(k);
+      };
       const body = [];
       let j = i + 1;
-      while (j < lines.length && !/^```/.test(lines[j])) body.push(lines[j++]);
-      const text = body.join('\n').replace(/\n$/, '');
+      while (j < lines.length && !closeRe.test(lines[j])) body.push(dedent(lines[j++]));
+      const text = body.join('\n').replace(/\n+$/, '');
       // NESTED code (inside ::: details / a blockquote) stays a paragraph. A
       // nested block is sent INSIDE the rich message, where an unsupported type
       // rejects the whole thing — and hoisting it out would move the code away

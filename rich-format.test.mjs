@@ -6,6 +6,8 @@ import {
   stripModeMarkers,
   detailsToHtml,
   splitCodeRuns,
+  tableSegments,
+  planReply,
 } from './rich-format.mjs';
 
 let pass = 0;
@@ -342,6 +344,59 @@ eq('splitCodeRuns on rich-only input', splitCodeRuns([{ type: 'paragraph', text:
   { rich: [{ type: 'paragraph', text: 'x' }] },
 ]);
 eq('splitCodeRuns on nothing', splitCodeRuns([]), []);
+
+// ---------- planReply: only a table is ever a rich message ----------
+// A rich paragraph is plain text, so the old path (the WHOLE reply as rich
+// blocks whenever it held a table) delivered every inline command with nothing
+// to tap. The plan keeps the grid and sends the prose around it as HTML.
+{
+  const unesc = (x) => x.replace(/&(amp|lt|gt|quot);/g, (_, e) => ({ amp: '&', lt: '<', gt: '>', quot: '"' })[e]);
+  const codes = (parts) => parts.filter((p) => p.kind === 'html').flatMap((p) => [...p.html.matchAll(/<code>([\s\S]*?)<\/code>/g)].map((m) => unesc(m[1])));
+  const pres = (parts) => parts.filter((p) => p.kind === 'html').flatMap((p) => [...p.html.matchAll(/<pre><code class="language-text">([\s\S]*?)<\/code><\/pre>/g)].map((m) => unesc(m[1])));
+  const GRID = '| file | status |\n|---|---|\n| a.mjs | ok |\n| b.mjs | red |';
+
+  const mixed = planReply(`Run \`npm test\` first.\n\n${GRID}\n\nThen \`git push\` and:\n\n\`\`\`\nnode bg.mjs ps\n\`\`\``, { limit: 4000 });
+  eq('plan: html, the grid, html', mixed.map((p) => p.kind), ['html', 'rich', 'html']);
+  eq('plan: inline code around a table keeps its code entity', codes(mixed), ['npm test', 'git push']);
+  eq('plan: the fence is a real block', pres(mixed), ['node bg.mjs ps']);
+  eq('plan: the rich part is the table and nothing else', mixed[1].blocks.map((b) => b.type), ['table']);
+  ok('plan: no prose leaks into the rich part', !JSON.stringify(mixed[1].blocks).includes('npm test'));
+  ok('plan: the grid has an HTML fallback of its own', mixed[1].fallback.length === 1 && mixed[1].fallback[0].html.includes('<b>a.mjs</b>'));
+  eq('plan: the one block gets the Copy button, on its own message', mixed.map((p) => p.markup?.inline_keyboard?.[0]?.[0]?.copy_text?.text ?? null), [null, null, 'node bg.mjs ps']);
+
+  // A command in a cell: the grid would make it plain text, and one holding a
+  // pipe was cut in two by the cell splitter. It is drawn on the HTML path.
+  const cmdTable = '| step | command |\n|---|---|\n| find | `ps aux | grep bridge` |\n| stop | `kill -TERM 123` |';
+  const withCode = planReply(`${cmdTable}\n\nDone.`, { limit: 4000 });
+  eq('plan: a table with code in a cell stays on the HTML path', withCode.map((p) => p.kind), ['html']);
+  eq('plan: the command in the cell is whole, pipe included', codes(withCode), ['ps aux | grep bridge', 'kill -TERM 123']);
+  eq('segments: code cells keep the table in the markdown', tableSegments(cmdTable).map((x) => Object.keys(x)[0]), ['md']);
+  eq('segments: <!--rich--> asks for the grid anyway', planReply(`<!--rich-->\n${cmdTable}`, { limit: 4000 }).map((p) => p.kind), ['rich']);
+
+  eq('plan: rich off keeps every table on the HTML path', planReply(`${GRID}\n\nx`, { limit: 4000, rich: false }).map((p) => p.kind), ['html']);
+  eq('plan: <!--plain--> does too, and the marker is gone', planReply(`<!--plain-->\n${GRID}`, { limit: 4000 }).map((p) => p.kind + (p.html.includes('plain') ? '!' : '')), ['html']);
+
+  // A fence that merely SHOWS a table is code, not a table.
+  const shown = '```\n| a | b |\n|---|---|\n| 1 | 2 |\n```';
+  ok('a table inside a fence does not route the reply to rich', !shouldUseRich(shown));
+  eq('plan: and it arrives as one block, pipes intact', pres(planReply(shown, { limit: 4000 })), ['| a | b |\n|---|---|\n| 1 | 2 |']);
+  eq('plan: a table inside ::: details stays with its section', planReply(`::: details More\n${GRID}\n:::`, { limit: 4000 }).map((p) => p.kind), ['html']);
+
+  // Several blocks, several buttons, each on the message that shows its block.
+  const long = 'x'.repeat(300);
+  const multi = planReply(`\`\`\`\ncd ~/dev/app\n\`\`\`\n\n\`\`\`\n${long}\n\`\`\`\n\n\`\`\`\nnpm ci\n\`\`\``, { limit: 4000 });
+  eq('plan: one message, a button per block that fits the 256 cap', multi.map((p) => p.markup.inline_keyboard.map((r) => r[0].copy_text.text)), [['cd ~/dev/app', 'npm ci']]);
+  const far = planReply(`\`\`\`\nfirst --one\n\`\`\`\n\n${'word '.repeat(900)}\n\n\`\`\`\nsecond --two\n\`\`\``, { limit: 4000 });
+  eq('plan: a button rides the message that shows its block', far.map((p) => (p.markup ? p.markup.inline_keyboard.map((r) => r[0].copy_text.text) : [])), [['first --one'], ['second --two']]);
+  ok('plan: every part fits the limit', far.every((p) => p.html.length <= 4000));
+}
+
+// mdToRichBlocks reads a fence the way md-format does.
+eq(
+  'a fence nested in a list item is dedented in the rich parser too',
+  mdToRichBlocks('1. Run:\n   ```sh\n   cat <<EOF\n     kept\n   EOF\n   ```').find((b) => b.type === 'code'),
+  { type: 'code', lang: 'sh', text: 'cat <<EOF\n  kept\nEOF' },
+);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

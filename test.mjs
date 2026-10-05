@@ -101,9 +101,12 @@ t('deep paths collapse to the identifying tail', () => {
 // The shared render/chunk assertions moved to md-format.test.mjs with the
 // module. What stays here are the cases the private sibling does not carry.
 
-t('a fence with no language stays a bare <pre>', () => {
+// A bare <pre> is what this used to assert, and it is what broke copying: Telegram
+// labels an unlabelled block itself ("shell" for a command), the apps highlight
+// a labelled block, and a tap on a highlighted block copies one run of it.
+t('a fence with no language is sent with the plain one, never bare', () => {
   const html = M.mdToTelegramHtml('```\nplain\n```');
-  ok(html.includes('<pre>plain</pre>'), `got ${html}`);
+  ok(html.includes('<pre><code class="language-text">plain</code></pre>'), `got ${html}`);
 });
 
 t('a quote in a link URL cannot break out of href', () => {
@@ -317,8 +320,8 @@ t('the report id is resolved once per outcome funnel', () => {
 });
 
 // ---------- the outbound funnel: what actually reaches Telegram ----------
-// The unit suites prove the RENDERERS. This proves the WIRING: sendRich and
-// sendResult are pulled out of bridge.mjs BY SOURCE (importing it would boot a
+// The unit suites prove the RENDERERS. This proves the WIRING: sendResult and
+// send are pulled out of bridge.mjs BY SOURCE (importing it would boot a
 // second daemon) and run against a stub Telegram, so the assertions are about
 // the payloads a client would actually receive. The dash normalizer is REAL
 // here, and switchable, because whether a reply still carries an em dash by the
@@ -328,7 +331,7 @@ const SEND = await import(
   'data:text/javascript,' +
     encodeURIComponent(
       `import { chunks, escHtml, stripHtml, mdToTelegramHtml } from ${url('md-format.mjs')};
-       import { mdToRichBlocks, chunkBlocks, shouldUseRich, stripModeMarkers, detailsToHtml } from ${url('rich-format.mjs')};
+       import { planReply } from ${url('rich-format.mjs')};
        import { normalizeDashes } from ${url('dash-normalize.mjs')};
        const CHAT_ID = 'TEST';
        export let NO_DASHES = false;
@@ -341,10 +344,12 @@ const SEND = await import(
        };
        ${src.match(/let richOk = .*/)[0]}
        const gov = () => ({ coolingDown: () => false }); // the governor, quiet: these tests are about the rails
-       ${grab('sendRich')}
+       ${src.match(/let copyBtnOk = .*/)[0]}
+       ${grab('sendHtmlChunk')}
        ${grab('sendResult')}
-       export { sendResult };
-       export const reset = () => { box.calls = []; box.richFails = false; richOk = true; NO_DASHES = false; };`,
+       ${grab('send')}
+       export { sendResult, send };
+       export const reset = () => { box.calls = []; box.richFails = false; richOk = true; copyBtnOk = true; NO_DASHES = false; };`,
     )
 );
 const ta = async (name, fn) => {
@@ -379,6 +384,45 @@ await ta('with the flag off, the model keeps its own voice', async () => {
   await SEND.sendResult(DASHES.spaced.in);
   const text = SEND.box.calls.map((c) => JSON.stringify(c.payload)).join('');
   ok(/[\u2014]/.test(text), `the flag is off but the dash was still rewritten: ${text}`);
+});
+
+// ---------- copyable code, on the real outbound path ----------
+const TABLE = '| file | status |\n|---|---|\n| a.mjs | ok |\n';
+
+await ta('only a table is a rich message: the prose around it keeps its inline code', async () => {
+  SEND.reset();
+  await SEND.sendResult(`Run \`npm test\` first.\n\n${TABLE}\nThen \`git push\`.`);
+  eq(SEND.box.calls.map((c) => c.method).join(','), 'sendMessage,sendRichMessage,sendMessage', 'rail order');
+  eq(SEND.box.calls[0].payload.text, 'Run <code>npm test</code> first.');
+  eq(SEND.box.calls[2].payload.text, 'Then <code>git push</code>.');
+});
+
+await ta('a table Telegram refuses costs that grid only, and the rest of the reply is sent once', async () => {
+  SEND.reset();
+  SEND.box.richFails = true;
+  await SEND.sendResult(`Before \`a\`.\n\n${TABLE}\nAfter \`b\`.`);
+  const texts = SEND.box.calls.map((c) => c.payload.text);
+  eq(texts.length, 3);
+  eq(texts[0], 'Before <code>a</code>.');
+  ok(texts[1].includes('<b>a.mjs</b>'), 'the table fell back to its HTML rendering');
+  eq(texts[2], 'After <code>b</code>.');
+});
+
+await ta('a block is sent with the plain language and an exact Copy button', async () => {
+  SEND.reset();
+  await SEND.sendResult('Run this:\n\n```bash\nnpm ci && npm test\n```');
+  eq(SEND.box.calls.length, 1);
+  ok(SEND.box.calls[0].payload.text.includes('<pre><code class="language-text">npm ci &amp;&amp; npm test</code></pre>'), 'not a plain block');
+  eq(SEND.box.calls[0].payload.reply_markup.inline_keyboard[0][0].copy_text.text, 'npm ci && npm test');
+});
+
+await ta('send(): a long markdown text is rendered first, so a fence at the limit is not cut', async () => {
+  SEND.reset();
+  const code = Array.from({ length: 10 }, (_, i) => `run-step ${i} --flag`).join('\n');
+  await SEND.send(`${'word '.repeat(780)}\n\n\`\`\`\n${code}\n\`\`\`\n\nDone.`);
+  const texts = SEND.box.calls.map((c) => c.payload.text);
+  eq(texts.length, 2);
+  ok(texts[1].startsWith(`<pre><code class="language-text">${code}</code></pre>`), 'the block did not arrive whole in one message');
 });
 
 // ---------- report ----------

@@ -34,7 +34,7 @@ import { homedir, hostname, platform } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import readline from 'node:readline';
-import { mdToRichBlocks, chunkBlocks, shouldUseRich, stripModeMarkers, detailsToHtml } from './rich-format.mjs';
+import { planReply } from './rich-format.mjs';
 import { chunks, escHtml, stripHtml, mdToTelegramHtml } from './md-format.mjs';
 import { createGovernor } from './tg-governor.mjs';
 import {
@@ -827,25 +827,21 @@ async function tg(method, payload, attempt = 0, { retry429 = true, disposable = 
 // failed send has always produced.
 async function send(text, { markdown = true, disposable = false, opening = false } = {}) {
   let last = null;
-  for (const chunk of chunks(text, TG_MSG_LIMIT)) {
+  // Rendered FIRST, split second. Splitting the raw markdown and rendering
+  // each piece cut a fenced block in two wherever the limit fell: the first
+  // piece had a fence nobody closed, the second a closer nobody opened, and
+  // neither arrived as a code block.
+  const parts = markdown ? chunks(mdToTelegramHtml(text), TG_MSG_LIMIT, { closePre: true }) : chunks(text, TG_MSG_LIMIT);
+  for (const chunk of parts) {
     if (markdown) {
       try {
-        last = await tg(
-          'sendMessage',
-          {
-            chat_id: CHAT_ID,
-            text: mdToTelegramHtml(chunk),
-            parse_mode: 'HTML',
-          },
-          0,
-          { disposable, opening },
-        );
+        last = await tg('sendMessage', { chat_id: CHAT_ID, text: chunk, parse_mode: 'HTML' }, 0, { disposable, opening });
         continue;
       } catch {
         /* fall through to plain */
       }
     }
-    last = await tg('sendMessage', { chat_id: CHAT_ID, text: chunk }, 0, { disposable, opening });
+    last = await tg('sendMessage', { chat_id: CHAT_ID, text: markdown ? stripHtml(chunk) : chunk }, 0, { disposable, opening });
   }
   return last;
 }
@@ -9704,57 +9700,74 @@ const RATE_LIMIT_CACHE = process.env.BRIDGE_RATE_LIMIT_CACHE || path.join(HOME, 
 // never a silent outage. sendResult's job is that the answer always arrives.
 let richOk = process.env.TG_RICH !== '0';
 
-async function sendRich(text) {
-  if (!richOk) return false;
-  // While the chat is cooling down the answer will be HELD, and a held rich
-  // payload cannot degrade to plain text later the way HTML can. Take the HTML
-  // rail now so what waits in the outbox is recoverable.
-  if (gov().coolingDown()) return false;
-  // Rich blocks cannot carry inline bold/code (Telegram drops parse_mode and
-  // entities inside them), so they are used only for a real TABLE, which is the
-  // one thing the HTML path genuinely cannot express.
-  if (!shouldUseRich(text)) return false;
-  const blocks = mdToRichBlocks(stripModeMarkers(text));
-  if (!blocks.length) return false;
-  try {
-    for (const group of chunkBlocks(blocks)) {
-      await tg('sendRichMessage', { chat_id: CHAT_ID, rich_message: { blocks: group } });
+// Same latch shape as richOk, for Bot API 8.0 copy buttons: one rejection (old
+// client, schema drift) drops the button for the rest of the run instead of
+// costing every later message a failed send. The message itself always goes.
+let copyBtnOk = true;
+
+// One HTML message. Degrades in steps rather than all at once: button dropped,
+// then formatting dropped, and only a double failure loses the text.
+async function sendHtmlChunk(chunk, markup) {
+  const msg = { chat_id: CHAT_ID, text: chunk, parse_mode: 'HTML' };
+  if (markup && copyBtnOk) {
+    try {
+      await tg('sendMessage', { ...msg, reply_markup: markup });
+      return;
+    } catch (e) {
+      copyBtnOk = false;
+      console.error(`[bridge] copy button rejected, sending without it for the rest of this run: ${e.message}`);
     }
-    return true;
+  }
+  try {
+    await tg('sendMessage', msg);
   } catch (e) {
-    // A penalty says nothing about the schema: the HTML rail takes over for
-    // this answer and rich stays available for the next one.
-    if (e.code === 429) return false;
-    richOk = false;
-    console.error(`[bridge] rich send failed, falling back to HTML for the rest of this run: ${e.message}`);
-    return false;
+    try {
+      await tg('sendMessage', { chat_id: CHAT_ID, text: stripHtml(chunk) });
+    } catch (e2) {
+      // A swallowed failure here means the user's ANSWER vanished with the
+      // run still reporting "✅ Done" — the worst possible silent failure.
+      console.error(`[bridge] RESULT NOT DELIVERED (${e2.message}; first attempt: ${e.message})`);
+    }
   }
 }
 
+// THE ONE FUNNEL EVERY ENGINE'S ANSWER GOES THROUGH.
+//
+// What goes out is decided by planReply (rich-format.mjs), not here: the plan
+// is the ordered list of messages, each already valid on its own, with its
+// Copy buttons attached. This function only sends it, so the plan can be read
+// and tested without a daemon or a network.
+//
+// Only a table is ever a rich message. The prose around it goes out as HTML,
+// so an inline command keeps its code entity (a rich paragraph is plain text
+// and has nothing to tap). A table Telegram refuses falls back to its own HTML
+// rendering and latches the rich rail off; the rest of the reply is untouched,
+// where the old all-or-nothing path re-sent the whole answer.
 async function sendResult(text) {
-  // THE ONE FUNNEL EVERY ENGINE'S ANSWER GOES THROUGH, which is why the dash
-  // normalizer sits here and not in either runner. Claude has been trained off
-  // em dashes by their CLAUDE.md and Codex has not, and a two-engine bridge whose
-  // replies read in two different registers is the thing this whole job is
-  // about. Off by default in config.example.json; see dash-normalize.mjs for
-  // what it will not touch (code, fences, URLs, the handoff markers).
+  // The dash normalizer sits here and not in either runner: Claude has been
+  // trained off em dashes by their CLAUDE.md and Codex has not, and a two-engine
+  // bridge whose replies read in two different registers is the thing it is
+  // for. Off by default in config.example.json; see dash-normalize.mjs for
+  // what it will not touch (code, URLs, the handoff markers).
   text = normalizeDashes(text, { enabled: NO_DASHES });
-  if (await sendRich(text)) return;
-  // `::: details` becomes an expandable blockquote here, so a message can
-  // collapse detail without giving up inline emphasis.
-  const html = detailsToHtml(stripModeMarkers(text), mdToTelegramHtml);
-  for (const chunk of chunks(html, TG_MSG_LIMIT, { closePre: true })) {
-    try {
-      await tg('sendMessage', { chat_id: CHAT_ID, text: chunk, parse_mode: 'HTML' });
-    } catch (e) {
+  // While the chat is cooling down the answer will be HELD, and a held rich
+  // payload cannot degrade to plain text later the way HTML can.
+  const parts = planReply(text, { limit: TG_MSG_LIMIT, rich: richOk && !gov().coolingDown() });
+  for (const part of parts) {
+    if (part.kind === 'rich' && richOk) {
       try {
-        await tg('sendMessage', { chat_id: CHAT_ID, text: stripHtml(chunk) });
-      } catch (e2) {
-        // A swallowed failure here means the user's ANSWER vanished with the run
-        // still reporting "✅ Done" — the worst possible silent failure.
-        console.error(`[bridge] RESULT NOT DELIVERED (${e2.message}; first attempt: ${e.message})`);
+        await tg('sendRichMessage', { chat_id: CHAT_ID, rich_message: { blocks: part.blocks } });
+        continue;
+      } catch (e) {
+        // A penalty says nothing about the schema: rich stays available. Any
+        // other refusal latches it off rather than doubling every later send.
+        if (e.code !== 429) {
+          richOk = false;
+          console.error(`[bridge] rich send failed, tables go out as HTML for the rest of this run: ${e.message}`);
+        }
       }
     }
+    for (const m of part.kind === 'rich' ? part.fallback : [part]) await sendHtmlChunk(m.html, m.markup);
   }
 }
 

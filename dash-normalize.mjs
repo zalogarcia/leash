@@ -41,16 +41,18 @@
 // job, ready to be pasted into md-format.mjs the day the public port happens.
 // ---------------------------------------------------------------------------
 
+import { codeRanges } from './md-format.mjs';
+
 export const EM_DASH = '\u2014';
 export const EN_DASH = '\u2013';
 
-// A fenced block, an inline code span, a bare URL, the handoff markers, and an
-// HTML tag. Order matters: the fence is matched before the inline span, or a
-// fence containing a backtick pair would be split at the wrong place.
+// A bare URL, the handoff markers, and an HTML tag. Code is NOT in this list:
+// it is located by md-format's codeRanges, the same parser the renderer uses,
+// so what counts as code here is exactly what reaches Telegram as code. The two
+// regexes that used to sit here could not see a four backtick fence or a span
+// delimited by two backticks, and a dash inside one of those was rewritten.
 const PROTECTED = new RegExp(
   [
-    '```[\\s\\S]*?```', // fenced code
-    '`[^`\\n]*`', // inline code
     '<<<[^>]*>>>', // the handoff markers
     'https?://\\S+', // a URL in prose
     '<[^<>\\n]{1,200}>', // an HTML tag, or an <a@b.c> style autolink
@@ -124,15 +126,25 @@ export function normalizeDashes(text, { enabled = true } = {}) {
   // boundary as the end of the line and turn the dash into a full stop in the
   // middle of a sentence.
   const held = [];
+  // NUL-delimited, so the placeholder cannot collide with a number in the
+  // prose and cannot itself be rewritten by any rule below. Same sentinel
+  // md-format.mjs uses when it lifts code spans out of a markdown reply.
+  const hold = (hit) => `\u0000${held.push(hit) - 1}\u0000`;
+  // Code first, by position, so nothing below can match across or inside it.
+  let lifted = '';
+  let at = 0;
+  for (const [a, b] of codeRanges(src)) {
+    if (a < at) continue;
+    lifted += src.slice(at, a) + hold(src.slice(a, b));
+    at = b;
+  }
+  lifted += src.slice(at);
   // A fresh regex per call: PROTECTED is global and lastIndex is state.
-  const masked = src.replace(new RegExp(PROTECTED.source, 'g'), (hit) => {
-    held.push(hit);
-    // NUL-delimited, so the placeholder cannot collide with a number in the
-    // prose and cannot itself be rewritten by any rule below. Same sentinel
-    // md-format.mjs uses when it lifts code spans out of a markdown reply.
-    return `\u0000${held.length - 1}\u0000`;
-  });
-  return normalizeRun(masked).replace(/\u0000(\d+)\u0000/g, (_, i) => held[Number(i)]);
+  const masked = lifted.replace(new RegExp(PROTECTED.source, 'g'), hold);
+  // Restored until none is left: a held URL or tag can itself hold a code span.
+  let done = normalizeRun(masked);
+  for (let pass = 0; pass < 3 && done.includes('\u0000'); pass++) done = done.replace(/\u0000(\d+)\u0000/g, (_, i) => held[Number(i)]);
+  return done;
 }
 
 /** Does this text still carry a dash the rule forbids? For tests and audits. */
