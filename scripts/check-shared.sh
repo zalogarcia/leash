@@ -75,6 +75,10 @@ SHARED_MODULES=(
   bg-draft.test.mjs
   worker-env.mjs
   worker-env.test.mjs
+  wall-guard.mjs
+  wall-guard.test.mjs
+  wall-resume.mjs
+  wall-resume.test.mjs
 )
 
 # NOT LISTED, and why. These modules came from the private sibling and behave

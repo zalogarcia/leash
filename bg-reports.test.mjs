@@ -166,6 +166,10 @@ const M = await import(
         `export const settleOps = () => Promise.all([...pendingOps]);`,
         `const rotateOffLimitedAccount = async () => ({ outcome: ROT.outcome, lines: ['Swapped to the next account. The account is live.'], activeName: 'a', nextName: 'b' });`,
         `const swapFailedLine = () => 'swap failed';`,
+        // THE USAGE WALL GUARD: a death on the wall is recorded for the resume
+        // at the lift. Recorded here; its use is wall-guard-wiring.test.mjs's.
+        `export const WALL_DEATHS = [];`,
+        `const noteWallDeath = (runId, task, opts) => { WALL_DEATHS.push({ runId, task, ...opts }); };`,
         grab('bgDraftPath'),
         grab('bgRunLogPath'),
         grab('isWorkerDeathText'),
@@ -831,6 +835,13 @@ t('★ WALL UP, Codex chat lane: the handback goes as always; the wall death is 
   eq(w?.handback, 'delivered');
   eq(w?.died, true);
   ok(Number(w?.deliveredAt) > 0);
+});
+
+t('★ the usage wall guard: a death on the wall is recorded for the resume, with its brief', () => {
+  const d = M.WALL_DEATHS.find((x) => x.runId === 'bg8-1790000000500');
+  ok(d, JSON.stringify(M.WALL_DEATHS));
+  eq(d.task, WALL_TASK, 'the whole brief, which the resume puts back behind its note');
+  eq(d.finalReportSeen, false);
 });
 
 // No wall episode (a rehearsal wall from config, or none at all): today's

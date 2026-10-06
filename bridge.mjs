@@ -308,6 +308,11 @@ import { codexAccountBlock, createCodexAccount, fetchCodexRateLimits, readCodexR
 import { normalizeDashes } from './dash-normalize.mjs';
 import { describeWhen, isDailyDue } from './schedule-due.mjs';
 import { createWallWake, pickNextAccount } from './wall-wake.mjs';
+// THE USAGE WALL GUARD: the checkpoint steer before an all-accounts wall and the
+// resume of the workers that died on it, after. Both pure and shared; the
+// wiring is wallGuardTick and resumeWallDeaths below.
+import { wallGuardSettings, wallGuardStatusLine, checkpointCandidates, checkpointDecision, checkpointSteerText, checkpointNotice, nextAccountAfter, createWallGuardStore, baseRunId } from './wall-guard.mjs';
+import { resumeCandidates, resumePlan, resumeTiming, resumeNote, resumeBrief, resumeQueueItem, resumeWakeLines, resumeLiftNotice, liftNoticeDue, checkpointCommitFrom, sameJobTitle } from './wall-resume.mjs';
 import {
   CODEX_EFFORTS,
   canProduceHandoff,
@@ -2045,6 +2050,16 @@ function runClaude(
         model: st.model || DEFAULT_MODEL || null,
         effort: DEFAULT_EFFORT || null,
       });
+      // THE WALL GUARD'S DISPATCH RECORD (wall-guard.mjs): the facts a resume
+      // after an all-accounts wall must carry over that the brief does not. The
+      // scheduled run mark above all: a job resumed without it would run as
+      // attended, and the hooks that hold an unattended run's writes would not
+      // hold its. Best effort: a record that fails costs a resume, never a run.
+      try {
+        if (schedule?.id != null) wallGuard.job(`${lane.name || 'bg'}-${startedAt}`, { scheduleId: schedule.id, allowWrite: schedule.allowWrite === true });
+      } catch (e) {
+        console.error('[bridge] wall guard dispatch record failed:', e.message);
+      }
     }
     run.terminate = () => {
       child.kill('SIGTERM');
@@ -2927,6 +2942,12 @@ const BG_HELD_FILE = path.join(SCRIPT_DIR, 'bg-held.json');
 // wall-wake.mjs and liftClaudeWall.
 const WALL_WAKE_FILE = path.join(SCRIPT_DIR, 'wall-wake.json');
 const wallWake = createWallWake({ file: WALL_WAKE_FILE, log: (m) => console.error(`[bridge] wall wake-up: ${m}`) });
+// THE USAGE WALL GUARD's record (wall-guard.mjs): which workers were told to
+// save in which window, each worker's dispatch facts, the deaths waiting for the
+// lift and the deaths already resumed. On disk beside the wall episode, for the
+// same reason: a restart must undo neither a steer nor a resume.
+const WALL_GUARD_FILE = path.join(SCRIPT_DIR, 'wall-guard.json');
+const wallGuard = createWallGuardStore({ file: WALL_GUARD_FILE, log: (m) => console.error(`[bridge] wall guard: ${m}`) });
 const BG_CLI = path.join(SCRIPT_DIR, 'bg.mjs');
 const BG_RESULTS_FILE = path.join(SCRIPT_DIR, 'bg-results.jsonl'); // background outcomes the chat lane can read back
 // THE CHAT RING: the last ten turns of THIS conversation, both engines, on
@@ -4724,13 +4745,26 @@ function liftClaudeWall(via, { live = null, movedNow = false, sweep = false } = 
       handbackCapNotified = false;
       lastParkedAt = 0;
     }
+    const liftedAt = Number(ep.until) > 0 && ep.until <= now ? ep.until : now;
+    // THE WALL GUARD'S RESUMES (wall-resume.mjs), queued HERE: after the claim,
+    // so once per wall across restarts, and before the wake-up is written, so
+    // the wake-up can tell the chat lane which jobs are already queued again
+    // ("do not dispatch these again") and which were not, with the reason.
+    // Never throws into the lift: a failure here costs the resumes, not the
+    // wake-up.
+    let resumes = { resumed: [], skipped: [], timing: null };
+    try {
+      resumes = resumeWallDeaths(ep, { readyAt: liftedAt, now });
+    } catch (e) {
+      console.error('[bridge] wall guard resume failed; the wake-up lists the workers as before:', e.message);
+    }
     const note = (count, withMessage) =>
       wallWakePrompt({
         name: BRIDGE_NAME,
         ownerName: OWNER_NAME,
         live: liveName,
         liveSince: movedAt || (ep.movedTo && ep.movedTo === liveName ? ep.movedAt : null),
-        liftedAt: Number(ep.until) > 0 && ep.until <= now ? ep.until : now,
+        liftedAt,
         workers: ep.workers,
         parked: [...(ep.carried?.parked || []), ...parked],
         chatsParked: count,
@@ -4738,11 +4772,25 @@ function liftClaudeWall(via, { live = null, movedNow = false, sweep = false } = 
         bgCli: BG_CLI,
         timeZone: OWNER_TZ,
         now,
+        resumeLines: resumeWakeLines(resumes),
       });
     // A Codex chat lane ignores a prepend, so the note is folded only where it
     // will be read.
     const chats = flushParkedWalledChats({ fold: chatLaneEngine() === 'codex' ? null : (count) => note(count, true) });
     flushParkedWalledJobs();
+    // The resumes are in the drop box now; start them through the same drain
+    // (and the same cap) as any handoff, rather than at the next long poll.
+    if (resumes.resumed.length) drainBgHandoff();
+    // ONE LINE TO THE OWNER for the resumes, when a worker died on the wall
+    // (resumed or not): written by the bridge, once, because this lift's claim
+    // is once per wall. A worker that only finished is in the wake-up already.
+    try {
+      if (liftNoticeDue(resumes)) {
+        send(resumeLiftNotice({ ...resumes, late: Boolean(resumes.timing?.late), lateMin: resumes.timing?.lateMin || 0 }), { markdown: false }).catch(() => {});
+      }
+    } catch (e) {
+      console.error('[bridge] wall guard lift notice failed; the wake-up still runs:', e.message);
+    }
     let carrier = chats.folded ? 'a parked chat message' : null;
     if (!carrier && flushParkedCodexChats({ fold: note(chats.count, false) })) carrier = 'the Codex catch-up';
     if (!carrier) {
@@ -4783,6 +4831,316 @@ function ownerLiftedWall(name = null) {
   if (!wallWake.pending()) return null;
   wallWake.vouched({ name, now: Date.now() });
   return liftClaudeWall('manual', { live: name || null, movedNow: Boolean(name) });
+}
+
+// ---------------------------------------------------------------------------
+// THE USAGE WALL GUARD (2026-10-06): save the work before the wall, restart it
+// after. The decisions, the texts and the record are pure (wall-guard.mjs,
+// wall-resume.mjs, both shared modules); what follows is only
+// the wiring: where the reading, the workers, the selector's verdict and the
+// clock come from, and where the steer, the notices and the resumes go.
+//
+// The case it exists for: eight workers used a whole five hour window in about
+// ninety minutes with every other account already at its limit, several died
+// with uncommitted work, and each needed a resume brief written by hand.
+// ---------------------------------------------------------------------------
+
+/** The settings, read fresh: config.json `wallGuard`, ON with the defaults when absent. */
+function wallGuardNow() {
+  // From config.json an object or `false`; from the environment a string,
+  // where "false" switches it off and JSON text is read as the object.
+  const v = conf('wallGuard');
+  return wallGuardSettings(typeof v === 'string' && v.trim().startsWith('{') ? confObj('wallGuard') : v);
+}
+
+// The selector's verdict costs a probe per candidate it has to ask about, so
+// the tick asks at most this often. The poll loop runs about every 50 s, and
+// a window burning at the morning's pace moves about one percent a minute.
+const WALL_GUARD_PROBE_MS = 60_000;
+let wallGuardLastProbe = 0;
+let wallGuardInflight = null;
+// The last reason the tick stood down, so the log says it once, not per tick.
+let wallGuardLastSkip = null;
+
+/** One tick at a time; the poll loop calls this every cycle. */
+function kickWallGuard() {
+  if (wallGuardInflight) return wallGuardInflight;
+  const op = wallGuardTick().catch((e) => {
+    console.error('[bridge] wall guard tick failed:', e.message);
+    return null;
+  });
+  wallGuardInflight = op;
+  pendingOps.add(op);
+  op.finally(() => {
+    pendingOps.delete(op);
+    if (wallGuardInflight === op) wallGuardInflight = null;
+  });
+  return op;
+}
+
+function wallGuardSkip(reason, key = null) {
+  const tag = `${reason}|${key || ''}`;
+  if (tag === wallGuardLastSkip) return { fired: false, reason };
+  wallGuardLastSkip = tag;
+  // Only the reasons that say something about an armed window are worth a
+  // line: "below threshold" every 50 seconds is not.
+  if (key) logAccountDecision({ decision: 'wall_guard_standing_down', reason });
+  return { fired: false, reason };
+}
+
+/**
+ * THE CHECKPOINT STEER (wall-guard.mjs). Cheap until it matters: with no
+ * Claude worker running nothing is read at all; otherwise the live account's
+ * usage (the cached lookup /status reads, at most one request a minute) and
+ * the worker list decide whether the window is armed and anyone is left to
+ * tell, and only then is the selector asked
+ * whether another account could take a run (the SAME rule a rotation uses,
+ * pickHealthyAccount, so there is one definition of "available"). Each worker
+ * is told once per window, through steerInto, the one place a steer is
+ * delivered, so it arrives in the frame `bg.mjs steer` produces. The owner
+ * gets one line per window. Nothing here stops a worker or touches a login.
+ */
+async function wallGuardTick(now = Date.now()) {
+  const settings = wallGuardNow();
+  if (!settings.enabled || !CLAUDE_AVAILABLE) return { fired: false, reason: 'off' };
+  // The wall is already up: what was running has died or is held, and a
+  // checkpoint now would land in a run that cannot act on it.
+  if (now < rotationPausedUntil) return { fired: false, reason: 'wall up' };
+  // Nothing to tell, nothing to read: the usage lookup is a network request.
+  if (!bgWorkerDescriptors().some((w) => (w.engine || 'claude') === 'claude')) return wallGuardSkip('no Claude worker running');
+  const snap = await withDeadline(accountUsage.activeOnly(), 3_000, null);
+  const account = snap?.active?.name || null;
+  const usage = snap?.row?.usage || null;
+  now = Date.now();
+  const pre = checkpointCandidates({ settings, usage, account, now, workers: bgWorkerDescriptors() });
+  if (!pre.ready) return wallGuardSkip(pre.reason);
+  const left = checkpointCandidates({ settings, usage, account, now, workers: bgWorkerDescriptors(), steered: wallGuard.handled(pre.key) });
+  if (!left.ready) return wallGuardSkip(left.reason);
+  if (now - wallGuardLastProbe < WALL_GUARD_PROBE_MS) return { fired: false, reason: 'waiting for the next selector check' };
+  wallGuardLastProbe = now;
+  const sel = await withDeadline(pickHealthyAccount({ activeName: account, lines: [], quiet: true }), WALL_LIFT_SWEEP_WAIT_MS, null);
+  const othersFree = sel ? sel.outcome === 'selected' : null;
+  // RE-READ after the await: a worker may have ended, a steer may have landed
+  // from another path, and the wall itself may have gone up meanwhile.
+  const at = Date.now();
+  if (at < rotationPausedUntil) return { fired: false, reason: 'wall up' };
+  const d = checkpointDecision({ settings, usage, account, now: at, othersFree, workers: bgWorkerDescriptors(), steered: wallGuard.handled(pre.key) });
+  if (!d.fire) return wallGuardSkip(d.reason, d.key);
+  wallGuardLastSkip = null;
+  const init = { account, kind: d.window.kind, percent: d.window.percent, resetsAt: d.window.resetsAtMs };
+  const text = checkpointSteerText({ percent: d.window.percent, windowLabel: d.window.label, resume: settings.resume });
+  const steered = [];
+  const unreachable = [];
+  for (const w of d.targets) {
+    const res = steerInto(w.runId, text);
+    if (res?.ok) {
+      wallGuard.steered(d.key, w.runId, { lane: w.lane, title: w.title }, init);
+      steered.push(w);
+    } else {
+      const why = res?.reason ? `the steer was refused: ${res.reason}` : 'the steer was refused';
+      wallGuard.unreachable(d.key, w.runId, { lane: w.lane, title: w.title, why }, init);
+      unreachable.push({ ...w, why });
+    }
+  }
+  for (const w of d.unreachable) {
+    // A survivor of a restart has no run handle here; a live one that cannot
+    // be steered is ending (its result is in, its stdin is closing).
+    const why = w.run ? 'its run is ending, no longer steerable' : 'survived a restart, no pipe to it';
+    wallGuard.unreachable(d.key, w.runId, { lane: w.lane, title: w.title, why }, init);
+    unreachable.push({ ...w, why });
+  }
+  logAccountDecision({
+    decision: 'wall_guard_checkpoint',
+    account,
+    count: steered.length,
+    reason: `${Math.round(d.window.percent)}% of ${d.window.label}, no other account free; ${steered.length} told to save, ${unreachable.length} unreachable (${unreachable.map((w) => w.runId).join(', ') || 'none'})`,
+  });
+  // ONE LINE PER WINDOW, claimed (and persisted) before it is sent, so a
+  // restart, or a worker that starts later in the same window, sends nothing.
+  if (wallGuard.claimNotice(d.key, init)) {
+    const next = nextAccountAfter({ rows: accounts.describe(at), active: account, activeResetMs: d.window.resetsAtMs, now: at });
+    send(
+      checkpointNotice({
+        account,
+        percent: d.window.percent,
+        windowLabel: d.window.label,
+        thresholdPercent: settings.thresholdPercent,
+        steered,
+        unreachable,
+        next: next ? { name: next.name, clock: fmtUntil(next.atMs, { timeZone: OWNER_TZ }), guessed: next.guessed } : null,
+      }),
+      { markdown: false },
+    ).catch(() => {});
+  }
+  return { fired: true, key: d.key, steered: steered.map((w) => w.runId), unreachable: unreachable.map((w) => w.runId) };
+}
+
+/**
+ * The drop box half of a worker's dispatch record: its directory pin and, for
+ * a job the guard resumed, its place in the chain. The spawn half (the
+ * scheduled run mark, the account) is written by runClaude.
+ */
+function noteWallGuardJob(runId, it) {
+  const patch = {};
+  if (it.cwd) patch.cwd = it.cwd;
+  if (it.resumeOf) {
+    patch.resumeOf = it.resumeOf;
+    patch.resumeCount = Number(it.resumeCount) || 1;
+    patch.resumeRoot = it.resumeRoot || it.resumeOf;
+  }
+  if (Object.keys(patch).length) wallGuard.job(runId, patch);
+}
+
+/**
+ * The last "WIP checkpoint" commit a run made, read off its own log: the
+ * evidence the worker cannot author. Null when there is none or no log.
+ */
+function readCheckpointCommit(logPath) {
+  try {
+    if (!logPath || !existsSync(logPath)) return null;
+    const hits = readFileSync(logPath, 'utf8')
+      .split('\n')
+      .filter((l) => l.includes('WIP checkpoint'));
+    return hits.length ? checkpointCommitFrom(hits.join('\n')) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A CLAUDE WORKER DIED ON THE WALL. Its brief, its draft and report paths,
+ * whether it had already written its final report, and its checkpoint commit
+ * go into the guard's record, where the lift finds them. Never throws: the
+ * handback this rides beside is load bearing and this is not.
+ */
+function noteWallDeath(runId, task, { draft = null, finalReportSeen = false, account = null } = {}) {
+  try {
+    const draftFile = draft?.file || (existsSync(bgDraftPath(runId)) ? bgDraftPath(runId) : null);
+    wallGuard.death(runId, {
+      text: String(task || ''),
+      title: briefTitle(stripLaneRules(String(task || '')), 300),
+      draft: draftFile,
+      report: bgReportPath(runId),
+      runLog: bgRunLogPath(runId),
+      finalReportSeen: Boolean(finalReportSeen),
+      checkpoint: readCheckpointCommit(bgRunLogPath(runId)),
+      ...(account ? { account } : {}),
+    });
+    console.log(`[bridge] wall guard: ${runId} died on the wall; recorded for the resume at the lift`);
+  } catch (e) {
+    console.error(`[bridge] wall guard could not record the death of ${runId}:`, e.message);
+  }
+}
+
+/**
+ * IS THIS RUN STILL ALIVE? The live worker registry and the process, never a
+ * log line: on 2026-09-25 a "died on a limit" line was wrong and a second
+ * worker was sent onto a live one.
+ */
+function runIsAlive(runId) {
+  const id = baseRunId(runId);
+  if (bgWorkerDescriptors().some((w) => baseRunId(w.runId) === id || baseRunId(w.watchdogId || '') === id)) return true;
+  return Object.entries(inflight.read()).some(([k, rec]) => baseRunId(k) === id && rec?.pid && pidAlive(rec.pid));
+}
+
+/** Every title running, queued or held right now: a resume never doubles one. */
+function activeJobTitles() {
+  const titles = bgWorkerDescriptors().map((w) => w.title);
+  for (const r of queuedBgJobRows()) titles.push(r.title);
+  for (const it of readHeldBgJobs()) {
+    const text = typeof it === 'string' ? it : it?.text;
+    if (text) titles.push(briefTitle(stripLaneRules(parseEnginePrefix(text).text)));
+  }
+  return titles.filter(Boolean);
+}
+
+/** Resumes to the TAIL of the drop box, the shape bg.mjs writes. False on a failed write. */
+function queueResumeJobs(items) {
+  let queued = [];
+  try {
+    const raw = JSON.parse(readFileSync(BG_QUEUE_FILE, 'utf8'));
+    if (Array.isArray(raw)) queued = raw;
+  } catch {
+    queued = []; // no file, or a half-written one: these are the queue
+  }
+  try {
+    const tmp = `${BG_QUEUE_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify([...queued, ...items], null, 2));
+    renameSync(tmp, BG_QUEUE_FILE);
+    return true;
+  } catch (e) {
+    console.error('[bridge] wall guard could not queue the resumes:', e.message);
+    return false;
+  }
+}
+
+/**
+ * THE RESUMES AT THE LIFT (wall-resume.mjs). Called by liftClaudeWall right
+ * after it claims the wake-up (once per wall, across restarts) and BEFORE the
+ * wake-up is written, so the wake-up can say which jobs are already queued
+ * again. Each death is claimed in the guard's record before anything is
+ * queued, so a restart never queues it twice; the queue is the ordinary drop
+ * box, so the concurrency cap applies; and each item is pinned to Claude, so
+ * a wall that comes back before the drain holds it instead of sending it to
+ * Codex. Each item also carries the PACE (`resumeMaxConcurrent`), so the dead
+ * workers come back a few at a time and not all at once. Returns { resumed,
+ * skipped, timing, maxRunning }.
+ */
+function resumeWallDeaths(ep, { readyAt = null, now = Date.now() } = {}) {
+  const settings = wallGuardNow();
+  // The episode's own start, or the one it carried forward: a death recorded
+  // before that belongs to a wall long gone. A minute of slack for the wall
+  // being raised a moment after the first death was recorded.
+  const since = (Number(ep?.carried?.from) || Number(ep?.raisedAt) || 0) - 60_000;
+  const { candidates, stale } = resumeCandidates({ episodeWorkers: ep?.workers || [], deaths: wallGuard.deaths(), since });
+  for (const id of stale) wallGuard.settleDeath(id);
+  const timing = resumeTiming({ readyAt, now, withinMinutes: settings.resumeWithinMinutes });
+  if (!candidates.length) return { resumed: [], skipped: [], timing };
+  const busy = activeJobTitles();
+  const plan = resumePlan({
+    candidates: candidates.map((c) => ({ ...c, task: c.text ? stripLaneRules(String(c.text)) : '' })),
+    settings,
+    isAlive: (id) => runIsAlive(id),
+    isBusy: (title) => busy.some((b) => sameJobTitle(b, title)),
+    wasResumed: (id) => wallGuard.wasResumed(id),
+  });
+  const items = [];
+  const resumed = [];
+  const skipped = [...plan.skip];
+  for (const r of plan.resume) {
+    const note = resumeNote({
+      runId: r.runId,
+      endedClock: Number(r.at) > 0 ? fmtUntil(r.at, { timeZone: OWNER_TZ }) : null,
+      account: r.account || null,
+      count: r.count,
+      max: r.max,
+      draft: r.draft && existsSync(r.draft) ? r.draft : null,
+      report: r.report && existsSync(r.report) ? r.report : null,
+      checkpoint: r.checkpoint || null,
+      // No salvage tool ships with this repo, so the note names the dead
+      // run's own log for its writes.
+      writesCommand: null,
+      runLog: r.runLog || null,
+    });
+    const brief = resumeBrief({ text: r.text, task: r.task, title: briefTitle(r.task, 300), count: r.count, max: r.max, note });
+    if (!wallGuard.claimResume(r.runId, { count: r.count, title: brief.title, root: r.resumeRoot || r.runId })) {
+      skipped.push({ ...r, reason: 'the resume claim could not be saved, so it was not queued' });
+      continue;
+    }
+    items.push(resumeQueueItem({ death: r, text: brief.text, count: r.count, now, maxRunning: settings.resumeMaxConcurrent }));
+    resumed.push({ runId: r.runId, title: r.title || briefTitle(r.task), newTitle: brief.title, count: r.count, max: r.max });
+  }
+  if (items.length && !queueResumeJobs(items)) {
+    // Claimed and not queued: never claimed twice, so they go to the chat lane.
+    for (const r of resumed.splice(0)) skipped.push({ ...r, reason: 'the drop box would not take it; dispatch it by hand' });
+  }
+  for (const c of [...resumed, ...skipped]) wallGuard.settleDeath(c.runId);
+  logAccountDecision({
+    decision: 'wall_guard_resume',
+    count: resumed.length,
+    reason: `${resumed.length} resumed (${resumed.map((r) => r.runId).join(', ') || 'none'}), ${skipped.length} not${timing.late ? `; late, ${timing.lateMin} min after the account was ready` : ''}${settings.resumeMaxConcurrent > 0 ? `; paced at ${settings.resumeMaxConcurrent} at a time` : ''}`,
+  });
+  return { resumed, skipped, timing, maxRunning: settings.resumeMaxConcurrent };
 }
 
 /**
@@ -4988,11 +5346,16 @@ const codexTakingChat = () => codexCanTakeChat() && !codexWalled();
 // `draft` is the worker's draft report (bg-draft.mjs) when it left one. This is
 // THE case the draft exists for: a limit most often lands inside the verifier
 // dispatch, the most expensive step, after all the work was already done.
-async function handleLimitDeath(task, outcome, runId, steers = [], draft = null) {
+async function handleLimitDeath(task, outcome, runId, steers = [], draft = null, { finalReportSeen = false } = {}) {
   const detail = String(outcome.answer || '');
   const rot = await rotateOffLimitedAccount(detail);
   if (rot.outcome === 'no_claude') return;
   const lines = rot.lines;
+  // DIED ON THE WALL: the death that raised it, or one while it stood. The
+  // wall guard's resume (wall-resume.mjs) records it with its brief, and the
+  // lift queues it again.
+  const wallDeath = rot.outcome === 'exhausted' || rot.outcome === 'paused';
+  if (wallDeath) noteWallDeath(runId, task, { draft, finalReportSeen, account: rot.activeName || null });
   // The worker lane's own voice, unchanged: a bubble it can read later, naming
   // both halves of the swap.
   if (rot.outcome === 'swapped') {
@@ -5015,7 +5378,7 @@ async function handleLimitDeath(task, outcome, runId, steers = [], draft = null)
       draft,
       // Died ON the wall (the death that raised it, or one while it stood): the
       // lift's wake-up lists it whether or not this handback is held.
-      wallDeath: rot.outcome === 'exhausted' || rot.outcome === 'paused',
+      wallDeath,
       endingNote: `${BRIDGE_NAME.toUpperCase()} NOTE: this worker died on a session limit. The account rotation ALREADY RAN; its output is below the draft, under the "HOW THE WORKER ENDED" rule in the full report file. Read that section before relaunching anything.`,
     },
   );
@@ -5215,7 +5578,7 @@ function reportBgOutcome(task, outcome, runId = null, { steers = [], finalReport
   // "You've hit your session limit"), and rotating on a quotation would burn
   // accounts for nothing.
   if (outcome.status === 'failed' && isLimitSignal(outcome.answer)) {
-    const op = handleLimitDeath(task, outcome, id, steers, draft).catch((e) => {
+    const op = handleLimitDeath(task, outcome, id, steers, draft, { finalReportSeen: seen }).catch((e) => {
       console.error('[bridge] account rotation failed:', e.message);
       handBackToChat(task, outcome.answer, outcome.status, id, steers, { draft }); // the report must never be lost to a rotation bug
     });
@@ -9144,6 +9507,7 @@ function queuedBgJobRows({ running = runningBgWorkers() } = {}) {
         bypass: Boolean(typeof it === 'object' && it?.now),
         title: briefTitle(stripLaneRules(pre.text)),
         queuedAt: (typeof it === 'object' && it?.queuedAt) || null,
+        maxRunning: (typeof it === 'object' && it?.maxRunning) || null, // a resumed job's own pace
       };
     })
     .filter(Boolean);
@@ -9342,7 +9706,14 @@ function drainBgHandoff() {
     // `--now` is the only way past, and it has to be typed at dispatch: a cap
     // that lifts itself under load is not a cap, and load is when it matters.
     const bypass = Boolean(typeof it === 'object' && it?.now);
-    if (!hasSlot({ running, max: MAX_CONCURRENT_WORKERS, engine: 'claude', bypass })) {
+    // A JOB'S OWN, LOWER CAP: a job the wall guard resumed carries its pace
+    // (`maxRunning`, wall-resume.mjs) and starts only while fewer Claude
+    // workers than that are running, so the workers a wall killed do not all
+    // come back at once and use the next window the way they used the last.
+    // It can only lower the cap (bg-admission.mjs slotCap). A deferred resume
+    // does not hold back an ordinary job behind it.
+    const itemMax = typeof it === 'object' && it ? it.maxRunning : null;
+    if (!hasSlot({ running, max: MAX_CONCURRENT_WORKERS, engine: 'claude', bypass, itemMax })) {
       deferred.push(typeof it === 'object' && it ? it : { text: queuedText });
       continue;
     }
@@ -9380,6 +9751,15 @@ function drainBgHandoff() {
         : null;
     dispatchPrompt(text, lane, { priority: true, schedule }); // already claimed out of the file: must not be dropped
     running++; // this worker is live from here on, so the next item sees a fuller pool
+    // THE WALL GUARD'S DISPATCH RECORD, the drop box half: the directory pin
+    // and, for a job the guard itself resumed, its place in the resume chain
+    // (wall-resume.mjs). Its own try, after the dispatch: decoration must never
+    // cost the job.
+    try {
+      if (lane.current?.startedAt && typeof it === 'object' && it) noteWallGuardJob(`${lane.name}-${lane.current.startedAt}`, it);
+    } catch (e) {
+      console.error('[bridge] wall guard dispatch record failed (the job was already dispatched):', e.message);
+    }
     try {
       // runClaude sets lane.current synchronously, so the id exists by now. If
       // it somehow does not, handoffNotice falls back to the lane name.
@@ -10334,6 +10714,7 @@ async function handleCommand(text, msg = null) {
               reason: st.lastWakeUp?.reason ?? null,
               timeZone: OWNER_TZ,
             }),
+            wallGuard: wallGuardStatusLine(wallGuardNow()),
             usageBlock: liveUsage ? usageLine(liveUsage.row, { timeZone: OWNER_TZ }) : null,
             // THE HEALTH LEDGER, one row per account. The usage line above
             // answers "how much headroom is left where I am"; this answers
@@ -11852,6 +12233,10 @@ async function pollLoop() {
         flushParkedWalledJobs(); // and the handed-off jobs that had no account
       }
       drainBgHandoff();
+      // THE USAGE WALL GUARD (wallGuardTick): near the wall with no account to
+      // rotate to, every running Claude worker is told once to save a
+      // checkpoint. Reads nothing while no Claude worker is running.
+      kickWallGuard();
       // A LIVE ACCOUNT THAT IS ALREADY KNOWN DOWN. Cheap (one ledger read) and
       // on the same slow cadence as the drift check, because the expensive half
       // only runs when it has somewhere to move to.

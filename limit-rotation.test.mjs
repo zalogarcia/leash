@@ -89,6 +89,13 @@ import { fmtLeft } from ${url('usage-limits.mjs')};
 // the chat session and its user would.
 import { createWallWake, pickNextAccount } from ${url('wall-wake.mjs')};
 import { wallWakePrompt, limitWallLine, needsLoginNotice } from ${url('system-messages.mjs')};
+// THE USAGE WALL GUARD's lines: the lift folds them into the wake-up. Real
+// builders; the resumes themselves are wall-guard-wiring.test.mjs's subject, so
+// here the lift finds none and the wake-up must read as it did.
+import { resumeWakeLines, resumeLiftNotice, liftNoticeDue } from ${url('wall-resume.mjs')};
+export const RESUME_CALLS = [];
+const resumeWallDeaths = (ep, opts) => { RESUME_CALLS.push({ runIds: (ep?.workers || []).map((w) => w.runId), ...opts }); return { resumed: [], skipped: [], timing: null }; };
+const drainBgHandoff = () => {};
 import { unlinkSync } from 'node:fs';
 
 // The clock is frozen at the incident, so a "one hour out" guess is a value a
@@ -1116,6 +1123,7 @@ await B.rotateOffLimitedAccount(WALL);
 B.wallWake.worker({ runId: 'bg39-1790775701643', title: 'Re-check walled accounts', status: 'died on a session limit', report: '/bridge/bg-reports/bg39-1790775701643.md', draft: '/bridge/bg-reports/bg39-1790775701643.draft.md', died: true, handback: 'held' });
 toTheReset();
 B.DISPATCHED.length = 0;
+B.RESUME_CALLS.length = 0;
 let lift = await B.liftClaudeWall('reset', { sweep: true });
 await t('★ THE LIFT, nothing parked: exactly ONE daemon-authored wake-up turn in the chat lane', () => {
   eq(mainTurns().length, 1, JSON.stringify(B.DISPATCHED.map((d) => d.text.slice(0, 60))));
@@ -1139,6 +1147,11 @@ lift = await B.liftClaudeWall('poll', { sweep: true });
 await t('★ a second lift of the same wall does not wake the chat twice', () => {
   eq(mainTurns().length, 1);
   eq(lift, null);
+});
+await t('★ the usage wall guard: the lift asks for the resumes ONCE per wall, after the claim, with the episode and the lift time', () => {
+  eq(B.RESUME_CALLS.length, 1, JSON.stringify(B.RESUME_CALLS));
+  eq(B.RESUME_CALLS[0].runIds.join(','), 'bg39-1790775701643', 'the claimed episode, with the worker that died on the wall');
+  ok(Number(B.RESUME_CALLS[0].readyAt) > 0 && Number(B.RESUME_CALLS[0].now) >= Number(B.RESUME_CALLS[0].readyAt), JSON.stringify(B.RESUME_CALLS[0]));
 });
 
 // A parked chat in the same lift: the note rides in front of it. One turn.

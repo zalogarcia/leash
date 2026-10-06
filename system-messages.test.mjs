@@ -97,6 +97,8 @@ import {
   bothWalledLine,
   enginesBackLine,
 } from './system-messages.mjs';
+import { resumeWakeLines } from './wall-resume.mjs';
+import { wallGuardSettings, wallGuardStatusLine } from './wall-guard.mjs';
 import { readFileSync } from 'node:fs';
 import { escHtml } from './md-format.mjs';
 // The REAL bar and the REAL window row, so a gauge assertion below cannot pass
@@ -1449,6 +1451,42 @@ t('wall wake-up: ★ a carried row says it was already listed, never "NOT delive
   const mixed = wallWakePrompt({ ...CARRIED_ARGS, parked: [...CARRIED_ARGS.parked, WAKE_ARGS.parked[0]] });
   ok(mixed.includes('📥 2 reports the capped handback chain was holding, 1 of them NOT reported to you before:'), mixed);
   ok(wallWakePrompt(WAKE_ARGS).includes('📥 1 report the capped handback chain was holding, NOT reported to you before:'), 'fresh rows keep the old header');
+});
+
+// THE USAGE WALL GUARD: the wake-up names the jobs the bridge already queued
+// again, with "Do NOT dispatch these again", and every job it did not resume
+// with the reason, from the real builder in wall-resume.mjs.
+const RESUME_LINES = resumeWakeLines({
+  resumed: [{ runId: 'bg39-1790775701643', title: 'Re-check walled accounts', count: 1, max: 2 }],
+  skipped: [
+    { runId: 'bg41-1790776000000', title: 'Reels batch', reason: 'it finished; its report is held for you' },
+    { runId: 'bg42-1790776000001', title: 'The audit', reason: 'its brief says Auto-resume: no' },
+  ],
+});
+t('wall wake-up: ★ the jobs already resumed, "Do NOT dispatch these again", and the rest with their reasons', () => {
+  const s = wallWakePrompt({ ...WAKE_ARGS, resumeLines: RESUME_LINES });
+  ok(s.includes('🔁 The bridge already RESUMED 1 job'), s);
+  ok(s.includes('Do NOT dispatch these again:'), s);
+  ok(s.includes('  1. bg39-1790775701643 · Re-check walled accounts · queued as resume 1 of 2'), s);
+  ok(s.includes('⏸ The bridge did NOT resume 2 jobs; each is yours to decide:'), s);
+  ok(s.includes('bg41-1790776000000 · Reels batch · it finished; its report is held for you'), s);
+  ok(s.includes('bg42-1790776000001 · The audit · its brief says Auto-resume: no'), s);
+  ok(s.includes('never dispatch a resumed job again'), 'the pick-up instruction says it too');
+  ok(s.indexOf('🔁') < s.indexOf('🔍 Pick up now'), 'before the instruction it qualifies');
+  ok(!s.includes('\n\n'), 'no blank line inside the note: the fold relies on it');
+  noDashes(s, 'wallWakePrompt/resume');
+});
+
+t('wall wake-up: no resume lines leaves the note exactly as it was', () => {
+  eq(wallWakePrompt({ ...WAKE_ARGS, resumeLines: [] }), wallWakePrompt(WAKE_ARGS));
+  ok(wallWakePrompt(WAKE_ARGS).includes('↳ relaunch ONLY the remainders (a limit death already carries its account rotation)'));
+});
+
+t('status: the wall guard row sits above the usage gauges, house style', () => {
+  const s = statusHeader({ ...HEADER_ARGS, wallGuard: wallGuardStatusLine(wallGuardSettings(undefined)) });
+  ok(s.includes('🛡 Wall guard: save at 95% · resume on, within 5 min, at most 2 per job'), s);
+  noDashes(s, 'statusHeader/wallGuard');
+  eq(statusHeader({ ...HEADER_ARGS, wallGuard: null }), statusHeader(HEADER_ARGS), 'absent, nothing changes');
 });
 
 t('wall wake-up: ★ no dashes, no tokens, no model names', () => {

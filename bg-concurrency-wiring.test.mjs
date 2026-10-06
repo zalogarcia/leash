@@ -148,6 +148,10 @@ const raiseClaudeWall = () => Promise.resolve();
 const armWallResume = () => {};
 const send = (text) => { SENT.push(text); return Promise.resolve(); };
 const recordBgResult = (task, outcome) => { RESULTS.push({ task, outcome }); };
+// THE WALL GUARD'S DISPATCH RECORD: recorded; its use is
+// wall-guard-wiring.test.mjs's subject.
+export const WALL_JOBS = [];
+const noteWallGuardJob = (runId, it) => { WALL_JOBS.push({ runId, cwd: it?.cwd || null }); };
 const claudeMissingLine = () => 'no claude';
 const CODEX_MISSING_LINE = 'no codex';
 const startCodexJob = (text, opts) => { CODEX.push({ text, opts }); return { runId: 'codex-' + CODEX.length, transport: 'exec', startedAt: Date.now() }; };
@@ -370,6 +374,59 @@ t('the bypass is never inferred: an item without the flag is capped', () => {
   writeQueue([job('one'), job('two')]);
   B.drainBgHandoff();
   eq(B.DISPATCHED.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n7b. ★ a job resumed after a usage wall starts at its own pace (maxRunning on the item)');
+// ---------------------------------------------------------------------------
+// The afternoon of 2026-10-06: nine workers restarted at once after a wall,
+// used the next five hour window in about ninety minutes and walled it too.
+// The wall guard's resumes carry a pace; the REAL drain has to honour it, and
+// an ordinary job behind a waiting resume must not be held back by it.
+
+B.resetPool();
+B.setCap(10);
+{
+  const resumed = (name) => job(name, { engine: 'claude', resumeOf: `bg-${name}`, resumeCount: 1, maxRunning: 4 });
+  writeQueue([resumed('r1'), resumed('r2'), resumed('r3'), resumed('r4'), resumed('r5'), resumed('r6'), job('new job')]);
+}
+B.drainBgHandoff();
+
+t('★ six resumes at a pace of four under a cap of ten: four start, and the ordinary job behind them starts too', () => {
+  eq(B.DISPATCHED.map(titleOf).join(','), 'r1,r2,r3,r4,new job');
+});
+
+t('★ the two that wait are back in the drop box, in order, with every field they arrived with', () => {
+  const q = readQueue();
+  eq(q.map((x) => titleOf(x.text)).join(','), 'r5,r6');
+  eq(q[0].maxRunning, 4);
+  eq(q[0].resumeOf, 'bg-r5');
+  eq(q[0].engine, 'claude');
+});
+
+t('★ ps says they are waiting, though the pool has five slots free', () => {
+  const rows = B.queuedBgJobRows();
+  eq(rows.map((r) => r.waiting).join(','), 'true,true');
+  eq(rows.map((r) => r.waitPosition).join(','), '1,2');
+});
+
+t('★ one worker finishing is not enough (four still run); the next resume starts when the pool is under the pace', () => {
+  B.finishFakeWorker();
+  B.drainBgHandoff();
+  eq(B.DISPATCHED.map(titleOf).join(','), 'r1,r2,r3,r4,new job', 'five ran, four run now: still at the pace');
+  B.finishFakeWorker();
+  B.drainBgHandoff();
+  eq(B.DISPATCHED.map(titleOf).join(','), 'r1,r2,r3,r4,new job,r5');
+  eq(readQueue().map((x) => titleOf(x.text)).join(','), 'r6', 'and the last one still waits, never dropped');
+});
+
+t('★ a job cannot raise the cap with the same field', () => {
+  B.resetPool();
+  B.setCap(1);
+  writeQueue([job('one'), job('greedy', { maxRunning: 50 })]);
+  B.drainBgHandoff();
+  eq(B.DISPATCHED.map(titleOf).join(','), 'one');
+  eq(readQueue().map((x) => titleOf(x.text)).join(','), 'greedy');
 });
 
 // ---------------------------------------------------------------------------

@@ -32,3 +32,5 @@ tg-ledger.jsonl
 tg-ledger.jsonl.tmp
 wall-wake.json
 wall-wake.json.*.tmp
+wall-guard.json
+wall-guard.json.*.tmp

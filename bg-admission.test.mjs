@@ -11,6 +11,7 @@
 //   node bg-admission.test.mjs
 
 import {
+  slotCap,
   DEFAULT_MAX_CONCURRENT_WORKERS,
   hasSlot,
   maxConcurrentWorkers,
@@ -100,6 +101,26 @@ t('the defaults alone still cap', () => {
   eq(hasSlot(), true);
 });
 
+t('★ a job with its own LOWER cap starts only under it (the pace of a job resumed after a wall)', () => {
+  ok(hasSlot({ running: 3, max: 10, itemMax: 4 }), 'three running, the fourth may start');
+  ok(!hasSlot({ running: 4, max: 10, itemMax: 4 }), 'four running: it waits though the pool has six free');
+  ok(hasSlot({ running: 4, max: 10 }), 'an ordinary job behind it still starts');
+});
+
+t('★ a job can only LOWER the cap, never raise it: the drop box is a file any worker can write', () => {
+  ok(!hasSlot({ running: 3, max: 3, itemMax: 50 }), 'asking for more than the cap gets the cap');
+  eq(slotCap(3, 50), 3);
+  eq(slotCap(10, 4), 4);
+  for (const junk of [0, -1, null, undefined, '', 'x', NaN, true, false, {}, 0.4]) eq(slotCap(10, junk), 10, `junk ${String(junk)} is ignored`);
+  eq(slotCap(10, '4'), 4, 'a number that arrived as a string');
+  eq(slotCap(10, 4.9), 4, 'never half a worker');
+});
+
+t('the bypass and Codex are unchanged by a job cap', () => {
+  ok(hasSlot({ running: 9, max: 10, itemMax: 2, bypass: true }));
+  ok(hasSlot({ running: 9, max: 10, itemMax: 2, engine: 'codex' }));
+});
+
 // ---------------------------------------------------------------------------
 console.log('\n3. FIFO on the way back into the drop box');
 // ---------------------------------------------------------------------------
@@ -176,6 +197,17 @@ t('★ a bypass job runs now AND pushes the jobs behind it back', () => {
   );
   eq(rows[0].waiting, false);
   eq(rows[1].waiting, true);
+});
+
+t('★ ps tells the truth about a paced job: it WAITS at its own cap while the pool has room', () => {
+  const paced = (title) => ({ engine: 'claude', title, maxRunning: 4 });
+  const rows = queueRows([paced('r1'), paced('r2'), paced('r3'), { engine: 'claude', title: 'new job' }], { running: 2, max: 10 });
+  eq(rows.map((r) => r.waiting).join(','), 'false,false,true,false', 'two start (2 + 2 = 4), the third waits, the ordinary job behind it starts');
+  eq(rows.map((r) => r.waitPosition).join(','), '0,0,1,0');
+  const full = queueRows([paced('r1'), { engine: 'claude', title: 'new job' }], { running: 4, max: 10 });
+  eq(full.map((r) => r.waiting).join(','), 'true,false');
+  const plain = queueRows([{ engine: 'claude', title: 'a' }, { engine: 'claude', title: 'b' }], { running: 4, max: 10 });
+  eq(plain.map((r) => r.waiting).join(','), 'false,false', 'no job cap: exactly as before');
 });
 
 t('an unknown engine is treated as claude, which is the capped side', () => {

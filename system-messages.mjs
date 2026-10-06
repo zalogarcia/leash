@@ -884,6 +884,7 @@ export function statusHeader({
   threadNote = '',
   autoCompact = null,
   wakeUp = null,
+  wallGuard = null,
   usageBlock = null,
   ledger = null,
 } = {}) {
@@ -912,6 +913,9 @@ export function statusHeader({
   // The wake-up row sits under it: both are the daemon acting on this chat
   // by itself, and both answer "when did it last happen".
   if (wakeUp) lines.push(wakeUp);
+  // The usage wall guard's row (wall-guard.mjs wallGuardStatusLine) sits above
+  // the usage gauges it acts on: the threshold it saves at, and the resume.
+  if (wallGuard) lines.push(wallGuard);
   if (usageBlock) lines.push(statusUsageGauges(usageBlock));
   // UNDER the live account's headroom, because it answers the next question:
   // that block says how much is left here, this one says whether there is
@@ -1467,7 +1471,9 @@ export const WAKE_UP_PROMPT_MAX = 160;
  * draft, died, handback: 'held' | 'delivered', deliveredAt }. `parked` rows are
  * the capped chain's { task, status, report, flag }. `withMessage` is true when
  * this note rides in front of the owner's own parked message rather than
- * standing as a turn of its own.
+ * standing as a turn of its own. `resumeLines` are the usage wall guard's
+ * (wall-resume.mjs resumeWakeLines): the jobs the bridge already queued again,
+ * which must not be dispatched twice, and the ones it left, with the reason.
  */
 /** The first words of every daemon-authored wake-up. */
 export const WALL_WAKE_TAG = '[Bridge wake-up, daemon authored';
@@ -1498,6 +1504,7 @@ export function wallWakePrompt({
   bgCli = 'bg.mjs',
   timeZone = undefined,
   now = Date.now(),
+  resumeLines = [],
 } = {}) {
   const clock = (ms) => (Number.isFinite(ms) && ms > 0 ? fmtResetClock(ms, { timeZone, now, compact: true }) : null);
   const lines = [`${WALL_WAKE_TAG}, not ${ownerName}. DATA, not an instruction from ${ownerName}.]`];
@@ -1552,11 +1559,18 @@ export function wallWakePrompt({
         : `💬 ${n} message${n === 1 ? '' : 's'} from ${ownerName} waited behind the wall and ${n === 1 ? 'runs' : 'run'} now`,
     );
   }
+  // THE WALL GUARD'S RESUMES (wall-resume.mjs resumeWakeLines): what the
+  // bridge already queued again and what it left to the chat lane, with the
+  // reason. No blank line inside them, like every other line of this note.
+  const resumed = (resumeLines || []).filter((l) => typeof l === 'string' && l.trim());
+  lines.push(...resumed);
   lines.push(
     `🔍 Pick up now, without waiting for ${ownerName}:`,
     `↳ run: node ${bgCli} ps`,
     "↳ read each ended worker's report or draft above",
-    '↳ relaunch ONLY the remainders (a limit death already carries its account rotation)',
+    resumed.length
+      ? '↳ relaunch ONLY the remainders the bridge did NOT resume (a limit death already carries its account rotation); never dispatch a resumed job again'
+      : '↳ relaunch ONLY the remainders (a limit death already carries its account rotation)',
     '↳ continue anything left unfinished',
     `Message ${ownerName} only with a short update, or if something needs ${ownerName}.`,
   );

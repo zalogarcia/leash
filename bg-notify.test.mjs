@@ -39,6 +39,7 @@ import {
   WORKER_IDLE_MS,
 } from './bg-notify.mjs';
 import { bgOutcome } from './detached-workers.mjs';
+import { resumeQueueItem } from './wall-resume.mjs';
 
 let pass = 0;
 const failures = [];
@@ -906,6 +907,11 @@ const renameSync = () => {
 // stubbed (bg-codex-wiring.test.mjs owns the notice shape, and a real timer in
 // a unit suite is a test that waits an hour); the HOLD and the RE-QUEUE are the
 // real functions, because losing a claimed brief is the failure that matters.
+// THE WALL GUARD'S DISPATCH RECORD: the drain records each Claude job's
+// directory pin and resume chain for the resume after a wall. Recorded here;
+// its use is wall-guard-wiring.test.mjs's subject.
+export const WALL_JOBS = [];
+const noteWallGuardJob = (runId, it) => { WALL_JOBS.push({ runId, cwd: it?.cwd || null, resumeOf: it?.resumeOf || null }); };
 const CLAUDE_AVAILABLE = true;
 export const WALLS_RAISED = [];
 const raiseClaudeWall = async () => { WALLS_RAISED.push(Date.now()); return null; };
@@ -1293,6 +1299,36 @@ t('★ with every Claude account walled, an ordinary job runs on Codex instead o
   eq(B.CODEX_STARTED.length, 1);
   eq(B.CODEX_STARTED[0].reason, 'claude_limited');
   ok(/🧠 codex · every Claude account is limited/.test(B.SENT[0]), B.SENT[0]);
+});
+
+// THE USAGE WALL GUARD'S RESUME, through the REAL drain and the REAL resolver:
+// a resume is queued at the lift, but the wall can come back before the drain
+// reaches it. Pinned to Claude on its queue item, it is HELD, never sent to
+// Codex; the fallback for a NEW job is exactly what it was.
+t('★ a resume queued as the wall comes back is HELD for the next lift, never routed to Codex', () => {
+  B.reset([{}]);
+  B.setLimitWall(Date.now() + HOUR, true); // the fallback is ON
+  const item = resumeQueueItem({ death: { runId: 'bg56-1791297312986', cwd: '/tmp/wt' }, text: '# SHIP-THE-WIDGET (auto resume 1 of 2)\n\n## RESUME NOTE\n', count: 1, now: Date.now() });
+  B.setQueue([item, { text: '# A brand new job' }]);
+  B.drainBgHandoff();
+  eq(B.CODEX_STARTED.length, 1, 'only the NEW job went to Codex');
+  eq(B.CODEX_STARTED[0].text, '# A brand new job');
+  eq(B.CODEX_STARTED[0].reason, 'claude_limited', 'the fallback for new jobs is unchanged');
+  eq(B.DISPATCHED.length, 0, 'and nothing spawned into the wall');
+  const held = B.readHeldBgJobs();
+  eq(held.length, 1, 'the resume waits');
+  eq(held[0].resumeOf, 'bg56-1791297312986');
+  eq(held[0].engine, 'claude');
+  eq(held[0].cwd, '/tmp/wt', 'held as the queue item it arrived as, pin and all');
+});
+
+t('★ ...and at the next lift it runs on Claude, through the ordinary drain', () => {
+  B.setLimitWall(0, true);
+  B.flushParkedWalledJobs();
+  eq(B.readHeldBgJobs().length, 0);
+  eq(B.DISPATCHED.length, 1);
+  eq(B.CODEX_STARTED.length, 1, 'still only the one new job on Codex');
+  eq(B.WALL_JOBS.at(-1)?.resumeOf, 'bg56-1791297312986', 'and the drain records its place in the chain');
 });
 
 t('★ /codex off means the wall is HELD OUT, not spawned into', () => {

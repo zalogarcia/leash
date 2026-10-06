@@ -1838,6 +1838,9 @@ const startCodexJob = (text, opts) => runCodex(text, opts);
 const dispatchPrompt = (text, lane) => { CLAUDE.push({ text, lane: lane?.name }); };
 export const RECORDED = [];
 const recordBgResult = (task, record) => { RECORDED.push({ task, record }); };
+// THE WALL GUARD'S DISPATCH RECORD: its use is wall-guard-wiring.test.mjs's
+// subject.
+const noteWallGuardJob = () => {};
 const getBgLane = () => ({ name: 'bg', current: null, queue: [] });
 export const bgLanes = [];
 // THE CONCURRENCY CAP, by the module-binding names production uses, the same
