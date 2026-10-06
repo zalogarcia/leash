@@ -164,11 +164,17 @@ export function resumeCandidates({ episodeWorkers = [], deaths = [], since = 0, 
   const raises = (Array.isArray(raisedAt) ? raisedAt : [raisedAt]).map(Number).filter((n) => n > 0);
   for (const d of deaths || []) {
     if (!d || !d.runId) continue;
-    if (Number(d.at) < Number(since)) {
-      stale.push(d.runId);
-      continue;
-    }
-    if (d.provisional && !raises.some((r) => Math.abs(Number(d.at) - r) <= PROVISIONAL_WINDOW_MS)) {
+    if (d.provisional) {
+      // The raise window IS the test for a provisional death: one inside it
+      // belongs to this episode by definition, whatever slack the caller's
+      // `since` carries. Cut by `since` first, the window was only as wide
+      // before the raise as that slack (60 s), not the two minutes it says
+      // (QA round 3, 2026-10-06).
+      if (!raises.some((r) => Math.abs(Number(d.at) - r) <= PROVISIONAL_WINDOW_MS)) {
+        stale.push(d.runId);
+        continue;
+      }
+    } else if (Number(d.at) < Number(since)) {
       stale.push(d.runId);
       continue;
     }

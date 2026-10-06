@@ -370,6 +370,14 @@ t('★ QA round 2: a PROVISIONAL death counts only when the wall went up around 
   const again = resumeCandidates({ deaths: [swap, near], since, raisedAt: [RAISED - 16 * MIN, RAISED] });
   eq(again.candidates.map((c) => c.runId).sort(), [swap.runId, near.runId].sort(), 'each is near one of the raises');
   eq(resumeCandidates({ deaths: [near], since, raisedAt: [null, 0, undefined] }).stale, [near.runId]);
+  // QA round 3: the window is the test, not the caller's slack. The daemon passes
+  // `since` as the raise minus 60 s; a slow rotation raises the wall later than that.
+  const tight = RAISED - 60_000;
+  const at = (sec) => death(`bg2${sec}-17912900002${sec}`, RAISED - sec * 1000, { provisional: true });
+  const edge = resumeCandidates({ deaths: [at(59), at(61), at(119), at(121)], since: tight, raisedAt: RAISED });
+  eq(edge.candidates.map((c) => c.runId), [at(59).runId, at(61).runId, at(119).runId], 'two minutes before the raise, as documented');
+  eq(edge.stale, [at(121).runId]);
+  eq(resumeCandidates({ deaths: [death('bg30-1791290000300', RAISED - 61_000)], since: tight, raisedAt: RAISED }).stale, ['bg30-1791290000300'], 'a recorded wall death still obeys `since`');
   ok(PROVISIONAL_WINDOW_MS >= 90_000, 'wider than the rotation cooldown a provisional death can arrive in');
 });
 
