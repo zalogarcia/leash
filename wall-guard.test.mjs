@@ -196,9 +196,27 @@ t('★ QA 2026-10-06: the weekly and five hour windows both over, their order fl
   eq([flipped.fire, flipped.reason], [false, 'already steered']);
 });
 
-t('with no open five hour window the arming window keys it', () => {
-  const d = decide({ usage: usage(99, 97, { fiveReset: iso(-1) }) });
+t('with no five hour window in the reading at all, the arming window keys it', () => {
+  const d = decide({ usage: { sevenDay: { percent: 97, resetsAt: iso(3 * 24 * 60) }, scoped: [] } });
+  eq(d.fire, true);
   ok(d.key.includes('|sevenDay|'), d.key);
+});
+
+t('★ QA round 2: a reading taken before the five hour reset is stale as a whole, so a boundary is TWO episodes, not three', () => {
+  const weekly = 97; // over the threshold the whole time
+  const before = decide({ usage: usage(40, weekly, { fiveReset: iso(1) }) });
+  // 30 seconds past the reset, still holding the reading from before it.
+  const gap = decide({ usage: usage(40, weekly, { fiveReset: iso(1) }), now: NOW + 1.5 * MIN });
+  const after = decide({ usage: usage(1, weekly, { fiveReset: iso(301) }), now: NOW + 2 * MIN });
+  eq([before.fire, after.fire], [true, true]);
+  eq([gap.fire, gap.reason, gap.key], [false, 'stale', null], 'armed by its weekly figure it opened a third episode under the weekly key');
+  eq(new Set([before.key, gap.key, after.key].filter(Boolean)).size, 2);
+  ok(before.key.includes('|fiveHour|') && after.key.includes('|fiveHour|') && before.key !== after.key);
+});
+
+t('a five hour window with no readable reset does not make the reading stale; the weekly window still arms it', () => {
+  const d = decide({ usage: { fiveHour: { percent: 10, resetsAt: null }, sevenDay: { percent: 97, resetsAt: iso(3 * 24 * 60) }, scoped: [] } });
+  eq([d.fire, d.window.kind], [true, 'sevenDay']);
 });
 
 t('★ a worker that cannot be steered is UNREACHABLE, named, and still makes the guard fire', () => {

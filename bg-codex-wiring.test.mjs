@@ -1841,6 +1841,7 @@ const recordBgResult = (task, record) => { RECORDED.push({ task, record }); };
 // THE WALL GUARD'S DISPATCH RECORD: its use is wall-guard-wiring.test.mjs's
 // subject.
 const noteWallGuardJob = () => {};
+const runningResumedWorkers = () => 0; // the resume pace's count; bg-concurrency-wiring.test.mjs runs the real one
 const getBgLane = () => ({ name: 'bg', current: null, queue: [] });
 export const bgLanes = [];
 // THE CONCURRENCY CAP, by the module-binding names production uses, the same

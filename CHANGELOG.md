@@ -53,9 +53,15 @@ limit in its verifier, and the account fixes that sit under both.**
   publish). Same engine, same directory, the same title as a prefix, through the ordinary queue
   and cap. A resume is pinned to Claude, so it waits for the lift and is never routed to Codex; the
   Codex fallback for new jobs is unchanged.
-- **Resumes are paced.** A resumed job starts only while fewer than `resumeMaxConcurrent` Claude
-  workers are running (4 by default); the rest wait in the queue and start as workers finish, and
-  `bg.mjs ps` lists them as waiting. The pace rides on the queue item and can only lower the cap.
+- **Resumes are paced.** At most `resumeMaxConcurrent` resumed jobs run at once (4 by default);
+  the rest wait in the queue and start as the others finish, and `bg.mjs ps` lists them as
+  waiting. The pace rides on the queue item, is a second condition on top of the ordinary cap
+  (never a way past it), and counts resumed jobs only, so new work is not held back by a waiting
+  resume and cannot starve one.
+- **Every worker a wall kills is counted, not only the first.** One wall ends several workers
+  inside the same seconds, while the rotation the first one started is still asking the other
+  accounts. A death that arrives in that gap is recorded as provisional and resumed when the wall
+  went up around it; when that rotation found a free account instead, it is dropped.
 - **Four safety rules, each persisted in `wall-guard.json` (gitignored).** Never a run that is
   still alive (the worker registry and the process are asked, not a log line), never the same
   death twice, at most `resumeChainMax` automatic resumes per job (2 by default; after that the

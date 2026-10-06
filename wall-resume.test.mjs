@@ -16,6 +16,7 @@ import {
   checkpointCommitFrom,
   sameJobTitle,
   resumeCandidates,
+  PROVISIONAL_WINDOW_MS,
   resumePlan,
   resumeTiming,
   resumeNote,
@@ -325,15 +326,15 @@ t('nothing to say: no lines', () => {
 
 t('★ the pace is said where a waiting job could be mistaken for a lost one', () => {
   const wake = resumeWakeLines({ resumed: RESUMED, skipped: [], maxRunning: 4 }).join('\n');
-  ok(/at most 4 workers run at once, the rest start as workers finish, so a job still waiting in the queue is not lost/.test(wake), wake);
+  ok(/at most 4 resumed jobs run at once, the rest start as they finish, so a job still waiting in the queue is not lost/.test(wake), wake);
   ok(/Do NOT dispatch these again/.test(wake));
   ok(!/run at once/.test(resumeWakeLines({ resumed: RESUMED, skipped: [] }).join('\n')), 'no pace, no words about one');
   const many = Array.from({ length: 6 }, (_, i) => ({ runId: `bg${i}-179129000000${i}`, title: `JOB-${i}-1006`, count: 1, max: 2 }));
   const n = resumeLiftNotice({ resumed: many, skipped: [], maxRunning: 4 });
   ok(/^🔁 Resumed 6 jobs after the usage wall$/m.test(n), n);
-  ok(/^🚦 Paced: at most 4 workers run at once, the rest start as workers finish$/m.test(n), n);
+  ok(/^🚦 Paced: at most 4 resumed jobs run at once, the rest start as they finish$/m.test(n), n);
   ok(!/Paced/.test(resumeLiftNotice({ resumed: RESUMED, skipped: [], maxRunning: 4 })), 'one job under a pace of four waits for nothing, so the line says nothing');
-  ok(/at most 1 worker run at once/.test(paceWords(1)) && paceWords(0) === '' && paceWords(null) === '');
+  ok(/^at most 1 resumed job runs at once/.test(paceWords(1)) && paceWords(0) === '' && paceWords(null) === '');
   ok(!DASHES.test(wake + n));
 });
 
@@ -350,6 +351,33 @@ t('★ QA 2026-10-06: no line is owed when nothing died (a finished worker is al
   eq(liftNoticeDue({ resumed: [], skipped: [SKIPPED[2]] }), false);
   eq(liftNoticeDue({ resumed: [], skipped: [SKIPPED[0]] }), true);
   eq(liftNoticeDue({ resumed: RESUMED, skipped: [] }), true);
+});
+
+t('★ QA round 2: a PROVISIONAL death counts only when the wall went up around it', () => {
+  const RAISED = NOW;
+  const death = (runId, at, extra = {}) => ({ runId, at, text: BRIEF, title: 'BUILD-THE-THING-1006', ...extra });
+  const near = death('bg7-1791290000007', RAISED - 20_000, { provisional: true }); // 20 s before the wall went up
+  const after = death('bg8-1791290000008', RAISED + 60_000, { provisional: true });
+  const swap = death('bg9-1791290000009', RAISED - 15 * MIN, { provisional: true }); // died on a swap, a wall came later
+  const sure = death('bg10-1791290000010', RAISED - 15 * MIN); // a recorded wall death is never second guessed
+  const since = RAISED - 30 * MIN; // an episode carried forward reaches back this far
+  const r = resumeCandidates({ episodeWorkers: [{ runId: near.runId, title: near.title, died: false }], deaths: [near, after, swap, sure], since, raisedAt: RAISED });
+  eq(r.candidates.map((c) => c.runId).sort(), [after.runId, sure.runId, near.runId].sort());
+  eq(r.stale, [swap.runId], 'dropped: no wall went up around it');
+  eq(r.candidates.find((c) => c.runId === near.runId).died, true, 'the store says it died, whatever the episode row says');
+  eq(resumeCandidates({ deaths: [near], since }).stale, [near.runId], 'no raise time known: a provisional death is not trusted');
+  // A wall raised again before its wake-up ran: the same episode, a later raise.
+  const again = resumeCandidates({ deaths: [swap, near], since, raisedAt: [RAISED - 16 * MIN, RAISED] });
+  eq(again.candidates.map((c) => c.runId).sort(), [swap.runId, near.runId].sort(), 'each is near one of the raises');
+  eq(resumeCandidates({ deaths: [near], since, raisedAt: [null, 0, undefined] }).stale, [near.runId]);
+  ok(PROVISIONAL_WINDOW_MS >= 90_000, 'wider than the rotation cooldown a provisional death can arrive in');
+});
+
+t('★ QA round 2: a death the drop box would not take is still a death, so the owner still gets a line', () => {
+  const lost = [{ runId: 'bg3-1791290000003', title: 'BUILD-THE-THING-1006', died: true, reason: 'the drop box would not take it; dispatch it by hand' }];
+  eq(liftNoticeDue({ resumed: [], skipped: lost }), true);
+  const n = resumeLiftNotice({ resumed: [], skipped: lost });
+  ok(/Resumed no jobs/.test(n) && /Not resumed: 1 · 1 the drop box would not take it$/.test(n), n);
 });
 
 t('★ QA 2026-10-06: two dead runs with the same title come back as ONE resume', () => {

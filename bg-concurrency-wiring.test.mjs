@@ -124,7 +124,7 @@ export const finishFakeWorker = () => {
   if (lane) lane.current = null;
   return lane;
 };
-export const resetPool = () => { bgLanes.length = 0; laneSeq = 0; DISPATCHED.length = 0; CODEX.length = 0; HELD.length = 0; SENT.length = 0; RESULTS.length = 0; DISPATCH_OPTS.length = 0; NOTICES.length = 0; SAVED.length = 0; SCHEDULES = { nextId: 1, items: [] }; FAIL_WRITE = false; };
+export const resetPool = () => { RESUMED_RUNS.clear(); bgLanes.length = 0; laneSeq = 0; DISPATCHED.length = 0; CODEX.length = 0; HELD.length = 0; SENT.length = 0; RESULTS.length = 0; DISPATCH_OPTS.length = 0; NOTICES.length = 0; SAVED.length = 0; SCHEDULES = { nextId: 1, items: [] }; FAIL_WRITE = false; };
 
 // runningBgWorkers reads this, so the real counter is under test too.
 function bgWorkerDescriptors() {
@@ -151,7 +151,12 @@ const recordBgResult = (task, outcome) => { RESULTS.push({ task, outcome }); };
 // THE WALL GUARD'S DISPATCH RECORD: recorded; its use is
 // wall-guard-wiring.test.mjs's subject.
 export const WALL_JOBS = [];
-const noteWallGuardJob = (runId, it) => { WALL_JOBS.push({ runId, cwd: it?.cwd || null }); };
+// The guard's record of which running jobs are RESUMES, as the daemon keeps it
+// (wall-guard.mjs jobOf): runningResumedWorkers, the REAL function, reads it.
+const RESUMED_RUNS = new Map();
+const wallGuard = { jobOf: (runId) => RESUMED_RUNS.get(runId) || null };
+export const failResumedCount = (v) => { wallGuard.jobOf = v ? () => { throw new Error('record unreadable'); } : (runId) => RESUMED_RUNS.get(runId) || null; };
+const noteWallGuardJob = (runId, it) => { WALL_JOBS.push({ runId, cwd: it?.cwd || null }); if (it?.resumeOf) RESUMED_RUNS.set(runId, { resumeOf: it.resumeOf }); };
 const claudeMissingLine = () => 'no claude';
 const CODEX_MISSING_LINE = 'no codex';
 const startCodexJob = (text, opts) => { CODEX.push({ text, opts }); return { runId: 'codex-' + CODEX.length, transport: 'exec', startedAt: Date.now() }; };
@@ -191,13 +196,14 @@ const B = await import(
         HARNESS,
         grab('bgStrandedJobs', 'let'),
         grab('runningBgWorkers'),
+        grab('runningResumedWorkers'),
         grab('requeueDeferredBgJobs'),
         grab('queuedBgJobRows'),
         grab('drainBgHandoff'),
         grab('scheduleApprovesWrites'),
         grab('queueScheduledRun'),
         grab('checkSchedules'),
-        'export { drainBgHandoff, runningBgWorkers, requeueDeferredBgJobs, queuedBgJobRows, queueScheduledRun, checkSchedules };',
+        'export { drainBgHandoff, runningBgWorkers, runningResumedWorkers, requeueDeferredBgJobs, queuedBgJobRows, queueScheduledRun, checkSchedules };',
       ].join('\n'),
     )
 );
@@ -381,19 +387,20 @@ console.log('\n7b. ★ a job resumed after a usage wall starts at its own pace (
 // ---------------------------------------------------------------------------
 // The afternoon of 2026-10-06: nine workers restarted at once after a wall,
 // used the next five hour window in about ninety minutes and walled it too.
-// The wall guard's resumes carry a pace; the REAL drain has to honour it, and
-// an ordinary job behind a waiting resume must not be held back by it.
+// The wall guard's resumes carry a pace; the REAL drain has to honour it. The
+// pace counts the RESUMED jobs running, not the pool: a waiting resume must not
+// hold back an ordinary job, and ordinary jobs must not starve a resume.
+
+const resumed = (name) => job(name, { engine: 'claude', resumeOf: `bg-${name}`, resumeCount: 1, maxRunning: 4 });
 
 B.resetPool();
 B.setCap(10);
-{
-  const resumed = (name) => job(name, { engine: 'claude', resumeOf: `bg-${name}`, resumeCount: 1, maxRunning: 4 });
-  writeQueue([resumed('r1'), resumed('r2'), resumed('r3'), resumed('r4'), resumed('r5'), resumed('r6'), job('new job')]);
-}
+writeQueue([resumed('r1'), resumed('r2'), resumed('r3'), resumed('r4'), resumed('r5'), resumed('r6'), job('new job')]);
 B.drainBgHandoff();
 
 t('★ six resumes at a pace of four under a cap of ten: four start, and the ordinary job behind them starts too', () => {
   eq(B.DISPATCHED.map(titleOf).join(','), 'r1,r2,r3,r4,new job');
+  eq(B.runningResumedWorkers(), 4, 'the real counter, off the guard record');
 });
 
 t('★ the two that wait are back in the drop box, in order, with every field they arrived with', () => {
@@ -410,14 +417,34 @@ t('★ ps says they are waiting, though the pool has five slots free', () => {
   eq(rows.map((r) => r.waitPosition).join(','), '1,2');
 });
 
-t('★ one worker finishing is not enough (four still run); the next resume starts when the pool is under the pace', () => {
-  B.finishFakeWorker();
-  B.drainBgHandoff();
-  eq(B.DISPATCHED.map(titleOf).join(','), 'r1,r2,r3,r4,new job', 'five ran, four run now: still at the pace');
-  B.finishFakeWorker();
+t('★ a resumed worker finishing starts the next resume; the last one waits, never dropped', () => {
+  B.finishFakeWorker(); // r1, the first lane
   B.drainBgHandoff();
   eq(B.DISPATCHED.map(titleOf).join(','), 'r1,r2,r3,r4,new job,r5');
-  eq(readQueue().map((x) => titleOf(x.text)).join(','), 'r6', 'and the last one still waits, never dropped');
+  eq(readQueue().map((x) => titleOf(x.text)).join(','), 'r6');
+  eq(B.runningResumedWorkers(), 4);
+});
+
+t('★ QA 2026-10-06: six ordinary workers and a steady stream of new handoffs do NOT starve a resume', () => {
+  B.resetPool();
+  B.setCap(10);
+  for (let i = 0; i < 6; i++) B.startFakeWorker(`ordinary ${i}`);
+  writeQueue([resumed('starved')]);
+  B.drainBgHandoff();
+  eq(B.DISPATCHED.map(titleOf).join(','), 'starved', 'counted against the whole pool it waited forever behind six ordinary workers');
+  eq(readQueue().length, 0);
+});
+
+t('★ and the ordinary cap still holds a resume: the pace is never a way past it', () => {
+  B.resetPool();
+  B.setCap(2);
+  B.startFakeWorker('a');
+  B.startFakeWorker('b');
+  writeQueue([resumed('held by the cap')]);
+  B.drainBgHandoff();
+  eq(B.DISPATCHED.length, 0);
+  eq(readQueue().map((x) => titleOf(x.text)).join(','), 'held by the cap');
+  eq(B.queuedBgJobRows()[0].waiting, true);
 });
 
 t('★ a job cannot raise the cap with the same field', () => {
@@ -427,6 +454,23 @@ t('★ a job cannot raise the cap with the same field', () => {
   B.drainBgHandoff();
   eq(B.DISPATCHED.map(titleOf).join(','), 'one');
   eq(readQueue().map((x) => titleOf(x.text)).join(','), 'greedy');
+});
+
+t('★ a guard record that cannot be read holds the resumes one cycle (a full pace), and ordinary jobs still start', () => {
+  B.resetPool();
+  B.setCap(10);
+  B.startFakeWorker('already running'); // the count asks the record about each running worker
+  B.failResumedCount(true);
+  try {
+    writeQueue([resumed('r1'), job('ordinary')]);
+    B.drainBgHandoff();
+    eq(B.DISPATCHED.map(titleOf).join(','), 'ordinary');
+    eq(readQueue().map((x) => titleOf(x.text)).join(','), 'r1', 'waiting, not dropped');
+  } finally {
+    B.failResumedCount(false);
+  }
+  B.drainBgHandoff();
+  eq(B.DISPATCHED.map(titleOf).join(','), 'ordinary,r1', 'and it starts on the next cycle');
 });
 
 // ---------------------------------------------------------------------------

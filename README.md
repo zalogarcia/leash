@@ -394,8 +394,9 @@ new run (read the checkpoint and the git state first, verify the live state befo
 write, never repeat a send, a deploy, a migration, a payment or a publish). A resume keeps the dead
 run's engine, its directory and its title as a prefix, goes through the ordinary queue and cap, and
 is pinned to Claude, so it waits for the lift instead of going to Codex. Resumes come back paced:
-a resumed job starts only while fewer than 4 Claude workers are running, and the rest start as
-workers finish, so the workers a wall killed do not use the next window the way they used the last.
+at most 4 resumed jobs run at once (and never more than `maxConcurrentWorkers` allows), and the
+rest start as they finish, so the workers a wall killed do not use the next window the way they
+used the last. The pace counts resumed jobs only: new work is never held back by them.
 A job is never resumed while its run is still alive, never twice for the same death, at most twice
 in a row (after that it goes to the chat with the reason), and never when its brief has the line
 `Auto-resume: no`. The wake-up at the lift lists what was resumed under "Do NOT dispatch these
@@ -1071,8 +1072,8 @@ and `wallGuard` (`{"enabled": true, "thresholdPercent": 95, "resume": true,
 "resumeWithinMinutes": 5, "resumeChainMax": 2, "resumeMaxConcurrent": 4}`: the
 usage wall guard above. `thresholdPercent` is where workers are told to save,
 `resume` switches the restart after the wall, `resumeChainMax` is how many
-automatic resumes one job gets, `resumeMaxConcurrent` is the pace resumes come
-back at (0 for the ordinary cap alone), and a resume queued more than
+automatic resumes one job gets, `resumeMaxConcurrent` is how many resumed jobs
+run at once (0 for the ordinary cap alone), and a resume queued more than
 `resumeWithinMinutes` after the account was ready is reported as late. On with
 these values when the block is absent; `"wallGuard": false` turns it all off).
 

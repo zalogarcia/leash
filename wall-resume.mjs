@@ -142,13 +142,33 @@ export function sameJobTitle(a, b, { minChars = 12 } = {}) {
  * happened during this episode (`since`, the episode's start); an older one
  * belongs to a wall long gone and is returned in `stale` for the caller to
  * drop. Returns { candidates, stale }.
+ *
+ * A PROVISIONAL death (`provisional: true`) is one whose caller could not say
+ * whether it died on the wall: it arrived while the rotation that would raise
+ * the wall was still in progress, and that daemon keeps no record of how the
+ * rotation ended. One wall kills several workers inside the same seconds, so
+ * without these only the first of them was ever resumed (QA round 2,
+ * 2026-10-06). It counts only when the wall went up around it (`raisedAt`,
+ * within PROVISIONAL_WINDOW_MS either side), which is what "that rotation
+ * found every account limited" looks like afterwards. A rotation that swapped
+ * instead raised no wall, so its provisional deaths are claimed by no lift and
+ * are dropped as stale by the next one. `raisedAt` is one time or several: a
+ * wall raised again before its wake-up ran is the same episode with a later
+ * raise, and a death around that later raise is as much a wall death.
  */
-export function resumeCandidates({ episodeWorkers = [], deaths = [], since = 0 } = {}) {
+export const PROVISIONAL_WINDOW_MS = 2 * 60_000;
+
+export function resumeCandidates({ episodeWorkers = [], deaths = [], since = 0, raisedAt = null } = {}) {
   const byId = new Map();
   const stale = [];
+  const raises = (Array.isArray(raisedAt) ? raisedAt : [raisedAt]).map(Number).filter((n) => n > 0);
   for (const d of deaths || []) {
     if (!d || !d.runId) continue;
     if (Number(d.at) < Number(since)) {
+      stale.push(d.runId);
+      continue;
+    }
+    if (d.provisional && !raises.some((r) => Math.abs(Number(d.at) - r) <= PROVISIONAL_WINDOW_MS)) {
       stale.push(d.runId);
       continue;
     }
@@ -320,11 +340,11 @@ const firstLine = (s) =>
  * `resumeRoot` ride along for the next dispatch record.
  *
  * `maxRunning` is THE PACE (the `resumeMaxConcurrent` setting): the item
- * carries it, and the drain starts the job only while fewer Claude workers
- * than that are running (bg-admission.mjs hasSlot `itemMax`). On the item, so
- * a resume held through a second wall keeps its pace, and so the drain needs
- * no setting of its own. It can only lower the ordinary cap. Absent or 0: the
- * ordinary cap alone.
+ * carries it, and the drain starts the job only while fewer RESUMED jobs than
+ * that are running (bg-admission.mjs hasSlot `itemMax` and `pacedRunning`).
+ * On the item, so a resume held through a second wall keeps its pace, and so
+ * the drain needs no setting of its own. It is a second condition on top of
+ * the ordinary cap, never a way past it. Absent or 0: the ordinary cap alone.
  */
 export function resumeQueueItem({ death = {}, text = '', count = 1, now = Date.now(), maxRunning = 0 } = {}) {
   const d = death || {};
@@ -346,7 +366,7 @@ export function resumeQueueItem({ death = {}, text = '', count = 1, now = Date.n
 /** The pace, in words, for the wake-up and the owner's line. Empty when there is none. */
 export function paceWords(maxRunning) {
   const n = Math.floor(Number(maxRunning));
-  return n > 0 ? `at most ${n} worker${n === 1 ? '' : 's'} run at once, the rest start as workers finish` : '';
+  return n > 0 ? `at most ${n} resumed job${n === 1 ? ' runs' : 's run'} at once, the rest start as they finish` : '';
 }
 
 const short = (s, n) => {

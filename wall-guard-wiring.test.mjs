@@ -34,6 +34,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { STEER_HEADER, encodeLine, steerFraming } from './bg-steer.mjs';
+import { liftNoticeDue, resumeLiftNotice } from './wall-resume.mjs';
 import { checkpointSteerText } from './wall-guard.mjs';
 import { briefTitle, stripLaneRules } from './bg-lane-rules.mjs';
 
@@ -552,9 +553,9 @@ await t('★ the ORIGINAL brief unchanged, the RESUME NOTE first, the same engin
 });
 
 await t('★ the queued row carries the pace (4 at a time by default), and the wake-up says a waiting job is not lost', async () => {
-  eq(QUEUE[0].maxRunning, 4, 'the drain reads it off the item (bg-admission.mjs slotCap)');
+  eq(QUEUE[0].maxRunning, 4, 'the drain reads it off the item (bg-admission.mjs paceOf)');
   const w = B.DISPATCHED[0].text;
-  ok(/at most 4 workers run at once, the rest start as workers finish, so a job still waiting in the queue is not lost/.test(w), w);
+  ok(/at most 4 resumed jobs run at once, the rest start as they finish, so a job still waiting in the queue is not lost/.test(w), w);
 });
 
 await t('★ the note names the draft, the checkpoint commit read off the log, and where its writes are', async () => {
@@ -629,6 +630,54 @@ await t('★ the pace is a setting: another number rides on the item, and 0 puts
   ok(!('maxRunning' in none.item), JSON.stringify(none.item));
   eq(none.r.maxRunning, 0);
   B.setConf({});
+});
+
+await t('★ QA round 2: when the drop box will not take a resume, the death is still counted and the owner still gets a line', async () => {
+  const id = 'bg79-1791290000790';
+  B.setConf({});
+  B.wallGuard.death(id, { text: 'LANE RULES\n\n--- TASK ---\n\n# LOST-TO-THE-QUEUE-1006\n\nDo the thing.', title: 'LOST-TO-THE-QUEUE-1006' });
+  B.wallWake.raised({ until: LIFT_AT + 400 * MIN, now: LIFT_AT + 390 * MIN });
+  B.wallWake.worker({ runId: id, title: 'LOST-TO-THE-QUEUE-1006', died: true, handback: 'held' });
+  B.setNow(LIFT_AT + 401 * MIN);
+  // The drain's temp file path is a directory, so the write back fails.
+  const blocker = `${P('bg-queue.json')}.${process.pid}.tmp`;
+  mkdirSync(blocker);
+  let r;
+  try {
+    r = B.resumeWallDeaths(B.wallWake.current(), { readyAt: LIFT_AT + 400 * MIN, now: LIFT_AT + 401 * MIN });
+  } finally {
+    rmSync(blocker, { recursive: true, force: true });
+  }
+  eq(r.resumed.length, 0);
+  const row = r.skipped.find((x) => x.runId === id);
+  eq([row?.died, row?.reason], [true, 'the drop box would not take it; dispatch it by hand']);
+  eq(liftNoticeDue(r), true, 'the owner is told');
+  ok(/Not resumed: \d+ · .*\b1 the drop box would not take it/.test(resumeLiftNotice(r)), resumeLiftNotice(r)); // the episode carries rows of the lifts above
+
+});
+
+await t('★ a worker that died behind a rotation still in progress is resumed when that rotation raised the wall, and dropped when it did not', async () => {
+  // One wall kills several workers inside the same seconds. This daemon keeps
+  // no record of how the first corpse's rotation ended, so the later deaths are
+  // recorded as provisional and the lift decides by when the wall went up.
+  const raised = LIFT_AT + 500 * MIN;
+  const near = 'bg81-1791290000810';
+  const swapDeath = 'bg82-1791290000820';
+  const brief = (title) => `LANE RULES\n\n--- TASK ---\n\n# ${title}\n\nDo the thing.`;
+  B.setConf({});
+  B.setNow(raised - 60 * MIN);
+  B.noteWallDeath(swapDeath, brief('DIED-ON-A-SWAP-1006'), { provisional: true }); // an hour before any wall
+  B.setNow(raised - 20_000);
+  B.noteWallDeath(near, brief('SECOND-CORPSE-1006'), { provisional: true }); // 20 s before the wall went up
+  B.wallWake.raised({ until: raised + 10 * MIN, now: raised });
+  B.wallWake.worker({ runId: near, title: 'SECOND-CORPSE-1006', died: false, handback: 'held' }); // what the handback recorded
+  B.setNow(raised + 11 * MIN);
+  const r = B.resumeWallDeaths(B.wallWake.current(), { readyAt: raised + 10 * MIN, now: raised + 11 * MIN });
+  ok(r.resumed.some((x) => x.runId === near), JSON.stringify(r));
+  ok(!r.resumed.some((x) => x.runId === swapDeath) && !r.skipped.some((x) => x.runId === swapDeath), 'claimed by no lift');
+  eq(B.wallGuard.deathOf(swapDeath), null, 'and dropped from the record');
+  const q = JSON.parse(readFileSync(P('bg-queue.json'), 'utf8'));
+  eq(q.at(-1).resumeOf, near);
 });
 
 // THE QUEUED ROW, printed for the report (text clipped; the assertions above read it whole).

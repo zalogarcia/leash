@@ -61,26 +61,35 @@ export function maxConcurrentWorkers(raw) {
  * automatic: a cap that lifts itself under pressure is not a cap, and the
  * pressure is exactly when it has to hold.
  */
-export function hasSlot({ running = 0, max = DEFAULT_MAX_CONCURRENT_WORKERS, engine = 'claude', bypass = false, itemMax = null } = {}) {
+export function hasSlot({ running = 0, max = DEFAULT_MAX_CONCURRENT_WORKERS, engine = 'claude', bypass = false, itemMax = null, pacedRunning = 0 } = {}) {
   if (engine === 'codex') return true; // not capped, see the header
   if (bypass) return true;
-  return Number(running) < slotCap(max, itemMax);
+  if (!(Number(running) < Number(max))) return false;
+  const pace = paceOf(itemMax);
+  return pace === null || Number(pacedRunning) < pace;
 }
 
 /**
- * A JOB'S OWN, LOWER CAP (`maxRunning` on a drop box item).
+ * A JOB'S OWN PACE (`maxRunning` on a drop box item).
  *
  * A job the bridge restarted after a usage wall carries the pace it restarts
- * at (wall-resume.mjs resumeQueueItem): it starts only while fewer Claude
- * workers than that are running. It can only LOWER the cap, never raise it,
- * because the drop box is a file any worker can write: a job may ask to wait
- * longer, and that is all it may ask. Anything that is not a whole number of
- * one or more is ignored.
+ * at (wall-resume.mjs resumeQueueItem): it starts only while fewer RESUMED
+ * jobs than that are running (`pacedRunning`). Counting the resumed jobs and
+ * not the whole pool is deliberate. Counted against the whole pool, a resume
+ * never started while five ordinary workers were kept busy, and every later
+ * handoff ran past it (QA, 2026-10-06); counted this way the workers a wall
+ * killed still do not all come back at once, and new work is never held back
+ * by them.
+ *
+ * It is a SECOND condition on top of the cap, so it can only make a job wait
+ * longer and never start one the cap would hold: the drop box is a file any
+ * worker can write. Returns a whole number of one or more, or null for no pace
+ * (absent, zero, negative, not a number).
  */
-export function slotCap(max = DEFAULT_MAX_CONCURRENT_WORKERS, itemMax = null) {
-  const m = Number(max);
+export function paceOf(itemMax) {
+  if (itemMax == null || itemMax === '' || typeof itemMax === 'boolean' || typeof itemMax === 'object') return null;
   const own = Math.floor(Number(itemMax));
-  return itemMax != null && itemMax !== '' && typeof itemMax !== 'boolean' && Number.isFinite(own) && own >= 1 ? Math.min(m, own) : m;
+  return Number.isFinite(own) && own >= 1 ? own : null;
 }
 
 /**
@@ -104,23 +113,24 @@ export function mergeRequeue(deferred, queued) {
  * jobs that will actually have to wait, because "queued, position 2" means the
  * second job waiting for a slot, not the second line in a file.
  *
- * Items are `{ engine, title, queuedAt, bypass, maxRunning }`; the caller
- * resolves the engine, since only the daemon knows the config default and the
- * chat setting. `maxRunning` is a job's own lower cap (slotCap): a job that
- * waits on it is reported as waiting, or `ps` would show a paced job as about
- * to start while the daemon holds it.
+ * Items are `{ engine, title, queuedAt, bypass, maxRunning, resumed }`; the
+ * caller resolves the engine, since only the daemon knows the config default
+ * and the chat setting. `maxRunning` is a job's own pace (paceOf) and
+ * `pacedRunning` how many resumed jobs run now: a job that waits on its pace is
+ * reported as waiting, or `ps` would show it as about to start while the
+ * daemon holds it. `resumed` rows count toward the pace of the rows behind them.
  */
-export function queueRows(items, { running = 0, max = DEFAULT_MAX_CONCURRENT_WORKERS } = {}) {
+export function queueRows(items, { running = 0, max = DEFAULT_MAX_CONCURRENT_WORKERS, pacedRunning = 0 } = {}) {
   const list = Array.isArray(items) ? items : [];
   let free = Math.max(0, Number(max) - Number(running));
+  let paced = Number(pacedRunning) || 0;
   let waitSeq = 0;
   return list.map((it, i) => {
     const engine = it?.engine === 'codex' ? 'codex' : 'claude';
     const bypass = Boolean(it?.bypass);
-    // Workers busy by the time this row is reached: the ones running now plus
-    // every row ahead of it that takes a slot.
-    const busy = Number(max) - free;
-    const waiting = engine === 'claude' && !bypass && (free <= 0 || busy >= slotCap(max, it?.maxRunning));
+    const pace = paceOf(it?.maxRunning);
+    const waiting = engine === 'claude' && !bypass && (free <= 0 || (pace !== null && paced >= pace));
+    if (engine === 'claude' && !waiting && it?.resumed) paced++;
     // A bypass job takes a REAL worker, so it pushes `free` negative and the
     // jobs behind it wait longer. Anything else would report a queue that is
     // shorter than the one the daemon will actually run.

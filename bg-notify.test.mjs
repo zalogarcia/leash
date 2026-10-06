@@ -912,6 +912,8 @@ const renameSync = () => {
 // its use is wall-guard-wiring.test.mjs's subject.
 export const WALL_JOBS = [];
 const noteWallGuardJob = (runId, it) => { WALL_JOBS.push({ runId, cwd: it?.cwd || null, resumeOf: it?.resumeOf || null }); };
+// How many resumed jobs run (the pace's count): bg-concurrency-wiring.test.mjs runs the real one.
+const runningResumedWorkers = () => 0;
 const CLAUDE_AVAILABLE = true;
 export const WALLS_RAISED = [];
 const raiseClaudeWall = async () => { WALLS_RAISED.push(Date.now()); return null; };

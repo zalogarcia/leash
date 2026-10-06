@@ -100,13 +100,14 @@ export const THRESHOLD_MAX = 100;
 export const RESUME_WITHIN_MAX_MINUTES = 60;
 export const RESUME_CHAIN_LIMIT = 10;
 // THE RESUME PACE (resumeMaxConcurrent). A resumed job starts only while fewer
-// than this many Claude workers are running; the rest wait in the ordinary
-// queue and start as workers finish. Nine workers restarted at once after a
-// wall used the next five hour window in about ninety minutes and walled it
-// too (2026-10-06, afternoon), which is the loop the chain cap exists to stop
-// and this keeps from starting. It only ever LOWERS the ordinary cap
-// (bg-admission.mjs hasSlot), never raises it; 0 or false means "no pace of
-// its own, the ordinary cap alone".
+// than this many RESUMED jobs are running; the rest wait in the ordinary queue
+// and start as the others finish. Nine workers restarted at once after a wall
+// used the next five hour window in about ninety minutes and walled it too
+// (2026-10-06, afternoon), which is the loop the chain cap exists to stop and
+// this keeps from starting. It is a second condition on top of the ordinary
+// cap (bg-admission.mjs hasSlot), so it can only make a resume wait, and it
+// never holds back new work; 0 or false means "no pace of its own, the
+// ordinary cap alone".
 export const RESUME_PACE_LIMIT = 50;
 
 const num = (v) => (v === null || v === undefined || v === '' || typeof v === 'boolean' ? NaN : Number(v));
@@ -184,13 +185,22 @@ export function openWindows(usage, now = Date.now()) {
  * against each other. Keyed by the arming window instead, a weekly window at
  * 97 armed it, the five hour window then passed it, the key changed, and
  * every worker was told twice and the owner twice (QA, 2026-10-06). With no
- * open five hour window the arming window keys it.
+ * five hour window in the reading at all the arming window keys it.
+ *
+ * A READING WHOSE FIVE HOUR WINDOW HAS ALREADY RESET IS STALE AS A WHOLE. It
+ * was taken before that reset, and the next reading (seconds away while a
+ * worker is talking to the API) carries the new window. Armed by its weekly
+ * figure in between, it opened a third episode under the weekly key at every
+ * five hour boundary, and every worker was told again within minutes (QA
+ * round 2, 2026-10-06).
  */
 export function checkpointTrigger({ settings = WALL_GUARD_DEFAULTS, usage = null, account = null, now = Date.now() } = {}) {
   const s = settings || WALL_GUARD_DEFAULTS;
   if (!s.enabled) return { armed: false, reason: 'off', window: null, key: null };
   const hasAny = usage && (usage.fiveHour || usage.sevenDay || (Array.isArray(usage.scoped) && usage.scoped.length));
   if (!account || !hasAny) return { armed: false, reason: 'no reading', window: null, key: null };
+  const fiveReset = usage.fiveHour ? resetsAtToMs(usage.fiveHour.resetsAt) : NaN;
+  if (Number.isFinite(fiveReset) && !(fiveReset > Number(now))) return { armed: false, reason: 'stale', window: null, key: null };
   const open = openWindows(usage, now);
   if (!open.length) return { armed: false, reason: 'stale', window: null, key: null };
   const over = open.filter((w) => w.percent >= s.thresholdPercent);

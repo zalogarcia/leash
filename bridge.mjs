@@ -950,6 +950,23 @@ function runningBgWorkers() {
     return MAX_CONCURRENT_WORKERS;
   }
 }
+/**
+ * How many of those are jobs the WALL GUARD RESUMED, which is what a resume's
+ * pace counts (bg-admission.mjs hasSlot `pacedRunning`). Read off the guard's
+ * dispatch record, written by the drain when it starts a resume and kept
+ * across a restart, so a resumed worker that outlived the daemon still counts.
+ * A count that cannot be made is reported as a full pace, for the same reason
+ * runningBgWorkers reports a full pool: the resume waits one poll cycle, and
+ * failing open here would let every resumed job start at once.
+ */
+function runningResumedWorkers() {
+  try {
+    return bgWorkerDescriptors().filter((w) => (w.engine || 'claude') !== 'codex' && wallGuard.jobOf(w.runId)?.resumeOf).length;
+  } catch (e) {
+    console.error('[bridge] could not count the running resumed workers, treating the pace as full:', e.message);
+    return MAX_CONCURRENT_WORKERS;
+  }
+}
 const allLanes = () => [LANES.main, ...bgLanes];
 makeBgLane(); // bg1 exists from boot
 // Commands that historically run for many minutes — routed to bg automatically.
@@ -5013,7 +5030,7 @@ function readCheckpointCommit(logPath) {
  * go into the guard's record, where the lift finds them. Never throws: the
  * handback this rides beside is load bearing and this is not.
  */
-function noteWallDeath(runId, task, { draft = null, finalReportSeen = false, account = null } = {}) {
+function noteWallDeath(runId, task, { draft = null, finalReportSeen = false, account = null, provisional = false } = {}) {
   try {
     const draftFile = draft?.file || (existsSync(bgDraftPath(runId)) ? bgDraftPath(runId) : null);
     wallGuard.death(runId, {
@@ -5025,8 +5042,13 @@ function noteWallDeath(runId, task, { draft = null, finalReportSeen = false, acc
       finalReportSeen: Boolean(finalReportSeen),
       checkpoint: readCheckpointCommit(bgRunLogPath(runId)),
       ...(account ? { account } : {}),
+      ...(provisional ? { provisional: true } : {}),
     });
-    console.log(`[bridge] wall guard: ${runId} died on the wall; recorded for the resume at the lift`);
+    console.log(
+      provisional
+        ? `[bridge] wall guard: ${runId} died behind a rotation still in progress; recorded, and resumed at the lift only if that rotation raised the wall`
+        : `[bridge] wall guard: ${runId} died on the wall; recorded for the resume at the lift`,
+    );
   } catch (e) {
     console.error(`[bridge] wall guard could not record the death of ${runId}:`, e.message);
   }
@@ -5092,7 +5114,7 @@ function resumeWallDeaths(ep, { readyAt = null, now = Date.now() } = {}) {
   // before that belongs to a wall long gone. A minute of slack for the wall
   // being raised a moment after the first death was recorded.
   const since = (Number(ep?.carried?.from) || Number(ep?.raisedAt) || 0) - 60_000;
-  const { candidates, stale } = resumeCandidates({ episodeWorkers: ep?.workers || [], deaths: wallGuard.deaths(), since });
+  const { candidates, stale } = resumeCandidates({ episodeWorkers: ep?.workers || [], deaths: wallGuard.deaths(), since, raisedAt: [ep?.raisedAt, ep?.updatedAt] });
   for (const id of stale) wallGuard.settleDeath(id);
   const timing = resumeTiming({ readyAt, now, withinMinutes: settings.resumeWithinMinutes });
   if (!candidates.length) return { resumed: [], skipped: [], timing };
@@ -5124,7 +5146,7 @@ function resumeWallDeaths(ep, { readyAt = null, now = Date.now() } = {}) {
     });
     const brief = resumeBrief({ text: r.text, task: r.task, title: briefTitle(r.task, 300), count: r.count, max: r.max, note });
     if (!wallGuard.claimResume(r.runId, { count: r.count, title: brief.title, root: r.resumeRoot || r.runId })) {
-      skipped.push({ ...r, reason: 'the resume claim could not be saved, so it was not queued' });
+      skipped.push({ ...r, died: true, reason: 'the resume claim could not be saved, so it was not queued' });
       continue;
     }
     items.push(resumeQueueItem({ death: r, text: brief.text, count: r.count, now, maxRunning: settings.resumeMaxConcurrent }));
@@ -5132,7 +5154,8 @@ function resumeWallDeaths(ep, { readyAt = null, now = Date.now() } = {}) {
   }
   if (items.length && !queueResumeJobs(items)) {
     // Claimed and not queued: never claimed twice, so they go to the chat lane.
-    for (const r of resumed.splice(0)) skipped.push({ ...r, reason: 'the drop box would not take it; dispatch it by hand' });
+    // `died`, so the owner's line still counts them.
+    for (const r of resumed.splice(0)) skipped.push({ ...r, died: true, reason: 'the drop box would not take it; dispatch it by hand' });
   }
   for (const c of [...resumed, ...skipped]) wallGuard.settleDeath(c.runId);
   logAccountDecision({
@@ -5356,6 +5379,15 @@ async function handleLimitDeath(task, outcome, runId, steers = [], draft = null,
   // lift queues it again.
   const wallDeath = rot.outcome === 'exhausted' || rot.outcome === 'paused';
   if (wallDeath) noteWallDeath(runId, task, { draft, finalReportSeen, account: rot.activeName || null });
+  // BEHIND A ROTATION STILL IN PROGRESS (`cooldown`). One wall kills several
+  // workers inside the same seconds: the first corpse's rotation is still
+  // asking the other accounts when the next corpse arrives, and nothing here
+  // records how that rotation ends. Recorded as "it finished", every worker
+  // after the first was never resumed. So the death is recorded as
+  // PROVISIONAL, and the lift counts it only when the wall went up around it
+  // (wall-resume.mjs resumeCandidates); a rotation that swapped instead raised
+  // no wall, and its provisional deaths are dropped by the next lift.
+  else if (rot.outcome === 'cooldown') noteWallDeath(runId, task, { draft, finalReportSeen, provisional: true });
   // The worker lane's own voice, unchanged: a bubble it can read later, naming
   // both halves of the swap.
   if (rot.outcome === 'swapped') {
@@ -9508,10 +9540,11 @@ function queuedBgJobRows({ running = runningBgWorkers() } = {}) {
         title: briefTitle(stripLaneRules(pre.text)),
         queuedAt: (typeof it === 'object' && it?.queuedAt) || null,
         maxRunning: (typeof it === 'object' && it?.maxRunning) || null, // a resumed job's own pace
+        resumed: Boolean(typeof it === 'object' && it?.resumeOf),
       };
     })
     .filter(Boolean);
-  return queueRows(rows, { running, max: MAX_CONCURRENT_WORKERS });
+  return queueRows(rows, { running, max: MAX_CONCURRENT_WORKERS, pacedRunning: runningResumedWorkers() });
 }
 
 // A running session hands a long job to the background lane by appending here
@@ -9545,6 +9578,7 @@ function drainBgHandoff() {
   // than re-read per item: nothing else in this synchronous loop can change it,
   // and bgWorkerDescriptors() reads the inflight registry off disk.
   let running = runningBgWorkers();
+  let pacedRunning = runningResumedWorkers(); // the resumed jobs among them, for a resume's pace
   const deferred = [];
   for (const it of items) {
     const queuedText = typeof it === 'string' ? it : it?.text;
@@ -9706,14 +9740,16 @@ function drainBgHandoff() {
     // `--now` is the only way past, and it has to be typed at dispatch: a cap
     // that lifts itself under load is not a cap, and load is when it matters.
     const bypass = Boolean(typeof it === 'object' && it?.now);
-    // A JOB'S OWN, LOWER CAP: a job the wall guard resumed carries its pace
-    // (`maxRunning`, wall-resume.mjs) and starts only while fewer Claude
-    // workers than that are running, so the workers a wall killed do not all
-    // come back at once and use the next window the way they used the last.
-    // It can only lower the cap (bg-admission.mjs slotCap). A deferred resume
-    // does not hold back an ordinary job behind it.
+    // A RESUME'S PACE: a job the wall guard resumed carries its pace
+    // (`maxRunning`, wall-resume.mjs) and starts only while fewer RESUMED jobs
+    // than that are running, so the workers a wall killed do not all come back
+    // at once and use the next window the way they used the last. A second
+    // condition on top of the cap, never a way past it (bg-admission.mjs
+    // paceOf). It counts the resumed jobs, not the pool: a waiting resume does
+    // not hold back an ordinary job behind it, and ordinary jobs cannot starve
+    // it either.
     const itemMax = typeof it === 'object' && it ? it.maxRunning : null;
-    if (!hasSlot({ running, max: MAX_CONCURRENT_WORKERS, engine: 'claude', bypass, itemMax })) {
+    if (!hasSlot({ running, max: MAX_CONCURRENT_WORKERS, engine: 'claude', bypass, itemMax, pacedRunning })) {
       deferred.push(typeof it === 'object' && it ? it : { text: queuedText });
       continue;
     }
@@ -9751,6 +9787,7 @@ function drainBgHandoff() {
         : null;
     dispatchPrompt(text, lane, { priority: true, schedule }); // already claimed out of the file: must not be dropped
     running++; // this worker is live from here on, so the next item sees a fuller pool
+    if (typeof it === 'object' && it?.resumeOf) pacedRunning++; // and a resume counts toward the next resume's pace
     // THE WALL GUARD'S DISPATCH RECORD, the drop box half: the directory pin
     // and, for a job the guard itself resumed, its place in the resume chain
     // (wall-resume.mjs). Its own try, after the dispatch: decoration must never
