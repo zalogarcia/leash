@@ -32,6 +32,7 @@
   "progress": { "background": true },
   "autoCompact": { "enabled": false, "thresholdPercent": 60, "cooldownMinutes": 30 },
   "wakeUp": { "afterRestart": true, "afterCompact": true },
+  "wallGuard": { "enabled": true, "thresholdPercent": 95, "resume": true, "resumeWithinMinutes": 5, "resumeChainMax": 2, "resumeMaxConcurrent": 4 },
 
   "logFile": "",
 
@@ -65,6 +66,7 @@
     "progress": "{\"background\": false} turns off the live 🌙 line a background worker keeps on screen from dispatch to done. Default true.",
     "autoCompact": "{\"enabled\": true} lets the daemon run the same compaction /compact runs, by itself, when a chat turn ends with the session at or past thresholdPercent of its context window and nothing is queued, steered or asked and unanswered. The live message says it was automatic. cooldownMinutes is the least time between two compactions, manual or automatic. Default off, 60, 30.",
     "wakeUp": "afterRestart: true sends the chat ONE wake-up turn after a daemon restart when the last process was cut mid turn (a persisted turn-in-flight marker, not a guess from timestamps) or its last answer promised a next step, telling it to finish any unfinished work now: pending dispatches, promised deliveries, workers to collect, files written but not used. Skipped when you already sent a message after the restart, on a walled engine, on a Codex chat lane, and never twice for the same turn. afterCompact: true makes the fresh chat a compaction opens CONTINUE the summary's Unfinished work list instead of acknowledging and waiting. Both default true; a bare false turns both off.",
+    "wallGuard": "The usage wall guard. Before a wall: when the live account is at or past thresholdPercent of a usage window (five hour or weekly) and no other account can take a run, every running Claude background worker that can be steered is told ONCE per window to save a checkpoint (a WIP commit on its own branch or a patch, plus a resume note in its draft report) and carry on; it is never told to stop. After the wall: with resume true, each Claude worker that died on the wall with its job unfinished is queued again at the lift, as its original brief behind a RESUME NOTE, on Claude, in the same directory, through the ordinary queue. resumeChainMax is how many automatic resumes one job gets before it goes to the chat instead. resumeMaxConcurrent is the pace: a resumed job starts only while fewer Claude workers than that are running (0 = the ordinary cap alone). A resume queued more than resumeWithinMinutes after the account was ready is reported as late. A brief with the line `Auto-resume: no` is never resumed. Default: on, 95, true, 5, 2, 4. A bare false turns the whole guard off.",
     "logFile": "Where the daemon writes its own log. Empty = the path the service manager already gives it (launchd / systemd).",
     "bgTailMs": "How often the daemon polls a detached worker's log file, in ms. This replaces the stdout pipe. Default 300.",
     "reattachPollMs": "How often to check whether a worker that outlived a daemon restart has exited, in ms. Default 5000.",

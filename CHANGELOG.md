@@ -32,6 +32,42 @@ limit in its verifier, and the account fixes that sit under both.**
   path skips a flagged slot, and the `/account` keyboard marks it and refuses its tap. Token refresh
   is single flight per slot, so two readers never present the same single use refresh token.
 
+### The usage wall guard
+
+- **Before the wall, workers save their work.** When the live account is at or past 95% of a usage
+  window (five hour or weekly) on a reading whose window is still open, and no other account can
+  take a run by the selector's own rule, each running Claude background worker that can be steered
+  gets ONE steer for that window, through the same path `bg.mjs steer` uses: finish the step in
+  hand, start no new long step, commit the work in progress on its own branch with files staged by
+  name (a patch file on a shared checkout; no push, deploy, merge or migration), write a resume
+  note at the top of its draft report, then continue. It never says stop. Codex workers get
+  nothing. A worker that cannot be steered is named in the one line the owner gets per window,
+  which also names the next account and its reset time. It does not fire on a stale reading, with
+  another account free, with no Claude worker running, or a second time for the same worker in the
+  same window, across restarts.
+- **After the wall, the workers that died on it are started again.** At the lift the daemon queues
+  each Claude worker that died on the wall with its job unfinished: the original brief, whole and
+  unchanged, behind a `RESUME NOTE` (why the run ended, its draft report, its checkpoint commit,
+  where to read its production writes, and the rules: continue from the checkpoint, verify the live
+  state before any production write, never repeat a send, a deploy, a migration, a payment or a
+  publish). Same engine, same directory, the same title as a prefix, through the ordinary queue
+  and cap. A resume is pinned to Claude, so it waits for the lift and is never routed to Codex; the
+  Codex fallback for new jobs is unchanged.
+- **Resumes are paced.** A resumed job starts only while fewer than `resumeMaxConcurrent` Claude
+  workers are running (4 by default); the rest wait in the queue and start as workers finish, and
+  `bg.mjs ps` lists them as waiting. The pace rides on the queue item and can only lower the cap.
+- **Four safety rules, each persisted in `wall-guard.json` (gitignored).** Never a run that is
+  still alive (the worker registry and the process are asked, not a log line), never the same
+  death twice, at most `resumeChainMax` automatic resumes per job (2 by default; after that the
+  job goes to the chat with the reason), and never a brief with the line `Auto-resume: no`.
+- **No double dispatch through the chat.** The wake-up at the lift lists the jobs already resumed
+  under "Do NOT dispatch these again" and every job not resumed with its reason. The owner gets
+  one line at the lift: how many were resumed, their titles, how many were not and why.
+- **Settings and the off switch.** One `wallGuard` block in `config.json`: `enabled`,
+  `thresholdPercent` (95), `resume`, `resumeWithinMinutes` (5), `resumeChainMax` (2),
+  `resumeMaxConcurrent` (4). No block means ON with those defaults; `"wallGuard": false` turns the
+  whole guard off. `/status` shows one line for it.
+
 ### Background workers
 
 - **The draft report.** Every Claude background worker is given `BG_REPORT_DRAFT`

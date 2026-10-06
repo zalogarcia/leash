@@ -380,6 +380,31 @@ handback chain was holding, and the instruction to pick up. Worker reports that 
 wall are held for that turn instead of dying on the same wall. The episode lives in `wall-wake.json`
 (gitignored), so a restart mid wall still wakes the chat once, and only once.
 
+**Near a wall, workers save their work. After it, the ones that died are started again.** When the
+live account reaches 95% of a usage window (the five hour one or a weekly one) and no other account
+can take a run, by the same rule a rotation uses, every running Claude background worker that can be
+steered gets ONE steer for that window: finish the step in hand, commit the work in progress on its
+own branch (or write a patch on a shared checkout), put a resume note at the top of its draft
+report, then carry on. The steer never tells a worker to stop. Codex workers get nothing, and a
+worker that cannot be reached (it outlived a daemon restart, so there is no pipe to it) is named in
+the one line you get per window. When the wall lifts, every Claude worker that DIED on it with its
+job unfinished is queued again by the daemon: its original brief, whole and unchanged, behind a
+`RESUME NOTE` that names the dead run, its draft report, its checkpoint commit and the rules for the
+new run (read the checkpoint and the git state first, verify the live state before any production
+write, never repeat a send, a deploy, a migration, a payment or a publish). A resume keeps the dead
+run's engine, its directory and its title as a prefix, goes through the ordinary queue and cap, and
+is pinned to Claude, so it waits for the lift instead of going to Codex. Resumes come back paced:
+a resumed job starts only while fewer than 4 Claude workers are running, and the rest start as
+workers finish, so the workers a wall killed do not use the next window the way they used the last.
+A job is never resumed while its run is still alive, never twice for the same death, at most twice
+in a row (after that it goes to the chat with the reason), and never when its brief has the line
+`Auto-resume: no`. The wake-up at the lift lists what was resumed under "Do NOT dispatch these
+again" and what was not, each with its reason. The record lives in `wall-guard.json` (gitignored),
+so a restart cannot undo any of it. Settings are the `wallGuard` block in `config.json`: with no
+block the guard is ON with the defaults, and `"wallGuard": false` turns the whole guard off. The
+guard reads the same usage lookup `/status` does, at most once a minute and only while a Claude
+worker is running; when that lookup is rate limited it has no reading and stands down.
+
 **A dead login is flagged, never rotated onto.** When a slot's token refresh is refused
 (`invalid_grant`) or its login has expired, Leash flags the slot and says so once, with the fix:
 `/login` in Claude Code as that account, then `/account capture <name>`, which clears the flag. Every
@@ -971,6 +996,9 @@ node bg-reports.test.mjs         # the full report on disk, and the handback tha
 node accounts.test.mjs           # the account store and the rotation rules
 node limit-rotation.test.mjs     # the rotation, the wall, its re-check and the wake-up at the lift
 node wall-wake.test.mjs          # the wall episode on disk and the next-account rule
+node wall-guard.test.mjs         # the usage wall guard: the trigger, the steer text, the record
+node wall-resume.test.mjs        # the resume after a wall: the plan, its safety rules, the brief
+node wall-guard-wiring.test.mjs  # both, wired: a real stdin pipe, the real lift through a restart
 node account-usage.test.mjs      # live plan usage per account
 node account-buttons.test.mjs    # the one-tap swap keyboard
 node credential-store.test.mjs   # the keychain / file store behind a swap
@@ -1038,7 +1066,15 @@ and `autoCompact` (`{"enabled": true, "thresholdPercent": 60, "cooldownMinutes":
 lets the daemon compact an idle chat by itself past the threshold, default off),
 `wakeUp` (`{"afterRestart": true, "afterCompact": true}`: wake the chat after a
 restart that cut a turn or left a promise unfinished, and make a compaction's
-fresh chat continue the summary's unfinished work; both default on).
+fresh chat continue the summary's unfinished work; both default on),
+and `wallGuard` (`{"enabled": true, "thresholdPercent": 95, "resume": true,
+"resumeWithinMinutes": 5, "resumeChainMax": 2, "resumeMaxConcurrent": 4}`: the
+usage wall guard above. `thresholdPercent` is where workers are told to save,
+`resume` switches the restart after the wall, `resumeChainMax` is how many
+automatic resumes one job gets, `resumeMaxConcurrent` is the pace resumes come
+back at (0 for the ordinary cap alone), and a resume queued more than
+`resumeWithinMinutes` after the account was ready is reported as late. On with
+these values when the block is absent; `"wallGuard": false` turns it all off).
 
 Every key can be overridden with a `BRIDGE_<UPPER_SNAKE>` environment variable,
 including the object-valued ones: `BRIDGE_STYLE='{"noDashes":true}'`,
