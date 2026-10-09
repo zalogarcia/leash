@@ -80,6 +80,7 @@ import {
 } from './account-autoswitch.mjs';
 import {
   createAccountUsage,
+  fmtResetClock,
   invalidateUsageCache,
   resetsAtToMs,
   usageLine,
@@ -5083,7 +5084,7 @@ async function autoSwitchCandidates(activeName, now, { all = false } = {}) {
     if (!r.captured) c.verdict = { free: false, reason: 'no captured login' };
     else if (r.needsLogin) c.verdict = { free: false, reason: `needs a fresh login (${r.needsLogin.reason || 'refused'})` };
     else if (r.limited) {
-      c.verdict = { free: false, reason: `walled until ${fmtUntil(Number(r.limitedUntil) * 1000, { timeZone: OWNER_TZ })}` };
+      c.verdict = { free: false, reason: `walled until ${fmtResetClock(Number(r.limitedUntil) * 1000, { timeZone: OWNER_TZ })}` };
       // The ledger's own clock is a reset too: the lookup comes the moment it passes.
       autoSwitchProbes.set(r.name, { ...(prev || {}), at: prev?.at ?? null, verdict: c.verdict, blockedUntilMs: Number(r.limitedUntil) * 1000 });
     } else {
@@ -5140,7 +5141,7 @@ async function autoSwitchTick(now = Date.now(), { dryRun = false } = {}) {
   // THE OWNER'S HOLD: a pick judged now when no reading was at hand then.
   if (autoSwitchOwnerHold?.name === name && autoSwitchOwnerHold.until === null && heldUsage) armOwnerHold(name, heldUsage);
   if (autoSwitchOwnerHold && autoSwitchOwnerHold.name === name && now < autoSwitchOwnerHold.until) {
-    gates.push(`the owner chose ${name} past the threshold; left alone until ${fmtUntil(autoSwitchOwnerHold.until, { timeZone: OWNER_TZ })}`);
+    gates.push(`the owner chose ${name} past the threshold; left alone until ${fmtResetClock(autoSwitchOwnerHold.until, { timeZone: OWNER_TZ })}`);
     if (!dryRun) return autoSwitchSkip(gates[gates.length - 1]);
   }
   const usage = snap?.row?.state === 'ok' && snap.row.usage ? snap.row.usage : null;
