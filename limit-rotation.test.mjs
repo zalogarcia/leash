@@ -366,6 +366,18 @@ const B = await import(
         grab('raiseClaudeWall'),
         grab('armWallResume'),
         grab('rotateOffLimitedAccount'),
+        // The one switch chain the sweep, the wall re-check and the move at a
+        // wall swap on.
+        'let accountSwitchChain = Promise.resolve();',
+        'let accountSwitchBusy = 0;',
+        // The non-rotation cooldown mark the sweep and the wall re-check set.
+        'let swapCooldownMark = 0;',
+        'export const swapMark = () => swapCooldownMark;',
+        'export const cooldownUntil = () => rotationCooldownUntil;',
+        // A switch holding the chain: release(true) lands it (the cooldown
+        // armed, as every landed switch arms it), release(false) gives up.
+        'export const holdSwitchChain = () => { let release; const gate = new Promise((r) => { release = r; }); accountSwitchBusy++; accountSwitchChain = accountSwitchChain.then(() => gate); return (landed) => { if (landed) rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS; accountSwitchBusy--; release(); }; };',
+        grab('swapOnSwitchChain'),
         grab('sweepWalledActiveAccount'),
         grab('recheckDuringWall'),
         grab('kickWalledSweep'),
@@ -515,6 +527,11 @@ B.setList(THREE());
 B.setProbes({ 'c@example.com': HEALTHY('c@example.com'), 'b@example.com': HEALTHY('b@example.com') });
 B.setUsageRow(row({ fiveHour: win(100, iso(6 * HOUR)), sevenDay: win(100, iso(40 * HOUR)), scoped: [], extraUsage: null }));
 let rot = await B.rotateOffLimitedAccount(WALL);
+const markAfterSwap = [B.swapMark(), B.cooldownUntil()];
+await t('★ a rotation that LANDS marks its cooldown, so an owner\'s switch waiting on it may go (account switch, QA round 5)', () => {
+  ok(markAfterSwap[1] > NOW, 'the cooldown is armed');
+  eq(markAfterSwap[0], markAfterSwap[1], 'and marked as landed');
+});
 await t('★ the wall with no clock marks the account until the API window, not one hour out', () => {
   eq(rot.outcome, 'swapped');
   eq(B.marked.length, 1, 'exactly one account marked');
@@ -564,8 +581,10 @@ B.setList([
 ]);
 B.setUsageRow(row({ fiveHour: win(100, iso(6 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }));
 rot = await B.rotateOffLimitedAccount(WALL);
+const markAfterWall = [B.swapMark(), B.cooldownUntil()];
 await t('the enrichment still runs when nothing is free to swap to', () => {
   eq(rot.outcome, 'exhausted');
+  eq(markAfterWall[0], markAfterWall[1], 'a rotation that ends at a wall marks its cooldown as landed too');
   eq(B.marked[0].resetsAt, Math.floor((NOW + 6 * HOUR) / 1000), 'the wall clock has to be right precisely then');
   ok(B.CALLS.some((c) => c.raiseWall === 'claude'), 'and the wall notice goes up');
   // Since 2026-09-30 a held wall is RE-CHECKED when nothing else is free (a
@@ -1691,6 +1710,51 @@ await t('★ a rotation whose pick is refused as a dead login selects again and 
   ok(rot.lines.join('\n').includes(`"${ME}" turned out to need a fresh login`), rot.lines.join('\n'));
   eq(B.NOTICES.length, 1, 'the late refusal is said once');
 });
+
+// ---------------------------------------------------------------------------
+// THE SWEEP ON THE ONE SWITCH CHAIN. The sweep's own checks are seconds old by
+// the time it swaps; an automatic, scheduled or commanded switch running
+// meanwhile must not be followed by a second swap onto the sweep's stale pick.
+// ---------------------------------------------------------------------------
+const sweepRaceSetup = () => {
+  B.reset();
+  B.setActive('b@example.com');
+  B.setList([walledSlot('b@example.com'), slot('c@example.com', { lastActiveAt: new Date(NOW - HOUR).toISOString() })]);
+  B.setProbes({ 'c@example.com': HEALTHY('c@example.com') });
+};
+
+sweepRaceSetup();
+{
+  const release = B.holdSwitchChain();
+  const pending = B.sweepWalledActiveAccount();
+  for (let i = 0; i < 50; i++) await Promise.resolve();
+  const before = swaps();
+  release(true);
+  const res = await pending;
+  await t('★ the sweep waits for a switch already on the chain and stands down when it lands (no second swap)', () => {
+    eq(before, '', 'nothing swapped while the other switch held the chain');
+    eq(res.moved, false, JSON.stringify(res));
+    ok(/another switch moved the login/.test(res.reason || ''), JSON.stringify(res));
+    eq(swaps(), '', 'the sweep never wrote the keychain');
+  });
+}
+
+sweepRaceSetup();
+{
+  const release = B.holdSwitchChain();
+  const pending = B.sweepWalledActiveAccount();
+  for (let i = 0; i < 50; i++) await Promise.resolve();
+  release(false);
+  const res = await pending;
+  await t('...and when the switch ahead of it did not land, the sweep moves the login as before', () => {
+    eq(res.moved, true, JSON.stringify(res));
+    eq(swaps(), 'c@example.com');
+  });
+  await t('★ the sweep marks its cooldown as not a rotation\'s, so an owner\'s switch right after is not held off (QA round 4)', () => {
+    ok(B.cooldownUntil() > NOW, 'the sweep armed the cooldown');
+    eq(B.swapMark(), B.cooldownUntil(), 'and marked it as its own');
+  });
+}
 
 rmSync(TMP, { recursive: true, force: true });
 

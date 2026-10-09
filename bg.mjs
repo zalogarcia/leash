@@ -12,6 +12,8 @@
 //   node bg.mjs btw <lane|runId|pid|latest> "a side question"
 //   node bg.mjs btw <lane|runId|pid|latest> --file ./btw.md
 //   node bg.mjs ps                                  (what is running, right now)
+//   node bg.mjs account switch <name>               (move the Claude login to that stored account now)
+//   node bg.mjs account check                       (the automatic switch's decision on the real readings, nothing swapped)
 //
 // The Leash daemon drains this drop-box each poll cycle (<=~1 min) and runs the
 // text in its own background Claude session, streaming progress to Telegram.
@@ -102,7 +104,7 @@ const TARGET_SHAPE = /^(?:latest|\d+|bg\d*|[A-Za-z][A-Za-z0-9_]*-\d{10,}(?:-\d+)
 const UNREACHABLE = `bridge daemon not reachable at ${SOCK}; it must be running the version with steering (restart with safe-restart.sh after upgrading)`;
 
 // One request, one response, one connection. Newline-delimited JSON.
-function ask(req) {
+function ask(req, timeoutMs = 15_000) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const done = (fn, v) => {
@@ -112,7 +114,7 @@ function ask(req) {
     };
     const sock = net.createConnection(SOCK);
     let buf = '';
-    sock.setTimeout(15_000);
+    sock.setTimeout(timeoutMs);
     sock.on('connect', () => sock.write(JSON.stringify(req) + '\n'));
     sock.on('data', (d) => {
       buf += d.toString();
@@ -216,6 +218,51 @@ if (argv[0] === 'btw') {
     ].join('\n'),
   );
   process.exit(1);
+}
+
+// THE CLAUDE ACCOUNT, switched by the daemon. The daemon does the swap single
+// flight with its own locks, so the credential store and accounts.json are
+// never written by a second process; this only asks. `account check` runs the
+// automatic switch's decision on the real readings and swaps nothing. A
+// switch from a background worker or a scheduled run is refused by the daemon
+// (the caller's LEASH_LANE, LEASH_TRIGGER and TMUX go with the request, the
+// same rule schedule.mjs applies to the write approval).
+//
+// Only the two exact shapes engage, so a brief that opens with the word
+// "account" is still a brief: a quoted brief is one argv element and never
+// reaches this test.
+// A MISTYPED ACTION (`account swtch x`) is a usage error, not a brief: a real
+// brief is one quoted argv element or --file, so two or three bare words that
+// open with "account" are never one, and dispatching them would start a worker.
+// A flag in second place (`account --file x`) is the ordinary dispatch path;
+// the word alone (`account`, the action forgotten) is the usage error too.
+if (
+  argv[0] === 'account' &&
+  argv.length <= 3 &&
+  argv.every((a) => !/\s/.test(a)) &&
+  (argv.length === 1 || (argv[1] !== 'check' && argv[1] !== 'switch' && !String(argv[1]).startsWith('--')))
+) {
+  console.error('usage: node bg.mjs account switch <stored account name>   |   node bg.mjs account check');
+  process.exit(1);
+}
+if (argv[0] === 'account' && (argv[1] === 'check' || argv[1] === 'switch')) {
+  const action = argv[1];
+  const name = String(argv[2] ?? '').trim();
+  if ((action === 'switch' && (!name || argv.length !== 3)) || (action === 'check' && argv.length !== 2)) {
+    console.error('usage: node bg.mjs account switch <stored account name>   |   node bg.mjs account check');
+    process.exit(1);
+  }
+  const from = { lane: process.env.LEASH_LANE || null, trigger: process.env.LEASH_TRIGGER || null, tmux: Boolean(process.env.TMUX) };
+  let res;
+  try {
+    res = await ask(action === 'switch' ? { op: 'account', action, name, from } : { op: 'account', action }, 35_000);
+  } catch (e) {
+    console.error(e.unreachable ? UNREACHABLE : `bg.mjs account ${action}: ${e.message}`);
+    process.exit(2);
+  }
+  if (res.ok) console.log(res.text || 'done');
+  else console.error(`NOT done: ${res.detail || res.reason || 'refused'}`);
+  process.exit(res.ok ? 0 : 1);
 }
 
 // ---------------------------------------------------------------------------

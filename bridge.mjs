@@ -64,6 +64,21 @@ import {
 import { createAccountStore, fingerprint, isLimitSignal, parseResetTime } from './accounts.mjs';
 import { selectAccount, PROBE_TIMEOUT_MS, createRecheckLimiter, limitClearVerdict } from './account-selector.mjs';
 import {
+  autoSwitchSettings,
+  autoSwitchStatusLine,
+  autoSwitchDecision,
+  candidateVerdict,
+  probeDue,
+  overThreshold,
+  readingLine,
+  switchTargetVerdict,
+  autoSwitchNotice,
+  switchRefusedNotice,
+  alreadyOnNotice,
+  EVIDENCE_MAX_AGE_MS as AUTO_SWITCH_EVIDENCE_MS,
+  PROBE_EVERY_MS as AUTO_SWITCH_RETRY_MS,
+} from './account-autoswitch.mjs';
+import {
   createAccountUsage,
   invalidateUsageCache,
   resetsAtToMs,
@@ -3586,6 +3601,14 @@ function handleSteerRequest(raw) {
     };
   }
   if (req.op === 'btw') return btwInto(req.target, req.text);
+  // The one op that answers later: a switch probes and writes the keychain.
+  // A throw is said as a throw; the deadline only answers the caller, the
+  // switch itself keeps going in the daemon and its Telegram notice says how
+  // it ends.
+  if (req.op === 'account') {
+    const run = handleAccountRequest(req).catch((e) => ({ ok: false, reason: 'failed', detail: `the daemon could not do it: ${e.message}` }));
+    return withDeadline(run, 25_000, { ok: false, reason: 'timeout', detail: 'still running in the daemon after 25s; the Telegram notice says how it ends, so do not send it again' });
+  }
   return steerInto(req.target, req.text);
 }
 
@@ -3639,7 +3662,12 @@ function startSteerServer() {
         console.error('[bridge] steer request failed:', e.message);
         res = steerFailure(STEER_REASONS.WRITE_FAILED, { detail: e.message });
       }
-      answer(res);
+      // An `account` request answers later (it is deadlined at 25s inside);
+      // the idle timer must not cut it off while it works.
+      if (res && typeof res.then === 'function') {
+        sock.setTimeout(30_000);
+        res.then(answer, (e) => answer(steerFailure(STEER_REASONS.WRITE_FAILED, { detail: e.message })));
+      } else answer(res);
     });
   });
   server.on('error', (e) => {
@@ -3808,6 +3836,19 @@ const accounts = createAccountStore({
 // one-line summary reads. 60s TTL inside the module, so /status asking on
 // every call costs nothing.
 const accountUsage = createAccountUsage({ store: accounts });
+// EVERY SWAP THAT LANDS, from any path (the rotation, /account, its buttons,
+// the automatic switch): the automatic switch's settle window counts from it.
+const swapToStore = accounts.swapTo;
+accounts.swapTo = async (...args) => {
+  const res = await swapToStore(...args);
+  if (res?.ok) {
+    lastAccountSwap = { from: res.from || null, to: res.to || null, at: Date.now() };
+    // The owner's hold belongs to the stint he chose; an owner's path arms it
+    // again after this returns (armOwnerHold).
+    autoSwitchOwnerHold = null;
+  }
+  return res;
+};
 
 // THE CODEX ACCOUNT. Same idea one engine over: the ChatGPT login `codex` runs
 // on has its own two rate-limit windows, its own plan and its own bill, and
@@ -4245,7 +4286,7 @@ function flagLoginsFromRows(rows, { via = null } = {}) {
  * every account on this machine the moment the network blinked. The worst case
  * of a timeout is exactly the behaviour that shipped before this existed.
  */
-async function pickHealthyAccount({ activeName = null, lines = [], quiet = false } = {}) {
+async function pickHealthyAccount({ activeName = null, lines = [], quiet = false, othersOnly = false } = {}) {
   // READ AFTER THE MARK. The caller has already written the wall for the
   // account that just died, and this list is what the selector filters and what
   // the earliest-reset clock is computed from.
@@ -4273,6 +4314,12 @@ async function pickHealthyAccount({ activeName = null, lines = [], quiet = false
     // (rate limited), so a paid reset is not invisible until the ledger's clock.
     recheck: limitRecheck,
     onDecision: (d) => {
+      // `othersOnly` is the wall guard asking whether ANOTHER account could
+      // take a run while the live one still has room. "Every account walled"
+      // is not what that answer means.
+      if (othersOnly && d.decision === 'all_accounts_walled_until') {
+        d = { ...d, decision: 'no_other_account_free', count: Math.max(0, (Number(d.count) || 0) - (activeName ? 1 : 0)) };
+      }
       // `quiet` is the wall sweep: it runs every minute while a wall is up, and
       // a skip line per walled account per minute says nothing the wall notice
       // does not already say.
@@ -4455,12 +4502,21 @@ async function sweepWalledActiveAccount() {
   if (claudeRunInFlight()) {
     return { checked: true, moved: false, reason: 'a run started while this was probing' };
   }
-  const res = await accounts.swapTo(pick.name, { refuseFlagged: true });
+  // ON THE ONE SWITCH CHAIN, and asked again when its turn comes: every switch
+  // that lands arms the cooldown, so a cooldown up then means the login has
+  // already moved, and the sweep's pick is stale.
+  const res = await swapOnSwitchChain(
+    pick.name,
+    { refuseFlagged: true },
+    () => !(Date.now() < rotationCooldownUntil) && !(Date.now() < rotationPausedUntil) && !claudeRunInFlight(),
+  );
+  if (res.skipped) return { checked: true, moved: false, reason: res.error };
   if (!res.ok) {
     console.error(`[bridge] pre-emptive swap off the walled account "${name}" failed: ${res.error}`);
     return { checked: true, moved: false, error: res.error };
   }
   rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS;
+  swapCooldownMark = rotationCooldownUntil; // not a rotation's: an owner's switch need not wait it out
   invalidateUsageCache();
   console.log(
     `[bridge] the live account "${name}" was already known limited; moved to "${pick.name}" before anything ran on it`,
@@ -4530,13 +4586,17 @@ async function recheckDuringWall() {
   // sweep above keeps). The wall still comes down: a run that dies on that
   // login rotates onto the account this just found.
   if (liveName && liveName !== pick.name) {
-    const res = await accounts.swapTo(pick.name, { refuseFlagged: true });
+    // On the one switch chain; the owner's own switch lifts the wall, and a
+    // lift while this waited means there is nothing left for it to do.
+    const res = await swapOnSwitchChain(pick.name, { refuseFlagged: true }, () => Date.now() < rotationPausedUntil);
+    if (res.skipped) return { checked: true, moved: false, reason: 'the wall lifted while this waited its turn' };
     if (!res.ok) {
       console.error(`[bridge] swap onto the re-checked account "${pick.name}" failed: ${res.error}`);
       return { checked: true, moved: false, error: res.error };
     }
     moved = true;
     rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS;
+    swapCooldownMark = rotationCooldownUntil; // not a rotation's: an owner's switch need not wait it out
     invalidateUsageCache();
   }
   rotationPausedUntil = 0;
@@ -4611,7 +4671,7 @@ function kickWalledSweep({ fresh = false } = {}) {
  * moves the login instead. A run in flight is not a try; the one minute sweep
  * (recheckDuringWall) asks again once it has ended.
  */
-async function moveLoginToNextAtWall() {
+async function moveLoginToNextAtWall({ inRotation = false } = {}) {
   if (!(Date.now() < rotationPausedUntil)) return { moved: false, reason: 'no wall' };
   if (!wallWake.pending()) return { moved: false, reason: 'no wall episode' };
   const next = pickNextAccount(accounts.describe());
@@ -4636,7 +4696,14 @@ async function moveLoginToNextAtWall() {
     logAccountDecision({ ...decision, reason: 'earliest known reset; the login is already on it' });
     return { moved: false, already: true, to: next.name };
   }
-  const res = await accounts.swapTo(next.name, { refuseFlagged: true });
+  // On the one switch chain, and only while the wall it is moving for is up.
+  // INSIDE A ROTATION it swaps directly: the rotation's cooldown already holds
+  // every switch off, and a swap queued behind an owner's switch would wait
+  // out that switch's lookups for nothing.
+  const res = inRotation
+    ? await accounts.swapTo(next.name, { refuseFlagged: true })
+    : await swapOnSwitchChain(next.name, { refuseFlagged: true }, () => Date.now() < rotationPausedUntil);
+  if (res.skipped) return { moved: false, reason: 'the wall lifted while this waited its turn' };
   if (!res.ok) {
     console.error(`[bridge] wall-time swap onto "${next.name}" failed: ${res.error}`);
     logAccountDecision({ ...decision, reason: `swap failed (${res.error}); the lift moves the login instead` });
@@ -4851,6 +4918,459 @@ function ownerLiftedWall(name = null) {
 }
 
 // ---------------------------------------------------------------------------
+// THE ACCOUNT SWITCH BEFORE THE LIMIT, AND ON A SCHEDULE (2026-10-08).
+//
+// The rotation moves the login only when a run DIES on a limit, and at an
+// all-accounts wall to the earliest known reset. On 2026-10-07 to 10-08 the
+// live account sat at 94 to 95 percent of its week and never reached 100, so
+// nothing moved it; two accounts reset at 14:00Z with whole weeks free and the
+// login stayed put until the owner typed /account by hand. The rules are pure
+// and shared (account-autoswitch.mjs); this is the wiring: where the live
+// reading and each candidate's lookup come from, the single flight every
+// switch goes through, the swap, the notice, the schedule and the socket.
+//
+// ONE PATH FOR EVERY SWITCH. The automatic tick, a scheduled switch and
+// `bg.mjs account switch` all go through switchAccountNow, one at a time, and
+// it swaps through accounts.swapTo inside this daemon, so the keychain and
+// accounts.json are never written by a second process. A running Claude Code
+// process follows the swap (measured in run logs: the weekly reset in its
+// rate_limit_event changes mid run), so
+// a switch never waits for the workers; the drift guard covers the residual
+// race exactly as it does for the rotation.
+//
+// THE LIVE ACCOUNT'S NUMBERS come from a lookup made with the live token
+// (accountUsage.activeOnly, cached for a minute), the same reading the usage
+// wall guard uses, so they are the live account's for certain.
+// ---------------------------------------------------------------------------
+
+/** The settings, read fresh: config.json `accountAutoSwitch`, ON with the defaults when absent. */
+function autoSwitchNow() {
+  return autoSwitchSettings(conf('accountAutoSwitch'));
+}
+
+// Every swap that lands, from any path, through the swapTo wrapper above:
+// { from, to, at }. The settle window counts from it, so the owner's own
+// /account and the rotation's swaps hold the automatic switch off too.
+let lastAccountSwap = null;
+// The last switch this section made (automatic, scheduled or by command), for
+// the /status line: { to, at, via }.
+let lastAutoSwitch = null;
+// One candidate's last lookup: name -> { at, verdict, blockedUntilMs }.
+const autoSwitchProbes = new Map();
+let autoSwitchInflight = null;
+let autoSwitchLastSkip = null;
+// A FAILED AUTOMATIC SWAP (the keychain refused the write, a login went bad
+// mid swap) pauses the automatic switch for PROBE_EVERY_MS, and its refusal is
+// said once per reason, not once per poll cycle: a locked keychain overnight
+// would otherwise send a refusal every minute until morning.
+let autoSwitchBackoffUntil = 0;
+let autoSwitchLastRefusal = null;
+// AN OWNER'S PICK PAST THE THRESHOLD, { name, until }: a switch the owner
+// made (scheduled, by command, a typed /account, an account button) onto an
+// account already over an automatic threshold is the owner's choice, so the
+// automatic switch leaves that account alone until the window that crossed
+// resets, instead of undoing it after the settle window. EVERY landed swap
+// clears it in the accounts.swapTo wrapper, and only an owner's path arms it
+// again (armOwnerHold), so it never re-engages on a later stint the owner did
+// not choose. `until: null` means no reading was at hand at the pick: the next
+// tick judges it on the live reading.
+let autoSwitchOwnerHold = null;
+
+/** Arm (or clear) the owner's hold for `name`, from the usage the pick saw. */
+function armOwnerHold(name, usage) {
+  if (!name) {
+    autoSwitchOwnerHold = null;
+    return;
+  }
+  if (!usage) {
+    autoSwitchOwnerHold = { name, until: null };
+    return;
+  }
+  const crossed = overThreshold(usage, autoSwitchNow(), Date.now());
+  const clocks = crossed.map((w) => w.resetsAtMs).filter((v) => Number.isFinite(v) && v > Date.now());
+  autoSwitchOwnerHold = crossed.length ? { name, until: clocks.length ? Math.max(...clocks) : Date.now() + 5 * 3600_000 } : null;
+}
+// The rotation cooldown value of the last swap that has LANDED (a switch here,
+// the walled-account sweep, the wall's re-check, a rotation once its swap lands
+// or it raises the wall), so an owner's switch can tell a rotation still in
+// flight from the rest (there is no landing record in this build): a cooldown
+// that is not the mark belongs to a rotation still moving the login, and the
+// switch waits for it to land before it swaps.
+let swapCooldownMark = 0;
+// How often an owner's switch looks again while a rotation's cooldown is up.
+const SWITCH_COOLDOWN_POLL_MS = 1000;
+// The chain every switch runs on, so a scheduled switch arriving while the
+// automatic one is swapping waits its turn instead of racing it; and a count,
+// so the automatic tick can stand down while anything is queued on it.
+let accountSwitchChain = Promise.resolve();
+let accountSwitchBusy = 0;
+
+/**
+ * A SWAP MADE OUTSIDE switchAccountNow (the walled-account sweep, the wall's
+ * re-check, the move at a wall) runs on the same one chain, so it never
+ * interleaves with an automatic, scheduled or commanded switch: those checks
+ * are seconds old by the time their swap is called.
+ * `stillWanted` is asked when its turn comes, with nothing awaited between it
+ * and the swap; false stands it down with { ok: false, skipped: true }.
+ */
+function swapOnSwitchChain(name, opts, stillWanted = () => true) {
+  accountSwitchBusy++;
+  const run = accountSwitchChain.then(() =>
+    stillWanted() ? accounts.swapTo(name, opts) : { ok: false, skipped: true, error: 'another switch moved the login while this waited its turn' },
+  );
+  accountSwitchChain = run.catch(() => {});
+  return run.finally(() => {
+    accountSwitchBusy--;
+  });
+}
+
+/** When the login last moved: this process's own record, else the newest `lastActiveAt` on disk. */
+function lastSwapAt() {
+  if (lastAccountSwap?.at) return lastAccountSwap.at;
+  let newest = null;
+  for (const a of accounts.listAccounts()) {
+    const t = Date.parse(a?.lastActiveAt || '');
+    if (Number.isFinite(t) && (newest === null || t > newest)) newest = t;
+  }
+  return newest;
+}
+
+function autoSwitchSkip(reason, key = null) {
+  // Keyed on the stable part: a candidate's "(asked N min ago)" changes every
+  // minute and would log the same standing-down once a minute (QA round 10).
+  const tag = `${String(reason).replace(/ \(asked \d+ min ago\)/g, '')}|${key || ''}`;
+  if (tag === autoSwitchLastSkip) return { switched: false, reason };
+  autoSwitchLastSkip = tag;
+  // Only a reason about an account over its threshold is worth a line: the
+  // common "below the thresholds" would be one line every poll cycle.
+  if (key) logAccountDecision({ decision: 'account_autoswitch_standing_down', account: key, reason });
+  return { switched: false, reason };
+}
+
+/** One tick at a time; the poll loop calls this every cycle, before the wall guard. */
+function kickAutoSwitch() {
+  if (autoSwitchInflight) return autoSwitchInflight;
+  const op = autoSwitchTick().catch((e) => {
+    console.error('[bridge] account auto switch tick failed:', e.message);
+    return null;
+  });
+  autoSwitchInflight = op;
+  pendingOps.add(op);
+  op.finally(() => {
+    pendingOps.delete(op);
+    if (autoSwitchInflight === op) autoSwitchInflight = null;
+  });
+  return op;
+}
+
+/**
+ * Every other stored account's verdict: a fresh lookup for the ones due one
+ * (account-autoswitch.mjs probeDue: never asked, right after a known reset, or
+ * every five minutes), the last verdict for the rest while it is young enough
+ * to count. A slot the ledger holds walled, flagged for a login or never
+ * captured is not asked at all. `all` asks every candidate now (the dry run).
+ */
+async function autoSwitchCandidates(activeName, now, { all = false } = {}) {
+  const settings = autoSwitchNow();
+  const rows = accounts.describe(now);
+  const out = [];
+  const asks = [];
+  rows.forEach((r, order) => {
+    if (r.name === activeName) return;
+    const prev = autoSwitchProbes.get(r.name) || null;
+    const c = { name: r.name, order, verdict: null, resetPassed: false };
+    out.push(c);
+    if (!r.captured) c.verdict = { free: false, reason: 'no captured login' };
+    else if (r.needsLogin) c.verdict = { free: false, reason: `needs a fresh login (${r.needsLogin.reason || 'refused'})` };
+    else if (r.limited) {
+      c.verdict = { free: false, reason: `walled until ${fmtUntil(Number(r.limitedUntil) * 1000, { timeZone: OWNER_TZ })}` };
+      // The ledger's own clock is a reset too: the lookup comes the moment it passes.
+      autoSwitchProbes.set(r.name, { ...(prev || {}), at: prev?.at ?? null, verdict: c.verdict, blockedUntilMs: Number(r.limitedUntil) * 1000 });
+    } else {
+      const blockedUntilMs = prev?.blockedUntilMs ?? null;
+      if (all || probeDue({ lastProbeAt: prev?.at ?? null, blockedUntilMs, now })) {
+        c.resetPassed = Boolean(blockedUntilMs && blockedUntilMs <= now && prev?.verdict && !prev.verdict.free);
+        asks.push(
+          withDeadline(accountUsage.one(r.name), PROBE_TIMEOUT_MS + 1000, null).then((row) => {
+            // A refused login found here is flagged and said once, as from any probe.
+            if (row) flagLoginsFromRows([row], { via: 'auto switch' });
+            c.verdict = candidateVerdict(row, { name: r.name, settings, now: Date.now() });
+            autoSwitchProbes.set(r.name, { at: Date.now(), verdict: c.verdict, blockedUntilMs: c.verdict.blockedUntilMs ?? null });
+          }),
+        );
+      } else if (prev?.verdict && prev.at && now - prev.at <= AUTO_SWITCH_EVIDENCE_MS) {
+        c.verdict = prev.verdict;
+      } else {
+        c.verdict = { free: false, reason: prev?.verdict?.reason ? `${prev.verdict.reason} (asked ${Math.round((now - prev.at) / 60_000)} min ago)` : 'not asked yet' };
+      }
+    }
+  });
+  await Promise.all(asks);
+  return out;
+}
+
+/**
+ * THE AUTOMATIC SWITCH, once per poll cycle (kickAutoSwitch). The live
+ * account's numbers come from a lookup on the live token, the same one /status
+ * reads, cached for a minute inside account-usage.mjs (and held back while the
+ * endpoint answers 429), so it costs at most one usage call a minute. Over a
+ * threshold the other accounts are asked (paced) and the pure decision runs.
+ * `dryRun` asks every candidate now and returns the decision without
+ * swapping: `node bg.mjs account check`.
+ */
+async function autoSwitchTick(now = Date.now(), { dryRun = false } = {}) {
+  const settings = autoSwitchNow();
+  const gates = [];
+  if (!settings.enabled) gates.push('off');
+  if (!CLAUDE_AVAILABLE) gates.push('no claude on this machine');
+  // A wall up belongs to the wall machinery (recheckDuringWall moves the login
+  // off it); a rotation that just landed has its own cooldown to run out.
+  if (now < rotationPausedUntil) gates.push('the all-accounts wall is up');
+  if (now < rotationCooldownUntil) gates.push('a rotation landed moments ago');
+  if (wallLiftInflight) gates.push('a wall lift is running');
+  if (accountSwitchBusy) gates.push('a switch is running');
+  if (now < autoSwitchBackoffUntil) gates.push('the last automatic swap failed, waiting before the next try');
+  if (gates.length && !dryRun) return autoSwitchSkip(gates[0]);
+  // The live account and its numbers, from one lookup on the live token
+  // (cached for a minute inside account-usage.mjs).
+  const snap = await withDeadline(accountUsage.activeOnly(), PROBE_TIMEOUT_MS + 1000, null);
+  const name = snap?.active?.name || null;
+  if (!name && !dryRun) return autoSwitchSkip('the live account is not identified yet');
+  const heldUsage = snap?.row?.state === 'ok' && snap.row.usage ? snap.row.usage : null;
+  // THE OWNER'S HOLD: a pick judged now when no reading was at hand then.
+  if (autoSwitchOwnerHold?.name === name && autoSwitchOwnerHold.until === null && heldUsage) armOwnerHold(name, heldUsage);
+  if (autoSwitchOwnerHold && autoSwitchOwnerHold.name === name && now < autoSwitchOwnerHold.until) {
+    gates.push(`the owner chose ${name} past the threshold; left alone until ${fmtUntil(autoSwitchOwnerHold.until, { timeZone: OWNER_TZ })}`);
+    if (!dryRun) return autoSwitchSkip(gates[gates.length - 1]);
+  }
+  const usage = snap?.row?.state === 'ok' && snap.row.usage ? snap.row.usage : null;
+  const source = usage ? 'lookup' : 'none';
+  if (!dryRun && !usage) return autoSwitchSkip('no usable reading for the live account');
+  if (!dryRun && !overThreshold(usage, settings, now).length) return autoSwitchSkip('below the thresholds');
+  const at = Date.now();
+  const candidates = await autoSwitchCandidates(name, at, { all: dryRun });
+  const decision = autoSwitchDecision({ settings, active: { name, usage }, candidates, now: Date.now(), lastSwitchAt: lastSwapAt() });
+  if (dryRun) return { switched: false, dryRun: true, gates, source, usage, candidates, decision, settings, name };
+  if (!decision.switch) return autoSwitchSkip(decision.reason, decision.over.length ? name : null);
+  // RE-READ after the awaits: a rotation, a wall or another switch may have
+  // landed meanwhile, and the login may already have moved.
+  const t2 = Date.now();
+  const nowLive = (await accounts.activeAccount().catch(() => null))?.account?.name || null;
+  if (t2 < rotationPausedUntil || t2 < rotationCooldownUntil || accountSwitchBusy || nowLive !== name) {
+    return autoSwitchSkip('the login moved while this was deciding');
+  }
+  autoSwitchLastSkip = null;
+  logAccountDecision({ decision: 'account_autoswitch', account: name, reason: `${decision.reason} · source=${source}` });
+  return switchAccountNow(decision.to, {
+    via: 'auto',
+    why: decision.why,
+    over: decision.over,
+    fromName: name,
+    fromUsage: usage,
+    toUsage: decision.target?.verdict?.usage || null,
+  });
+}
+
+/**
+ * THE ONE PATH FOR EVERY SWITCH: automatic (`via: 'auto'`, already decided),
+ * scheduled (`'schedule'`) or by command (`'command'`). Serialized on one
+ * chain. Returns { ok, to, from, noop?, reason? } and sends ONE message: the
+ * switch, the refusal, or "already on it".
+ */
+function switchAccountNow(target, opts = {}) {
+  accountSwitchBusy++;
+  const run = accountSwitchChain.then(() => doSwitchAccount(target, opts));
+  accountSwitchChain = run.catch(() => {});
+  const op = run
+    .catch((e) => {
+      console.error('[bridge] account switch failed:', e.message);
+      return { ok: false, reason: e.message };
+    })
+    .finally(() => {
+      accountSwitchBusy--;
+      pendingOps.delete(op);
+    });
+  pendingOps.add(op);
+  return op;
+}
+
+async function doSwitchAccount(target, { via = 'auto', why = null, over = [], fromName = null, fromUsage = null, toUsage = null, scheduleId = null } = {}) {
+  const say = (text) => send(text, { markdown: false }).catch((e) => console.error(`[bridge] account switch notice not delivered: ${e.message}`));
+  const active = await accounts.activeAccount().catch(() => null);
+  let activeName = active?.account?.name || null;
+  const refuse = (reason) => {
+    logAccountDecision({ decision: 'account_switch_refused', account: target, via, reason });
+    // An automatic swap that failed pauses the automatic switch and says so
+    // once per reason (autoSwitchBackoffUntil above); the owner's own switch
+    // always gets its answer.
+    if (via === 'auto') {
+      autoSwitchBackoffUntil = Date.now() + AUTO_SWITCH_RETRY_MS;
+      if (autoSwitchLastRefusal === reason) return { ok: false, to: target, from: activeName, reason };
+      autoSwitchLastRefusal = reason;
+    }
+    say(switchRefusedNotice({ target, via, scheduleId, reason, stillOn: activeName }));
+    return { ok: false, to: target, from: activeName, reason };
+  };
+  // RE-READ after the await above, for the automatic switch: its decision was
+  // made before it, and a limit death in between may have rotated the login
+  // (and armed the cooldown) already. Two swaps must never interleave; the
+  // rotation's wins and this one stands down quietly.
+  if (via === 'auto') {
+    const t = Date.now();
+    if (t < rotationCooldownUntil || t < rotationPausedUntil || (fromName && activeName !== fromName)) {
+      logAccountDecision({ decision: 'account_autoswitch_standing_down', account: fromName, reason: 'the login moved while this was deciding' });
+      return { ok: false, to: target, from: activeName, reason: 'the login moved while this was deciding' };
+    }
+  }
+  let name = target;
+  let note = null;
+  if (via !== 'auto') {
+    // THE OWNER NAMED IT, so it is checked by name: a stored account, a
+    // captured login that is not flagged, not walled in the ledger, and not
+    // spent on a fresh lookup. An account merely past the automatic
+    // threshold is allowed, with a note.
+    const pre = switchTargetVerdict({ target, rows: accounts.describe(Date.now()), activeName, now: Date.now(), timeZone: OWNER_TZ });
+    if (!pre.ok) return refuse(pre.reason);
+    if (pre.noop) {
+      logAccountDecision({ decision: 'account_switch_noop', account: pre.name, via });
+      say(alreadyOnNotice({ name: pre.name, via, scheduleId }));
+      return { ok: true, noop: true, to: pre.name, from: activeName };
+    }
+    const row = await withDeadline(accountUsage.one(pre.name), PROBE_TIMEOUT_MS + 1000, null);
+    if (row) flagLoginsFromRows([row], { via: `${via} switch` });
+    const v = switchTargetVerdict({ target, rows: accounts.describe(Date.now()), activeName, row, now: Date.now(), timeZone: OWNER_TZ });
+    if (!v.ok) return refuse(v.reason);
+    name = v.name;
+    note = v.note || null;
+    toUsage = v.usage || null;
+    fromUsage = fromUsage || accountUsage.peek(activeName)?.usage || null;
+    why = via;
+  }
+  // A ROTATION IN FLIGHT (or one that just landed) arms the cooldown before
+  // its own awaits. The owner's switch waits it out (bounded), then re-reads
+  // the login and re-checks its target, as the private build does on its
+  // landing record: a scheduled `once` entry is already consumed, so a refusal
+  // here would lose it. Nothing is awaited between the last check and the
+  // arming below.
+  //
+  // WAIT FOR IT TO LAND, not for its cooldown to run out (QA round 5): a
+  // rotation re-arms the cooldown when its swap lands and restores it when the
+  // swap fails, so the value CHANGING is the landing; a rotation that had
+  // already landed when this arrived holds the same value until it expires.
+  const rotationHolds = () => Date.now() < rotationCooldownUntil && rotationCooldownUntil !== swapCooldownMark;
+  if (via !== 'auto' && rotationHolds()) {
+    const seen = rotationCooldownUntil;
+    for (let i = 0; i < Math.ceil((ROTATION_COOLDOWN_MS + 5000) / SWITCH_COOLDOWN_POLL_MS) && rotationHolds() && rotationCooldownUntil === seen; i++) {
+      await sleep(SWITCH_COOLDOWN_POLL_MS);
+    }
+    const after = await accounts.activeAccount().catch(() => null);
+    activeName = after?.account?.name || activeName;
+    if (rotationHolds() && rotationCooldownUntil === seen) return refuse('a rotation is still moving the login; nothing changed, ask again in a minute');
+    const v2 = switchTargetVerdict({ target, rows: accounts.describe(Date.now()), activeName, now: Date.now(), timeZone: OWNER_TZ });
+    if (!v2.ok) return refuse(v2.reason);
+    if (v2.noop) {
+      logAccountDecision({ decision: 'account_switch_noop', account: v2.name, via });
+      say(alreadyOnNotice({ name: v2.name, via, scheduleId }));
+      return { ok: true, noop: true, to: v2.name, from: activeName };
+    }
+  }
+  // ARMED BEFORE THE SWAP, like the rotation's guard: a worker that dies on the
+  // outgoing account's limit while this lands is told "already rotated",
+  // instead of rotating again and marking the account this just moved to.
+  const cooldownWas = rotationCooldownUntil;
+  const markWas = swapCooldownMark;
+  rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS;
+  swapCooldownMark = rotationCooldownUntil;
+  let res;
+  try {
+    res = await accounts.swapTo(name, { refuseFlagged: true });
+  } catch (e) {
+    // A THROW (accounts.json unwritable, the disk full) is a failed swap too:
+    // the cooldown comes back, and it is said the way a refused swap is (the
+    // automatic switch pauses).
+    rotationCooldownUntil = cooldownWas;
+    swapCooldownMark = markWas;
+    // Where the login IS now: the store can throw after the keychain write.
+    activeName = (await accounts.activeAccount().catch(() => null))?.account?.name || activeName;
+    return refuse(`the swap failed: ${e.message}`);
+  }
+  if (!res.ok) {
+    // Both back: a landed cooldown still running stays marked as landed, so
+    // the next owner switch does not wait on a rotation that is not there.
+    rotationCooldownUntil = cooldownWas;
+    swapCooldownMark = markWas;
+    return refuse(res.needsLogin ? res.error : `the swap did not write: ${res.error}`);
+  }
+  rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS;
+  swapCooldownMark = rotationCooldownUntil;
+  invalidateUsageCache();
+  lastAutoSwitch = { to: name, at: Date.now(), via };
+  autoSwitchLastRefusal = null;
+  if (via !== 'auto') armOwnerHold(name, toUsage);
+  // The owner's choice ends an all-accounts wall the same way /account does.
+  if (via !== 'auto' && Date.now() < rotationPausedUntil) {
+    rotationPausedUntil = 0;
+    ownerLiftedWall(name);
+  }
+  logAccountDecision({ decision: 'account_switched', account: name, via, reason: `from ${res.from || activeName || 'an unidentified login'}${scheduleId != null ? ` · schedule #${scheduleId}` : ''}` });
+  say(
+    autoSwitchNotice({
+      from: res.from || fromName || activeName,
+      to: name,
+      via,
+      why: why || (via === 'auto' ? 'threshold' : via),
+      over,
+      fromUsage,
+      toUsage,
+      scheduleId,
+      note,
+    }),
+  );
+  return { ok: true, to: name, from: res.from || activeName };
+}
+
+/** A scheduled switch fired (checkSchedules): the same one path, never awaited by the poll loop. */
+function runScheduledSwitch(s) {
+  logAccountDecision({ decision: 'account_switch_scheduled', account: s.switchAccount, reason: `schedule #${s.id}` });
+  return switchAccountNow(s.switchAccount, { via: 'schedule', scheduleId: s.id });
+}
+
+/** `node bg.mjs account check`: the decision with the real readings, as text. Nothing is swapped. */
+function autoSwitchCheckText(r) {
+  const now = Date.now();
+  const lines = [`Account auto switch dry run · ${new Date(now).toISOString()}`];
+  lines.push(`Settings: ${r.settings.enabled ? `on · 5h ${r.settings.fiveHourThreshold}% · week ${r.settings.weekThreshold}%` : 'off'}`);
+  if (r.gates.length) lines.push(`Gates that would stop a real tick: ${r.gates.join(' · ')}`);
+  lines.push(`Live: ${r.name || 'not identified'} · ${r.usage ? readingLine(r.usage, now) : 'no usable reading'} · source ${r.source}`);
+  const over = overThreshold(r.usage, r.settings, now);
+  lines.push(`Over a threshold: ${over.length ? over.map((w) => `${Math.round(w.percent)}% of ${w.label}`).join(' · ') : 'no'}`);
+  for (const c of r.candidates) lines.push(`Candidate ${c.name}: ${c.verdict?.free ? `free · ${c.verdict.reason}` : `not free · ${c.verdict?.reason || 'not asked'}`}`);
+  lines.push(r.decision.switch ? `Decision: SWITCH to ${r.decision.to} (${r.decision.why})` : `Decision: stay · ${r.decision.reason}`);
+  return lines.join('\n');
+}
+
+/**
+ * The socket's `account` op (bg.mjs account switch|check). A switch is the
+ * owner's: refused when the caller says it is a background worker or a
+ * scheduled run (the env bg.mjs forwards, the same rule schedule.mjs applies to
+ * the write approval), allowed from the chat lane and from a terminal.
+ */
+async function handleAccountRequest(req) {
+  if (req.action === 'check') {
+    const r = await autoSwitchTick(Date.now(), { dryRun: true });
+    return { ok: true, text: autoSwitchCheckText(r), decision: { switch: r.decision.switch, to: r.decision.to, reason: r.decision.reason } };
+  }
+  const from = req.from || {};
+  if (!from.tmux && (from.lane === 'bg' || from.trigger)) {
+    return { ok: false, reason: 'refused', detail: "a background worker or a scheduled run cannot switch the Claude account; only the owner's own lanes can (the chat lane, a terminal, a schedule they set)" };
+  }
+  const r = await switchAccountNow(req.name, { via: 'command' });
+  return r.ok
+    ? { ok: true, text: r.noop ? `already on ${r.to}, nothing changed` : `switched to ${r.to} (from ${r.from || 'an unidentified login'})` }
+    : { ok: false, reason: 'refused', detail: r.reason || 'refused' };
+}
+
+// ---------------------------------------------------------------------------
 // THE USAGE WALL GUARD (2026-10-06): save the work before the wall, restart it
 // after. The decisions, the texts and the record are pure (wall-guard.mjs,
 // wall-resume.mjs, both shared modules); what follows is only
@@ -4935,7 +5455,7 @@ async function wallGuardTick(now = Date.now()) {
   if (!left.ready) return wallGuardSkip(left.reason);
   if (now - wallGuardLastProbe < WALL_GUARD_PROBE_MS) return { fired: false, reason: 'waiting for the next selector check' };
   wallGuardLastProbe = now;
-  const sel = await withDeadline(pickHealthyAccount({ activeName: account, lines: [], quiet: true }), WALL_LIFT_SWEEP_WAIT_MS, null);
+  const sel = await withDeadline(pickHealthyAccount({ activeName: account, lines: [], quiet: true, othersOnly: true }), WALL_LIFT_SWEEP_WAIT_MS, null);
   const othersFree = sel ? sel.outcome === 'selected' : null;
   // RE-READ after the await: a worker may have ended, a steer may have landed
   // from another path, and the wall itself may have gone up meanwhile.
@@ -5299,6 +5819,9 @@ async function rotateOffLimitedAccount(detail) {
     }
     if (res.ok) {
       rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS;
+      // LANDED: an owner's switch waiting on this rotation may go now (the
+      // account switch's doSwitchAccount; the mark is what tells it).
+      swapCooldownMark = rotationCooldownUntil;
       // An automatic rotation changes which account is live just as much as
       // a manual /account <name> does, so the cached usage rows and the
       // cached "which account is active" answer are stale the moment it
@@ -5332,13 +5855,15 @@ async function rotateOffLimitedAccount(detail) {
   // running, so the lift finds it already there; before the notice goes up, so
   // the notice can say so.
   wallWake.raised({ until: rotationPausedUntil, now: Date.now() });
-  const nextMove = await moveLoginToNextAtWall().catch((e) => ({ moved: false, error: e.message }));
+  const nextMove = await moveLoginToNextAtWall({ inRotation: true }).catch((e) => ({ moved: false, error: e.message }));
   if (nextMove.moved) lines.push(`Moved the login to "${nextMove.to}", the account that frees first; the bridge wakes you when it does.`);
   raiseClaudeWall().catch(() => {});
   // A TIMER AS WELL AS THE POLL. The poll loop long polls for 50s, so the held
   // messages would resume up to a minute after the reset; this wakes the flush
   // at the reset itself and the poll remains the backstop if it is missed.
   armWallResume(earliest);
+  // LANDED (at a wall): an owner's switch waiting on this rotation may go now.
+  swapCooldownMark = rotationCooldownUntil;
   return { outcome: 'exhausted', activeName, nextName: null, error: null, reset, lines };
 }
 
@@ -5812,6 +6337,10 @@ const handleAccountCallback = createAccountCallbacks({
   onSwapped: (res) => {
     rotationPausedUntil = 0;
     rotationCooldownUntil = 0;
+    // Your pick, kept by the automatic switch if it is already past a
+    // threshold (armOwnerHold), read before the cache goes.
+    const seen = res?.to ? accountUsage.peek(res.to) : null;
+    armOwnerHold(res?.to || null, seen?.state === 'ok' ? seen.usage : null);
     invalidateUsageCache();
     ownerLiftedWall(res?.to || null);
   },
@@ -9906,6 +10435,7 @@ const localToday = () => {
 const localHHMM = () => new Date().toTimeString().slice(0, 5);
 
 function fmtSchedule(s) {
+  if (s.switchAccount) return `#${s.id} · ${describeWhen(s)} · 🔀 switch account · ${clip(oneLine(s.switchAccount), 60)}`;
   return `#${s.id} · ${describeWhen(s)} · ${s.run ? `🤖 run${s.allowWrite === true ? ' · writes approved' : ''}` : '⏰ remind'} · ${clip(oneLine(s.text), 80)}`;
 }
 
@@ -9982,6 +10512,12 @@ function checkSchedules() {
     }
     if (due) {
       changed = true;
+      // A SCHEDULED ACCOUNT SWITCH (schedule.mjs --switch-account): through the
+      // one switch path, which checks the target and sends the one message.
+      if (s.switchAccount) {
+        runScheduledSwitch(s).catch(() => {});
+        continue;
+      }
       if (s.run) {
         // THE CONCURRENCY CAP, asked here the same way the drop box asks it.
         //
@@ -10752,6 +11288,7 @@ async function handleCommand(text, msg = null) {
               timeZone: OWNER_TZ,
             }),
             wallGuard: wallGuardStatusLine(wallGuardNow()),
+            autoSwitch: autoSwitchStatusLine(autoSwitchNow(), { last: lastAutoSwitch, timeZone: OWNER_TZ }),
             usageBlock: liveUsage ? usageLine(liveUsage.row, { timeZone: OWNER_TZ }) : null,
             // THE HEALTH LEDGER, one row per account. The usage line above
             // answers "how much headroom is left where I am"; this answers
@@ -11195,6 +11732,9 @@ async function handleCommand(text, msg = null) {
         if (r.ok) {
           rotationPausedUntil = 0;
           rotationCooldownUntil = 0;
+          // Your pick, kept by the automatic switch if it is already past a
+          // threshold (armOwnerHold; the reading read before the swap).
+          armOwnerHold(r.to || parts[0], brief?.state === 'ok' ? brief.usage : null);
           // A swap changes which account is live, so the cached "active"
           // answer and every cached row are stale the moment it lands.
           invalidateUsageCache();
@@ -12270,10 +12810,11 @@ async function pollLoop() {
         flushParkedWalledJobs(); // and the handed-off jobs that had no account
       }
       drainBgHandoff();
-      // THE USAGE WALL GUARD (wallGuardTick): near the wall with no account to
-      // rotate to, every running Claude worker is told once to save a
-      // checkpoint. Reads nothing while no Claude worker is running.
-      kickWallGuard();
+      // THE ACCOUNT SWITCH BEFORE THE LIMIT (autoSwitchTick), then THE USAGE
+      // WALL GUARD (wallGuardTick): the switch runs first, so a worker is told
+      // to save a checkpoint only when no account could be switched to. The
+      // guard reads nothing while no Claude worker is running.
+      kickAutoSwitch().then(() => kickWallGuard());
       // A LIVE ACCOUNT THAT IS ALREADY KNOWN DOWN. Cheap (one ledger read) and
       // on the same slow cadence as the drift check, because the expensive half
       // only runs when it has somewhere to move to.

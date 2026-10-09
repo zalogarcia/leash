@@ -885,6 +885,7 @@ export function statusHeader({
   autoCompact = null,
   wakeUp = null,
   wallGuard = null,
+  autoSwitch = null,
   usageBlock = null,
   ledger = null,
 } = {}) {
@@ -916,6 +917,10 @@ export function statusHeader({
   // The usage wall guard's row (wall-guard.mjs wallGuardStatusLine) sits above
   // the usage gauges it acts on: the threshold it saves at, and the resume.
   if (wallGuard) lines.push(wallGuard);
+  // The automatic account switch's row (account-autoswitch.mjs
+  // autoSwitchStatusLine) beside it: the step before the guard, the
+  // thresholds it moves the login at and the last time it did.
+  if (autoSwitch) lines.push(autoSwitch);
   if (usageBlock) lines.push(statusUsageGauges(usageBlock));
   // UNDER the live account's headroom, because it answers the next question:
   // that block says how much is left here, this one says whether there is

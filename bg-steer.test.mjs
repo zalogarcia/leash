@@ -271,6 +271,19 @@ t('missing or empty target is refused', () => {
   eq(validateRequest({ op: 'steer', target: '  ', text: 'hi' }).reason, REASONS.INVALID);
 });
 
+t('account: check needs nothing else; switch needs a name and carries its caller', () => {
+  const j = (v) => JSON.stringify(v);
+  eq(j(validateRequest({ op: 'account', action: 'check' })), j({ ok: true, op: 'account', action: 'check' }));
+  eq(
+    j(validateRequest({ op: 'account', action: 'switch', name: ' you@example.test ', from: { lane: 'bg', trigger: 'schedule', tmux: 'yes' } })),
+    j({ ok: true, op: 'account', action: 'switch', name: 'you@example.test', from: { lane: 'bg', trigger: 'schedule', tmux: false } }),
+  );
+  eq(j(validateRequest({ op: 'account', action: 'switch', name: 'x' }).from), j({ lane: null, trigger: null, tmux: false }));
+  eq(validateRequest({ op: 'account', action: 'switch' }).reason, REASONS.INVALID);
+  eq(validateRequest({ op: 'account', action: 'drop', name: 'x' }).reason, REASONS.INVALID);
+  eq(validateRequest({ op: 'account' }).reason, REASONS.INVALID);
+});
+
 t('missing op is refused; an unknown op is named as such', () => {
   eq(validateRequest({}).reason, REASONS.INVALID);
   eq(validateRequest({ op: 'kill', target: 'bg' }).reason, REASONS.UNKNOWN_OP);

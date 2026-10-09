@@ -392,6 +392,104 @@ t('list marks an approved entry, and only that one', () => {
   ok(!/[\u2013\u2014]/.test(lines.join('\n')), 'no dash in the marker');
 });
 
+console.log('\n5. --switch-account: a scheduled move of the Claude login');
+// The daemon does the switch at fire time (bridge.mjs runScheduledSwitch) and
+// refuses a walled or flagged account with one message. The CLI refuses what
+// it can see now: a name that is not stored, a --run, an unattended caller.
+
+const ACCOUNTS = path.join(WORK, 'accounts.json');
+writeFileSync(
+  ACCOUNTS,
+  JSON.stringify([
+    { name: 'zalo@example.test', email: 'zalo@example.test', claudeAiOauth: { accessToken: 'not-a-real-token' } },
+    { name: 'hello@example.test', email: 'hello@example.test', claudeAiOauth: { accessToken: 'not-a-real-token' } },
+  ]),
+);
+
+t('★ add once HH:MM --switch-account stores the target, a default text, and says what it is', () => {
+  seed([]);
+  const r = run('add', 'once', '23:59', '--switch-account', 'zalo@example.test');
+  eq(r.code, 0, r.err);
+  const item = read().items[0];
+  eq(item.switchAccount, 'zalo@example.test');
+  eq(item.kind, 'once');
+  eq(item.text, 'switch the Claude account to zalo@example.test');
+  eq(item.run, undefined, 'a switch is not a Claude task');
+  ok(r.out.includes('switch account to zalo@example.test'), r.out);
+});
+
+t('the name matches case-insensitively and is stored as the slot name; a text after it is kept', () => {
+  seed([]);
+  const r = run('add', 'in', '90m', '--switch-account', 'HELLO@Example.test', 'move before the night batch');
+  eq(r.code, 0, r.err);
+  eq(read().items[0].switchAccount, 'hello@example.test');
+  eq(read().items[0].text, 'move before the night batch');
+  const d = run('add', 'daily', '09:00', '--switch-account', 'zalo@example.test');
+  eq(d.code, 0, d.err);
+  ok(run('list').out.includes('daily 09:00 · switch account to zalo@example.test'), run('list').out);
+});
+
+t('refused: a name that is not stored names the stored ones, and nothing is written', () => {
+  seed([]);
+  const r = run('add', 'once', '23:59', '--switch-account', 'nobody@example.test');
+  eq(r.code, 1);
+  ok(r.err.includes('"nobody@example.test" is not a stored account (stored: zalo@example.test, hello@example.test)'), r.err);
+  eq(read().items.length, 0);
+});
+
+t('refused: no name, or --run with it', () => {
+  seed([]);
+  eq(run('add', 'once', '23:59', '--switch-account').code, 1);
+  const r = run('add', 'once', '23:59', '--switch-account', 'zalo@example.test', '--run');
+  eq(r.code, 1);
+  ok(r.err.includes('do not go together'), r.err);
+  eq(read().items.length, 0);
+});
+
+t('★ refused from a background worker or a scheduled run; allowed from a tmux pane', () => {
+  seed([]);
+  const bg = runEnv({ LEASH_LANE: 'bg' }, 'add', 'once', '23:59', '--switch-account', 'zalo@example.test');
+  eq(bg.code, 1);
+  ok(bg.err.includes("only the owner's own lanes can"), bg.err);
+  const sched = runEnv({ LEASH_TRIGGER: 'schedule' }, 'add', 'once', '23:59', '--switch-account', 'zalo@example.test');
+  eq(sched.code, 1);
+  eq(read().items.length, 0);
+  const pane = runEnv({ LEASH_LANE: 'bg', TMUX: '/tmp/tmux-501/default,1,0' }, 'add', 'once', '23:59', '--switch-account', 'zalo@example.test');
+  eq(pane.code, 0, pane.err);
+  const chat = runEnv({ LEASH_LANE: 'chat' }, 'add', 'once', '23:58', '--switch-account', 'zalo@example.test');
+  eq(chat.code, 0, chat.err);
+});
+
+t('a switch entry cannot be turned into a --run by update', () => {
+  seed([{ id: 1, kind: 'once', at: Date.now() + 3600_000, text: 'switch', switchAccount: 'zalo@example.test' }]);
+  const r = run('update', '1', '--run');
+  eq(r.code, 1);
+  eq(read().items[0].run, undefined);
+});
+
+t('no accounts.json means nothing is stored, so the switch is refused', () => {
+  rmSync(ACCOUNTS);
+  seed([]);
+  const r = run('add', 'once', '23:59', '--switch-account', 'zalo@example.test');
+  eq(r.code, 1);
+  ok(r.err.includes('(accounts.json has none)'), r.err);
+});
+
+t('★ update --switch-account is refused, not silently ignored (QA round 1), and the entry keeps its target', () => {
+  writeFileSync(ACCOUNTS, JSON.stringify([{ name: 'zalo@example.test', email: 'zalo@example.test' }, { name: 'hello@example.test', email: 'hello@example.test' }]));
+  seed([]);
+  eq(run('add', 'once', '23:59', '--switch-account', 'zalo@example.test').code, 0);
+  const id = read().items[0].id;
+  const r = run('update', String(id), '--switch-account', 'hello@example.test');
+  eq(r.code, 1);
+  ok(r.err.includes('--switch-account is set when an entry is added'), r.err);
+  eq(read().items[0].switchAccount, 'zalo@example.test');
+});
+
+t('the usage text documents the flag', () => {
+  ok(run('help').out.includes('--switch-account'), 'usage is missing --switch-account');
+});
+
 // ---------------------------------------------------------------------------
 rmSync(WORK, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${failures.length} failed`);

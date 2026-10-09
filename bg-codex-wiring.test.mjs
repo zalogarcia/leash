@@ -663,6 +663,8 @@ const OWNER_TZ = 'UTC';
 // the parsed reset" and "swapped once" are the two claims the chat lane never
 // made before, so they are asserted on the calls themselves.
 export let rotationCooldownUntil = 0;
+// The account switch's landed-cooldown mark: the rotation sets it when it lands.
+let swapCooldownMark = 0;
 export const setCooldownUntil = (v) => { rotationCooldownUntil = v; };
 const ROTATION_COOLDOWN_MS = 90000;
 export const ACC = { active: null, free: [], swapOk: true, swapError: 'locked', earliest: 0, swapDelayMs: 0, marked: [], swapped: [], cacheKills: 0, ledger: [], probes: [] };

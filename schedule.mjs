@@ -10,6 +10,7 @@
 //   node schedule.mjs add once 2026-07-30 09:30 "text"  # specific date+time
 //   node schedule.mjs add in 90m "text"                 # relative: m|h|d
 //   node schedule.mjs add daily 03:00 --run --allow-write "text"  # a run approved for db writes
+//   node schedule.mjs add once 10:05 --switch-account you@example.com   # move the Claude login then
 //   node schedule.mjs remove <id>
 //   node schedule.mjs update <id> [--at HH:MM|YYYY-MM-DDTHH:MM] [--text "…"] [--run true|false]
 //                                 [--every N] [--anchor YYYY-MM-DD] [--allow-write true|false]
@@ -27,6 +28,12 @@
 //        it; this adds LEASH_ALLOW_WRITE=1 for this entry. Turning --run off
 //        takes the approval with it. A background worker or a scheduled run
 //        cannot grant it (refused); only revoke.
+//        --switch-account <name>  → at that time the daemon moves the Claude
+//        login to that stored account (a name in accounts.json) instead of
+//        sending a reminder. The text is optional. Refused here for a name that
+//        is not stored, with --run, and from a background worker or a
+//        scheduled run (the owner's lanes only); refused by the daemon at fire
+//        time, with one message, when the account is walled or needs a login.
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import path from 'node:path';
@@ -65,7 +72,8 @@ const localToday = () => {
 // an every-N-days item shows the date it actually lands on next.
 const fmt = (s) => {
   const next = nextDaily(s, localToday());
-  return `#${s.id} · ${describeWhen(s)}${next ? ` (next ${next})` : ''} · ${s.run ? `run${s.allowWrite === true ? ' (writes approved)' : ''}` : 'remind'} · ${s.text}`;
+  const what = s.switchAccount ? `switch account to ${s.switchAccount}` : s.run ? `run${s.allowWrite === true ? ' (writes approved)' : ''}` : 'remind';
+  return `#${s.id} · ${describeWhen(s)}${next ? ` (next ${next})` : ''} · ${what} · ${s.text}`;
 };
 // The owner's approval is a permission, so the confirmation says it in words
 // every time an approved entry is added or updated, and says so when it goes.
@@ -94,7 +102,7 @@ const hasFlag = (name) => argv.includes(`--${name}`);
 // `update` documents below. Treating every flag as value-taking made
 // `add daily 08:00 --run "text"` swallow the text and die with "missing text".
 // `--allow-write` follows the same rule, for the same reason.
-const VALUE_FLAGS = new Set(['at', 'text', 'every', 'anchor']);
+const VALUE_FLAGS = new Set(['at', 'text', 'every', 'anchor', 'switch-account']);
 const BOOL_FLAGS = new Set(['run', 'allow-write']);
 
 // THE WRITE APPROVAL IS THE OWNER'S. A background worker or a scheduled run
@@ -107,6 +115,21 @@ const grantFromUnattended = () =>
   !process.env.TMUX && (process.env.LEASH_LANE === 'bg' || !!process.env.LEASH_TRIGGER);
 const REFUSE_GRANT =
   "--allow-write is the owner's approval for database writes and migrations, and a background worker or a scheduled run cannot grant it (that is the run the write guard holds). Nothing was changed. Put the write in your report for the owner; they approve it from their own chat.";
+// THE ACCOUNT SWITCH IS THE OWNER'S too, for the same reason and by the same
+// rule: a background worker or a scheduled run does not get to decide which
+// Claude account the whole machine runs on.
+const REFUSE_SWITCH =
+  "--switch-account moves the Claude login for every run on this machine, and a background worker or a scheduled run cannot schedule that (only the owner's own lanes can). Nothing was changed. Put it in your report; the owner or the chat lane schedules it.";
+// The stored account names, from accounts.json beside this file. Names and
+// emails only: nothing else in that file is read into anything.
+const storedAccounts = () => {
+  try {
+    const list = JSON.parse(readFileSync(path.join(path.dirname(FILE), 'accounts.json'), 'utf8'));
+    return Array.isArray(list) ? list.filter((a) => a && a.name).map((a) => ({ name: String(a.name), email: a.email ? String(a.email) : null })) : [];
+  } catch {
+    return [];
+  }
+};
 const takesValue = (tok, next) => {
   if (!tok?.startsWith('--')) return false;
   const name = tok.slice(2);
@@ -158,6 +181,17 @@ if (cmd === 'list') {
   } else {
     die('add daily|every|once|in …');
   }
+  if (hasFlag('switch-account')) {
+    const want = String(flag('switch-account') ?? '').trim();
+    if (!want || want.startsWith('--')) die('add <when> --switch-account <stored account name> ["text"]');
+    if (grantFromUnattended()) die(REFUSE_SWITCH);
+    if (hasFlag('run')) die('--switch-account and --run do not go together: a switch is done by the daemon, not by a Claude task');
+    const stored = storedAccounts();
+    const hit = stored.find((a) => a.name.toLowerCase() === want.toLowerCase() || (a.email || '').toLowerCase() === want.toLowerCase());
+    if (!hit) die(`"${want}" is not a stored account${stored.length ? ` (stored: ${stored.map((a) => a.name).join(', ')})` : ' (accounts.json has none)'}; nothing scheduled`);
+    item.switchAccount = hit.name;
+    if (!item.text) item.text = `switch the Claude account to ${hit.name}`;
+  }
   if (!item.text) die('missing text');
   if (item.kind === 'once' && item.at <= Date.now())
     die(`${new Date(item.at).toLocaleString()} is in the past — nothing scheduled; give a future date/time`);
@@ -185,6 +219,10 @@ if (cmd === 'list') {
   const id = Number(positional[1]);
   const item = store.items.find((s) => s.id === id);
   if (!item) die(`no schedule #${id}`);
+  // The target of a scheduled switch is set when the entry is added, where it
+  // is checked against the stored accounts and the caller's lane. Accepted
+  // here it would print "updated" and change nothing.
+  if (hasFlag('switch-account')) die(`--switch-account is set when an entry is added; to change the target, remove #${id} and add a new one. Nothing was changed.`);
   const at = flag('at');
   if (at) {
     if (item.kind === 'daily') {
@@ -243,6 +281,7 @@ if (cmd === 'list') {
   // `--run` bare = on (matches `add`); `--run true|false` explicit; `--no-run` off.
   // Never consume the next token unless it's literally true/false, or a flag
   // following --run would be silently read as its value.
+  if (item.switchAccount && argv.includes('--run') && flag('run') !== 'false') die('a --switch-account schedule cannot become a --run: the daemon does the switch itself');
   if (argv.includes('--no-run')) delete item.run;
   else if (argv.includes('--run')) {
     const v = flag('run');

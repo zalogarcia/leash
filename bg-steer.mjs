@@ -143,6 +143,19 @@ export function validateRequest(req) {
   const op = String(req?.op ?? '').trim();
   if (!op) return { ok: false, reason: REASONS.INVALID, detail: 'missing op' };
   if (op === 'ps') return { ok: true, op: 'ps' };
+  // THE ACCOUNT SWITCH (bg.mjs account switch|check). `from` is what the CLI
+  // knows about its caller (LEASH_LANE, LEASH_TRIGGER, TMUX): the daemon
+  // refuses a switch from a background worker or a scheduled run with it.
+  if (op === 'account') {
+    const action = String(req?.action ?? '').trim();
+    if (action === 'check') return { ok: true, op, action };
+    if (action !== 'switch') return { ok: false, reason: REASONS.INVALID, detail: 'account wants the action switch or check' };
+    const name = String(req?.name ?? '').trim();
+    if (!name) return { ok: false, reason: REASONS.INVALID, detail: 'account switch wants an account name' };
+    const f = req?.from && typeof req.from === 'object' ? req.from : {};
+    const from = { lane: f.lane ? String(f.lane) : null, trigger: f.trigger ? String(f.trigger) : null, tmux: f.tmux === true };
+    return { ok: true, op, action, name, from };
+  }
   if (!TEXT_OPS.has(op)) return { ok: false, reason: REASONS.UNKNOWN_OP, detail: `unknown op "${op}"` };
   const target = String(req?.target ?? '').trim();
   if (!target) return { ok: false, reason: REASONS.INVALID, detail: 'missing target' };

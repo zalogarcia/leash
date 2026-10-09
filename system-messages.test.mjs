@@ -99,6 +99,7 @@ import {
 } from './system-messages.mjs';
 import { resumeWakeLines } from './wall-resume.mjs';
 import { wallGuardSettings, wallGuardStatusLine } from './wall-guard.mjs';
+import { autoSwitchSettings, autoSwitchStatusLine } from './account-autoswitch.mjs';
 import { readFileSync } from 'node:fs';
 import { escHtml } from './md-format.mjs';
 // The REAL bar and the REAL window row, so a gauge assertion below cannot pass
@@ -1487,6 +1488,18 @@ t('status: the wall guard row sits above the usage gauges, house style', () => {
   ok(s.includes('🛡 Wall guard: save at 95% · resume on, within 5 min, at most 2 per job'), s);
   noDashes(s, 'statusHeader/wallGuard');
   eq(statusHeader({ ...HEADER_ARGS, wallGuard: null }), statusHeader(HEADER_ARGS), 'absent, nothing changes');
+});
+
+t('status: the account auto switch row sits after the wall guard row and above the usage gauges, house style', () => {
+  const guard = wallGuardStatusLine(wallGuardSettings(undefined));
+  const row = autoSwitchStatusLine(autoSwitchSettings(undefined));
+  eq(row, '🔀 Account auto switch: at 90% of 5h · 90% of the week');
+  const s = statusHeader({ ...HEADER_ARGS, wallGuard: guard, autoSwitch: row });
+  const lines = s.split('\n');
+  eq(lines.indexOf(row), lines.indexOf(guard) + 1, 'right under the wall guard');
+  noDashes(s, 'statusHeader/autoSwitch');
+  eq(statusHeader({ ...HEADER_ARGS, autoSwitch: autoSwitchStatusLine(autoSwitchSettings(false)) }).split('\n').includes('🔀 Account auto switch: off'), true, 'off says off');
+  eq(statusHeader({ ...HEADER_ARGS, autoSwitch: null }), statusHeader(HEADER_ARGS), 'absent, nothing changes');
 });
 
 t('wall wake-up: ★ no dashes, no tokens, no model names', () => {

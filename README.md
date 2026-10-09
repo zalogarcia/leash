@@ -406,6 +406,35 @@ block the guard is ON with the defaults, and `"wallGuard": false` turns the whol
 guard reads the same usage lookup `/status` does, at most once a minute and only while a Claude
 worker is running; when that lookup is rate limited it has no reading and stands down.
 
+**The login moves before the limit, and on a schedule.** The rotation above moves the login only
+when a run dies on a limit. Before that, every poll cycle, Leash checks the live account: at or past
+90% of its 5 hour window, or of any weekly window (the per model ones included), it moves the login
+to the other stored account with the most weekly headroom, and sends one message saying from which
+account to which, why, and both accounts' numbers. An account counts as free only on a lookup made
+with its own token in the last few minutes, every window under the thresholds; a slot that needs a
+login, one walled in the ledger and one whose lookup fails are never moved onto. It does not swap
+back and forth: it moves only while the live account is over a threshold, only onto an account
+under every one, and not at all for five minutes after any swap (yours, the rotation's or its own).
+A candidate is asked at most every five minutes while the live account is over, and once more the
+minute a reset that kept it out passes, so an account whose week resets at 14:00 is taken at 14:00.
+The usage wall guard runs after it, so workers are told to save a checkpoint only when there was
+nowhere to switch to. You can also switch on a schedule or right now:
+
+```bash
+node schedule.mjs add once 10:05 --switch-account you@example.com   # at 10:05, through the daemon
+node schedule.mjs add daily 07:00 --switch-account you@example.com  # every morning
+node bg.mjs account switch you@example.com    # now
+node bg.mjs account check                     # what the automatic switch would do, with the real numbers
+```
+
+The target must be a stored account. A switch to an account that is walled, needs a login, or shows
+a spent window on a fresh lookup is refused with one message, and nothing moves. A background worker
+or a scheduled run cannot schedule or ask for a switch (refused); the chat lane and a terminal can.
+Every switch, automatic, scheduled or asked for, is done by the daemon itself, one at a time, so the
+credential store is never written by a second process. Settings are the `accountAutoSwitch` block in
+`config.json` (`{"enabled": true, "weekThreshold": 90, "fiveHourThreshold": 90}`), ON with those
+values when absent, `"accountAutoSwitch": false` to turn it off. `/status` shows one line for it.
+
 **A dead login is flagged, never rotated onto.** When a slot's token refresh is refused
 (`invalid_grant`) or its login has expired, Leash flags the slot and says so once, with the fix:
 `/login` in Claude Code as that account, then `/account capture <name>`, which clears the flag. Every
@@ -1000,6 +1029,8 @@ node wall-wake.test.mjs          # the wall episode on disk and the next-account
 node wall-guard.test.mjs         # the usage wall guard: the trigger, the steer text, the record
 node wall-resume.test.mjs        # the resume after a wall: the plan, its safety rules, the brief
 node wall-guard-wiring.test.mjs  # both, wired: a real stdin pipe, the real lift through a restart
+node account-autoswitch.test.mjs # the switch before the limit: thresholds, proof, no flapping, notices
+node account-autoswitch-wiring.test.mjs  # wired: the real store, the schedule, `bg.mjs account` on a real socket
 node account-usage.test.mjs      # live plan usage per account
 node account-buttons.test.mjs    # the one-tap swap keyboard
 node credential-store.test.mjs   # the keychain / file store behind a swap
@@ -1075,7 +1106,11 @@ usage wall guard above. `thresholdPercent` is where workers are told to save,
 automatic resumes one job gets, `resumeMaxConcurrent` is how many resumed jobs
 run at once (0 for the ordinary cap alone), and a resume queued more than
 `resumeWithinMinutes` after the account was ready is reported as late. On with
-these values when the block is absent; `"wallGuard": false` turns it all off).
+these values when the block is absent; `"wallGuard": false` turns it all off),
+and `accountAutoSwitch` (`{"enabled": true, "weekThreshold": 90,
+"fiveHourThreshold": 90}`: the login moves to a free account once the live one
+is at or past either threshold, see above; on with these values when the block
+is absent, `"accountAutoSwitch": false` turns it off).
 
 Every key can be overridden with a `BRIDGE_<UPPER_SNAKE>` environment variable,
 including the object-valued ones: `BRIDGE_STYLE='{"noDashes":true}'`,

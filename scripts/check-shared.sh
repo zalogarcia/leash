@@ -79,6 +79,8 @@ SHARED_MODULES=(
   wall-guard.test.mjs
   wall-resume.mjs
   wall-resume.test.mjs
+  account-autoswitch.mjs
+  account-autoswitch.test.mjs
 )
 
 # NOT LISTED, and why. These modules came from the private sibling and behave

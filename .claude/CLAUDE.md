@@ -31,10 +31,10 @@ no TypeScript, no linter, no formatter. Node is the only requirement.
 daemon against the live bot token, and two consumers of `getUpdates` fight over
 the offset. Every suite that needs it reads it as TEXT and slices the functions
 it wants, then evaluates them with a harness supplying the surrounding globals.
-Verified: zero of the 45 suites import it.
+Verified: zero of the 47 suites import it.
 
 **2. This repo is half of a deliberate pair.** A private sibling holds the
-same daemon with owner specific prose in it. 42 modules are expected to be
+same daemon with owner specific prose in it. 44 modules are expected to be
 BYTE IDENTICAL in both copies and `./scripts/check-shared.sh` fails if any of
 them drifts; the list, and the reasoned exclusions, live in that script's own
 comments. It finds the sibling from this repo's own directory name, or from
@@ -53,8 +53,8 @@ captured. The short version:
 
 ```bash
 node --check bridge.mjs                                   # the entry point parses
-for f in test.mjs *.test.mjs; do node "$f" || echo "FAIL $f"; done   # 45 offline suites
-./scripts/check-shared.sh                                 # 42 shared modules identical
+for f in test.mjs *.test.mjs; do node "$f" || echo "FAIL $f"; done   # 47 offline suites
+./scripts/check-shared.sh                                 # 44 shared modules identical
 ./install.sh --dry-run                                    # the installer, changing nothing
 ./.claude/verify.sh                                       # all of the above, with one line per check
 ```

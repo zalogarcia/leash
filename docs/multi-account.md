@@ -51,6 +51,9 @@ the next time its turn comes.
 | `/account <name>` | swap to that slot |
 | `/account capture <name>` | bank the CURRENT login into a slot (setup, once per account) |
 | `/usage` | the full diagnostic view: 5h block + weekly window for every slot, with token fingerprints |
+| `node bg.mjs account switch <name>` | swap to that slot from a terminal or the chat lane, through the daemon (refused from a background worker or a scheduled run) |
+| `node bg.mjs account check` | what the automatic switch below would do right now, on the real numbers; swaps nothing |
+| `node schedule.mjs add <when> --switch-account <name>` | a scheduled swap: once, daily, every N days or in N minutes |
 
 The buttons under `/account` are owner-only (any other Telegram user's tap is
 refused), double-checked against both a digest of the slot name and the
@@ -73,13 +76,35 @@ Two guards keep a limit wall from eating the whole rotation: a 90-second
 several), and a **pause** when every account is limited (one message with the
 earliest reset, then the rotation stands down instead of thrashing).
 
-Workers that are already running are never killed by a swap — they keep their
-in-memory session. Only new workers pick up the new account. The corollary is a
-small residual race: a still-running worker on the old account can refresh its
+Workers that are already running are never killed by a swap. A running Claude
+Code process reads the credential store as it goes, so it picks the new login up
+by itself (measured in run logs: the weekly reset in a run's rate_limit_event
+changes mid run). The corollary is a small residual race: a still-running worker on the old account can refresh its
 token and write the old account's blob back over the swap. A **drift guard**
 re-checks every 60 seconds and re-asserts the intended account when that
 happens — and when it finds credentials it cannot identify (say you ran
 `claude /login` by hand), it never overwrites them: your login always wins.
+
+### Before the limit: the automatic switch
+
+Rotation reacts to a death. One step earlier, every poll cycle, Leash looks at
+the live account: once it is at or past 90% of its 5 hour window or of any
+weekly window, it moves the login to the stored account with the most weekly
+headroom and tells you in one message (from, to, why, both readings). A
+candidate counts as free only on a lookup made with its own token in the last
+few minutes showing every window under both thresholds; a slot that needs a
+login, one the ledger holds limited, and one whose lookup fails are never moved
+onto. It does not ping-pong: it moves only while the live account is over a
+threshold, only onto an account under every one, and not for five minutes
+after any swap. A candidate is asked at most every five minutes while the live
+account is over, and again the minute a reset that kept it out passes.
+`accountAutoSwitch` in `config.json` sets the thresholds (`weekThreshold`,
+`fiveHourThreshold`, both 90) or turns it off (`false`).
+
+A scheduled switch (`schedule.mjs ... --switch-account`) and `bg.mjs account
+switch` take the same path inside the daemon, one at a time, and are refused
+with one message when the account is not stored, is limited, needs a login, or
+shows a spent window on a fresh lookup.
 
 ### When every account is limited: the Codex fallback
 

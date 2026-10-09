@@ -4,6 +4,35 @@ All notable changes to Leash. Dates are release dates.
 
 ## Unreleased
 
+### The account switch before the limit
+
+- **The login moves before the limit.** When the live Claude account is at or past 90% of its 5
+  hour window or of any weekly window, and another stored account is provably free (its own fresh
+  lookup, every window under the thresholds), the daemon moves the login to the one with the most
+  weekly headroom and sends one message: from, to, why, both readings. The rotation used to move
+  only after a run died on a limit, so an account sitting at 95% of its week was never left.
+- **No flapping.** It moves only while the live account is over a threshold, only onto an account
+  under every one, and not for five minutes after any swap (the owner's, the rotation's or its own).
+- **A reset is noticed the minute it passes.** A candidate is asked at most every five minutes while
+  the live account is over, and once more right after a reset that kept it out.
+- **A scheduled switch and a switch now.** `node schedule.mjs add <when> --switch-account <name>`
+  and `node bg.mjs account switch <name>`, refused for a name that is not stored, an account that is
+  walled or needs a login, and from a background worker or a scheduled run. `node bg.mjs account
+  check` prints the decision on the real numbers and swaps nothing. Every switch is done by the
+  daemon, one at a time.
+- **Settings.** `accountAutoSwitch` in `config.json` (`enabled`, `weekThreshold`, `fiveHourThreshold`;
+  on with 90 and 90 when absent, `false` to turn it off); `/status` shows one line for it.
+- **The wall guard runs after it,** so workers are told to save a checkpoint only when there was
+  nowhere to switch to, and its question about the other accounts is logged as
+  `no_other_account_free`, never as every account walled.
+- **Your pick stands.** A switch you make (scheduled, `bg.mjs account switch`, `/account`, the
+  account buttons) onto an account already past a threshold is left alone by the automatic switch
+  until the window that crossed resets.
+- **One path for every swap.** The walled-account sweep and the moves at a wall swap on the same
+  chain as the switch, so two swaps never interleave; a switch that arrives while a rotation is
+  landing waits for it, then checks its target again. A swap the keychain refuses is said once and
+  retried after five minutes, not every minute.
+
 **An all-accounts wall that wakes the chat once when it lifts, a worker report that survives a usage
 limit in its verifier, and the account fixes that sit under both.**
 
