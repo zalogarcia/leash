@@ -178,9 +178,13 @@ const M = await import(
         `const rotateOffLimitedAccount = async () => ({ outcome: ROT.outcome, lines: ['Swapped to the next account. The account is live.'], activeName: 'a', nextName: 'b' });`,
         `const swapFailedLine = () => 'swap failed';`,
         // THE USAGE WALL GUARD: a death on the wall is recorded for the resume
-        // at the lift. Recorded here; its use is wall-guard-wiring.test.mjs's.
+        // at the lift, and a death the cooldown turned away asks how the
+        // rotation behind it ended. Recorded, and steerable from a test.
         `export const WALL_DEATHS = [];`,
         `const noteWallDeath = (runId, task, opts) => { WALL_DEATHS.push({ runId, task, ...opts }); };`,
+        `export let BEHIND = null;`,
+        `export const setBehind = (v) => { BEHIND = v; };`,
+        `const rotationBehindCooldown = async () => BEHIND;`,
         grab('bgDraftPath'),
         grab('bgRunLogPath'),
         grab('isWorkerDeathText'),
@@ -855,22 +859,43 @@ t('★ the usage wall guard: a death on the wall is recorded for the resume, wit
   eq(d.finalReportSeen, false);
 });
 
-// THE SECOND CORPSE. One wall kills several workers inside the same seconds:
-// the first one's rotation is still asking the other accounts when the next
-// arrives, and that one is turned away with `cooldown`. Nothing in this daemon
-// records how the first rotation ended, so this death used to be filed as "it
-// finished" and never resumed. It is recorded as PROVISIONAL now; the lift
-// counts it only when the wall went up around it (wall-resume.mjs).
+// THE COOLDOWN CASE (2026-10-06). One wall kills several workers inside the
+// same seconds; the first corpse's rotation is still probing when the next
+// arrives, and the double swap guard answers `cooldown`. When the rotation
+// behind it ends with every account walled, that worker died on the wall too.
+M.resetChain();
+M.resetWallWake();
+M.wallWake.raised({ until: Date.now() + 3600_000 });
+M.setWalled(true);
 M.setChatEngine('claude');
 M.ROT.outcome = 'cooldown';
-M.reportBgOutcome(WALL_TASK, { status: 'failed', answer: "The worker FAILED: You've hit your session limit", record: "FAILED: You've hit your session limit" }, 'bg8-1790000000700');
+M.setBehind({ outcome: 'exhausted' });
+M.WALL_DEATHS.length = 0;
+beforeHold = M.dispatched.length;
+M.reportBgOutcome(WALL_TASK, { status: 'failed', answer: "The worker FAILED: You've hit your session limit", record: "FAILED: You've hit your session limit" }, 'bg8-1790000000650');
 await M.settleOps();
-t('★ the usage wall guard: a death behind a rotation still in progress is recorded as provisional, never lost', () => {
-  const d = M.WALL_DEATHS.find((x) => x.runId === 'bg8-1790000000700');
-  ok(d, JSON.stringify(M.WALL_DEATHS.map((x) => x.runId)));
-  eq(d.provisional, true);
-  eq(d.task, WALL_TASK);
+t('★ a death behind a cooldown that ended in the wall: held, marked died, recorded for the resume', () => {
+  eq(M.dispatched.length, beforeHold, 'not sent into a walled chat lane');
+  const w = M.wallWake.current().workers.find((x) => x.runId === 'bg8-1790000000650');
+  eq(w?.died, true, JSON.stringify(w));
+  eq(w?.handback, 'held');
+  eq(M.WALL_DEATHS.map((x) => x.runId).join(','), 'bg8-1790000000650');
+  ok(readFileSync(M.bgReportPath('bg8-1790000000650'), 'utf8').includes('The rotation behind that cooldown found EVERY account limited'), 'the report says why');
 });
+
+M.resetChain();
+M.resetWallWake();
+M.setWalled(false);
+M.setBehind({ outcome: 'swapped' });
+M.WALL_DEATHS.length = 0;
+beforeHold = M.dispatched.length;
+M.reportBgOutcome(WALL_TASK, { status: 'failed', answer: "The worker FAILED: You've hit your session limit", record: "FAILED: You've hit your session limit" }, 'bg8-1790000000660');
+await M.settleOps();
+t('a death behind a cooldown that SWAPPED is not a wall death: handed back as before, nothing recorded', () => {
+  eq(M.dispatched.length, beforeHold + 1);
+  eq(M.WALL_DEATHS.length, 0);
+});
+M.setBehind(null);
 
 M.ROT.outcome = 'swapped';
 M.reportBgOutcome(WALL_TASK, { status: 'failed', answer: "The worker FAILED: You've hit your session limit", record: "FAILED: You've hit your session limit" }, 'bg8-1790000000800');
@@ -878,6 +903,8 @@ await M.settleOps();
 t('and a death on a plain swap is not recorded at all: the resume is for the wall', () => {
   ok(!M.WALL_DEATHS.some((x) => x.runId === 'bg8-1790000000800'), JSON.stringify(M.WALL_DEATHS.map((x) => x.runId)));
 });
+M.ROT.outcome = 'paused';
+M.setWalled(true);
 
 // No wall episode (a rehearsal wall from config, or none at all): today's
 // behaviour exactly, whatever the wall says.

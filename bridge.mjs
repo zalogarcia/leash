@@ -5678,7 +5678,7 @@ function readCheckpointCommit(logPath) {
  * go into the guard's record, where the lift finds them. Never throws: the
  * handback this rides beside is load bearing and this is not.
  */
-function noteWallDeath(runId, task, { draft = null, finalReportSeen = false, account = null, provisional = false } = {}) {
+function noteWallDeath(runId, task, { draft = null, finalReportSeen = false, account = null } = {}) {
   try {
     const draftFile = draft?.file || (existsSync(bgDraftPath(runId)) ? bgDraftPath(runId) : null);
     wallGuard.death(runId, {
@@ -5690,13 +5690,8 @@ function noteWallDeath(runId, task, { draft = null, finalReportSeen = false, acc
       finalReportSeen: Boolean(finalReportSeen),
       checkpoint: readCheckpointCommit(bgRunLogPath(runId)),
       ...(account ? { account } : {}),
-      ...(provisional ? { provisional: true } : {}),
     });
-    console.log(
-      provisional
-        ? `[bridge] wall guard: ${runId} died behind a rotation still in progress; recorded, and resumed at the lift only if that rotation raised the wall`
-        : `[bridge] wall guard: ${runId} died on the wall; recorded for the resume at the lift`,
-    );
+    console.log(`[bridge] wall guard: ${runId} died on the wall; recorded for the resume at the lift`);
   } catch (e) {
     console.error(`[bridge] wall guard could not record the death of ${runId}:`, e.message);
   }
@@ -6067,20 +6062,25 @@ async function handleLimitDeath(task, outcome, runId, steers = [], draft = null,
   const rot = await rotateOffLimitedAccount(detail);
   if (rot.outcome === 'no_claude') return;
   const lines = rot.lines;
-  // DIED ON THE WALL: the death that raised it, or one while it stood. The
-  // wall guard's resume (wall-resume.mjs) records it with its brief, and the
-  // lift queues it again.
-  const wallDeath = rot.outcome === 'exhausted' || rot.outcome === 'paused';
+  // DIED ON THE WALL: the death that raised it, one while it stood, or one the
+  // double swap guard turned away while the rotation behind it was finding
+  // every account limited (one wall kills several workers inside the same
+  // seconds, and the first corpse's rotation is still probing when the next
+  // arrives). The last one used to read as "the account is live" and went to
+  // a chat lane that was walled too.
+  let wallDeath = rot.outcome === 'exhausted' || rot.outcome === 'paused';
+  if (!wallDeath && rot.outcome === 'cooldown') {
+    const behind = await rotationBehindCooldown().catch(() => null);
+    if (behind?.outcome === 'exhausted') {
+      wallDeath = true;
+      lines.push('The rotation behind that cooldown found EVERY account limited, so this worker died on the wall, not on an account that was already swapped.');
+    }
+  }
+  // THE WALL GUARD'S RESUME (wall-resume.mjs): a Claude worker that died on the
+  // wall is recorded with its brief, and the lift queues it again. (The
+  // module's provisional rule stays inert here: the landing record answers how
+  // the rotation behind a cooldown ended, so no death is provisional.)
   if (wallDeath) noteWallDeath(runId, task, { draft, finalReportSeen, account: rot.activeName || null });
-  // BEHIND A ROTATION STILL IN PROGRESS (`cooldown`). One wall kills several
-  // workers inside the same seconds: the first corpse's rotation is still
-  // asking the other accounts when the next corpse arrives, and nothing here
-  // records how that rotation ends. Recorded as "it finished", every worker
-  // after the first was never resumed. So the death is recorded as
-  // PROVISIONAL, and the lift counts it only when the wall went up around it
-  // (wall-resume.mjs resumeCandidates); a rotation that swapped instead raised
-  // no wall, and its provisional deaths are dropped by the next lift.
-  else if (rot.outcome === 'cooldown') noteWallDeath(runId, task, { draft, finalReportSeen, provisional: true });
   // The worker lane's own voice, unchanged: a bubble it can read later, naming
   // both halves of the swap.
   if (rot.outcome === 'swapped') {
@@ -6101,8 +6101,9 @@ async function handleLimitDeath(task, outcome, runId, steers = [], draft = null,
     // of the rotation block, which moves below it in the report.
     {
       draft,
-      // Died ON the wall (the death that raised it, or one while it stood): the
-      // lift's wake-up lists it whether or not this handback is held.
+      // Died ON the wall (the death that raised it, one while it stood, or one
+      // behind a cooldown that ended there): the lift's wake-up lists it
+      // whether or not this handback is held.
       wallDeath,
       endingNote: `${BRIDGE_NAME.toUpperCase()} NOTE: this worker died on a session limit. The account rotation ALREADY RAN; its output is below the draft, under the "HOW THE WORKER ENDED" rule in the full report file. Read that section before relaunching anything.`,
     },
