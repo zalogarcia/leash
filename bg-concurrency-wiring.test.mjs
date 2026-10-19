@@ -896,6 +896,21 @@ t('a hand-written allowWrite with no scheduleId marks nothing', () => {
 });
 
 // ---------------------------------------------------------------------------
+console.log('\n13. a resume carries the model decision of the death it resumes (startModel)');
+// ---------------------------------------------------------------------------
+
+t('★ a resume carries its model decision to the dispatch; an ordinary job carries none', () => {
+  B.resetPool();
+  B.setCap(10);
+  writeQueue([job('carried', { engine: 'claude', resumeOf: 'bg-carried', resumeCount: 1, carriedModel: { model: 'opus', told: false } }), job('plain')]);
+  B.drainBgHandoff();
+  eq(B.DISPATCHED.map(titleOf).join(','), 'carried,plain');
+  eq(JSON.stringify(B.DISPATCH_OPTS[0].carriedModel), JSON.stringify({ model: 'opus', told: false }));
+  eq(B.DISPATCH_OPTS[1].carriedModel, null);
+  writeQueue([]);
+});
+
+// ---------------------------------------------------------------------------
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {
   for (const f of failures) console.error(`  ✗ ${f}`);

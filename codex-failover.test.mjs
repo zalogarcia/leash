@@ -133,7 +133,7 @@ assert.equal((source.match(/notice: outcome\.status === 'failed' \? codexChatErr
 // as a background worker handback.
 assert.ok(source.includes("background: mode !== 'ask', prompt:"));
 // The drain forwards a Claude pin and the takeover note to the lane.
-assert.ok(source.includes('dispatchPrompt(pinnedClaude ? `claude: ${text}` : text, lane, { priority: true, schedule, cwd, prepend: itemPrepend });'));
+assert.ok(source.includes('dispatchPrompt(pinnedClaude ? `claude: ${text}` : text, lane, { priority: true, schedule, cwd, prepend: itemPrepend, carriedModel });'));
 // A held worker report is kept (keepHandback), never parked in memory.
 assert.equal((source.match(/keepHandback\(item\.handback, 'wall'\)/g) || []).length, 2);
 process.stdout.write('60 passed, 0 failed\n');

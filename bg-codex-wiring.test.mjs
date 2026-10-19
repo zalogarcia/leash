@@ -645,6 +645,7 @@ import { composeWithQuote } from ${url('reply-quote.mjs')};
 import { workerLine, WORKER_TICK_MS, WORKER_IDLE_MS } from ${url('bg-notify.mjs')};
 import { claudeMissingLine, resolveEngine } from ${url('engine-state.mjs')};
 import { isLimitSignal, parseResetTime } from ${url('accounts.mjs')};
+import { modelFamily, usageForModel, refusalScope } from ${url('model-limits.mjs')};
 import { fmtLeft } from ${url('usage-limits.mjs')};
 import fs from 'node:fs';
 const { existsSync } = fs;
@@ -875,12 +876,16 @@ export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wa
         grab('ROTATION_LANDING_WAIT_MS', 'const'),
         grab('rotationStarted'),
         grab('rotationBehindCooldown'),
+        // The rotation's model rule. With no model (laneModel is null here) it
+        // classifies nothing, which is the chat lane this suite is about.
+        grab('classifyModelRefusal'),
         grab('rotateOffLimitedAccount'),
         grab('codexCanTakeChat', 'const'),
         grab('codexTakingChat', 'const'),
         grab('chatLimitRetryPlan'),
         grab('handbackLimitPlan'),
         grab('keepHandback'),
+        'const laneModel = () => null;',
         grab('handleChatLimitFailure'),
         'export { withoutWallWakeNote, dispatchPrompt, drainQueue, startResolvedRun, flushParkedWalledChats, bothEnginesWalledLine, raiseClaudeWall, claudeWallFacts, noEngineForChat, canRunHeldItem, trackQueueAck, resolveQueueAck, QUEUE_MAX, PARKED_WALLED_MAX, raiseWall, settleWall, wallNotices, rotateOffLimitedAccount, chatLimitRetryPlan, handleChatLimitFailure, codexCanTakeChat, codexTakingChat, chatRunFailure, resultEventErrored, handbackLimitPlan, keepHandback, rotationBehindCooldown };',
       ].join('\n'),
@@ -1741,7 +1746,7 @@ await t('★ the retry cap and the images survive the QUEUE, not just the dispat
 
 await t('★ there is exactly ONE copy of the rotation, and the worker path uses it', () => {
   const death = grab('handleLimitDeath');
-  ok(/rotateOffLimitedAccount\(detail\)/.test(death), 'the worker path must go through the shared function');
+  ok(/rotateOffLimitedAccount\(detail, \{ model:/.test(death), 'the worker path must go through the shared function');
   ok(!/markLimited|nextAvailable|swapTo\(/.test(death), `a second copy of the rotation:\n${death}`);
   // And the worker's own bubble is unchanged: it still names both halves.
   ok(/🔄 Session limit on "\$\{rot\.activeName/.test(death), death);

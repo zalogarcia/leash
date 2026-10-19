@@ -1,3 +1,4 @@
+import { modelBlocked, modelFamily } from './model-limits.mjs';
 // Claude Code ACCOUNT SWITCHER, for an owner who legitimately holds more than
 // one Claude subscription (a personal plan and a work plan, say). Each account's
 // OAuth credentials are banked in a named slot; a swap makes a different slot
@@ -355,9 +356,9 @@ export function parseResetTime(text, { now = Date.now(), timeZone } = {}) {
   return { resetsAt: Math.floor(ts / 1000), guessed: false, note };
 }
 
-export function isLimited(acct, now = Date.now()) {
+export function isLimited(acct, now = Date.now(), model = undefined) {
   const until = Number(acct?.limitedUntil);
-  return Number.isFinite(until) && until > 0 && until * 1000 > now;
+  return (Number.isFinite(until) && until > 0 && until * 1000 > now) || (model !== undefined && modelBlocked(acct, model, now));
 }
 
 // The slot's needs-login flag, or null. A slot carrying one cannot take a run
@@ -373,10 +374,10 @@ export function loginFlag(acct) {
 // between two. A never-used slot (lastActiveAt null) sorts first, because it
 // has the freshest window by definition. Ties break on file order, so the
 // choice is deterministic and a test can assert it.
-export function nextAvailable(accounts, { activeName = null, now = Date.now() } = {}) {
+export function nextAvailable(accounts, { activeName = null, now = Date.now(), model = undefined } = {}) {
   const usable = (accounts || [])
     .map((a, i) => ({ a, i }))
-    .filter(({ a }) => a && a.claudeAiOauth && a.name !== activeName && !isLimited(a, now) && !loginFlag(a));
+    .filter(({ a }) => a && a.claudeAiOauth && a.name !== activeName && !isLimited(a, now, model) && !loginFlag(a));
   if (!usable.length) return null;
   usable.sort((x, y) => {
     const lx = x.a.lastActiveAt ? Date.parse(x.a.lastActiveAt) : 0;
@@ -389,10 +390,10 @@ export function nextAvailable(accounts, { activeName = null, now = Date.now() } 
 // Earliest moment any account frees up, for the "everything is limited" message.
 // A slot that needs a login frees nothing when its wall ends, so its clock is
 // not a moment anything can resume at.
-export function earliestReset(accounts, now = Date.now()) {
+export function earliestReset(accounts, now = Date.now(), model = undefined) {
   const times = (accounts || [])
-    .filter((a) => isLimited(a, now) && !loginFlag(a))
-    .map((a) => Number(a.limitedUntil))
+    .filter((a) => isLimited(a, now, model) && !loginFlag(a))
+    .map((a) => Math.max(Number(a.limitedUntil) || 0, ...Object.entries(a.modelLimits || {}).filter(([key]) => model !== undefined && (!modelFamily(model) || key === 'unknown' || key === modelFamily(model))).map(([, v]) => Number(v.until) || 0)))
     .filter((n) => Number.isFinite(n));
   return times.length ? Math.min(...times) : null;
 }
@@ -706,6 +707,10 @@ export function createAccountStore({
       email: email ?? prev?.email ?? null,
       claudeAiOauth: live.claudeAiOauth,
       limitedUntil: prev?.limitedUntil ?? null,
+      limitedCause: prev?.limitedCause ?? null,
+      limitedSource: prev?.limitedSource ?? null,
+      limitedVerifiedAt: prev?.limitedVerifiedAt ?? null,
+      modelLimits: prev?.modelLimits || {},
       lastActiveAt: prev?.lastActiveAt ?? null,
       capturedAt: at,
     };
@@ -964,13 +969,14 @@ export function createAccountStore({
   // "why is this account down", and a mark with no timestamp cannot answer
   // "how old is that belief". Optional, so the two-argument call sites that
   // predate them keep working unchanged.
-  function markLimited(name, resetsAt, { source = null, verifiedAt = null } = {}) {
+  function markLimited(name, resetsAt, { source = null, verifiedAt = null, cause = null } = {}) {
     const list = read();
     const i = list.findIndex((a) => a.name === name);
     if (i === -1) return { ok: false, error: `no account slot named "${name}"` };
     list[i] = {
       ...list[i],
       limitedUntil: Number(resetsAt) || null,
+      limitedCause: cause || 'unknown',
       limitedSource: source || list[i].limitedSource || null,
       limitedVerifiedAt: verifiedAt || new Date().toISOString(),
     };
@@ -981,13 +987,22 @@ export function createAccountStore({
     return { ok: true, account: list[i] };
   }
 
+  function setModelLimits(name, modelLimits) {
+    const list = read();
+    const i = list.findIndex(a => a.name === name);
+    if (i === -1) return { ok: false, error: 'unknown account' };
+    list[i] = { ...list[i], modelLimits };
+    write(list);
+    return { ok: true, account: list[i] };
+  }
+
   function clearLimit(name) {
     const list = read();
     const i = list.findIndex((a) => a.name === name);
     if (i === -1) return { ok: false, error: `no account slot named "${name}"` };
     // The reason goes with the wall. A cleared limit whose source and timestamp
     // survived would describe a wall that is no longer there.
-    list[i] = { ...list[i], limitedUntil: null, limitedSource: null, limitedVerifiedAt: null };
+    list[i] = { ...list[i], limitedUntil: null, limitedSource: null, limitedVerifiedAt: null, limitedCause: null };
     write(list);
     return { ok: true, account: list[i] };
   }
@@ -1057,6 +1072,8 @@ export function createAccountStore({
       lastActiveAt: a.lastActiveAt || null,
       limitedUntil: a.limitedUntil || null,
       limited: isLimited(a, now),
+      limitedCause: a.limitedCause || null,
+      modelLimits: a.modelLimits || {},
       // The ledger's provenance, for the /status rows. Never load bearing:
       // `limited` above is the gate, these two only say where the belief came
       // from and how old it is.
@@ -1091,6 +1108,7 @@ export function createAccountStore({
     swapTo,
     markLimited,
     clearLimit,
+    setModelLimits,
     markNeedsLogin,
     clearNeedsLogin,
     checkDrift,

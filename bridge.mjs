@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { normalizeRateLimitEvent } from './account-usage.mjs';
+import { modelFallbackNotice } from './system-messages.mjs';
+import { modelFamily, modelBlocked, usageForModel, scopedLimits, globalWindowsOpen, refusalScope, writeModelLimits, decideRunModel } from './model-limits.mjs';
 // Leash: Claude Code <-> Telegram.
 // Long-polls the Telegram Bot API (outbound only — no tunnel/webhook needed) and
 // runs incoming messages through headless Claude Code (`claude -p --resume`) with
@@ -184,6 +187,7 @@ import {
   swapFailedLine,
   needsLoginNotice,
   chatRotatedLine,
+  chatModelFallbackLine,
   chatWalledRetryLine,
   handbackLimitLine,
   bothWalledLine,
@@ -528,6 +532,13 @@ const LOG_FILE =
 const TG_FILE_LIMIT = 20 * 1024 * 1024; // Telegram bot API getFile cap
 // Empty = use whatever the `claude` CLI is configured to use.
 const DEFAULT_MODEL = conf('model', '');
+// BG_MODEL is what EVERY background worker runs on, whatever the chat lane's
+// /model says. The spawn line used to read `st.model || DEFAULT_MODEL` for
+// every lane, so the moment /model was set for the chat the whole worker pool
+// silently followed it onto that model and its limits (found 2026-09-02: both
+// live workers on the chat's model, three sessions sharing one limit). /model
+// steers the chat lane only. Empty = the configured `model` above.
+const BG_MODEL = conf('bgModel', '') || DEFAULT_MODEL;
 const DEFAULT_EFFORT = conf('effort', '');
 // Skip permission prompts (headless runs can't answer them). Set to false to
 // use acceptEdits instead — safer, but arbitrary Bash gets silently denied.
@@ -1862,10 +1873,10 @@ function editWorkerNotice(runId, patch, { keepAlive = false } = {}) {
 // handler had the failure in hand and no way to say what it was a failure OF.
 // `handback` is the same kind of passenger: the worker reports this turn hands
 // to the assistant, so a limit death re-reads them once or keeps them (see queueItem).
-function runClaude(
+async function runClaude(
   rawText,
   lane = LANES.main,
-  { prepend = '', kinds = [], images = [], priority = false, retried = false, replyQuote = null, schedule = null, handback = null, cwd: requestedCwd = null } = {},
+  { prepend = '', kinds = [], images = [], priority = false, retried = false, carriedModel = null, replyQuote = null, schedule = null, handback = null, cwd: requestedCwd = null } = {},
 ) {
   const st = chatState();
   // THREE STRINGS, not two, once a reply is in play: what you TYPED (rawText),
@@ -1891,19 +1902,24 @@ function runClaude(
     startedAt: Date.now(),
     stopped: false,
     prompt: rawText,
-    terminate: null,
+    terminate: () => { run.stopped = true; },
     lane,
     steers: [],
     btw: createBtwTracker(),
     gotResult: false, // set on the first result event; a steer written before it was acted on
   };
   lane.current = run;
+  let selectedModel;
+  try { selectedModel = startModel(lane, carriedModel); }
+  catch (error) { console.error('[bridge] start model failed:', error.message); selectedModel = laneModel(lane); }
+  if (run.stopped) { lane.current = null; drainQueue(lane); return; }
+  run.requestedModel = selectedModel;
   return new Promise(async (resolve) => {
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'];
     if (lane.sessionKey && st[lane.sessionKey]) args.push('--resume', st[lane.sessionKey]);
-    // Unset model/effort = whatever the `claude` CLI itself defaults to.
-    const model = st.model || DEFAULT_MODEL;
-    if (model) args.push('--model', model);
+    // Background lanes are pinned to BG_MODEL; /model only steers the chat
+    // lane. Unset model/effort = whatever the `claude` CLI itself defaults to.
+    if (selectedModel) args.push('--model', selectedModel);
     if (DEFAULT_EFFORT) args.push('--effort', DEFAULT_EFFORT);
     args.push('--add-dir', INBOX_DIR); // without this, reading attachments outside cwd gets permission-denied
     const memoryDir = path.join(HOME, '.claude', 'projects', HOME.replace(/\//g, '-'), 'memory');
@@ -2081,7 +2097,7 @@ function runClaude(
     });
     // Which account this process starts on, as far as the daemon knows: the
     // live session usage readings it emits are filed by it (noteStreamUsage).
-    const spawnAccount = liveAccount.current();
+    const spawnAccount = liveAccount.peek();
     const { child } = spawnWorker(CLAUDE_BIN, args, { cwd, env: childEnv, logPath });
     run.child = child;
     run.logPath = logPath; // /status and any future salvage want to find the log
@@ -2108,7 +2124,7 @@ function runClaude(
         // the old process), so there is no card to show it on, which is why a
         // record written before this field existed leaves it undefined and
         // every surface then shows nothing rather than a guess.
-        model: st.model || DEFAULT_MODEL || null,
+        model: selectedModel || null,
         effort: DEFAULT_EFFORT || null,
         // The account it was spawned on, for a re-attach after a restart to
         // file its usage readings by (noteStreamUsage). Absent on records from
@@ -2123,6 +2139,7 @@ function runClaude(
       try {
         wallGuard.job(`${lane.name || 'bg'}-${startedAt}`, {
           account: spawnAccount || null,
+          model: selectedModel,
           ...(schedule?.id != null ? { scheduleId: schedule.id, allowWrite: schedule.allowWrite === true } : {}),
         });
       } catch (e) {
@@ -2477,7 +2494,18 @@ function runClaude(
         child.stdin.end();
       } else if (ev.type === 'rate_limit_event') {
         // The plan usage numbers, after every API response. See noteStreamUsage.
-        noteStreamUsage(ev, spawnAccount);
+        const attributed = noteStreamUsage(ev, spawnAccount);
+        // The run's LAST refusal, as evidence for the rotation if it dies. A
+        // response allowed after it means the refusal was a subagent's and the
+        // run went on, so it is evidence of nothing. A refusal no account can
+        // be named for leaves the evidence as it was.
+        if (ev.rate_limit_info?.status !== 'rejected') {
+          run.rejectedLimit = null;
+          run.rejectedAccount = null;
+        } else if (attributed?.name) {
+          run.rejectedLimit = ev;
+          run.rejectedAccount = attributed.name;
+        }
       }
     };
 
@@ -2566,7 +2594,9 @@ function runClaude(
       if (lane.sessionKey && resultEvent?.session_id && genOk) {
         st[lane.sessionKey] = resultEvent.session_id;
       }
-      if (run.model) st.lastModel = run.model;
+      // lastModel describes the CHAT lane (the /model readout and the context
+      // gauge read it); a bg worker finishing on BG_MODEL must not overwrite it.
+      if (run.model && lane === LANES.main) st.lastModel = run.model;
       if (lastUsage && lane.ctxKey && genOk) {
         const u = lastUsage;
         // One message's input + cache reads + cache writes = what the model actually
@@ -2648,6 +2678,9 @@ function runClaude(
       const limitPlan = chatFailureDetail
         ? await handleChatLimitFailure(chatFailureDetail, {
             text: rawText,
+            model: run.requestedModel,
+            rejectedLimit: run.rejectedLimit,
+            rejectedAccount: run.rejectedAccount,
             lane,
             images,
             kinds,
@@ -2759,7 +2792,7 @@ function runClaude(
         }
         reportBgOutcome(
           rawText,
-          bgOutcome(bgTexts, resultEvent, code, stderrTail),
+          { ...bgOutcome(bgTexts, resultEvent, code, stderrTail), model: run.requestedModel, rejectedLimit: run.rejectedLimit, rejectedAccount: run.rejectedAccount },
           logPath ? path.basename(logPath, '.jsonl') : null,
           { steers: run.steers, finalReportSeen },
         );
@@ -3903,13 +3936,86 @@ const streamUsage = createStreamUsage({ file: STREAM_USAGE_FILE });
 const accountUsage = createAccountUsage({
   store: accounts,
   streamReading: (name) => streamUsage.get(name),
-  onUsage: (name, usage) => streamUsage.learn(name, usage),
+  onUsage: (name, usage) => {
+    streamUsage.learn(name, usage);
+    reconcileModelUsage(name, usage);
+  },
 });
 const liveAccount = createLiveAccountTracker({
   readCredentials: () => accounts.readCredentials(),
   resolveActive: () => accountUsage.resolveActive(),
   fingerprint,
 });
+// Each lane kind's last model decision ('chat', 'background'). startModel is
+// its only writer.
+const modelFallbacks = new Map();
+// Two limiters, five minutes per account each, a failed read spending its slot
+// too. Not one: a legacy recheck read BEFORE a refusal cannot answer it, so
+// sharing the slot delayed the Fable limit by up to five minutes (review 3
+// LOW 4). Wall recovery keeps its own.
+const modelUsageRecheck = createRecheckLimiter();
+const legacyModelRecheck = createRecheckLimiter();
+// The newest refusal read per account: { at, read }. See freshModelRead.
+const modelReads = new Map();
+const MODEL_READ_REUSE_MS = 10_000;
+
+function publishModelLimits(name) {
+  // Never throws: the export is a courtesy to other tools, and a failed write
+  // must not abort a usage lookup or a rotation.
+  try {
+    const account = accounts.listAccounts().find(a => a.name === name);
+    writeModelLimits(path.join(HOME, '.claude', 'state', 'model-limits.json'), name || null, account?.modelLimits || {});
+  } catch (e) {
+    console.error('[bridge] model state write failed:', e.message);
+  }
+}
+
+function reconcileModelUsage(name, usage) {
+  if (!usage?.scoped?.length) return;
+  const old = accounts.listAccounts().find(a => a.name === name);
+  if (!old) return;
+  const limits = scopedLimits(usage);
+  accounts.setModelLimits(name, limits);
+  // Only a wall the probe wrote: a wall from a refusal message keeps its own
+  // clear rule, since a lagging reading must not undo a real refusal.
+  if (old.limitedUntil && !old.limitedCause && old.limitedSource === 'probe' && globalWindowsOpen(usage) && Object.keys(limits).length) {
+    accounts.clearLimit(name);
+    logAccountDecision({ decision: 'account_limit_cleared_by_probe', account: name, reason: 'legacy wall belongs only to a model' });
+  }
+  if (liveAccount.current() === name) publishModelLimits(name);
+}
+
+function laneModel(lane = LANES.main, effective = false) {
+  if (effective && modelFallbacks.get(lane.isBg ? 'background' : 'chat')) return 'opus';
+  return lane.isBg ? BG_MODEL : chatState().model || DEFAULT_MODEL;
+}
+
+// THE MODEL A RUN STARTS ON. runClaude, the one Claude spawn site, calls this
+// for every run (a message, a retry, a queue drain, a background job, a resume,
+// a parked message), and decideRunModel decides. Only held facts, so nothing
+// slow stands in front of a run: no usage request, no keychain read, no swap.
+// The live account is the tracker's name, or, while the tracker re-reads after
+// a swap, the account that swap just installed; so the same facts give the
+// same answer whether the retry starts 0 ms or 400 ms after the swap.
+function startModel(lane, carried = null) {
+  const key = lane.isBg ? 'background' : 'chat';
+  const was = modelFallbacks.get(key) === true;
+  const name = liveAccount.peek() || (lastAccountSwap && Date.now() - lastAccountSwap.at < 15_000 ? lastAccountSwap.to : null);
+  const configured = laneModel(lane);
+  const d = decideRunModel({
+    configured,
+    account: (name && accounts.listAccounts().find((a) => a.name === name)) || null,
+    previous: { fallback: was },
+    carried,
+  });
+  modelFallbacks.set(key, d.fallback);
+  const line = d.notice ? modelFallbackNotice({ restored: d.notice === 'restored', clock: d.until ? fmtResetClock(d.until * 1000, { timeZone: OWNER_TZ }) : null }) : null;
+  if (line) Promise.resolve().then(() => send(line, { markdown: false })).catch((e) => console.error('[bridge] model notice failed:', e.message));
+  // A Fable lane's transitions; a lane moved off Fable by the owner just forgets.
+  if (d.fallback !== was && modelFamily(configured) === 'fable') logAccountDecision({ decision: d.fallback ? 'model_fallback' : 'model_restored', account: name, reason: line || 'announced by the line the owner already saw' });
+  return d.model;
+}
+
 // A swap changes the live account NOW, and the tracker would otherwise keep the
 // outgoing name for up to its 15s TTL, filing the incoming account's readings
 // under it. Wrapped once here so every swap site is covered: the rotation, the
@@ -3933,6 +4039,7 @@ accounts.swapTo = async (...args) => {
       // it again after this returns (armOwnerHold).
       autoSwitchOwnerHold = null;
       streamUsage.noteSwap(lastAccountSwap);
+      try { publishModelLimits(res.to); } catch (e) { console.error('[bridge] model state write failed:', e.message); }
     }
     return res;
   } finally {
@@ -3952,9 +4059,43 @@ accounts.swapTo = async (...args) => {
 // when the two agree: see the attribution rule in stream-usage.mjs.
 function noteStreamUsage(ev, spawnName = null) {
   try {
-    streamUsage.note(ev, { liveName: liveAccount.current(), spawnName });
+    // A stream reading never carries a per model window (0 of 10,231 real
+    // events, 2026-10-12), so it must not touch the model limits: writing
+    // scopedLimits() of it erased them, and rewrote accounts.json, on every
+    // event. Model limits come from the usage API (reconcileModelUsage) and
+    // from a classified refusal only. A refusal with both every-model windows
+    // open schedules one read, which says which model is out.
+    const attributed = streamUsage.note(ev, { liveName: liveAccount.current(), spawnName });
+    if (attributed?.name && ev.rate_limit_info?.status === 'rejected' && globalWindowsOpen(normalizeRateLimitEvent(ev))) scheduleModelUsageRead(attributed.name);
+    return attributed;
   } catch (e) {
     console.error(`[bridge] live session usage reading not recorded: ${e.message}`);
+  }
+}
+
+// ONE READ PER REFUSAL. The read a refused stream event schedules and the read
+// the refusal classification needs when the run closes are the same question,
+// asked seconds apart. So the newest one per account is kept, and a refusal
+// path asking within MODEL_READ_REUSE_MS of it waits for it instead of asking
+// again (review 2 F4). Short on purpose: a read from before a later wall must
+// not answer for the wall (review 2 F2). Never rejects; null when unread.
+function freshModelRead(name) {
+  const last = modelReads.get(name);
+  if (last && Date.now() - last.at < MODEL_READ_REUSE_MS) return last.read;
+  const read = withDeadline(accountUsage.one(name), PROBE_TIMEOUT_MS, null).catch(() => null);
+  modelReads.set(name, { at: Date.now(), read });
+  return read;
+}
+
+function scheduleModelUsageRead(name) {
+  if (modelUsageRecheck.take(name, Date.now())) freshModelRead(name);
+}
+
+async function recheckLegacyModelWalls(now = Date.now()) {
+  for (const account of accounts.listAccounts()) {
+    if (!(Number(account.limitedUntil) * 1000 > now) || account.limitedSource !== 'probe' || account.limitedCause || account.needsLogin) continue;
+    if (!legacyModelRecheck.take(account.name, now)) continue;
+    await withDeadline(accountUsage.one(account.name), PROBE_TIMEOUT_MS, null).catch(e => console.error('[bridge] legacy model recheck failed:', e.message));
   }
 }
 
@@ -3963,6 +4104,7 @@ function noteStreamUsage(ev, spawnName = null) {
 // /account said nothing about any of it. Same 60s TTL, same bars, same reset
 // clocks. See codex-account.mjs for where the numbers come from and for the
 // rule that no token ever leaves that module.
+
 const codexAccount = createCodexAccount({
   readAuth: () => {
     try {
@@ -4265,7 +4407,7 @@ function chatRunFailure(resultTexts, resultEvent, code, stderrTail = '') {
  * matters most: limitedUntil in the past is not a limit at all, so accepting it
  * would hand the dead account straight back to the next message.
  */
-async function usageResetFor(name) {
+async function usageResetFor(name, model = null) {
   if (!name) return null;
   try {
     // The cached row can predate the wall by the whole TTL, and a reading taken
@@ -4277,7 +4419,8 @@ async function usageResetFor(name) {
     if (!row || row.name !== name || !row.usage) return null;
     // A locked window counts even if its percent came back unreadable: the
     // reason string is the stronger signal of the two.
-    const windows = [row.usage.fiveHour, row.usage.sevenDay, ...(row.usage.scoped || [])].filter(
+    const scopedUsage = usageForModel(row.usage, model);
+    const windows = [scopedUsage.fiveHour, scopedUsage.sevenDay, ...(scopedUsage.scoped || [])].filter(
       (w) => w && w.resetsAt && (w.locked || Number.isFinite(Number(w.percent))),
     );
     const near95 = windows
@@ -4394,13 +4537,15 @@ function flagLoginsFromRows(rows, { via = null } = {}) {
  * every account on this machine the moment the network blinked. The worst case
  * of a timeout is exactly the behaviour that shipped before this existed.
  */
-async function pickHealthyAccount({ activeName = null, lines = [], quiet = false, othersOnly = false } = {}) {
+async function pickHealthyAccount({ activeName = null, lines = [], quiet = false, othersOnly = false, model = laneModel(), preferHeadroom = false } = {}) {
   // READ AFTER THE MARK. The caller has already written the wall for the
   // account that just died, and this list is what the selector filters and what
   // the earliest-reset clock is computed from.
   const list = accounts.listAccounts();
   const res = await selectAccount({
     accounts: list,
+    model,
+    preferHeadroom,
     activeName,
     now: Date.now(),
     // A refusal that answers AFTER the deadline is still flagged and said: the
@@ -4456,11 +4601,15 @@ async function pickHealthyAccount({ activeName = null, lines = [], quiet = false
   // own loop would honour them; the ledger is what makes them outlive this
   // rotation, this message and this daemon.
   for (const w of res.walls || []) {
-    accounts.markLimited(w.name, w.until, { source: w.guessed ? 'probe (no reset clock)' : 'probe' });
+    if (w.modelLimits) accounts.setModelLimits(w.name, w.modelLimits);
+    if (!w.scopedOnly) accounts.markLimited(w.name, w.globalUntil || w.until, { source: w.guessed ? 'probe (no reset clock)' : 'probe', cause: w.globalReason || w.reason });
   }
   // And the walls a re-check lifted, through the store's own clearLimit, which
   // takes the source and timestamp with the wall.
-  for (const c of res.cleared || []) accounts.clearLimit(c.name);
+  for (const c of res.cleared || []) {
+    accounts.clearLimit(c.name);
+    if (c.modelLimits) accounts.setModelLimits(c.name, c.modelLimits);
+  }
   // And the logins it found dead: flagged in the slot, said once.
   for (const d of res.needsLogin || []) flagNeedsLogin(d.name, d.reason, { via: 'probe' });
   return res;
@@ -4675,7 +4824,8 @@ async function recheckDuringWall() {
   if (!due && claudeRunInFlight()) return { checked: false, reason: 'a run is in flight; the move waits for the next sweep' };
   // activeName null: during a wall the live account is walled like the rest,
   // and a reset bought for IT is as good as one bought for any other.
-  const pick = await pickHealthyAccount({ activeName: null, quiet: true });
+  let pick = await pickHealthyAccount({ activeName: null, quiet: true, model: laneModel() });
+  if (!pick.name && modelFamily(laneModel()) === 'fable') pick = await pickHealthyAccount({ activeName: null, quiet: true, model: 'opus', preferHeadroom: true });
   if (!pick.name) return { checked: true, moved: false, reason: 'wall is up, every re-check kept its wall' };
   // RE-CHECKED after the probes: a hand swap or a capture lifts the wall
   // itself, and moving the login after that would overrule the user's choice.
@@ -5096,7 +5246,7 @@ function armOwnerHold(name, usage) {
     autoSwitchOwnerHold = { name, until: null };
     return;
   }
-  const crossed = overThreshold(usage, autoSwitchNow(), Date.now());
+  const crossed = overThreshold(usage, autoSwitchNow(), Date.now(), laneModel(undefined, true));
   const clocks = crossed.map((w) => w.resetsAtMs).filter((v) => Number.isFinite(v) && v > Date.now());
   autoSwitchOwnerHold = crossed.length ? { name, until: clocks.length ? Math.max(...clocks) : Date.now() + 5 * 3600_000 } : null;
 }
@@ -5178,6 +5328,9 @@ function autoSwitchSkip(reason, key = null) {
 /** One tick at a time; the poll loop calls this every cycle, before the wall guard. */
 function kickAutoSwitch() {
   if (autoSwitchInflight) return autoSwitchInflight;
+  const recheck = recheckLegacyModelWalls().catch(e => console.error('[bridge] legacy model recheck failed:', e.message));
+  pendingOps.add(recheck);
+  recheck.finally(() => pendingOps.delete(recheck));
   const op = autoSwitchTick().catch((e) => {
     console.error('[bridge] account auto switch tick failed:', e.message);
     return null;
@@ -5205,7 +5358,8 @@ async function autoSwitchCandidates(activeName, now, { all = false } = {}) {
   const asks = [];
   rows.forEach((r, order) => {
     if (r.name === activeName) return;
-    const prev = autoSwitchProbes.get(r.name) || null;
+    const stored = autoSwitchProbes.get(r.name);
+    const prev = stored?.model === laneModel(undefined, true) ? stored : null;
     const c = { name: r.name, order, verdict: null, resetPassed: false };
     out.push(c);
     if (!r.captured) c.verdict = { free: false, reason: 'no captured login' };
@@ -5213,7 +5367,7 @@ async function autoSwitchCandidates(activeName, now, { all = false } = {}) {
     else if (r.limited) {
       c.verdict = { free: false, reason: `walled until ${fmtResetClock(Number(r.limitedUntil) * 1000, { timeZone: OWNER_TZ })}` };
       // The ledger's own clock is a reset too: the lookup comes the moment it passes.
-      autoSwitchProbes.set(r.name, { ...(prev || {}), at: prev?.at ?? null, verdict: c.verdict, blockedUntilMs: Number(r.limitedUntil) * 1000 });
+      autoSwitchProbes.set(r.name, { model: laneModel(undefined, true), ...(prev || {}), at: prev?.at ?? null, verdict: c.verdict, blockedUntilMs: Number(r.limitedUntil) * 1000 });
     } else {
       const blockedUntilMs = prev?.blockedUntilMs ?? null;
       if (all || probeDue({ lastProbeAt: prev?.at ?? null, blockedUntilMs, now })) {
@@ -5222,8 +5376,8 @@ async function autoSwitchCandidates(activeName, now, { all = false } = {}) {
           withDeadline(accountUsage.one(r.name), PROBE_TIMEOUT_MS + 1000, null).then((row) => {
             // A refused login found here is flagged and said once, as from any probe.
             if (row) flagLoginsFromRows([row], { via: 'auto switch' });
-            c.verdict = candidateVerdict(row, { name: r.name, settings, now: Date.now() });
-            autoSwitchProbes.set(r.name, { at: Date.now(), verdict: c.verdict, blockedUntilMs: c.verdict.blockedUntilMs ?? null });
+            c.verdict = candidateVerdict(row, { name: r.name, settings, now: Date.now(), model: laneModel(undefined, true) });
+            autoSwitchProbes.set(r.name, { model: laneModel(undefined, true), at: Date.now(), verdict: c.verdict, blockedUntilMs: c.verdict.blockedUntilMs ?? null });
           }),
         );
       } else if (prev?.verdict && prev.at && now - prev.at <= AUTO_SWITCH_EVIDENCE_MS) {
@@ -5271,7 +5425,7 @@ async function autoSwitchTick(now = Date.now(), { dryRun = false } = {}) {
     const prev = autoSwitchLiveLookup?.name === name ? autoSwitchLiveLookup : null;
     const age = prev ? Date.now() - prev.at : Infinity;
     const contradicted =
-      prev && sessionUsage && overThreshold(sessionUsage, settings, now).length > 0 && okRow(prev.row) && !overThreshold(prev.row.usage, settings, now).length && age >= 60_000;
+      prev && sessionUsage && overThreshold(sessionUsage, settings, now, laneModel(undefined, true)).length > 0 && okRow(prev.row) && !overThreshold(prev.row.usage, settings, now, laneModel(undefined, true)).length && age >= 60_000;
     if (dryRun || !prev || age >= AUTO_SWITCH_RETRY_MS || contradicted) {
       row = await withDeadline(accountUsage.one(name), PROBE_TIMEOUT_MS + 1000, null);
       autoSwitchLiveLookup = { name, at: Date.now(), row };
@@ -5291,10 +5445,10 @@ async function autoSwitchTick(now = Date.now(), { dryRun = false } = {}) {
     if (!dryRun) return autoSwitchSkip(gates[gates.length - 1]);
   }
   if (!dryRun && !usage) return autoSwitchSkip('no usable reading for the live account');
-  if (!dryRun && !overThreshold(usage, settings, now).length) return autoSwitchSkip('below the thresholds');
+  if (!dryRun && !overThreshold(usage, settings, now, laneModel(undefined, true)).length) return autoSwitchSkip('below the thresholds');
   const at = Date.now();
   const candidates = await autoSwitchCandidates(name, at, { all: dryRun });
-  const decision = autoSwitchDecision({ settings, active: { name, usage }, candidates, now: Date.now(), lastSwitchAt: lastSwapAt() });
+  const decision = autoSwitchDecision({ settings, model: laneModel(undefined, true), active: { name, usage }, candidates, now: Date.now(), lastSwitchAt: lastSwapAt() });
   if (dryRun) return { switched: false, dryRun: true, gates, source, usage, candidates, decision, settings, name };
   if (!decision.switch) return autoSwitchSkip(decision.reason, decision.over.length ? name : null);
   // RE-READ after the awaits: a rotation, a wall or another switch may have
@@ -5373,7 +5527,7 @@ async function doSwitchAccount(target, { via = 'auto', why = null, over = [], fr
     // captured login that is not flagged, not walled in the ledger, and not
     // spent on a fresh lookup. An account merely past the automatic
     // threshold is allowed, with a note.
-    const pre = switchTargetVerdict({ target, rows: accounts.describe(Date.now()), activeName, now: Date.now(), timeZone: OWNER_TZ });
+    const pre = switchTargetVerdict({ model: laneModel(undefined, true), target, rows: accounts.describe(Date.now()), activeName, now: Date.now(), timeZone: OWNER_TZ });
     if (!pre.ok) return refuse(pre.reason);
     if (pre.noop) {
       logAccountDecision({ decision: 'account_switch_noop', account: pre.name, via });
@@ -5382,7 +5536,7 @@ async function doSwitchAccount(target, { via = 'auto', why = null, over = [], fr
     }
     const row = await withDeadline(accountUsage.one(pre.name), PROBE_TIMEOUT_MS + 1000, null);
     if (row) flagLoginsFromRows([row], { via: `${via} switch` });
-    const v = switchTargetVerdict({ target, rows: accounts.describe(Date.now()), activeName, row, now: Date.now(), timeZone: OWNER_TZ });
+    const v = switchTargetVerdict({ model: laneModel(undefined, true), target, rows: accounts.describe(Date.now()), activeName, row, now: Date.now(), timeZone: OWNER_TZ });
     if (!v.ok) return refuse(v.reason);
     name = v.name;
     note = v.note || null;
@@ -5402,7 +5556,7 @@ async function doSwitchAccount(target, { via = 'auto', why = null, over = [], fr
       const after = await accounts.activeAccount().catch(() => null);
       activeName = after?.account?.name || liveAccount.current() || activeName;
       if (inFlight(rotationLanding) && rotationLanding !== waitedFor) return refuse('a rotation is moving the login right now; nothing changed, ask again in a minute');
-      const v2 = switchTargetVerdict({ target, rows: accounts.describe(Date.now()), activeName, now: Date.now(), timeZone: OWNER_TZ });
+      const v2 = switchTargetVerdict({ model: laneModel(undefined, true), target, rows: accounts.describe(Date.now()), activeName, now: Date.now(), timeZone: OWNER_TZ });
       if (!v2.ok) return refuse(v2.reason);
       if (v2.noop) {
         logAccountDecision({ decision: 'account_switch_noop', account: v2.name, via });
@@ -5478,7 +5632,7 @@ function autoSwitchCheckText(r) {
   lines.push(`Settings: ${r.settings.enabled ? `on · 5h ${r.settings.fiveHourThreshold}% · week ${r.settings.weekThreshold}%` : 'off'}`);
   if (r.gates.length) lines.push(`Gates that would stop a real tick: ${r.gates.join(' · ')}`);
   lines.push(`Live: ${r.name || 'not identified'} · ${r.usage ? readingLine(r.usage, now) : 'no usable reading'} · source ${r.source}`);
-  const over = overThreshold(r.usage, r.settings, now);
+  const over = overThreshold(r.usage, r.settings, now, laneModel(undefined, true));
   lines.push(`Over a threshold: ${over.length ? over.map((w) => `${Math.round(w.percent)}% of ${w.label}`).join(' · ') : 'no'}`);
   for (const c of r.candidates) lines.push(`Candidate ${c.name}: ${c.verdict?.free ? `free · ${c.verdict.reason}` : `not free · ${c.verdict?.reason || 'not asked'}`}`);
   lines.push(r.decision.switch ? `Decision: SWITCH to ${r.decision.to} (${r.decision.why})` : `Decision: stay · ${r.decision.reason}`);
@@ -5583,14 +5737,14 @@ async function wallGuardTick(now = Date.now()) {
   // Only a reading that is provably this account's (usableLiveReading): the
   // 2026-10-08 20:52Z false wall acted on one account's 100 percent filed
   // under another seconds after the swap.
-  const usage = account ? usableLiveReading(account) : null;
+  const usage = usageForModel(account ? usableLiveReading(account) : null, laneModel({ isBg: true }, true));
   const pre = checkpointCandidates({ settings, usage, account, now, workers: bgWorkerDescriptors() });
   if (!pre.ready) return wallGuardSkip(pre.reason);
   const left = checkpointCandidates({ settings, usage, account, now, workers: bgWorkerDescriptors(), steered: wallGuard.handled(pre.key) });
   if (!left.ready) return wallGuardSkip(left.reason);
   if (now - wallGuardLastProbe < WALL_GUARD_PROBE_MS) return { fired: false, reason: 'waiting for the next selector check' };
   wallGuardLastProbe = now;
-  const sel = await withDeadline(pickHealthyAccount({ activeName: account, lines: [], quiet: true, othersOnly: true }), WALL_LIFT_SWEEP_WAIT_MS, null);
+  const sel = await withDeadline(pickHealthyAccount({ activeName: account, lines: [], quiet: true, othersOnly: true, model: laneModel({ isBg: true }, true) }), WALL_LIFT_SWEEP_WAIT_MS, null);
   const othersFree = sel ? sel.outcome === 'selected' : null;
   // RE-READ after the await: a worker may have ended, a steer may have landed
   // from another path, and the wall itself may have gone up meanwhile.
@@ -5758,13 +5912,18 @@ function queueResumeJobs(items) {
  * workers come back a few at a time and not all at once. Returns { resumed,
  * skipped, timing, maxRunning }.
  */
-function resumeWallDeaths(ep, { readyAt = null, now = Date.now() } = {}) {
+function resumeWallDeaths(ep, { readyAt = null, now = Date.now(), only = null } = {}) {
   const settings = wallGuardNow();
   // The episode's own start, or the one it carried forward: a death recorded
   // before that belongs to a wall long gone. A minute of slack for the wall
   // being raised a moment after the first death was recorded.
   const since = (Number(ep?.carried?.from) || Number(ep?.raisedAt) || 0) - 60_000;
-  const { candidates, stale } = resumeCandidates({ episodeWorkers: ep?.workers || [], deaths: wallGuard.deaths(), since, raisedAt: [ep?.raisedAt, ep?.updatedAt] });
+  // ONE DEATH, resumed at once with its model decision (handleLimitDeath, a
+  // refusal of Fable only): no other death is judged, settled or resumed here.
+  // Judged against this ad hoc episode, an older wall's deaths read as stale
+  // and lost their briefs before their own lift (QA round 2).
+  const deaths = only ? wallGuard.deaths().filter((d) => baseRunId(d.runId) === baseRunId(only.runId)) : wallGuard.deaths();
+  const { candidates, stale } = resumeCandidates({ episodeWorkers: ep?.workers || [], deaths, since, raisedAt: [ep?.raisedAt, ep?.updatedAt] });
   for (const id of stale) wallGuard.settleDeath(id);
   const timing = resumeTiming({ readyAt, now, withinMinutes: settings.resumeWithinMinutes });
   if (!candidates.length) return { resumed: [], skipped: [], timing };
@@ -5799,7 +5958,8 @@ function resumeWallDeaths(ep, { readyAt = null, now = Date.now() } = {}) {
       skipped.push({ ...r, died: true, reason: 'the resume claim could not be saved, so it was not queued' });
       continue;
     }
-    items.push(resumeQueueItem({ death: r, text: brief.text, count: r.count, now, maxRunning: settings.resumeMaxConcurrent }));
+    const item = resumeQueueItem({ death: r, text: brief.text, count: r.count, now, maxRunning: settings.resumeMaxConcurrent });
+    items.push(only ? { ...item, carriedModel: only.carriedModel } : item);
     resumed.push({ runId: r.runId, title: r.title || briefTitle(r.task), newTitle: brief.title, count: r.count, max: r.max });
   }
   if (items.length && !queueResumeJobs(items)) {
@@ -5841,9 +6001,10 @@ function clearLimitsFromRows(rows, { via = null } = {}) {
   for (const row of rows || []) {
     const w = row && walled.get(row.name);
     if (!w) continue;
-    const v = limitClearVerdict(row, { name: w.name, now, wallSetAt: w.limitedVerifiedAt });
+    const v = limitClearVerdict(row, { name: w.name, now, wallSetAt: w.limitedVerifiedAt, legacy: !w.limitedCause, model: laneModel() });
     if (!v.clear) continue;
     if (!accounts.clearLimit(w.name)?.ok) continue;
+    if (v.modelLimits) accounts.setModelLimits(w.name, v.modelLimits);
     logAccountDecision({ decision: 'account_limit_cleared_by_probe', account: w.name, wasUntil: w.limitedUntil, reason: v.reason, via });
     cleared.push(w.name);
   }
@@ -5895,8 +6056,42 @@ async function rotationBehindCooldown(now = Date.now()) {
   return now - rec.landedAt < ROTATION_COOLDOWN_MS ? rec.rot : null;
 }
 
-async function rotateOffLimitedAccount(detail) {
+/**
+ * THE ROTATION'S ONE MODEL RULE (2026-10-12): a refusal scoped to one model
+ * records a model limit, not an account wall. It moves nothing, so it runs
+ * ahead of both guards and still classifies a refusal inside a cooldown or a
+ * pause (review 3 LOW 3). An event counts only for the account it was filed
+ * under, and an event filed under another account than the live one makes
+ * this classify nothing: whose wall that was is the wall path's question
+ * (review 3 HIGH). The model the next run starts on is not decided here; that
+ * is startModel's.
+ *
+ * Returns null, or { name, family, sameAccount }: `sameAccount` when the lane
+ * keeps a model on this same account (a Fable run with Opus and the
+ * every-model windows open), which is then the whole answer.
+ */
+async function classifyModelRefusal(detail, { model = null, rejectedLimit = null, rejectedAccount = null, activeName } = {}) {
+  if (!modelFamily(model)) return null;
+  const name = activeName !== undefined ? activeName : (await accounts.activeAccount().catch(() => null))?.account?.name || null;
+  if (!name || (rejectedAccount && rejectedAccount !== name)) return null;
+  const event = rejectedAccount === name ? rejectedLimit : null;
+  const row = await freshModelRead(name);
+  const scope =
+    row?.name === name && row.state === 'ok' && row.source?.kind !== 'stream'
+      ? refusalScope({ model, usage: row.usage, event, text: detail })
+      : event
+        ? refusalScope({ model, usage: normalizeRateLimitEvent(event), event, text: detail })
+        : null;
+  if (!scope) return null;
+  const old = accounts.listAccounts().find((a) => a.name === name);
+  accounts.setModelLimits(name, { ...old?.modelLimits, [scope.family]: scope });
+  publishModelLimits(name);
   const now = Date.now();
+  const after = accounts.listAccounts().find((a) => a.name === name);
+  return { name, family: scope.family, sameAccount: scope.family === 'fable' && !modelBlocked(after, 'opus', now) && !(Number(after?.limitedUntil) * 1000 > now) };
+}
+
+async function rotateOffLimitedAccount(detail, { model = null, rejectedLimit = null, rejectedAccount = null } = {}) {
   const lines = [];
   let reset = parseResetTime(String(detail || ''));
 
@@ -5908,6 +6103,18 @@ async function rotateOffLimitedAccount(detail) {
     return { outcome: 'no_claude', activeName: null, nextName: null, error: null, reset, lines };
   }
 
+  const now = Date.now();
+  const modelLimit = (scoped) => {
+    lines.push(`ACCOUNT ROTATION: "${scoped.name}" refused ${scoped.family} only; its every-model windows are open. Recorded as a ${scoped.family} limit, not a wall. Opus runs on the same account, so nothing was swapped.`);
+    return { outcome: 'model_limit', activeName: scoped.name, nextName: scoped.name, error: null, reset, lines };
+  };
+  // INSIDE EITHER GUARD the model rule still applies: it moves nothing, and a
+  // refusal left unclassified here is a retry on the refused model (review 3
+  // LOW 3). The guard itself holds every swap off meanwhile.
+  if (now < rotationPausedUntil || now < rotationCooldownUntil) {
+    const scoped = await classifyModelRefusal(detail, { model, rejectedLimit, rejectedAccount });
+    if (scoped?.sameAccount) return modelLimit(scoped);
+  }
   if (now < rotationPausedUntil) {
     lines.push(
       `ACCOUNT ROTATION: standing down. Every enrolled Claude account is rate limited until ${new Date(rotationPausedUntil).toLocaleString()}. Do NOT re-fire this job yet.`,
@@ -5939,14 +6146,35 @@ async function rotateOffLimitedAccount(detail) {
 
   const active = await accounts.activeAccount();
   const activeName = active?.account?.name || null;
-  if (activeName) {
+  // The model rule, under the guard: nothing swaps while it reads.
+  const scoped = await classifyModelRefusal(detail, { model, rejectedLimit, rejectedAccount, activeName });
+  if (scoped?.sameAccount) {
+    rotationCooldownUntil = cooldownWas;
+    return landed(modelLimit(scoped));
+  }
+  // A LATE DEATH: the refusal was filed under another account, and the live
+  // one, matched by its own credentials rather than guessed, reads open on a
+  // fresh lookup. Walling it would be false, so nothing is walled or swapped.
+  // Anything short of that proof walls and rotates as before: a real wall is
+  // never skipped because the attribution disagreed (review 3 HIGH).
+  if (activeName && rejectedAccount && rejectedAccount !== activeName && ['refreshToken', 'accessToken', 'refreshTokenPrefix'].includes(active.matchedBy)) {
+    const row = await freshModelRead(activeName);
+    if (row?.name === activeName && row.state === 'ok' && row.source?.kind !== 'stream' && globalWindowsOpen(row.usage)) {
+      rotationCooldownUntil = cooldownWas;
+      lines.push(`ACCOUNT ROTATION: this limit was filed under "${rejectedAccount}", and the live account "${activeName}" reads with room. Nothing was walled or swapped.`);
+      return landed({ outcome: 'cooldown', activeName: null, nextName: null, error: null, reset, lines });
+    }
+  }
+  if (scoped && scoped.name === activeName) {
+    lines.push(`ACCOUNT ROTATION: "${activeName}" refused ${scoped.family} only. Recorded as a ${scoped.family} limit, not a wall.`);
+  } else if (activeName) {
     // A WALL WITH NO CLOCK ON IT still has to produce a real one, or the guess
     // frees this account in an hour and the next message dies on it again. See
     // usageResetFor; null means the API could not better the guess, and the
     // guess is still better than nothing.
     let source = reset.guessed ? 'guessed' : 'the wall message';
     if (reset.guessed) {
-      const better = await usageResetFor(activeName);
+      const better = await usageResetFor(activeName, model);
       if (better) {
         reset = better;
         source = 'the usage API';
@@ -5956,7 +6184,7 @@ async function rotateOffLimitedAccount(detail) {
     // the one the wall-time move picks over a known one (wall-wake.mjs
     // pickNextAccount), and a mark with no source kept whatever an older wall
     // had written there.
-    accounts.markLimited(activeName, reset.resetsAt, { source });
+    accounts.markLimited(activeName, reset.resetsAt, { source, cause: 'unknown' });
     // WHERE THE CLOCK CAME FROM, said out loud in both places. A guess and a
     // reading are worth different amounts to whoever reads this afterwards,
     // and the daemon log is where "why was it retried an hour early" is
@@ -5979,7 +6207,13 @@ async function rotateOffLimitedAccount(detail) {
   // before giving up. This is the fix for 12:46: `nextAvailable` alone hands
   // back the first account nothing has walled YET, which is not the same as an
   // account with headroom. See pickHealthyAccount.
-  let pick = await pickHealthyAccount({ activeName, lines });
+  let pick = await pickHealthyAccount({ activeName, lines, model });
+  // A Fable lane runs on Opus where Fable is out, so an account with Opus room
+  // is somewhere to go. Which model starts there is startModel's decision.
+  if (!pick.name && modelFamily(model) === 'fable') {
+    const opus = await pickHealthyAccount({ activeName, lines, model: 'opus', preferHeadroom: true });
+    if (opus.name) pick = opus;
+  }
   // ONE MORE SELECTION when the store refuses the pick because it was flagged
   // as needing a login while the swap waited (a refusal that answered after
   // the probe's deadline). That is not the keychain failing, so the reasoning
@@ -5989,7 +6223,7 @@ async function rotateOffLimitedAccount(detail) {
     const res = await accounts.swapTo(pick.name, { refuseFlagged: true });
     if (res.needsLogin && retries > 0) {
       lines.push(`"${pick.name}" turned out to need a fresh login, so it was not swapped onto.`);
-      pick = await pickHealthyAccount({ activeName, lines });
+      pick = await pickHealthyAccount({ activeName, lines, model });
       continue;
     }
     if (res.ok) {
@@ -6020,6 +6254,12 @@ async function rotateOffLimitedAccount(detail) {
   // in this same pass. Falling back to the store keeps the old behaviour when
   // there is nothing enrolled to read.
   const earliest = pick.earliest || accounts.earliestReset();
+  if (modelFamily(model) && accounts.describe(now).some(a => a.captured && !a.limited && !a.needsLogin)) {
+    rotationCooldownUntil = cooldownWas;
+    const error = `No account has room for ${modelFamily(model)}; other models remain available`;
+    lines.push(error);
+    return landed({ outcome: 'swap_failed', activeName, nextName: null, error, reset: earliest ? { resetsAt: earliest, guessed: false } : reset, lines });
+  }
   rotationPausedUntil = earliest ? earliest * 1000 : Date.now() + 3600_000;
   lines.push(`No account is available, all of them are limited. Rotation is paused until the earliest reset.`);
   // THE WALL EPISODE (wall-wake.mjs): what the lift will wake the chat with. Then the
@@ -6066,8 +6306,23 @@ const codexTakingChat = () => codexCanTakeChat() && !codexWalled();
 // dispatch, the most expensive step, after all the work was already done.
 async function handleLimitDeath(task, outcome, runId, steers = [], draft = null, { finalReportSeen = false } = {}) {
   const detail = String(outcome.answer || '');
-  const rot = await rotateOffLimitedAccount(detail);
+  const rot = await rotateOffLimitedAccount(detail, { model: outcome.model || wallGuard.jobOf?.(runId)?.model || null, rejectedLimit: outcome.rejectedLimit, rejectedAccount: outcome.rejectedAccount });
   if (rot.outcome === 'no_claude') return;
+  // REFUSED FABLE ONLY, with Opus open on the same account: nothing was walled
+  // or swapped, so the worker resumes now through the wall guard's resume, and
+  // carries Opus. Its start decision announces the change once (D8, review 3
+  // LOW 6). A resume the guard will not take goes back to the assistant below.
+  if (rot.outcome === 'model_limit') {
+    noteWallDeath(runId, task, { draft, finalReportSeen, account: rot.activeName });
+    const at = Date.now();
+    const resumed = resumeWallDeaths({ raisedAt: at, workers: [{ runId, died: true }] }, { readyAt: at, now: at, only: { runId, carriedModel: { model: 'opus', told: false } } });
+    if (resumed.resumed.some((r) => r.runId === runId)) {
+      // Started now, through the same drain and cap as any handoff: the dead
+      // run's own close handler drained before this resume was queued.
+      drainBgHandoff();
+      return;
+    }
+  }
   const lines = rot.lines;
   // DIED ON THE WALL: the death that raised it, one while it stood, or one the
   // double swap guard turned away while the rotation behind it was finding
@@ -6157,8 +6412,16 @@ function chatLimitRetryPlan(rot, { priority = false, retried = false, wake = fal
   //
   // EXCEPT THE WALL WAKE-UP (liftClaudeWall), claimed once per wall: dead on
   // an account that walled under it and rotated onto a free one, it gets the
-  // same one retry a typed message would, or nothing re-delivers it. On a wall
-  // the episode carries it forward instead (WALL_WAKE_CARRY_MS).
+  // same one retry a typed message would, or nothing re-delivers it (QA round 2).
+  // On a wall the episode carries it forward instead (WALL_WAKE_CARRY_MS).
+  //
+  // REFUSED FABLE ONLY, Opus open on the same account: no swap to name. The
+  // retry carries Opus, and this line is the owner's notice of it, so the
+  // retry's start decision does not repeat it. For the owner's message, its retry and
+  // the wake-up, ahead of the one retry cap: a model change burns no account,
+  // and a run on Opus cannot be refused Fable, so it cannot loop.
+  if (rot.outcome === 'model_limit' && (!priority || retried || wake)) return { line: chatModelFallbackLine(), retry: { priority: true, carriedModel: { model: 'opus', told: true } } };
+
   if (priority && !(wake && !walled)) return null;
 
   if (!walled) {
@@ -6223,6 +6486,8 @@ function handbackLimitPlan(rot, { retried = false, reports = 1, resumesAt = null
   if (rot.outcome === 'exhausted' || rot.outcome === 'paused') {
     return { line: say('walled', { resumesAt }), retry: null, keep: 'wall' };
   }
+  // Refused Fable only: the same account, no swap to name (chatLimitRetryPlan).
+  if (rot.outcome === 'model_limit') return { line: chatModelFallbackLine(), retry: { priority: true, carriedModel: { model: 'opus', told: true } } };
   // THE RE-READ DIED TOO. A swap is named only when THIS death made one: a
   // `borrowed` ending is the swap the re-read was already running on, so
   // "swapped to" would name the account it just died on.
@@ -6281,7 +6546,7 @@ function keepHandback(mark, where) {
 async function handleChatLimitFailure(detail, ctx = {}) {
   if (!isLimitSignal(detail)) return null;
   const { text = '', lane = LANES.main, images = [], kinds = [], prepend = '', priority = false, retried = false, replyQuote = null, handback = null } = ctx;
-  let rot = await rotateOffLimitedAccount(detail).catch((e) => {
+  let rot = await rotateOffLimitedAccount(detail, { model: ctx.model || laneModel(lane), rejectedLimit: ctx.rejectedLimit, rejectedAccount: ctx.rejectedAccount }).catch((e) => {
     console.error('[bridge] chat account rotation failed:', e.message);
     return null;
   });
@@ -7194,7 +7459,8 @@ const codexSettingsNow = () => codexSettings(engineArgs());
  * an unset model, so one card reads the same way whichever engine drew it.
  */
 function claudeCardSettings() {
-  return { model: chatState().model || DEFAULT_MODEL || 'default', effort: DEFAULT_EFFORT || 'default' };
+  // A worker card: the pool runs on BG_MODEL whatever the chat lane's /model says.
+  return { model: BG_MODEL || 'default', effort: DEFAULT_EFFORT || 'default' };
 }
 
 function codexCardSettings() {
@@ -10316,6 +10582,7 @@ function flushParkedWalledChats({ fold = null } = {}) {
       images: it.images,
       kinds: it.kinds || [],
       retried: Boolean(it.retried),
+      carriedModel: it.carriedModel ?? null,
       prepend: note ? [note, it.prepend].filter(Boolean).join('\n\n') : (it.prepend ?? null),
       replyQuote: it.replyQuote ?? null,
     });
@@ -10768,7 +11035,9 @@ function drainBgHandoff() {
     // Codex. `prepend` is a takeover's note, carried on the queue item.
     const pinnedClaude = ((typeof it === 'object' && it?.engine) || pre.engine) === 'claude';
     const itemPrepend = typeof it === 'object' && typeof it?.prepend === 'string' && it.prepend ? it.prepend : null;
-    dispatchPrompt(pinnedClaude ? `claude: ${text}` : text, lane, { priority: true, schedule, cwd, prepend: itemPrepend }); // a declared job directory survives on either engine
+    // A resume carries the model decision of the death it resumes (startModel).
+    const carriedModel = typeof it === 'object' && it ? it.carriedModel ?? null : null;
+    dispatchPrompt(pinnedClaude ? `claude: ${text}` : text, lane, { priority: true, schedule, cwd, prepend: itemPrepend, carriedModel }); // a declared job directory survives on either engine
     running++; // this worker is live from here on, so the next item sees a fuller pool
     if (typeof it === 'object' && it?.resumeOf) pacedRunning++; // and a resume counts toward the next resume's pace
     // THE WALL GUARD'S DISPATCH RECORD, the drop box half: the directory pin
@@ -11967,15 +12236,6 @@ async function handleCommand(text, msg = null) {
         );
         return;
       }
-      // Codex is optional, and EVERY path below this line either spawns it or
-      // describes a run of it, so the binary check belongs once, here. Without
-      // it a missing binary produced a start notice, two artifact files and a
-      // `spawn ENOENT` report handed to the assistant as a full Claude turn
-      // spent summarising an absent binary.
-      if (!CODEX_AVAILABLE) {
-        await send(CODEX_MISSING_LINE, { markdown: false });
-        return;
-      }
       if (!a) {
         const running = bgWorkerDescriptors().filter((w) => w.engine === 'codex');
         await send(
@@ -12120,6 +12380,7 @@ async function handleCommand(text, msg = null) {
           [
             `model: ${st.model || `${DEFAULT_MODEL || 'CLI default'} (default)`}`,
             `last run used: ${st.lastModel || 'n/a'}`,
+            `background workers: always ${BG_MODEL || 'the CLI default'} (not affected by /model)`,
             ...(bgLaneEngine() === 'codex' ? ['background engine: codex (/engine bg claude switches back)'] : []),
             '',
             'Set: /model fable | opus | sonnet | haiku | <full-id> · /model default resets',
@@ -12548,7 +12809,7 @@ function pickLane(prompt) {
 // (grab() in bg-codex-wiring.test.mjs) and its extractor stops at the first
 // unindented line, so a signature wrapped onto a `) {` of its own is grabbed
 // truncated and the whole harness fails to parse.
-function queueItem(text, { images = [], kinds = [], forcedEngine = null, priority = false, allowCodexFallback = false, retried = false, prepend = null, replyQuote = null, schedule = null, handback = null, cwd = null } = {}) {
+function queueItem(text, { images = [], kinds = [], forcedEngine = null, priority = false, allowCodexFallback = false, retried = false, carriedModel = null, prepend = null, replyQuote = null, schedule = null, handback = null, cwd = null } = {}) {
   // `kinds` is what ARRIVED, not what is being sent to a model: the run bubble's
   // first frame says "📎 3 photos" so a slow album is visibly landing rather
   // than silently missing.
@@ -12565,6 +12826,10 @@ function queueItem(text, { images = [], kinds = [], forcedEngine = null, priorit
     priority,
     allowCodexFallback,
     retried: Boolean(retried),
+    // A model decision the run brings with it (startModel). Only Opus can be
+    // carried: a forged or stale value in the drop box can at worst run one job
+    // on Opus.
+    carriedModel: carriedModel?.model === 'opus' ? { model: 'opus', told: carriedModel.told === true } : null,
     prepend: prepend == null ? null : String(prepend),
     // The bubble you were replying to, parsed once at the edge and carried, for
     // the same reason `prepend` is: a queued message is drained by a different
@@ -12828,7 +13093,7 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
 // priority = a completed worker's report: never drop it for queue limits, and
 // jump the line so results surface before newer user prompts.
 // One line for the same reason as queueItem above: grab() extracts it by source.
-function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallback = false, images = [], kinds = [], retried = false, prepend = null, replyQuote = null, schedule = null, handback = null, cwd = null } = {}) {
+function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallback = false, images = [], kinds = [], retried = false, carriedModel = null, prepend = null, replyQuote = null, schedule = null, handback = null, cwd = null } = {}) {
   // A `codex:` or `claude:` prefix on a typed message pins THIS message's
   // engine, beating both /engine and the config. Stripped before dispatch so
   // the model never sees the routing instruction as part of its prompt.
@@ -12844,8 +13109,9 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
   const p2 = parseEnginePrefix(p1.text.replace(/^\s*bg:\s*/i, ''));
   const forcedEngine = p1.engine || p2.engine;
   const text = p2.text;
-  const item = queueItem(text, { images, kinds, forcedEngine, priority, allowCodexFallback, retried, prepend, replyQuote, schedule, handback, cwd });
+  const item = queueItem(text, { images, kinds, forcedEngine, priority, allowCodexFallback, retried, carriedModel, prepend, replyQuote, schedule, handback, cwd });
   // NO ENGINE WILL TAKE THIS. Only for a message they typed: internal traffic
+
   // ignores the wall by construction (see engineForItem). Spawning here
   // produces two failures a minute on a lane that cannot answer, so the message
   // is parked and re-dispatched by itself when the first window comes back.
@@ -12999,6 +13265,7 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
     priority,
     retried,
     replyQuote,
+    carriedModel: item.carriedModel,
     // A scheduled run is marked in its worker's env (worker-env.mjs).
     schedule,
     // A worker report keeps its mark into the run (see queueItem).
@@ -13078,6 +13345,7 @@ function drainQueue(lane) {
     images: item.images || [],
     priority: Boolean(item.priority),
     retried: Boolean(item.retried),
+    carriedModel: item.carriedModel,
     // And a queued REPLY still says what it was replying to.
     replyQuote: item.replyQuote || null,
     // And a queued SCHEDULED run is still marked as one.
@@ -13583,6 +13851,7 @@ async function main() {
   // Name the live account before the first stream event needs it, so the
   // first readings after a boot are not dropped for want of one.
   liveAccount.refresh().catch(() => {});
+  kickAutoSwitch();
   const survivors = reattachLiveWorkers();
   if (survivors) console.log(`[bridge] ${survivors} background worker(s) survived the restart — re-attached`);
   // Steering is available for the whole life of the daemon, including while it is

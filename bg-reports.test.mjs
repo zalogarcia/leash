@@ -181,6 +181,7 @@ const M = await import(
         // at the lift, and a death the cooldown turned away asks how the
         // rotation behind it ended. Recorded, and steerable from a test.
         `export const WALL_DEATHS = [];`,
+        `const wallGuard = { jobOf: () => null };`,
         `const noteWallDeath = (runId, task, opts) => { WALL_DEATHS.push({ runId, task, ...opts }); };`,
         `export let BEHIND = null;`,
         `export const setBehind = (v) => { BEHIND = v; };`,

@@ -1221,7 +1221,8 @@ await t('usageLine is the one compact /status line, and nothing more', () => {
 // properties is asserted below on the new shape, plus the bar itself.
 await t('accountUsageBlock carries the bar, the reset clock AND the time left, and flags a locked window', () => {
   const b = accountUsageBlock(OK_ROW, { now: NOW });
-  eq(b.length, 2, 'one row per window');
+  eq(b.length, 3, 'one row per window, including the scoped week');
+  ok(b[2].includes(OK_ROW.usage.scoped[0].label), 'the scoped window is drawn');
   ok(/^   `5h ███░░░░░░░  32%` resets /.test(b[0]), b[0]);
   ok(/^   `wk ██░░░░░░░░  24%` resets /.test(b[1]), b[1]);
   // Both halves, still: the clock says WHEN, the span says HOW LONG. Only the

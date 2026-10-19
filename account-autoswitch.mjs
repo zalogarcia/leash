@@ -1,3 +1,4 @@
+import { usageForModel, modelBlocked, modelFamily } from './model-limits.mjs';
 // SWITCH CLAUDE ACCOUNTS BEFORE THE LIMIT, AND ON A SCHEDULE.
 //
 // SHARED MODULE, byte-identical in the public and private bridge repos and
@@ -135,7 +136,8 @@ export function autoSwitchStatusLine(settings, { last = null, timeZone, now = Da
  * reset has already passed, so it reads as empty. A `locked` window reads as
  * 100. A window with no readable percent is left out.
  */
-export function usageWindows(usage, settings = AUTO_SWITCH_DEFAULTS, now = Date.now()) {
+export function usageWindows(usage, settings = AUTO_SWITCH_DEFAULTS, now = Date.now(), model = null) {
+  usage = usageForModel(usage, model);
   if (!usage || typeof usage !== 'object') return [];
   const s = settings || AUTO_SWITCH_DEFAULTS;
   const all = [
@@ -159,26 +161,26 @@ export function usageWindows(usage, settings = AUTO_SWITCH_DEFAULTS, now = Date.
 }
 
 /** The windows at or past their threshold. Empty when the reading is under every one. */
-export function overThreshold(usage, settings = AUTO_SWITCH_DEFAULTS, now = Date.now()) {
-  return usageWindows(usage, settings, now).filter((w) => w.percent >= w.threshold);
+export function overThreshold(usage, settings = AUTO_SWITCH_DEFAULTS, now = Date.now(), model = null) {
+  return usageWindows(usage, settings, now, model).filter((w) => w.percent >= w.threshold);
 }
 
 /** The fullest weekly window (the flat one and the per model ones), or null. */
-export function weekPercent(usage, now = Date.now()) {
-  const w = usageWindows(usage, AUTO_SWITCH_DEFAULTS, now).filter((x) => x.kind !== 'fiveHour');
+export function weekPercent(usage, now = Date.now(), model = null) {
+  const w = usageWindows(usage, AUTO_SWITCH_DEFAULTS, now, model).filter((x) => x.kind !== 'fiveHour');
   return w.length ? Math.max(...w.map((x) => x.percent)) : null;
 }
 
 /** The five hour window, or null. */
-export function fiveHourPercent(usage, now = Date.now()) {
-  const w = usageWindows(usage, AUTO_SWITCH_DEFAULTS, now).find((x) => x.kind === 'fiveHour');
+export function fiveHourPercent(usage, now = Date.now(), model = null) {
+  const w = usageWindows(usage, AUTO_SWITCH_DEFAULTS, now, model).find((x) => x.kind === 'fiveHour');
   return w ? w.percent : null;
 }
 
 /** "5h 34% · week 18%", the two numbers a switch notice carries per account. */
-export function readingLine(usage, now = Date.now()) {
-  const f = fiveHourPercent(usage, now);
-  const wk = weekPercent(usage, now);
+export function readingLine(usage, now = Date.now(), model = null) {
+  const f = fiveHourPercent(usage, now, model);
+  const wk = weekPercent(usage, now, model);
   const bits = [];
   if (f !== null) bits.push(`5h ${Math.round(f)}%`);
   if (wk !== null) bits.push(`week ${Math.round(wk)}%`);
@@ -195,7 +197,7 @@ export function readingLine(usage, now = Date.now()) {
  * `blockedUntilMs` is when the windows that keep it out reset (the latest of
  * them), for the re-check right after.
  */
-export function candidateVerdict(row, { name = null, settings = AUTO_SWITCH_DEFAULTS, now = Date.now(), maxAgeMs = EVIDENCE_MAX_AGE_MS } = {}) {
+export function candidateVerdict(row, { name = null, settings = AUTO_SWITCH_DEFAULTS, now = Date.now(), model = null, maxAgeMs = EVIDENCE_MAX_AGE_MS } = {}) {
   const keep = (reason, extra = {}) => ({ free: false, reason, ...extra });
   if (!row) return keep('no usage lookup');
   if (!name || row.name !== name) return keep(`the reading belongs to "${row.name}", not this slot`);
@@ -207,7 +209,7 @@ export function candidateVerdict(row, { name = null, settings = AUTO_SWITCH_DEFA
   if (!Number.isFinite(at)) return keep('the lookup carries no time, so its age is unknown');
   if (at - Number(now) > 60_000) return keep('the lookup is dated in the future');
   if (Number(now) - at > maxAgeMs) return keep(`the lookup is ${Math.round((Number(now) - at) / 1000)}s old`);
-  const over = overThreshold(row.usage, settings, now);
+  const over = overThreshold(row.usage, settings, now, model);
   if (over.length) {
     const worst = over.reduce((a, b) => (b.percent > a.percent ? b : a));
     const clocks = over.map((w) => w.resetsAtMs).filter((v) => v !== null);
@@ -216,7 +218,7 @@ export function candidateVerdict(row, { name = null, settings = AUTO_SWITCH_DEFA
       usage: row.usage,
     });
   }
-  return { free: true, reason: readingLine(row.usage, now), usage: row.usage };
+  return { free: true, reason: readingLine(row.usage, now, model), usage: row.usage };
 }
 
 /**
@@ -224,10 +226,10 @@ export function candidateVerdict(row, { name = null, settings = AUTO_SWITCH_DEFA
  * then the lowest five hour figure, then list order. `free` is
  * [{ name, verdict, order }] with every verdict free.
  */
-export function pickTarget(free, now = Date.now()) {
+export function pickTarget(free, now = Date.now(), model = null) {
   const list = (free || []).filter((c) => c && c.name && c.verdict?.free);
   if (!list.length) return null;
-  const key = (c) => [weekPercent(c.verdict.usage, now) ?? 0, fiveHourPercent(c.verdict.usage, now) ?? 0, Number(c.order) || 0];
+  const key = (c) => [weekPercent(c.verdict.usage, now, model) ?? 0, fiveHourPercent(c.verdict.usage, now) ?? 0, Number(c.order) || 0];
   return list.slice().sort((a, b) => {
     const ka = key(a);
     const kb = key(b);
@@ -259,13 +261,13 @@ export function probeDue({ lastProbeAt = null, blockedUntilMs = null, now = Date
  * passed, which is the notice's reason. `lastSwitchAt` is the last swap of any
  * kind (ms). When `switch` is false, `reason` says why, for the log.
  */
-export function autoSwitchDecision({ settings = AUTO_SWITCH_DEFAULTS, active = null, candidates = [], now = Date.now(), lastSwitchAt = null, settleMs = SETTLE_MS } = {}) {
+export function autoSwitchDecision({ settings = AUTO_SWITCH_DEFAULTS, active = null, candidates = [], now = Date.now(), lastSwitchAt = null, model = null, settleMs = SETTLE_MS } = {}) {
   const s = settings || AUTO_SWITCH_DEFAULTS;
   const no = (reason, extra = {}) => ({ switch: false, reason, from: active?.name || null, to: null, over: [], target: null, why: null, ...extra });
   if (!s.enabled) return no('off');
   if (!active?.name) return no('the live account is not identified');
   if (!active.usage) return no('no usable reading for the live account');
-  const over = overThreshold(active.usage, s, now);
+  const over = overThreshold(active.usage, s, now, model);
   if (!over.length) return no('below the thresholds');
   const since = num(lastSwitchAt);
   if (Number.isFinite(since) && Number(now) - since < settleMs) {
@@ -277,7 +279,7 @@ export function autoSwitchDecision({ settings = AUTO_SWITCH_DEFAULTS, active = n
     const why = others.map((c) => `${c.name}: ${c.verdict?.reason || 'not asked'}`).join('; ');
     return no(`no other account is free${why ? ` (${why})` : ''}`, { over });
   }
-  const target = pickTarget(free, now);
+  const target = pickTarget(free, now, model);
   return {
     switch: true,
     reason: `${active.name} at ${over.map((w) => `${Math.round(w.percent)}% of ${w.label}`).join(', ')}; ${target.name} free (${target.verdict.reason})`,
@@ -296,7 +298,7 @@ export function autoSwitchDecision({ settings = AUTO_SWITCH_DEFAULTS, active = n
  * { ok, name, noop?, note?, reason?, refusal? } where `refusal` is one of
  * 'unknown', 'no-login', 'needs-login', 'walled' when `ok` is false.
  */
-export function switchTargetVerdict({ target = '', rows = [], activeName = null, row = null, settings = AUTO_SWITCH_DEFAULTS, now = Date.now(), timeZone } = {}) {
+export function switchTargetVerdict({ target = '', rows = [], activeName = null, row = null, settings = AUTO_SWITCH_DEFAULTS, now = Date.now(), model = null, timeZone } = {}) {
   const want = String(target || '').trim().toLowerCase();
   const refuse = (refusal, reason, name = null) => ({ ok: false, name, refusal, reason });
   if (!want) return refuse('unknown', 'no account was named');
@@ -308,8 +310,8 @@ export function switchTargetVerdict({ target = '', rows = [], activeName = null,
   }
   if (!slot.captured) return refuse('no-login', `${slot.name} has no captured login`, slot.name);
   if (slot.needsLogin) return refuse('needs-login', `${slot.name} needs a fresh login (${slot.needsLogin.reason || 'refused'})`, slot.name);
-  if (slot.limited) {
-    const until = num(slot.limitedUntil);
+  if (slot.limited || modelBlocked(slot, model, now)) {
+    const until = Math.max(num(slot.limitedUntil) || 0, ...Object.entries(slot.modelLimits || {}).filter(([key]) => !modelFamily(model) || key === 'unknown' || key === modelFamily(model)).map(([, value]) => Number(value.until) || 0));
     const clock = Number.isFinite(until) && until > 0 ? fmtResetClock(until * 1000, { timeZone, now }) : 'an unknown time';
     return refuse('walled', `${slot.name} is at its limit until ${clock}`, slot.name);
   }
@@ -318,14 +320,14 @@ export function switchTargetVerdict({ target = '', rows = [], activeName = null,
     const dead = rowLoginProblem(row);
     if (dead) return refuse('needs-login', `${slot.name} needs a fresh login (${dead})`, slot.name);
     if (row.state === 'ok' && row.usage && row.source?.kind !== 'stream') {
-      const spent = usageWindows(row.usage, settings, now).filter((w) => !w.stale && w.percent >= 100);
+      const spent = usageWindows(row.usage, settings, now, model).filter((w) => !w.stale && w.percent >= 100);
       if (spent.length) {
         const latest = spent.reduce((a, b) => ((b.resetsAtMs || 0) > (a.resetsAtMs || 0) ? b : a));
         const clock = latest.resetsAtMs ? fmtResetClock(latest.resetsAtMs, { timeZone, now }) : 'an unknown time';
         return refuse('walled', `${slot.name} has spent ${latest.label} until ${clock}`, slot.name);
       }
-      const over = overThreshold(row.usage, settings, now);
-      const line = readingLine(row.usage, now);
+      const over = overThreshold(row.usage, settings, now, model);
+      const line = readingLine(row.usage, now, model);
       return {
         ok: true,
         name: slot.name,

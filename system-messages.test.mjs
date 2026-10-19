@@ -17,6 +17,8 @@
 //   node system-messages.test.mjs
 
 import {
+  modelFallbackNotice,
+  chatModelFallbackLine,
   visibleOnly,
   workerCount,
   stepCount,
@@ -169,6 +171,23 @@ export const houseStyle = (s, where, opts) => {
 // ---------------------------------------------------------------------------
 // visibleOnly, the plain-text fallback rule
 // ---------------------------------------------------------------------------
+
+t('model fallback and restoration notices fit the house style', () => {
+  for (const value of [modelFallbackNotice({ clock: 'Thu 10:00am' }), modelFallbackNotice({ restored: true })]) {
+    noDashes(value, 'model notice');
+    linesFit(value, 'model notice');
+    ok(!value.includes('⏳'), 'a model change has no pending state');
+  }
+});
+
+t('same account fallback builder fits the model notice house style', () => {
+  const line = chatModelFallbackLine();
+  // Model notices name the model; the no-model gate is for progress footers.
+  noDashes(line, 'chatModelFallbackLine');
+  linesFit(line, 'chatModelFallbackLine');
+  eq(line, '🔄 Model: Opus\n👤 Account: same account');
+  ok(!line.includes('⏳'), 'a model change has no pending state');
+});
 
 t('visibleOnly: drops the blockquote BODY, not just its tags', () => {
   const html = '<b>📖 Help</b>\nthe index<blockquote expandable>the whole 4,700-char reference</blockquote>';

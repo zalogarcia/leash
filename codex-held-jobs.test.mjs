@@ -181,7 +181,7 @@ test('held chat release preserves task metadata and its background lane', () => 
   assert.deepEqual(state.dispatched, [[`codex: ${item.text}`, bgLane, {
     priority: true, schedule: item.schedule, handback: item.handback, cwd: item.cwd,
     allowCodexFallback: true, images: item.images, kinds: item.kinds, retried: true,
-    prepend: item.prepend, replyQuote: item.replyQuote,
+    carriedModel: null, prepend: item.prepend, replyQuote: item.replyQuote,
   }]]);
   assert.equal(state.held.length, 0);
 });

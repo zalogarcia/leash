@@ -462,7 +462,7 @@ await t('★ the prompt travels on stdin, never in argv: a 20,000 character line
   // fixed flags, and the text is written to the child's stdin as one
   // stream-json line. So its size is bounded by a pipe (which Node buffers),
   // not by ARG_MAX.
-  const start = BRIDGE_SRC.indexOf('\nfunction runClaude(');
+  const start = BRIDGE_SRC.indexOf('\nasync function runClaude(');
   const fn = BRIDGE_SRC.slice(start, BRIDGE_SRC.indexOf('\n}\n', start));
   ok(start > 0 && fn.length > 5000, 'runClaude was not found');
   ok(/const args = \['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'\];/.test(fn), 'the argument list changed shape');

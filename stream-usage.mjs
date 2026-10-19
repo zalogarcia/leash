@@ -493,6 +493,7 @@ export function createLiveAccountTracker({
   }
 
   return {
+    peek() { return cur.name; },
     current() {
       if (now() - cur.at >= ttlMs) refresh();
       return cur.name;

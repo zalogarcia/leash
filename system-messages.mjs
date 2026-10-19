@@ -1285,6 +1285,10 @@ export function enginesBackLine({ engine = null, count = 0 } = {}) {
   return `▶️ ${who} is back · running ${n} parked`;
 }
 
+export function chatModelFallbackLine() {
+  return ['🔄 Model: Opus', '👤 Account: same account'].join('\n');
+}
+
 /**
  * THEIR OWN MESSAGE hit the wall, and the bridge rotated under it.
  *
@@ -1904,6 +1908,11 @@ export function bootAnnounceLine({ name = 'Leash', host = '', workers = 0 } = {}
  * 3. Drop /usage's footer. The timezone is their own, and the swap hint is
  *    already on the other view, one line from the top.
  */
+export function modelFallbackNotice({ restored = false, clock = null } = {}) {
+  if (restored) return '✅ Fable: available\n🧠 Model: Fable';
+  return ['🟠 Fable: out', ...(clock ? [`🕒 Reset: ${clock}`] : []), '🧠 Model: Opus'].join('\n');
+}
+
 export function tightenAccountView(text) {
   const lines = String(text ?? '').split('\n');
   const out = [];

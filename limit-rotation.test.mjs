@@ -26,6 +26,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // cost the verification, not the rotation), so it is asserted here against the
 // module that owns it rather than restated.
 import { PROBE_TIMEOUT_MS } from './account-selector.mjs';
+import * as modelRules from './model-limits.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -78,6 +79,14 @@ const WALL =
   "You're out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.";
 
 const HARNESS = `
+import { normalizeRateLimitEvent } from ${url('account-usage.mjs')};
+import { modelFamily, modelBlocked, usageForModel, refusalScope, scopedLimits, globalWindowsOpen } from ${url('model-limits.mjs')};
+// The rotation's refusal read (freshModelRead): reset per test, since the clock is frozen.
+const modelReads = new Map();
+const MODEL_READ_REUSE_MS = 10000;
+const BG_MODEL = null;
+const laneModel = () => null;
+const publishModelLimits = () => {};
 import { parseResetTime, isLimited, earliestReset as earliestResetReal, loginFlag } from ${url('accounts.mjs')};
 // THE REAL SELECTION RULE. The whole point of this block is that a candidate is
 // verified before it is swapped onto, so a stub of it here would prove nothing.
@@ -128,7 +137,7 @@ export const setUsageThrows = (v) => { usageThrows = v; };
 export let usageHangs = false;
 export const setUsageHangs = (v) => { usageHangs = v; };
 export const reset = () => {
-  CALLS.length = 0; LOGS.length = 0; marked.length = 0; probeCalls.length = 0; clearedNames.length = 0; FLUSHES.length = 0;
+  CALLS.length = 0; LOGS.length = 0; marked.length = 0; modelReads.clear(); probeCalls.length = 0; clearedNames.length = 0; FLUSHES.length = 0;
   rotationPausedUntil = 0; rotationCooldownUntil = 0;
   limitRecheck = createRecheckLimiter(); CONFIG_WALL_UNTIL = 0; LANES.main.current = null; bgLanes.length = 0;
   walledSweepInflight = null; lastWalledActiveSweep = 0; pendingOps.clear(); ALL_SNAPSHOT = null; probeGate = null;
@@ -210,6 +219,7 @@ export let PROBES = {};
 export const setProbes = (v) => { PROBES = v; };
 export const probeCalls = [];
 const accounts = {
+  setModelLimits: (name, limits) => { const a = LIST.find(a => a.name === name); if (a) a.modelLimits = limits; return { ok: !!a }; },
   activeAccount: async () => ({ account: { name: ACTIVE } }),
   listAccounts: () => LIST,
   describe: (now = Date.now()) =>
@@ -390,6 +400,8 @@ const B = await import(
         grab('ROTATION_LANDING_WAIT_MS', 'const'),
         grab('rotationStarted'),
         grab('rotationBehindCooldown'),
+        grab('freshModelRead'),
+        grab('classifyModelRefusal'),
         grab('rotateOffLimitedAccount'),
         grab('holdHandbackForWall'),
         grab('handbackLimitPlan'),
@@ -666,9 +678,10 @@ await t('★ the skip is because of the SCOPED window, which the obvious rule mi
   // fiveHour 0% and sevenDay 97%: a check of "5h or weekly at 100" calls this
   // account healthy and reproduces the incident exactly.
   ok(B.probeCalls.includes('a@example.com'), `it asked: ${B.probeCalls.join(', ')}`);
-  const m = B.marked.find((x) => x.name === 'a@example.com');
-  ok(m, `the skipped account is walled in the ledger: ${JSON.stringify(B.marked)}`);
-  eq(m.resetsAt, Math.floor((NOW + 12 * HOUR) / 1000), 'until the window the API named');
+  const m = B.LIST.find((x) => x.name === 'a@example.com')?.modelLimits?.fable;
+  ok(m, 'the skipped model is walled in the ledger');
+  eq(B.marked.filter(w => w.name === 'a@example.com').length, 0, 'the model limit does not mark the whole account');
+  eq(m.until, Math.floor((NOW + 12 * HOUR) / 1000), 'until the window the API named');
   eq(m.source, 'probe', 'and the ledger records that this wall was learned by asking, not by dying');
 });
 
@@ -720,7 +733,8 @@ await t('★ with every account spent it cycles through all of them exactly once
   eq(B.probeCalls.length, 2, `each candidate asked once, never twice: ${B.probeCalls.join(', ')}`);
   eq(new Set(B.probeCalls).size, 2, 'and never the same one twice');
   eq(B.CALLS.filter((c) => c.swapTo).length, 0, 'nothing was swapped onto');
-  eq(B.marked.length, 3, 'all three are in the ledger: the one that died and the two that were asked');
+  eq(B.marked.length, 2, 'both global walls retain the original account-wall behavior');
+  eq(B.marked.length + B.LIST.filter(a => Object.keys(a.modelLimits || {}).length).length, 3, 'all three limits are in the ledger, with scoped walls kept separate');
   ok(B.LOGS.join('\n').includes('all_accounts_walled_until'), B.LOGS.join('\n'));
   // The wall waits for the soonest of the three, which is the account that
   // just died (two hours), not the twelve-hour weekly window.
@@ -2045,6 +2059,115 @@ rmSync(TMP, { recursive: true, force: true });
   });
 }
 
+const REAL_REJECTED = { type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: (NOW + 50 * HOUR) / 1000, rateLimitType: 'seven_day_overage_included', overageStatus: 'rejected', overageDisabledReason: 'out_of_credits', isUsingOverage: false, unifiedWindows: { five_hour: { utilization: 0.57, resetsAt: (NOW + HOUR) / 1000 }, seven_day: { utilization: 0.95, resetsAt: (NOW + 50 * HOUR) / 1000 }, seven_day_overage_included: { utilization: 1, resetsAt: (NOW + 50 * HOUR) / 1000 } } } };
+
+await t('scoped Fable refusal keeps the account open and continues on the same account', async () => {
+  B.reset();
+  const name = 'scoped-active';
+  B.setActive(name);
+  B.setList([{ name, claudeAiOauth: { accessToken: 'fixture' } }]);
+  B.setProbes({ [name]: row({ fiveHour: win(0, null), sevenDay: win(96, iso(50 * HOUR)), scoped: [{ label: 'Fable', percent: 100, resetsAt: iso(50 * HOUR) }] }, name) });
+  const result = await B.rotateOffLimitedAccount(WALL, { model: 'fable', rejectedLimit: REAL_REJECTED, rejectedAccount: name });
+  eq(result.outcome, 'model_limit');
+  eq(result.nextName, name, 'the same account');
+  eq(B.CALLS.filter(c => c.swapTo).length, 0, 'same-account fallback never swaps');
+  eq(B.marked.length, 0, 'a scoped refusal must never write an account wall');
+  ok(B.LIST[0].modelLimits.fable.until > NOW / 1000);
+  ok(result.lines.length > 0, 'a worker handback names what happened');
+  eq(B.pausedUntil(), 0);
+});
+
+await t('a scoped usage refusal never swaps back onto the live account', async () => {
+  B.reset();
+  const name = 'same-account';
+  B.setActive(name);
+  B.setList([{ name, claudeAiOauth: { accessToken: 'fixture' } }]);
+  B.setProbes({ [name]: row({ fiveHour: win(0, null), sevenDay: win(80, iso(50 * HOUR)), scoped: [{ label: 'Fable', percent: 100, resetsAt: iso(50 * HOUR) }] }, name) });
+  const result = await B.rotateOffLimitedAccount(WALL, { model: 'fable' });
+  eq(B.CALLS.filter(c => c.swapTo).length, 0, 'live account cannot be its own swap target');
+  eq(result.outcome, 'model_limit');
+});
+
+await t('a scoped refusal is classified inside a cooldown and a pause too: it moves nothing', async () => {
+  for (const guard of ['cooldown', 'paused']) {
+    B.reset();
+    const name = 'guarded';
+    B.setActive(name);
+    B.setList([{ name, claudeAiOauth: { accessToken: 'fixture' } }]);
+    B.setProbes({ [name]: row({ fiveHour: win(0, null), sevenDay: win(80, iso(50 * HOUR)), scoped: [{ label: 'Fable', percent: 100, resetsAt: iso(50 * HOUR) }] }, name) });
+    if (guard === 'cooldown') B.setCooldownUntil(NOW + 60000); else B.setPausedUntil(NOW + HOUR);
+    const result = await B.rotateOffLimitedAccount(WALL, { model: 'fable', rejectedLimit: REAL_REJECTED, rejectedAccount: name });
+    eq(result.outcome, 'model_limit', guard);
+    ok(B.LIST[0].modelLimits.fable.until > NOW / 1000, guard);
+  }
+});
+
+for (const blocked of ['opus', 'global']) await t(`a scoped Fable refusal with ${blocked} blocked rotates without walling for Fable, and the next start there is Fable`, async () => {
+  B.reset();
+  const name = 'both-blocked';
+  B.setActive(name);
+  B.setList([
+    { name, claudeAiOauth: { accessToken: 'fixture' }, ...(blocked === 'opus' ? { modelLimits: { opus: { until: (NOW + 50 * HOUR) / 1000 } } } : { limitedUntil: (NOW + 50 * HOUR) / 1000 }) },
+    { name: 'free-fable', claudeAiOauth: { accessToken: 'fixture2' } },
+  ]);
+  B.setProbes({ [name]: row({ fiveHour: win(0, null), sevenDay: win(80, iso(50 * HOUR)), scoped: [{ label: 'Fable', percent: 100, resetsAt: iso(50 * HOUR) }] }, name), 'free-fable': HEALTHY('free-fable') });
+  const result = await B.rotateOffLimitedAccount(WALL, { model: 'fable', rejectedLimit: REAL_REJECTED, rejectedAccount: name });
+  eq(result.outcome, 'swapped');
+  eq(result.nextName, 'free-fable');
+  eq(B.marked.length, 0, 'the Fable refusal itself is never an account wall');
+  eq(B.CALLS.filter(c => c.swapTo).length, 1, 'only the existing refusal rotation moves the account');
+  // The rotation reports no model: the start decision reads the new account.
+  eq(result.model, undefined);
+  eq(modelRules.decideRunModel({ configured: 'fable', account: B.LIST.find((a) => a.name === 'free-fable'), now: NOW }).model, 'fable');
+});
+
+await t('a real event with the global weekly window full still walls the account', async () => {
+  B.reset();
+  const name = 'global-active';
+  B.setActive(name);
+  B.setList([{ name, claudeAiOauth: { accessToken: 'fixture' } }]);
+  B.setProbes({ [name]: row({ fiveHour: win(0, null), sevenDay: win(95, iso(50 * HOUR)), scoped: [{ label: 'Fable', percent: 100, resetsAt: iso(50 * HOUR) }] }, name) });
+  const rejectedLimit = structuredClone(REAL_REJECTED);
+  rejectedLimit.rate_limit_info.unifiedWindows.seven_day.utilization = 1;
+  await B.rotateOffLimitedAccount(WALL, { model: 'fable', rejectedLimit, rejectedAccount: name });
+  eq(B.marked.length, 1, 'a fresh rejection beats the older open API reading');
+});
+
+await t('an Opus-only wall must not pause other model lanes', async () => {
+  B.reset();
+  const name = 'opus-active';
+  B.setActive(name);
+  B.setList([{ name, claudeAiOauth: { accessToken: 'fixture' } }]);
+  B.setProbes({ [name]: row({ fiveHour: win(0, null), sevenDay: win(80, iso(50 * HOUR)), scoped: [{ label: 'Opus', percent: 100, resetsAt: iso(50 * HOUR) }] }, name) });
+  await B.rotateOffLimitedAccount(WALL, { model: 'opus' });
+  eq(B.pausedUntil(), 0, 'a model wall must not raise the global pause');
+  eq(B.marked.length, 0);
+});
+
+await t('an attributed rejected Fable event works when the lookup is throttled', async () => {
+  B.reset();
+  const name = 'stream-active';
+  B.setActive(name);
+  B.setList([{ name, claudeAiOauth: { accessToken: 'fixture' } }]);
+  B.setProbes({});
+  const rejectedLimit = REAL_REJECTED;
+  const result = await B.rotateOffLimitedAccount(WALL, { model: 'fable', rejectedLimit, rejectedAccount: name });
+  eq(result.outcome, 'model_limit');
+  eq(B.marked.length, 0);
+  ok(B.LIST[0].modelLimits.fable.until > NOW / 1000);
+});
+
+await t('an event filed under another account than the live one classifies nothing, and with no proof the live one is fine, the wall stands', async () => {
+  B.reset();
+  const name = 'live-walled';
+  B.setActive(name);
+  B.setList([{ name, claudeAiOauth: { accessToken: 'fixture' } }, { name: 'other', claudeAiOauth: { accessToken: 'fixture2' } }]);
+  B.setProbes({ other: HEALTHY('other') });
+  const result = await B.rotateOffLimitedAccount(WALL, { model: 'fable', rejectedLimit: REAL_REJECTED, rejectedAccount: 'other' });
+  eq(B.marked.length, 1, 'a real wall was skipped because the attribution disagreed');
+  eq(B.marked[0].name, name);
+  eq(result.outcome, 'swapped');
+});
 
 // ---------------------------------------------------------------------------
 if (failures.length) {

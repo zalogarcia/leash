@@ -95,6 +95,11 @@ const CHARLIE = 'charlie@example.test';
 const DELTA = 'delta@example.test';
 
 const HARNESS = `
+import { normalizeRateLimitEvent } from ${url('account-usage.mjs')};
+import { modelFamily, usageForModel, refusalScope, scopedLimits } from ${url('model-limits.mjs')};
+const BG_MODEL = null;
+const laneModel = () => null;
+const publishModelLimits = () => {};
 import { readFileSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -196,6 +201,7 @@ ${grabSwapWrapper()}
 const flagLoginsFromRows = () => [];
 const flagNeedsLogin = () => false;
 let limitRecheck = createRecheckLimiter();
+const legacyModelRecheck = createRecheckLimiter();
 export const OWNER_LIFTS = [];
 const ownerLiftedWall = (name) => { OWNER_LIFTS.push(name); return null; };
 
@@ -257,6 +263,7 @@ ${grab('liveSince')}
 ${grab('usableLiveReading')}
 ${grab('autoSwitchSkip')}
 ${grab('kickAutoSwitch')}
+${grab('recheckLegacyModelWalls')}
 ${grab('autoSwitchCandidates')}
 ${grab('autoSwitchTick')}
 ${grab('switchAccountNow')}
@@ -367,6 +374,7 @@ await t('★ AC1: alpha at 95% of its week, charlie free: ONE tick swaps the key
   reset();
   H.setNow(RESET + 30_000);
   seedAccounts({ live: ME, walled: { [GMAIL]: GMAIL_WEEK } });
+  H.accounts.markLimited(GMAIL, Math.floor(GMAIL_WEEK / 1000), { source: 'probe', cause: 'seven_day' });
   H.BODY[ME] = body(12, RESET + HOUR, 95, ME_WEEK);
   H.BODY[CHARLIE] = body(0, null, 0, ZH_WEEK + 7 * 24 * HOUR);
   H.BODY[DELTA] = body(0, null, 3, ZH_WEEK + 7 * 24 * HOUR);

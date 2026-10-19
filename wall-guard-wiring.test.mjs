@@ -102,6 +102,11 @@ const NOW0 = Date.UTC(2026, 9, 6, 15, 40, 0);
 const MIN = 60_000;
 
 const HARNESS = `
+import { normalizeRateLimitEvent } from ${url('account-usage.mjs')};
+import { modelFamily, usageForModel, refusalScope, scopedLimits } from ${url('model-limits.mjs')};
+const BG_MODEL = null;
+const laneModel = () => null;
+const publishModelLimits = () => {};
 import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { wallGuardSettings, wallGuardStatusLine, checkpointCandidates, checkpointDecision, checkpointSteerText, checkpointNotice, nextAccountAfter, createWallGuardStore, baseRunId } from ${url('wall-guard.mjs')};
@@ -630,6 +635,30 @@ await t('★ the pace is a setting: another number rides on the item, and 0 puts
   ok(!('maxRunning' in none.item), JSON.stringify(none.item));
   eq(none.r.maxRunning, 0);
   B.setConf({});
+});
+
+await t('★ a resume of one death (a refusal of Fable only) carries its model decision and leaves every other death alone', async () => {
+  B.setConf({});
+  const old = 'bg80-1791290000800', mine = 'bg81-1791290000810', near = 'bg82-1791290000820';
+  B.setNow(LIFT_AT + 300 * MIN);
+  B.wallGuard.death(old, { text: 'LANE RULES\n\n--- TASK ---\n\n# EARLIER-WALL-1013\n\nDo the thing.', title: 'EARLIER-WALL-1013' });
+  B.setNow(LIFT_AT + 501 * MIN);
+  for (const [id, title] of [[mine, 'REFUSED-FABLE-1013'], [near, 'WALLED-NEAR-1013']]) {
+    B.wallGuard.death(id, { text: `LANE RULES\n\n--- TASK ---\n\n# ${title}\n\nDo the thing.`, title });
+  }
+  const before = JSON.parse(readFileSync(P('bg-queue.json'), 'utf8')).length;
+  const at = LIFT_AT + 501 * MIN;
+  const r = B.resumeWallDeaths({ raisedAt: at, workers: [{ runId: mine, died: true }] }, { readyAt: at, now: at, only: { runId: `${mine}-4242`, carriedModel: { model: 'opus', told: false } } });
+  const q = JSON.parse(readFileSync(P('bg-queue.json'), 'utf8')).slice(before);
+  eq(r.resumed.map((x) => x.runId).join(','), mine);
+  eq(q.length, 1);
+  eq(JSON.stringify(q[0].carriedModel), JSON.stringify({ model: 'opus', told: false }));
+  const left = B.wallGuard.deaths().map((d) => d.runId);
+  ok(left.includes(old), 'an older wall death lost its brief to this resume');
+  ok(left.includes(near), 'another recent death was settled by this resume');
+  // Leave the record as the tests below expect it.
+  B.wallGuard.settleDeath(old);
+  B.wallGuard.settleDeath(near);
 });
 
 await t('★ QA round 2: when the drop box will not take a resume, the death is still counted and the owner still gets a line', async () => {

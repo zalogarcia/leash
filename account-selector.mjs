@@ -1,3 +1,4 @@
+import { usageForModel, scopedLimits, globalWindowsOpen } from './model-limits.mjs';
 // WHICH ACCOUNT A RUN SHOULD START ON, and why the others cannot take it.
 //
 // SHARED MODULE, byte-identical in the public and private bridge repos and
@@ -39,9 +40,9 @@
 // sevenDay >= 100` calls this account healthy and hops onto it, which is
 // exactly the bug. The wall was the per-model WEEKLY SCOPED window at 100%.
 //
-// So every window the API reports counts, scoped ones included: five hour,
-// weekly, and each weekly_scoped row. That matches what the rotation's own
-// reset lookup already does with the same rows (bridge.mjs usageResetFor).
+// The global windows count for every run. A scoped window counts only for
+// its model family. Unknown model names count every scoped window, preserving
+// the conservative rule when the family cannot be identified.
 //
 // Two deliberate judgements:
 //
@@ -170,7 +171,7 @@ function toMs(v) {
  *   - a missing five hour or weekly window, any window locked, unreadable, or
  *     at or above CLEAR_BELOW_PERCENT, scoped per-model windows included
  */
-export function limitClearVerdict(row, { name = null, now = Date.now(), wallSetAt = null, maxAgeMs = CLEAR_EVIDENCE_MAX_AGE_MS } = {}) {
+export function limitClearVerdict(row, { name = null, now = Date.now(), model = null, legacy = false, modelWall = false, wallSetAt = null, maxAgeMs = CLEAR_EVIDENCE_MAX_AGE_MS } = {}) {
   const keep = (reason) => ({ clear: false, reason });
   if (!row) return keep('no usage reading');
   if (!name || row.name !== name) return keep(`the reading belongs to "${row.name}", not this slot`);
@@ -187,9 +188,12 @@ export function limitClearVerdict(row, { name = null, now = Date.now(), wallSetA
   if (at - t > 60_000) return keep('the reading is dated in the future');
   if (t - at > maxAgeMs) return keep(`the reading is ${Math.round((t - at) / 1000)}s old`);
 
-  const u = row.usage;
+  const u = usageForModel(row.usage, model);
   if (!u.fiveHour) return keep('the reading has no 5h window');
   if (!u.sevenDay) return keep('the reading has no weekly window');
+  if (legacy && globalWindowsOpen(row.usage) && Object.keys(scopedLimits(row.usage, now)).length) {
+    return { clear: true, reason: 'legacy wall belongs only to a model', modelLimits: scopedLimits(row.usage, now) };
+  }
   const windows = [
     { ...u.fiveHour, label: '5h' },
     { ...u.sevenDay, label: 'weekly' },
@@ -199,9 +203,9 @@ export function limitClearVerdict(row, { name = null, now = Date.now(), wallSetA
     if (w.locked) return keep(`the ${w.label} window is locked`);
     const p = w.percent === null || w.percent === undefined || w.percent === '' ? NaN : Number(w.percent);
     if (!Number.isFinite(p)) return keep(`the ${w.label} window is unreadable`);
-    if (p >= CLEAR_BELOW_PERCENT) return keep(`the ${w.label} window is at ${Math.round(p)}%`);
+    if (p >= (modelWall ? EXHAUSTED_PERCENT : CLEAR_BELOW_PERCENT)) return keep(`the ${w.label} window is at ${Math.round(p)}%`);
   }
-  return { clear: true, reason: windows.map((w) => `${w.label} ${Math.round(Number(w.percent))}%`).join(', ') };
+  return { clear: true, reason: windows.map((w) => `${w.label} ${Math.round(Number(w.percent))}%`).join(', '), ...(modelWall ? { modelLimits: scopedLimits(row.usage, now) } : {}) };
 }
 
 /**
@@ -239,11 +243,11 @@ export function createRecheckLimiter({ intervalMs = RECHECK_INTERVAL_MS } = {}) 
  * Returns { state: 'healthy' | 'exhausted' | 'unreadable', resetsAt, reason }
  * where resetsAt is epoch SECONDS (accounts.mjs's ledger unit) or null.
  */
-export function probeVerdict(row, { now = Date.now() } = {}) {
+export function probeVerdict(row, { now = Date.now(), model = null } = {}) {
   if (!row || row.state !== 'ok' || !row.usage) {
     return { state: 'unreadable', resetsAt: null, reason: String(row?.error || 'no usage reading') };
   }
-  const u = row.usage;
+  const u = usageForModel(row.usage, model);
   const windows = [
     u.fiveHour ? { ...u.fiveHour, label: 'the 5h window' } : null,
     u.sevenDay ? { ...u.sevenDay, label: 'the weekly window' } : null,
@@ -331,6 +335,8 @@ function headroom(windows) {
  */
 export async function selectAccount({
   accounts = [],
+  model = null,
+  preferHeadroom = false,
   activeName = null,
   now = Date.now(),
   probe = null,
@@ -338,6 +344,22 @@ export async function selectAccount({
   recheck = null,
 } = {}) {
   const list = (accounts || []).filter((a) => a && a.name);
+  if (preferHeadroom && typeof probe === 'function') {
+    const lookup = probe;
+    const readings = new Map();
+    for (const a of list) {
+      if (a.name === activeName || loginFlag(a) || !a.claudeAiOauth) continue;
+      try { readings.set(a.name, await lookup(a.name)); } catch { readings.set(a.name, null); }
+    }
+    probe = async name => readings.get(name) || null;
+    const score = a => {
+      const r = readings.get(a.name);
+      if (r?.state !== 'ok' || !r.usage) return Infinity;
+      const u = usageForModel(r.usage, model);
+      return Math.max(Number(u.sevenDay?.percent) || 0, ...(u.scoped || []).map(w => Number(w.percent) || 0));
+    };
+    list.sort((a, b) => score(a) - score(b));
+  }
   // Walls this pass DISCOVERED, held locally so the very next turn of the loop
   // honours them without a disk write in the middle of it. The caller persists
   // them through markLimited; this overlay only keeps the loop honest.
@@ -367,7 +389,7 @@ export async function selectAccount({
     if (a.name === activeName) continue;
     if (loginFlag(a)) {
       onDecision({ decision: 'account_skipped_needs_login', account: a.name, reason: loginFlag(a).reason || null });
-    } else if (isLimited(a, now)) {
+    } else if (isLimited(a, now, model)) {
       onDecision({ decision: 'account_skipped_known_walled', account: a.name, until: Number(a.limitedUntil) || null });
     }
   }
@@ -382,7 +404,7 @@ export async function selectAccount({
   // is fixed above; this is the guarantee that does not care. Asked once, ever.
   const asked = new Set();
   for (;;) {
-    const cand = nextAvailable(view(), { activeName, now });
+    const cand = nextAvailable(preferHeadroom ? view().map(a => ({ ...a, lastActiveAt: null })) : view(), { activeName, now, model });
     if (!cand) break;
     if (asked.has(cand.name)) break;
     asked.add(cand.name);
@@ -408,7 +430,7 @@ export async function selectAccount({
       loginDead(cand.name, dead);
       continue;
     }
-    const v = probeVerdict(row, { now });
+    const v = probeVerdict(row, { now, model });
     probed.push({ name: cand.name, state: v.state, reason: v.reason });
 
     if (v.state === 'exhausted') {
@@ -416,7 +438,11 @@ export async function selectAccount({
       // one second into the future, so the overlay, the persisted row and the
       // earliest-reset clock all agree that this account is out.
       const until = Math.max(v.resetsAt || guessUntil, Math.floor(Number(now) / 1000) + 1);
-      found.set(cand.name, { until, reason: v.reason, guessed: !v.resetsAt });
+      const models = scopedLimits(row.usage, now);
+      const global = probeVerdict({ ...row, usage: { ...row.usage, scoped: [] } }, { now });
+      found.set(cand.name, { until, reason: v.reason, guessed: !v.resetsAt,
+        ...(Object.keys(models).length ? { modelLimits: models, scopedOnly: global.state === 'healthy', globalUntil: global.resetsAt || guessUntil, globalReason: global.reason } : {}),
+      });
       onDecision({
         decision: 'account_walled',
         account: cand.name,
@@ -443,8 +469,12 @@ export async function selectAccount({
   // same reason it is never selected: it is the one that just died.
   if (recheck && typeof recheck.take === 'function' && typeof probe === 'function') {
     for (const a of list) {
-      if (a.name === activeName || !a.claudeAiOauth || asked.has(a.name) || !isLimited(a, now) || loginFlag(a)) continue;
-      if (!recheck.take(a.name, now, { since: a.limitedVerifiedAt })) continue;
+      if (a.name === activeName || !a.claudeAiOauth || asked.has(a.name) || !isLimited(a, now, model) || loginFlag(a)) continue;
+      const modelWall = !(Number(a.limitedUntil) * 1000 > now);
+      const verifiedAt = modelWall
+        ? Math.max(0, ...Object.values(a.modelLimits || {}).map(w => toMs(w.verifiedAt)).filter(Number.isFinite))
+        : a.limitedVerifiedAt;
+      if (!recheck.take(a.name, now, { since: verifiedAt })) continue;
       asked.add(a.name);
       let row = null;
       try {
@@ -460,20 +490,21 @@ export async function selectAccount({
         loginDead(a.name, dead);
         continue;
       }
-      const v = limitClearVerdict(row, { name: a.name, now, wallSetAt: a.limitedVerifiedAt });
+      const v = limitClearVerdict(row, { name: a.name, now, wallSetAt: verifiedAt, model, legacy: !a.limitedCause, modelWall });
       const wasUntil = Number(a.limitedUntil) || null;
       probed.push({ name: a.name, state: v.clear ? 'cleared' : 'kept', reason: v.reason });
       if (!v.clear) {
         onDecision({ decision: 'account_limit_kept', account: a.name, until: wasUntil, reason: v.reason });
         continue;
       }
+      if (probeVerdict(row, { now, model }).state === 'exhausted') continue;
       onDecision({ decision: 'account_limit_cleared_by_probe', account: a.name, wasUntil, reason: v.reason });
       return {
         outcome: 'selected',
         name: a.name,
         account: { ...a, limitedUntil: null },
         walls: walls(),
-        cleared: [{ name: a.name, reason: v.reason }],
+        cleared: [{ name: a.name, reason: v.reason, modelLimits: v.modelLimits }],
         needsLogin: needsLogin(),
         earliest: null,
         probed,
@@ -483,7 +514,7 @@ export async function selectAccount({
 
   // Nothing left. `earliest` reads the OVERLAID list, so a wall this pass just
   // discovered counts toward the clock the owner is told to wait for.
-  const earliest = earliestReset(view(), now);
+  const earliest = earliestReset(view(), now, model);
   if (!list.length) {
     onDecision({ decision: 'all_accounts_walled_until', until: null, count: 0, reason: 'no accounts enrolled' });
     return { outcome: 'none', name: null, account: null, walls: walls(), cleared: [], needsLogin: needsLogin(), earliest: null, probed };

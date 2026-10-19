@@ -587,6 +587,7 @@ await t('an unreadable store or an unidentifiable login is no name, never the la
 // THE WIRING in bridge.mjs, read as text (importing it would boot a daemon).
 // ---------------------------------------------------------------------------
 const SRC = readFileSync(new URL('./bridge.mjs', import.meta.url), 'utf8');
+const { makeRig, handleEvent, realEvent, apiBody, settle } = await import('./fixtures/model-owner-rig.mjs');
 const region = (start, end) => {
   const i = SRC.indexOf(start);
   if (i < 0) return '';
@@ -597,7 +598,7 @@ const region = (start, end) => {
 await t('every Claude stream the daemon parses records its rate_limit_event', () => {
   const runClaude = region('function runClaude(', '\nfunction ');
   ok(/else if \(ev\.type === 'rate_limit_event'\) \{[\s\S]{0,120}?noteStreamUsage\(ev, spawnAccount\);/.test(runClaude), 'runClaude onLine does not record the event with its spawn account');
-  const iSpawnAcct = runClaude.indexOf('const spawnAccount = liveAccount.current();');
+  const iSpawnAcct = runClaude.indexOf('const spawnAccount = liveAccount.peek();');
   ok(iSpawnAcct > -1 && iSpawnAcct < runClaude.indexOf('spawnWorker(CLAUDE_BIN'), 'the spawn account must be read before the spawn');
   ok(/inflight\.add\(run\.watchdogId, \{[\s\S]{0,2000}?account: spawnAccount,/.test(runClaude), 'the registry record does not carry the spawn account for a re-attach');
   ok(runClaude.includes('const onLine = (line) =>') && runClaude.includes('tailLines(logPath, onLine'), 'the one handler must still feed both the pipe and the bg log tail');
@@ -605,14 +606,45 @@ await t('every Claude stream the daemon parses records its rate_limit_event', ()
   ok(/onEvent: \(ev, \{ backlog, rec \}\) => \{\s*if \(!backlog && ev\?\.type === 'rate_limit_event'\) noteStreamUsage\(ev, rec\?\.account \?\? null\);/.test(wd), 're-attached survivors are not recorded, their backlog is, or their spawn account is lost');
 });
 
+await t('stream behavior records the refusal as the run\'s evidence and schedules one read, whatever the run\'s model', async () => {
+  for (const model of ['opus', 'fable']) {
+    const r = makeRig({ rows: [{ name: 'a' }], bodies: { a: apiBody() } });
+    try {
+      await r.liveAccount.refresh();
+      const ev = realEvent();
+      const run = handleEvent(r, ev, model);
+      await settle(8);
+      eq(run.rejectedAccount, 'a');
+      eq(run.rejectedLimit, ev);
+      eq(run.stopped, false);
+      eq(r.counts.usageGets.a || 0, 1);
+    } finally { r.cleanup(); }
+  }
+});
+
+await t('a reattached worker\'s refusal schedules the same one read', async () => {
+  const r = makeRig({ rows: [{ name: 'a' }], bodies: { a: apiBody() } });
+  try {
+    await r.liveAccount.refresh();
+    const start = SRC.indexOf('  onEvent: (ev, { backlog, rec }) => {');
+    const end = SRC.indexOf('\n  },', start);
+    const body = SRC.slice(start + '  onEvent: '.length, end) + '\n  }';
+    const handler = new Function('noteStreamUsage', `return ${body};`)(r.api.noteStreamUsage);
+    handler(realEvent(), { backlog: false, rec: { account: 'a', model: 'fable' } });
+    handler(realEvent(), { backlog: false, rec: { account: 'a', model: 'fable' } });
+    await settle(8);
+    eq(r.counts.usageGets.a || 0, 1);
+  } finally { r.cleanup(); }
+});
+
 await t('noteStreamUsage attributes by the live account at event time and never throws', () => {
-  const fn = region('function noteStreamUsage(ev, spawnName = null) {', '\n}\n');
+  const fn = region('function noteStreamUsage(', '\n}\n');
   ok(fn.includes('streamUsage.note(ev, { liveName: liveAccount.current(), spawnName })'), fn);
   ok(/try \{[\s\S]*\} catch \(e\)/.test(fn), 'a throw would cost the run its result line');
 });
 
 await t('the reader is fed the readings and learns from every good lookup', () => {
-  ok(/createAccountUsage\(\{\s*store: accounts,\s*streamReading: \(name\) => streamUsage\.get\(name\),\s*onUsage: \(name, usage\) => streamUsage\.learn\(name, usage\),/.test(SRC), 'the reader is not wired');
+  ok(/createAccountUsage\(\{\s*store: accounts,\s*streamReading: \(name\) => streamUsage\.get\(name\),\s*onUsage: \(name, usage\) => \{\s*streamUsage\.learn\(name, usage\);\s*reconcileModelUsage\(name, usage\);/.test(SRC), 'the reader is not wired');
   ok(SRC.includes("const STREAM_USAGE_FILE = path.join(SCRIPT_DIR, 'usage-stream.json');"));
 });
 

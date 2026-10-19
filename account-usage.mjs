@@ -274,6 +274,7 @@ export function normalizeUsage(body) {
   // present the weekly_scoped rows above are the same data, better labelled.
   if (!limits.length) {
     for (const [key, label] of [
+      ['seven_day_fable', 'Fable'],
       ['seven_day_opus', 'Opus'],
       ['seven_day_sonnet', 'Sonnet'],
     ]) {
@@ -330,6 +331,7 @@ export function normalizeUsage(body) {
 export const STREAM_FALLBACK_MAX_AGE_MS = 30 * 60_000;
 // Per model weeklies, labelled exactly as normalizeUsage labels the flat ones.
 const STREAM_SCOPED = [
+  ['seven_day_fable', 'Fable'],
   ['seven_day_opus', 'Opus'],
   ['seven_day_sonnet', 'Sonnet'],
 ];
@@ -356,8 +358,8 @@ export function normalizeRateLimitEvent(ev) {
   if (!fiveHour && !sevenDay) return null;
   const scoped = [];
   for (const [key, label] of STREAM_SCOPED) {
-    const w = streamWindow(uw[key], null);
-    if (w) scoped.push({ label, percent: w.percent, resetsAt: w.resetsAt });
+    const w = streamWindow(uw[key], lockedFor(key));
+    if (w) scoped.push({ label, percent: w.percent, resetsAt: w.resetsAt, ...(w.locked ? { locked: w.locked } : {}) });
   }
   return { fiveHour, sevenDay, scoped, extraUsage: null };
 }
@@ -1287,6 +1289,7 @@ export function accountUsageBlock(row, { now = Date.now(), timeZone = LOCAL_TZ }
   const lines = [
     accountWindowLine('5h', row.usage.fiveHour, { now, timeZone }),
     accountWindowLine('wk', row.usage.sevenDay, { now, timeZone }),
+    ...(row.usage.scoped || []).map(w => accountWindowLine(w.label, w, { now, timeZone })),
   ].filter(Boolean);
   if (!lines.length) return ['   ⚠️ usage unavailable'];
   const source = liveSourceLine(row, { now, timeZone });
@@ -1305,6 +1308,11 @@ function accountHeadline(r, { liveName, now, timeZone }) {
     // takes ms, and handing it seconds would read as 1970 — "due now" — on the
     // one row where being wrong about the clock matters.
     bits.push(`  ⛔ limited · ${fmtResetLeft(Number(r.limitedUntil) * 1000, now, { timeZone, withDay: false, withLeft: false })}`);
+  } else if (Object.values(r.modelLimits || {}).some(v => Number(v.until) * 1000 > now)) {
+    for (const [family, v] of Object.entries(r.modelLimits || {})) {
+      if (Number(v.until) * 1000 <= now) continue;
+      bits.push(`  🟠 ${family[0].toUpperCase() + family.slice(1)} out · ${fmtResetLeft(Number(v.until) * 1000, now, { timeZone, withDay: false, withLeft: false })}${family === 'fable' && r.captured && !r.needsLogin && !(Number(r.modelLimits?.opus?.until) * 1000 > now) && !(Number(r.modelLimits?.unknown?.until) * 1000 > now) ? ' · Opus ok' : ''}`);
+    }
   } else if (!r.captured) {
     bits.push('  ⚠️ no credentials captured');
   }
@@ -1478,7 +1486,7 @@ export function renderUsageReport({ active, rows }, { now = Date.now(), timeZone
     out.push(...windowBlock('5h', r.usage.fiveHour, { now, timeZone }));
     out.push(...windowBlock('wk', r.usage.sevenDay, { now, timeZone }));
     for (const s of r.usage.scoped || []) {
-      out.push(`   ${s.label} \`${usageBar(s.percent)}\` ${fmtPercent(s.percent)}`);
+      out.push(...windowBlock(s.label, s, { now, timeZone }));
     }
     const eu = r.usage.extraUsage;
     if (eu?.enabled) {
