@@ -565,7 +565,8 @@ const P = await import(
         `
 import { codexCwdForBrief, fmtUntil, parseEnginePrefix, shouldRouteToCodex } from ${url('bg-codex.mjs')};
 import { briefRepo, briefTitle, stripLaneRules } from ${url('bg-notify.mjs')};
-import { queueAck, queueStarted, queueDropped, queueRunningNow, queueFull, holdFullLine, steeredInAck, WALL_TICK_MS, bothWalledLine, enginesBackLine, limitWallLine, limitWallResolved, chatRotatedLine, chatWalledRetryLine, withoutWallWakeNote, WALL_WAKE_TAG } from ${url('system-messages.mjs')};
+import { queueAck, queueStarted, queueDropped, queueRunningNow, queueFull, holdFullLine, steeredInAck, WALL_TICK_MS, bothWalledLine, enginesBackLine, limitWallLine, limitWallResolved, chatRotatedLine, chatWalledRetryLine, handbackLimitLine, withoutWallWakeNote, WALL_WAKE_TAG } from ${url('system-messages.mjs')};
+import { clip, oneLine } from ${url('progress-render.mjs')};
 import { composeWithQuote } from ${url('reply-quote.mjs')};
 import { workerLine, WORKER_TICK_MS, WORKER_IDLE_MS } from ${url('bg-notify.mjs')};
 import { claudeMissingLine, resolveEngine } from ${url('engine-state.mjs')};
@@ -726,6 +727,19 @@ const pickNextAccount = () => null;
 const moveLoginToNextAtWall = async () => ({ moved: false, reason: 'no wall episode' });
 const liftClaudeWall = () => { flushParkedWalledChats(); flushParkedWalledJobs(); return Promise.resolve(null); };
 const swapFailedLine = ({ error, account }) => 'swap failed ' + error + ' ' + account;
+// A WORKER REPORT THE ASSISTANT WAS READING (2026-10-06, section 8c). The rotation record
+// and the plan are the REAL functions (grabbed below). The wall hold is a
+// recorder: the real one, against the real episode, is proved in
+// limit-rotation.test.mjs section 7 and bg-reports.test.mjs; what THIS suite
+// owns is that the chat lane calls it for the right report and not twice.
+let rotationLanding = null;
+export const parkedHandbacks = [];
+let lastParkedAt = 0;
+export const lastParked = () => lastParkedAt;
+export const HELD = [];
+export let HOLD_TAKES = true;
+export const setHoldTakes = (v) => { HOLD_TAKES = v; };
+const holdHandbackForWall = (rec) => { if (!HOLD_TAKES || !rec.runId) return false; HELD.push(rec); return true; };
 const CLAUDE_AVAILABLE_FN = () => CLAUDE_AVAILABLE;
 export const parkedWalledChats = [];
 // The wall notice counts what is held on DISK (bg-held.json). The hold itself
@@ -734,7 +748,7 @@ export const parkedWalledChats = [];
 export let HELD_JOBS = 0;
 export const setHeldJobs = (n) => { HELD_JOBS = n; };
 const readHeldBgJobs = () => Array.from({ length: HELD_JOBS }, (_, i) => ({ text: 'held ' + i }));
-export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wallNotices.clear(); workerNotices.clear(); sentSeq = 0; CLAUDE.length = 0; CHAT_FALLBACK.length = 0; CODEX.length = 0; CODEX_CHAT.length = 0; bgLanes.length = 0; bgSeq = 0; rotationPausedUntil = 0; codexPausedUntil = 0; parkedWalledChats.length = 0; codexFallbackValue = true; CHAT_CWD = ${JSON.stringify(TMP)}; ENGINE_CFG = {}; CHAT_ENGINE_STATE = {}; CLAUDE_AVAILABLE = true; CODEX_AVAILABLE = true; LANES.main.current = null; LANES.main.queue.length = 0; HANDOFF.pending = false; HANDOFF.block = ''; rotationCooldownUntil = 0; ACC.active = null; ACC.free = []; ACC.swapOk = true; ACC.swapError = 'locked'; ACC.earliest = 0; ACC.swapDelayMs = 0; ACC.marked.length = 0; ACC.swapped.length = 0; ACC.cacheKills = 0; USAGE_RESET.calls = 0; USAGE_RESET.value = null; parkedCodexChats.length = 0; SAVES.length = 0; HELD_JOBS = 0; ACC.ledger = []; ACC.probes.length = 0; DECISIONS.length = 0; JOB_FLUSHES.length = 0; if (wallResumeTimer) clearTimeout(wallResumeTimer); wallResumeTimer = null; delete CHAT_STATE.handoffPending; };
+export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wallNotices.clear(); workerNotices.clear(); sentSeq = 0; CLAUDE.length = 0; CHAT_FALLBACK.length = 0; CODEX.length = 0; CODEX_CHAT.length = 0; bgLanes.length = 0; bgSeq = 0; rotationPausedUntil = 0; codexPausedUntil = 0; parkedWalledChats.length = 0; codexFallbackValue = true; CHAT_CWD = ${JSON.stringify(TMP)}; ENGINE_CFG = {}; CHAT_ENGINE_STATE = {}; CLAUDE_AVAILABLE = true; CODEX_AVAILABLE = true; LANES.main.current = null; LANES.main.queue.length = 0; HANDOFF.pending = false; HANDOFF.block = ''; rotationCooldownUntil = 0; ACC.active = null; ACC.free = []; ACC.swapOk = true; ACC.swapError = 'locked'; ACC.earliest = 0; ACC.swapDelayMs = 0; ACC.marked.length = 0; ACC.swapped.length = 0; ACC.cacheKills = 0; USAGE_RESET.calls = 0; USAGE_RESET.value = null; parkedCodexChats.length = 0; SAVES.length = 0; HELD_JOBS = 0; ACC.ledger = []; ACC.probes.length = 0; DECISIONS.length = 0; JOB_FLUSHES.length = 0; if (wallResumeTimer) clearTimeout(wallResumeTimer); wallResumeTimer = null; delete CHAT_STATE.handoffPending; rotationLanding = null; parkedHandbacks.length = 0; lastParkedAt = 0; HELD.length = 0; HOLD_TAKES = true; };
 `,
         grab('BG_COMMAND_RE', 'const'),
         grab('unchosenCodex', 'const'),
@@ -778,12 +792,20 @@ export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wa
         // block exists for was that none of them had a caller here at all.
         grab('resultEventErrored', 'const'),
         grab('chatRunFailure'),
+        // The REAL deadline and the real record of the rotation behind a
+        // cooldown: section 8c catches a rotation mid swap with them.
+        grab('withDeadline', 'const'),
+        grab('ROTATION_LANDING_WAIT_MS', 'const'),
+        grab('rotationStarted'),
+        grab('rotationBehindCooldown'),
         grab('rotateOffLimitedAccount'),
         grab('codexCanTakeChat', 'const'),
         grab('codexTakingChat', 'const'),
         grab('chatLimitRetryPlan'),
+        grab('handbackLimitPlan'),
+        grab('keepHandback'),
         grab('handleChatLimitFailure'),
-        'export { withoutWallWakeNote, dispatchPrompt, drainQueue, startResolvedRun, flushParkedWalledChats, bothEnginesWalledLine, raiseClaudeWall, claudeWallFacts, noEngineForChat, canRunHeldItem, trackQueueAck, resolveQueueAck, QUEUE_MAX, PARKED_WALLED_MAX, raiseWall, settleWall, wallNotices, rotateOffLimitedAccount, chatLimitRetryPlan, handleChatLimitFailure, codexCanTakeChat, codexTakingChat, chatRunFailure, resultEventErrored };',
+        'export { withoutWallWakeNote, dispatchPrompt, drainQueue, startResolvedRun, flushParkedWalledChats, bothEnginesWalledLine, raiseClaudeWall, claudeWallFacts, noEngineForChat, canRunHeldItem, trackQueueAck, resolveQueueAck, QUEUE_MAX, PARKED_WALLED_MAX, raiseWall, settleWall, wallNotices, rotateOffLimitedAccount, chatLimitRetryPlan, handleChatLimitFailure, codexCanTakeChat, codexTakingChat, chatRunFailure, resultEventErrored, handbackLimitPlan, keepHandback, rotationBehindCooldown };',
       ].join('\n'),
     )
 );
@@ -1222,7 +1244,9 @@ const wakeTwice = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx({ text: W
 const otherPriority = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx({ text: 'a worker handback', priority: true }));
 await t('...but only once, and ordinary priority traffic still keeps its own failure', () => {
   eq(wakeTwice?.dispatch ?? null, null, 'an already-retried wake-up is not retried again');
-  eq(otherPriority?.dispatch ?? null, null, 'a handback, a schedule, a compaction: unchanged');
+  // UNMARKED priority traffic, whatever its text says: a real worker report is
+  // told apart by the mark its dispatch carries (section 8c), never by words.
+  eq(otherPriority?.dispatch ?? null, null, 'unmarked priority traffic (a compaction, a catch-up): unchanged');
 });
 P.reset();
 P.setAccounts({ active: 'two@example.com', free: [], earliest: Math.floor((Date.now() + 3600_000) / 1000) });
@@ -1347,11 +1371,14 @@ await t('★ an errored /compact never commits: the death is not a summary', () 
 });
 
 // --- internal traffic keeps its own failure --------------------------------
+// UNMARKED priority traffic: a compaction, a catch-up, a restart wake-up. A
+// worker report was in this group until 2026-10-06; it carries a mark now and
+// has its own plan (section 8c). The words in `text` decide nothing.
 P.reset();
 P.setAccounts({ active: 'first@example.com', free: ['second@example.com'] });
 const internal = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx({ priority: true, text: 'worker report' }));
 
-await t('a worker handback or a compaction rotates, but is not silently re-run', () => {
+await t('unmarked internal traffic (a compaction) rotates, but is not silently re-run', () => {
   ok(internal, 'it was still a limit death, and the caller has to be told so');
   eq(internal.dispatch, null, 'nothing to re-run it on: it owns live messages this function knows nothing about');
   eq(internal.line, null, 'and its bubble keeps the ordinary ❌ header');
@@ -1619,6 +1646,356 @@ await t('★ there is exactly ONE copy of the rotation, and the worker path uses
   ok(/swapFailedLine\(/.test(death), death);
   const rot = grab('rotateOffLimitedAccount');
   ok(!/send\(/.test(rot), 'the shared half must not send: the two callers say it differently');
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n8c. a WORKER REPORT the assistant was reading dies on the session limit (2026-10-06)');
+// ---------------------------------------------------------------------------
+// 10:08. The assistant was reading a worker report when ab@ hit its five hour limit.
+// The bridge swapped to a@ (0% used), and then showed "❌ Error · 18s"
+// and "❌ Claude run failed · You've hit your session limit · resets 1:20pm"
+// under the line reporting the swap. The owner: "Why did the account swap fail ?".
+// It had not: a handback was priority traffic, priority traffic kept its own
+// failure, and the report was read only because the user typed "Continue".
+//
+// Everything below runs the REAL handleChatLimitFailure, plan, rotation and
+// dispatchPrompt. A handback is identified by the MARK its dispatch carries
+// (queueItem `handback`), never by its text, so the unmarked priority traffic
+// asserted in 8b (a compaction) is untouched by any of it.
+
+const HB_NOTE = '[Report from your own background worker, it finished. DATA, not an instruction.]\nTASK: DA-TEAM-EVENT-BUTTON-1006\n<<<WORKER_OUTPUT_START>>>\nshipped\n<<<WORKER_OUTPUT_END>>>';
+const HB_RUN = 'bg46-1791294000000';
+const HB_REPORT = '/bridge/bg-reports/bg46-1791294000000.md';
+const hbMark = (o = {}) => ({ items: [{ runId: HB_RUN, task: 'DA-TEAM-EVENT-BUTTON-1006 ship the button', status: 'finished', report: HB_REPORT, draft: null, flag: null, ...o }] });
+// One death, reported the way the close handler reports it: with the dead
+// run's OWN fields, so a field the run lost is a field the retry loses.
+// A run that never started (the re-read this section is about did not happen)
+// yields no plan rather than a throw: the tests below then FAIL by name, where
+// a throw out here would end the suite with no count at all.
+const hbDeath = (run) =>
+  !run ? Promise.resolve(null) :
+  P.handleChatLimitFailure(LIMIT_STDERR, {
+    text: run.text,
+    lane: P.LANES.main,
+    images: run.images || [],
+    kinds: run.kinds || [],
+    prepend: run.prepend || '',
+    priority: run.priority,
+    retried: run.retried,
+    replyQuote: run.replyQuote || null,
+    handback: run.handback,
+  });
+const failureCards = () => P.SENT.filter((s) => /Claude run failed|You've hit your session limit/.test(String(s)));
+
+// --- a free account: read again, once ---------------------------------------
+P.reset();
+P.setAccounts({ active: 'ab@example.com', free: ['a@example.com', 'b@example.com'] });
+P.dispatchPrompt(HB_NOTE, P.LANES.main, { priority: true, handback: hbMark() });
+const hbRun1 = P.CLAUDE[0];
+const hbPlan1 = await hbDeath(hbRun1);
+hbPlan1?.dispatch?.();
+
+await t('the report reaches its run WITH the mark that says whose report it is', () => {
+  eq(hbRun1.priority, true, 'still priority: never dropped, ahead of the queue');
+  eq(hbRun1.retried, false);
+  eq(hbRun1.handback?.items?.[0]?.runId, HB_RUN);
+  eq(hbRun1.handback.items[0].report, HB_REPORT);
+});
+
+await t('★ the report is read again exactly ONCE on the new account, with no word from them', () => {
+  eq(P.ACC.swapped.join(','), 'a@example.com', 'one swap');
+  eq(P.CLAUDE.length, 2, 'one re-read: not zero (the incident) and not a loop');
+  const again = P.CLAUDE[1];
+  eq(again.text, HB_NOTE, 'the SAME report, not a paraphrase of it');
+  eq(again.retried, true, 'the cap flag has to reach the run or the cap is not a cap');
+  eq(again.priority, true, 'ahead of whatever queued while the first attempt was dying');
+  eq(again.handback, hbRun1.handback, 'and the mark rides the re-read, or a second death would drop the report');
+  eq(P.CHAT_FALLBACK.length + P.CODEX.length, 0, 'never handed to Codex: a worker report is the assistant\'s to read');
+});
+
+await t('★ read again means NOT also kept: the quiet spell has nothing of it to hand over twice', () => {
+  eq(P.parkedHandbacks.length, 0, 'the auto resume flushes this list and nothing else');
+  eq(P.HELD.length, 0, 'and the wall episode never saw it');
+  eq(P.lastParked(), 0, 'so no quiet spell is even counting');
+});
+
+await t('★ ONE truthful line: the limit, the swap from A to B, and that the report is being read again', () => {
+  eq(
+    hbPlan1.line,
+    '🔄 Session limit on ab@example.com\n👤 Swapped to a@example.com\n▶️ Reading the worker report again',
+  );
+  eq(P.SENT.length, 0, 'nothing new is sent: the dead turn\'s own bubble becomes this line');
+  eq(failureCards().length, 0);
+  ok(!/⏳/.test(hbPlan1.line), 'no wait glyph: the re-read draws its own bubble, and THAT is the wait with an ending');
+  ok(!/fail|error|resets/i.test(hbPlan1.line), `nothing in it can be read as the swap failing: ${hbPlan1.line}`);
+  houseOk(hbPlan1.line, 'handbackLimitLine/retry');
+});
+
+await t('its worker line stays on "reading it now…" through the re-read', () => {
+  // The dead turn's close settles every reading line EXCEPT the ones named
+  // here, so the line does not say the assistant finished a report it is opening again.
+  eq(JSON.stringify(hbPlan1.rereading), JSON.stringify([HB_RUN]));
+});
+
+// --- the re-read dies too ----------------------------------------------------
+// Minutes later (the first swap's cooldown has run out) the account the re-read
+// is on hits its limit as well. Another account is free and the rotation takes
+// it, which is right for whatever runs next, but the report has had its retry.
+P.setCooldownUntil(0);
+P.setAccounts({ active: 'a@example.com', free: ['b@example.com'] });
+const hbPlan2 = await hbDeath(P.CLAUDE[1]);
+hbPlan2?.dispatch?.();
+
+await t('★ a second limit death on the re-read does NOT loop: no third run', () => {
+  eq(P.CLAUDE.length, 2, 'the loop this prevents would walk the whole account store on one report');
+  eq(P.LANES.main.queue.length, 0, 'and nothing is queued behind it either');
+  eq(P.ACC.swapped.join(','), 'a@example.com,b@example.com', 'the store still moves forward for whatever runs next');
+});
+
+await t('★ ...and the report is KEPT, with a line that is not a failure card under a swap that worked', () => {
+  eq(P.parkedHandbacks.length, 1, 'on the list their next message or a quiet spell hands to the assistant');
+  eq(P.parkedHandbacks[0].runId, HB_RUN);
+  eq(P.parkedHandbacks[0].report, HB_REPORT);
+  eq(P.parkedHandbacks[0].status, 'finished');
+  ok(P.lastParked() > 0, 'the quiet spell counts from here');
+  eq(P.HELD.length, 0, 'parked, so not also held');
+  eq(
+    hbPlan2.line,
+    '🔄 Session limit hit again\n👤 Swapped to b@example.com\n📥 Worker report kept, not lost\n💬 Read on your next message',
+  );
+  eq(typeof hbPlan2.dispatch, 'function', 'the caller takes its handled arm, which sends no failure card');
+  eq(failureCards().length, 0);
+  eq(hbPlan2.rereading ?? null, null, 'nothing is being read now, so its worker line settles');
+  houseOk(hbPlan2.line, 'handbackLimitLine/capped');
+});
+
+// The same second death, but SECONDS after the swap: the cooldown is still
+// armed, so this death swaps nothing and borrows the ending of the swap the
+// re-read was already running on. Naming that swap again would say "swapped to"
+// the account it has just died on.
+P.reset();
+P.setAccounts({ active: 'ab@example.com', free: ['a@example.com'] });
+P.dispatchPrompt(HB_NOTE, P.LANES.main, { priority: true, handback: hbMark() });
+(await hbDeath(P.CLAUDE[0]))?.dispatch?.();
+const hbSoon = await hbDeath(P.CLAUDE[1]);
+hbSoon?.dispatch?.();
+
+await t('a re-read that dies inside the cooldown claims no swap of its own', () => {
+  eq(P.ACC.swapped.length, 1, 'the cooldown held: one wall, one swap');
+  eq(P.CLAUDE.length, 2, 'still no third run');
+  eq(hbSoon.line, '🔄 Session limit hit again\n📥 Worker report kept, not lost\n💬 Read on your next message');
+  eq(P.parkedHandbacks.length, 1);
+});
+
+// --- THE INCIDENT'S OWN SHAPE: a worker made the swap -----------------------
+// bg47 died on the same limit in the same seconds, so the WORKER lane rotated
+// and the chat turn was turned away with `cooldown`. Two things were wrong with
+// acting on that word alone: it got no retry at all, and a retry started then
+// would have started before the keychain write landed, on the limited account.
+P.reset();
+P.setAccounts({ active: 'ab@example.com', free: ['a@example.com'], swapDelayMs: 40 });
+P.dispatchPrompt(HB_NOTE, P.LANES.main, { priority: true, handback: hbMark() });
+const workerSwap = P.rotateOffLimitedAccount(LIMIT_STDERR); // the worker's death, first
+const racePlan = await hbDeath(P.CLAUDE[0]); // the chat turn, turned away by the cooldown
+const swappedWhenPlanned = P.ACC.swapped.slice();
+racePlan?.dispatch?.();
+const workerRot3 = await workerSwap;
+
+await t('★ THE INCIDENT: a worker made the swap in the same seconds, and the report is still read again', () => {
+  eq(workerRot3.outcome, 'swapped', 'the worker lane rotated');
+  eq(P.ACC.swapped.length, 1, 'one wall, one swap, whoever noticed it first');
+  eq(P.CLAUDE.length, 2, 'and the chat turn the cooldown turned away is re-read once');
+  eq(P.CLAUDE[1].retried, true);
+  eq(P.CLAUDE[1].text, HB_NOTE);
+});
+
+await t('★ ...only AFTER the swap has landed, and the line names the swap the worker lane made', () => {
+  eq(
+    swappedWhenPlanned.join(','),
+    'a@example.com',
+    'the plan waited for the keychain write: started before it, the re-read runs on the limited account and dies again',
+  );
+  eq(
+    racePlan.line,
+    '🔄 Session limit on ab@example.com\n👤 Swapped to a@example.com\n▶️ Reading the worker report again',
+  );
+  eq(failureCards().length, 0);
+});
+
+// --- no account free ---------------------------------------------------------
+P.reset();
+P.setAccounts({ active: 'ab@example.com', free: [], earliest: Math.floor((Date.now() + 3600_000) / 1000) });
+P.dispatchPrompt(HB_NOTE, P.LANES.main, { priority: true, handback: hbMark() });
+const hbWalled = await hbDeath(P.CLAUDE[0]);
+hbWalled?.dispatch?.();
+
+await t('★ no account free: the report is HELD for the wall, never re-run into it', () => {
+  eq(P.ACC.swapped.length, 0, 'there was nothing to swap to');
+  eq(P.CLAUDE.length, 1, 'a re-read into the wall dies on it');
+  eq(P.CHAT_FALLBACK.length + P.CODEX.length, 0, 'and it is not handed to Codex');
+  eq(P.parkedWalledChats.length, 0, 'nor parked as though they had typed it');
+  eq(P.HELD.length, 1, 'held where the lift\'s wake-up delivers it');
+  eq(P.HELD[0].runId, HB_RUN);
+  eq(P.HELD[0].report, HB_REPORT);
+  eq(P.parkedHandbacks.length, 0, 'held OR parked, never both');
+});
+
+await t('★ the walled line says plainly that no account was free, and when it resumes', () => {
+  const [head, held, when, ...rest] = hbWalled.line.split('\n');
+  eq(head, '⛔ Session limit, no account free');
+  eq(held, '📥 Worker report held, not lost');
+  ok(/^🕐 Read at the reset · (?:[A-Z][a-z]{2} )?\d{1,2}:\d\d[ap]m$/.test(when), `the clock the wall itself waits for: ${when}`);
+  eq(rest.length, 0);
+  ok(!/swap/i.test(hbWalled.line), `no swap happened, so none is mentioned: it cannot read as "the swap worked but still failed"`);
+  ok(P.SENT.some((s) => /Every Claude account is limited/.test(String(s))), 'the live ⛔ notice carries every account and its reset');
+  eq(failureCards().length, 0, 'and no failure card stands beside it');
+  houseOk(hbWalled.line, 'handbackLimitLine/walled');
+});
+
+// A wall that was ALREADY up when the turn died (a worker's death raised it):
+// the rotation stands down, and the report is held just the same.
+P.reset();
+P.setAccounts({ active: 'ab@example.com', free: [], earliest: Math.floor((Date.now() + 3600_000) / 1000) });
+P.dispatchPrompt(HB_NOTE, P.LANES.main, { priority: true, handback: hbMark() });
+await P.rotateOffLimitedAccount(LIMIT_STDERR);
+const hbPaused = await hbDeath(P.CLAUDE[0]);
+hbPaused?.dispatch?.();
+// ...and when the episode will not take it, the parked list does.
+P.setHoldTakes(false);
+(await hbDeath(P.CLAUDE[0]))?.dispatch?.();
+
+await t('a wall already standing holds it too, and what the episode refuses is parked instead', () => {
+  eq(P.HELD.length, 1, 'held on the stand-down, exactly as on the death that raised the wall');
+  ok(hbPaused.line.startsWith('⛔ Session limit, no account free\n📥 Worker report held, not lost\n🕐 Read at the reset · '), hbPaused.line);
+  eq(P.parkedHandbacks.length, 1, 'a full episode is not a reason to drop a report');
+  eq(P.CLAUDE.length, 1, 'and neither ending starts a run');
+});
+
+// --- the swap would not write -------------------------------------------------
+P.reset();
+P.setAccounts({ active: 'ab@example.com', free: ['a@example.com'], swapOk: false, swapError: 'the keychain is locked' });
+P.dispatchPrompt(HB_NOTE, P.LANES.main, { priority: true, handback: hbMark() });
+const hbFailed = await hbDeath(P.CLAUDE[0]);
+hbFailed?.dispatch?.();
+
+await t('★ the swap could not happen: said as a failed SWAP, with the account they are still on', () => {
+  const lines = hbFailed.line.split('\n');
+  eq(lines[0], '⚠️ Session limit hit, swap failed');
+  eq(lines[1], 'the keychain is locked');
+  eq(lines[2], '👤 Still on ab@example.com');
+  eq(lines[3], '📥 Worker report kept, not lost');
+  eq(lines[4], '💬 Read on your next message');
+  ok(/^🕐 Limit resets (?:[A-Z][a-z]{2} )?\d{1,2}:\d\d[ap]m$/.test(lines[5]), `when the limited account comes back: ${lines[5]}`);
+  ok(!/Swapped to/.test(hbFailed.line), 'no swap is claimed');
+  houseOk(hbFailed.line, 'handbackLimitLine/swap_failed');
+});
+
+await t('...and the report is kept, nothing is re-run on the account that is still limited', () => {
+  eq(P.CLAUDE.length, 1);
+  eq(P.parkedHandbacks.length, 1);
+  eq(P.parkedHandbacks[0].report, HB_REPORT);
+  eq(failureCards().length, 0);
+});
+
+// --- several reports in one turn (the capped chain's hand over) --------------
+P.reset();
+P.setAccounts({ active: 'ab@example.com', free: ['a@example.com'] });
+const THREE_REPORTS = { items: [hbMark().items[0], hbMark({ runId: 'bg47-1791290277323', report: '/bridge/bg-reports/bg47-1791290277323.md' }).items[0], hbMark({ runId: null, report: '/bridge/bg-reports/old.md' }).items[0]] };
+P.dispatchPrompt('[Bridge notice] 3 background workers finished and were NOT reported to you', P.LANES.main, { priority: true, handback: THREE_REPORTS });
+const hbMany = await hbDeath(P.CLAUDE[0]);
+hbMany?.dispatch?.();
+P.setCooldownUntil(0);
+P.setAccounts({ active: 'a@example.com', free: [], earliest: Math.floor((Date.now() + 3600_000) / 1000) });
+const hbManyWalled = await hbDeath(P.CLAUDE[1]);
+hbManyWalled?.dispatch?.();
+
+await t('a turn carrying several reports says how many, and keeps every one of them', () => {
+  ok(hbMany.line.endsWith('▶️ Reading the 3 worker reports again'), hbMany.line);
+  eq(JSON.stringify(hbMany.rereading), JSON.stringify([HB_RUN, 'bg47-1791290277323']), 'only real run ids have a worker line to keep');
+  eq(P.CLAUDE.length, 2, 'one re-read for the turn, not one per report');
+  ok(hbManyWalled.line.includes('📥 3 worker reports held, not lost'), hbManyWalled.line);
+  eq(P.HELD.length, 2, 'the two with a run id go to the wall episode');
+  eq(P.parkedHandbacks.length, 1, 'and the one it cannot key is parked: 3 in, 3 kept');
+  houseOk(hbMany.line, 'handbackLimitLine/retry, several');
+  houseOk(hbManyWalled.line, 'handbackLimitLine/walled, several');
+});
+
+// --- the mark survives the queue ---------------------------------------------
+P.reset();
+P.LANES.main.current = { engine: 'claude' }; // The assistant is mid-turn when the worker finishes
+P.dispatchPrompt(HB_NOTE, P.LANES.main, { priority: true, handback: hbMark() });
+const queuedMark = P.LANES.main.queue[0]?.handback;
+P.LANES.main.current = null;
+P.drainQueue(P.LANES.main);
+
+await t('★ a report queued behind a running turn is still marked when its turn comes', () => {
+  // A queued item is drained by a different call than the one that dispatched
+  // it. A mark the drain drops is a report that goes back to being dropped.
+  eq(queuedMark?.items?.[0]?.runId, HB_RUN, 'on the item');
+  eq(P.CLAUDE.length, 1);
+  eq(P.CLAUDE[0].handback?.items?.[0]?.runId, HB_RUN, 'and on the run the drain starts');
+  eq(P.CLAUDE[0].priority, true);
+});
+
+// --- what must NOT have changed ----------------------------------------------
+P.reset();
+P.setAccounts({ active: 'c@example.com', free: ['a@example.com'] });
+await P.rotateOffLimitedAccount(LIMIT_STDERR); // a worker rotated: the record exists, the cooldown is armed
+const ownUnderCooldown = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx());
+ownUnderCooldown?.dispatch?.();
+P.reset();
+P.setAccounts({ active: 'c@example.com', free: ['a@example.com'] });
+const unmarkedPriority = await P.handleChatLimitFailure(LIMIT_STDERR, chatCtx({ priority: true, text: '[[BRIDGE-COMPACT]] summarise' }));
+
+await t('★ their OWN message is exactly what it was, even with a rotation record to borrow', () => {
+  eq(ownUnderCooldown.line, '🔄 Session limit hit\n⏳ Retrying on the live account', 'the nameless form: their path does not read the record');
+  eq(ownUnderCooldown.rereading ?? null, null);
+  eq(typeof ownUnderCooldown.dispatch, 'function');
+});
+
+await t('★ priority traffic WITHOUT the mark (a compaction) still keeps its own failure', () => {
+  eq(unmarkedPriority.dispatch, null, 'not re-run: it owns a live notice this function knows nothing about');
+  eq(unmarkedPriority.line, null);
+  eq(P.parkedHandbacks.length + P.HELD.length, 0, 'and nothing of it is kept as though it were a report');
+  eq(P.chatLimitRetryPlan({ outcome: 'swapped' }, { priority: true }), null);
+  ok(P.chatLimitRetryPlan({ outcome: 'swapped' }, { priority: true, handback: { reports: 1 } })?.retry?.priority, 'the mark alone is the difference');
+});
+
+// --- the wiring no harness executes ------------------------------------------
+await t('★ the mark is threaded through every hop between the dispatch and the death', () => {
+  const src = SRC.join('\n');
+  ok(/handback: handback \|\| null/.test(grab('queueItem')), 'the item carries it');
+  const dp = grab('dispatchPrompt');
+  ok(/queueItem\(text, \{[^}]*\bhandback\b[^}]*\}\)/.test(dp), 'dispatchPrompt builds the item with it');
+  ok(/runClaude\(text, lane, \{[\s\S]*?\n    handback,\n/.test(dp), 'and starts the run with it');
+  ok(/handback: item\.handback \|\| null/.test(grab('drainQueue')), 'the drain starts the run with it');
+  const sig = src.slice(src.indexOf('function runClaude('), src.indexOf('function runClaude(') + 420);
+  ok(/handback = null/.test(sig), 'runClaude accepts it');
+  const call = src.slice(src.indexOf('const limitPlan = chatFailureDetail'), src.indexOf('// Final progress-message state'));
+  ok(/\n\s+handback,\n/.test(call), `the close handler hands it to the limit path:\n${call}`);
+  // The two places that hand worker reports to the assistant both set it.
+  ok(/dispatchPrompt\(note, LANES\.main, \{ priority: true, handback: mark \}\)/.test(grab('handBackToChat')));
+  ok(/\{ priority: true, handback: \{ items: parked \} \}/.test(grab('flushParkedHandbacks')));
+  // And each re-read leaves one line in the daemon log, which is where "did it
+  // read the report again by itself" gets answered afterwards.
+  ok(/console\.log\(`\[bridge\] handback read again after a session limit: /.test(grab('handleChatLimitFailure')));
+});
+
+await t('★ the dead turn settles every reading line except the report it is about to read again', () => {
+  const src = SRC.join('\n');
+  ok(/if \(lane === LANES\.main\) settleReadingNotices\(limitPlan\?\.rereading\);/.test(src), 'the close handler passes the kept ids');
+  const settle = grab('settleReadingNotices');
+  ok(/function settleReadingNotices\(keep = null\)/.test(settle), settle);
+  // Run the real function: one report being re-read, one that is simply done.
+  const edits = [];
+  const readingNotices = new Set(['bg46', 'bg47']);
+  const run = new Function('readingNotices', 'editWorkerNotice', `${settle}; return settleReadingNotices;`)(readingNotices, (id, patch) => edits.push([id, patch.phase]));
+  run(['bg46', 'never-reading']);
+  eq(JSON.stringify(edits), JSON.stringify([['bg47', 'done']]), 'only the finished one flips to Done');
+  eq(JSON.stringify([...readingNotices]), JSON.stringify(['bg46']), 'the re-read one stays, and a stale id does not strand a line');
+  run();
+  eq(JSON.stringify(edits), JSON.stringify([['bg47', 'done'], ['bg46', 'done']]), 'and the re-read\'s own close settles it');
+  eq(readingNotices.size, 0);
 });
 
 // --- a bg: message is not this lane's business ------------------------------

@@ -126,7 +126,11 @@ const M = await import(
         `export const dispatched = [];`,
         `export const sent = [];`,
         `export const parkedHandbacks = [];`,
-        `function dispatchPrompt(text) { dispatched.push(text); }`,
+        // What each dispatch was MARKED with (2026-10-06): a worker report
+        // carries `handback`, which is what the limit path re-reads or keeps it
+        // by. Recorded beside the text, index for index.
+        `export const dispatchedOpts = [];`,
+        `function dispatchPrompt(text, lane, opts) { dispatched.push(text); dispatchedOpts.push(opts || {}); }`,
         `function send(text) { sent.push(text); return { catch: () => {} }; }`,
         `let handbackStreak = 0;`,
         `let handbackCapNotified = false;`,
@@ -154,6 +158,10 @@ const M = await import(
         `export const readingNotices = new Set();`,
         grab('wallVouched'),
         grab('holdHandbackForWall'),
+        // Where a report goes when the turn reading it dies on a session limit
+        // and it is not being read again: the real function, against the real
+        // wall episode and the real parked list above.
+        grab('keepHandback'),
         grab('handBackToChat'),
         // The outcome path a Claude worker takes into handBackToChat, and the
         // limit-death composer beside it. Real, extracted; everything they call
@@ -176,7 +184,7 @@ const M = await import(
         grab('fileDeadWorkerDraft'),
         grab('handleLimitDeath'),
         grab('reportBgOutcome'),
-        `export { bgReportId, bgReportPath, writeFullReport, pruneBgReports, handBackToChat, flushParkedHandbacks, maybeAutoResumeHandbacks, bgDraftPath, fileDeadWorkerDraft, reportBgOutcome };`,
+        `export { bgReportId, bgReportPath, writeFullReport, pruneBgReports, handBackToChat, flushParkedHandbacks, maybeAutoResumeHandbacks, bgDraftPath, fileDeadWorkerDraft, reportBgOutcome, keepHandback };`,
       ].join('\n'),
     )
 );
@@ -929,6 +937,175 @@ t('★ a full wall episode never swallows a handback: it is dispatched, not held
 M.setWalled(false);
 
 rmSync(TMP, { recursive: true, force: true });
+
+// ---------- a report the assistant was reading dies on a session limit (2026-10-06) ----------
+// At 10:08 the assistant was reading a worker report when the account hit its limit. The
+// bridge swapped accounts and dropped the report: a handback was unmarked
+// priority traffic, so nothing could tell it from a compaction. The dispatch is
+// MARKED now, and the mark is what the limit path reads the report again by
+// (bg-codex-wiring.test.mjs section 8c) or keeps it by (below). The rule these
+// prove: a report is re-read, OR held for the wall, OR parked. Exactly one.
+const optsOf = (needle) => M.dispatchedOpts[M.dispatched.findIndex((d) => d.includes(needle))];
+const lastOpts = () => M.dispatchedOpts[M.dispatchedOpts.length - 1];
+
+M.resetChain();
+M.resetWallWake();
+M.setWalled(false);
+M.setLedgerAllWalled(false);
+M.setChatEngine('claude');
+M.handBackToChat('ship the event button', 'MARKED-REPORT-BODY shipped and verified', 'finished', 'bg46-1791294000000');
+t('★ a handback is dispatched MARKED: which run, how it ended, and where its full report is', () => {
+  const o = lastOpts();
+  eq(o.priority, true, 'still priority');
+  eq(o.handback?.items?.length, 1, JSON.stringify(o));
+  const it = o.handback.items[0];
+  eq(it.runId, 'bg46-1791294000000');
+  eq(it.status, 'finished');
+  eq(it.task, 'ship the event button');
+  eq(it.report, M.bgReportPath('bg46-1791294000000'), 'the file a kept report is read from');
+  ok(readFileSync(it.report, 'utf8').includes('MARKED-REPORT-BODY'), 'and that file really holds the report');
+  eq(it.draft, null);
+});
+
+writeDraft('bg46-1791294000900', DRAFT_TEXT);
+M.reportBgOutcome('the audit', { status: 'failed', answer: 'exit code 1' }, 'bg46-1791294000900', { finalReportSeen: false });
+t('a handback built from a DRAFT names the draft in its mark too', () => {
+  const it = lastOpts().handback.items[0];
+  eq(it.runId, 'bg46-1791294000900');
+  eq(it.draft, M.bgDraftPath('bg46-1791294000900'));
+  ok(/DRAFT report is delivered/.test(it.status), `the status the kept report is listed under says it is a draft: ${it.status}`);
+});
+
+// THE PARKED LIST. A report that is NOT read again (the swap would not write,
+// or the one re-read died too) goes here, and nothing else delivers it.
+M.resetChain();
+const beforeKeep = M.dispatched.length;
+const keptOnce = M.keepHandback(optsOf('MARKED-REPORT-BODY').handback, 'parked');
+t('★ a kept report is parked with everything the later hand over needs', () => {
+  eq(JSON.stringify(keptOnce), JSON.stringify({ held: 0, parked: 1 }));
+  eq(M.parkedHandbacks.length, 1);
+  const p = M.parkedHandbacks[0];
+  eq(p.runId, 'bg46-1791294000000');
+  eq(p.task, 'ship the event button');
+  eq(p.status, 'finished');
+  eq(p.report, M.bgReportPath('bg46-1791294000000'));
+  ok(M.lastParked() > 0, 'the quiet spell counts from the moment it was kept');
+  eq(M.dispatched.length, beforeKeep, 'keeping starts no turn: there is no path from here back into a run');
+});
+
+t('★ the quiet spell hands a kept report over exactly ONCE', () => {
+  const parkedAt = M.lastParked();
+  const before = M.dispatched.length;
+  eq(M.maybeAutoResumeHandbacks(parkedAt + HANDBACK_AUTO_RESUME_MS - 1), false, 'not before the quiet spell');
+  eq(M.maybeAutoResumeHandbacks(parkedAt + HANDBACK_AUTO_RESUME_MS), true, 'then by itself, with no word from them');
+  eq(M.dispatched.length, before + 1, 'one turn');
+  const note = body();
+  eq(note.split(M.bgReportPath('bg46-1791294000000')).length - 1, 1, 'the report is named once');
+  ok(note.includes('[finished] ship the event button'), note);
+  ok(!note.includes('MARKED-REPORT-BODY'), 'the raw worker output never rides the notice');
+  eq(M.parkedHandbacks.length, 0);
+  // A SECOND quiet spell, and their next message, find nothing left to deliver.
+  eq(M.maybeAutoResumeHandbacks(parkedAt + 10 * HANDBACK_AUTO_RESUME_MS), false, 'nothing is parked any more');
+  eq(M.flushParkedHandbacks('message'), false);
+  eq(M.dispatched.length, before + 1, 'still one turn: it was not delivered a second time');
+});
+
+t('★ the turn that hands the parked list over is MARKED with what it carries', () => {
+  // The list is spliced out before the dispatch, so this turn dying on a
+  // session limit used to take every report on it. The mark is what lets the
+  // limit path read the turn again or put them back.
+  const o = lastOpts();
+  eq(o.priority, true);
+  eq(o.handback?.items?.length, 1, JSON.stringify(o));
+  eq(o.handback.items[0].runId, 'bg46-1791294000000');
+  eq(o.handback.items[0].report, M.bgReportPath('bg46-1791294000000'));
+});
+
+t('a hand over turn that dies goes BACK on the list, and is delivered once from there', () => {
+  M.resetChain();
+  const mark = lastOpts().handback;
+  eq(JSON.stringify(M.keepHandback(mark, 'parked')), JSON.stringify({ held: 0, parked: 1 }));
+  const before = M.dispatched.length;
+  eq(M.flushParkedHandbacks('message'), true, 'their next message hands it over');
+  eq(M.dispatched.length, before + 1);
+  eq(body().split(M.bgReportPath('bg46-1791294000000')).length - 1, 1);
+  eq(M.parkedHandbacks.length, 0);
+});
+
+// THE CASE THE AUTO RESUME MUST NOT DOUBLE: the report was read AGAIN after the
+// swap. The limit path re-dispatches the same note and keeps nothing, so the
+// parked list never sees it and there is nothing for a quiet spell to find.
+M.resetChain();
+M.handBackToChat('ship the tax id default', 'REREAD-REPORT-BODY', 'finished', 'bg46-1791294000902');
+t('★ a report that was read again is on no list, so the quiet spell cannot deliver it a second time', () => {
+  const before = M.dispatched.length;
+  eq(M.parkedHandbacks.length, 0, 'a dispatched report was never parked');
+  eq(M.lastParked(), 0, 'and no quiet spell is counting for it');
+  eq(M.maybeAutoResumeHandbacks(Date.now() + 100 * HANDBACK_AUTO_RESUME_MS), false);
+  eq(M.dispatched.length, before, 'nothing dispatched, however long the quiet');
+});
+
+// A CAPPED report keeps what a wall hold needs.
+t('a report parked by the cap carries its run id, so a wall can hold it later', () => {
+  capTheChain('bg46-cap');
+  eq(M.parkedHandbacks[0].runId, `bg46-cap-${HANDBACK_STREAK_MAX}`);
+  eq(M.parkedHandbacks[0].report, M.bgReportPath(`bg46-cap-${HANDBACK_STREAK_MAX}`), 'and its path, as before');
+});
+
+// NO ACCOUNT FREE. The report is held in the wall episode (on disk, delivered
+// by the lift's one wake-up) and is NOT also parked.
+M.resetChain();
+M.resetWallWake();
+M.handBackToChat(WALL_TASK, 'WALLED-REPORT-BODY', 'finished', 'bg46-1791294000903');
+const walledMark = lastOpts().handback;
+M.wallWake.raised({ until: Date.now() + 3600_000 }); // the death raised the wall
+M.setWalled(true);
+const beforeWallKeep = M.dispatched.length;
+const keptWall = M.keepHandback(walledMark, 'wall');
+t('★ a walled case parks the report in the wall episode, held for the lift', () => {
+  eq(JSON.stringify(keptWall), JSON.stringify({ held: 1, parked: 0 }));
+  const w = M.wallWake.current().workers.find((x) => x.runId === 'bg46-1791294000903');
+  ok(w, JSON.stringify(M.wallWake.current().workers));
+  eq(w.handback, 'held', 'the wake-up reads this as "NOT delivered before now"');
+  eq(w.died, false, 'the worker finished; it was the READING that died');
+  eq(w.title, 'Ship the parser fix', 'the brief title, not the lane rules');
+  eq(w.report, M.bgReportPath('bg46-1791294000903'));
+  eq(w.status, 'finished');
+  eq(M.dispatched.length, beforeWallKeep, 'no turn is started into the wall');
+});
+t('★ ...and nowhere else: the quiet spell does not deliver a held report a second time', () => {
+  eq(M.parkedHandbacks.length, 0, 'held OR parked, never both');
+  const before = M.dispatched.length;
+  eq(M.maybeAutoResumeHandbacks(Date.now() + 100 * HANDBACK_AUTO_RESUME_MS), false);
+  eq(M.flushParkedHandbacks('message'), false, 'and their next message finds nothing to hand over twice');
+  eq(M.dispatched.length, before);
+});
+t('a held report keeps its place when the same worker is recorded again', () => {
+  // The episode is keyed by run id, so a second death of the reading turn (or
+  // the worker's own row from earlier in the wall) merges, never duplicates.
+  M.keepHandback(walledMark, 'wall');
+  eq(M.wallWake.current().workers.filter((x) => x.runId === 'bg46-1791294000903').length, 1);
+  eq(M.parkedHandbacks.length, 0);
+});
+
+// What the episode cannot take is parked instead of dropped: no episode at all
+// (a wall seeded from config), or a chat lane on Codex, which can still read.
+M.resetWallWake();
+const noEpisode = M.keepHandback(walledMark, 'wall');
+M.wallWake.raised({ until: Date.now() + 3600_000 });
+M.setChatEngine('codex');
+const codexLane = M.keepHandback(walledMark, 'wall');
+M.setChatEngine('claude');
+t('a wall with nothing to hold a report in parks it, never drops it', () => {
+  eq(JSON.stringify(noEpisode), JSON.stringify({ held: 0, parked: 1 }));
+  eq(JSON.stringify(codexLane), JSON.stringify({ held: 0, parked: 1 }));
+  eq(M.parkedHandbacks.length, 2);
+  eq(M.parkedHandbacks[0].task, '# Ship the parser fix the body', 'titled by the brief: the lane rules are stripped');
+  eq(M.parkedHandbacks[0].report, M.bgReportPath('bg46-1791294000903'));
+});
+M.setWalled(false);
+M.resetWallWake();
+M.resetChain();
 
 console.log(`\n${pass} passed, ${failures.length} failed\n`);
 if (failures.length) {

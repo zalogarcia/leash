@@ -88,7 +88,7 @@ import { fmtLeft } from ${url('usage-limits.mjs')};
 // rule and the real prompt and notice builders, so what the tests read is what
 // the chat session and its user would.
 import { createWallWake, pickNextAccount } from ${url('wall-wake.mjs')};
-import { wallWakePrompt, limitWallLine, needsLoginNotice } from ${url('system-messages.mjs')};
+import { wallWakePrompt, limitWallLine, needsLoginNotice, handbackLimitLine } from ${url('system-messages.mjs')};
 // THE USAGE WALL GUARD's lines: the lift folds them into the wake-up. Real
 // builders; the resumes themselves are wall-guard-wiring.test.mjs's subject, so
 // here the lift finds none and the wake-up must read as it did.
@@ -96,6 +96,10 @@ import { resumeWakeLines, resumeLiftNotice, liftNoticeDue } from ${url('wall-res
 export const RESUME_CALLS = [];
 const resumeWallDeaths = (ep, opts) => { RESUME_CALLS.push({ runIds: (ep?.workers || []).map((w) => w.runId), ...opts }); return { resumed: [], skipped: [], timing: null }; };
 const drainBgHandoff = () => {};
+// A WORKER REPORT KEPT THROUGH A LIMIT DEATH (2026-10-06, section 7): the real
+// hold and the real line, so what the wake-up lists is what the daemon records.
+import { clip, oneLine } from ${url('progress-render.mjs')};
+import { briefTitle, stripLaneRules } from ${url('bg-lane-rules.mjs')};
 import { unlinkSync } from 'node:fs';
 
 // The clock is frozen at the incident, so a "one hour out" guess is a value a
@@ -108,6 +112,11 @@ export const LOGS = [];
 const console = { log: (m) => LOGS.push(String(m)), error: (m) => LOGS.push('ERR ' + String(m)) };
 
 const CLAUDE_AVAILABLE = true;
+// What the real switch path (switchAccountNow, doSwitchAccount) needs beside
+// the harness's own stubs: the scheduled switch racing a rotation.
+import { switchTargetVerdict, autoSwitchNotice, switchRefusedNotice, alreadyOnNotice, PROBE_EVERY_MS as AUTO_SWITCH_RETRY_MS } from ${url('account-autoswitch.mjs')};
+let autoSwitchBackoffUntil = 0; let autoSwitchLastRefusal = null; let lastAutoSwitch = null;
+const usableLiveReading = () => null;
 const ROTATION_COOLDOWN_MS = 30000;
 let rotationPausedUntil = 0;
 let rotationCooldownUntil = 0;
@@ -133,7 +142,11 @@ export const reset = () => {
   parkedHandbacks.length = 0; handbackStreak = 0; handbackCapNotified = false; lastParkedAt = 0;
   CHAT_ENGINE = 'claude'; wallLiftInflight = null; wallNotices.clear();
   NOTICES.length = 0; flagged.length = 0;
+  rotationLanding = null;
 };
+// The rotation a cooldown stands for (bridge.mjs rotationStarted).
+let rotationLanding = null;
+export const landing = () => rotationLanding;
 // THE NEEDS-LOGIN NOTICE (2026-09-30): what send() was asked to deliver, and
 // every flag the store was asked to raise (raised or not).
 export const NOTICES = [];
@@ -291,7 +304,8 @@ const accountUsage = {
     if (probeGate) await probeGate;
     if (probeThrows) throw new Error('usage API unreachable');
     if (probeHangs) return new Promise(() => {});
-    return PROBES[name] ?? null;
+    // A fixture may be a function of the call, so one lookup can time out while the next reads.
+    const v = PROBES[name]; return (typeof v === 'function' ? v(name) : v) ?? null;
   },
 };
 export let ACTIVE = 'a@example.com';
@@ -337,8 +351,12 @@ let wallResumeTimer = null;
 // The REAL body (the .catch matters: it is what makes a rejecting API resolve
 // to the fallback rather than throw), with a short fuse so the hang case does
 // not hold the suite up for six seconds.
+// The fuse can be set: the chain-stall test stands it in for the real 45 s
+// landing wait, at a length a stall would visibly hit.
+let FUSE_MS = 20;
+export const setFuse = (v) => { FUSE_MS = v; };
 const withDeadline = (p, ms, fallback = null) =>
-  Promise.race([p.catch(() => fallback), new Promise((r) => setTimeout(() => r(fallback), 20))]);
+  Promise.race([p.catch(() => fallback), new Promise((r) => setTimeout(() => r(fallback), FUSE_MS))]);
 
 // Rendered once at raise, so a test can read the notice's text.
 const raiseWall = async (kind, cfg) => { CALLS.push({ raiseWall: kind }); RENDERS.push(cfg?.render ? cfg.render() : null); };
@@ -369,19 +387,23 @@ const B = await import(
         grab('claudeWallFacts'),
         grab('raiseClaudeWall'),
         grab('armWallResume'),
+        grab('ROTATION_LANDING_WAIT_MS', 'const'),
+        grab('rotationStarted'),
+        grab('rotationBehindCooldown'),
         grab('rotateOffLimitedAccount'),
+        grab('holdHandbackForWall'),
+        grab('handbackLimitPlan'),
+        grab('keepHandback'),
         // The one switch chain the sweep, the wall re-check and the move at a
         // wall swap on.
         'let accountSwitchChain = Promise.resolve();',
         'let accountSwitchBusy = 0;',
-        // The non-rotation cooldown mark the sweep and the wall re-check set.
-        'let swapCooldownMark = 0;',
-        'export const swapMark = () => swapCooldownMark;',
-        'export const cooldownUntil = () => rotationCooldownUntil;',
         // A switch holding the chain: release(true) lands it (the cooldown
         // armed, as every landed switch arms it), release(false) gives up.
         'export const holdSwitchChain = () => { let release; const gate = new Promise((r) => { release = r; }); accountSwitchBusy++; accountSwitchChain = accountSwitchChain.then(() => gate); return (landed) => { if (landed) rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS; accountSwitchBusy--; release(); }; };',
         grab('swapOnSwitchChain'),
+        grab('switchAccountNow'),
+        grab('doSwitchAccount'),
         grab('sweepWalledActiveAccount'),
         grab('recheckDuringWall'),
         grab('kickWalledSweep'),
@@ -396,7 +418,7 @@ const B = await import(
         grab('WALL_LIFT_SWEEP_WAIT_MS', 'const'),
         grab('liftClaudeWall'),
         grab('ownerLiftedWall'),
-        'export { flagNeedsLogin, flagLoginsFromRows, ledgerAllWalled, usageResetFor, pickHealthyAccount, rotateOffLimitedAccount, claudeWallFacts, sweepWalledActiveAccount, recheckDuringWall, kickWalledSweep, clearLimitsFromRows, renderAccountView, gatherUsage, moveLoginToNextAtWall, wallWakeDue, liftClaudeWall, ownerLiftedWall, armWallResume };',
+        'export { switchAccountNow, flagNeedsLogin, flagLoginsFromRows, ledgerAllWalled, usageResetFor, pickHealthyAccount, rotateOffLimitedAccount, claudeWallFacts, sweepWalledActiveAccount, recheckDuringWall, kickWalledSweep, clearLimitsFromRows, renderAccountView, gatherUsage, moveLoginToNextAtWall, wallWakeDue, liftClaudeWall, ownerLiftedWall, armWallResume, rotationBehindCooldown, handbackLimitPlan, keepHandback, ROTATION_LANDING_WAIT_MS };',
       ].join('\n'),
     )
 );
@@ -531,11 +553,6 @@ B.setList(THREE());
 B.setProbes({ 'c@example.com': HEALTHY('c@example.com'), 'b@example.com': HEALTHY('b@example.com') });
 B.setUsageRow(row({ fiveHour: win(100, iso(6 * HOUR)), sevenDay: win(100, iso(40 * HOUR)), scoped: [], extraUsage: null }));
 let rot = await B.rotateOffLimitedAccount(WALL);
-const markAfterSwap = [B.swapMark(), B.cooldownUntil()];
-await t('★ a rotation that LANDS marks its cooldown, so an owner\'s switch waiting on it may go (account switch, QA round 5)', () => {
-  ok(markAfterSwap[1] > NOW, 'the cooldown is armed');
-  eq(markAfterSwap[0], markAfterSwap[1], 'and marked as landed');
-});
 await t('★ the wall with no clock marks the account until the API window, not one hour out', () => {
   eq(rot.outcome, 'swapped');
   eq(B.marked.length, 1, 'exactly one account marked');
@@ -585,10 +602,8 @@ B.setList([
 ]);
 B.setUsageRow(row({ fiveHour: win(100, iso(6 * HOUR)), sevenDay: null, scoped: [], extraUsage: null }));
 rot = await B.rotateOffLimitedAccount(WALL);
-const markAfterWall = [B.swapMark(), B.cooldownUntil()];
 await t('the enrichment still runs when nothing is free to swap to', () => {
   eq(rot.outcome, 'exhausted');
-  eq(markAfterWall[0], markAfterWall[1], 'a rotation that ends at a wall marks its cooldown as landed too');
   eq(B.marked[0].resetsAt, Math.floor((NOW + 6 * HOUR) / 1000), 'the wall clock has to be right precisely then');
   ok(B.CALLS.some((c) => c.raiseWall === 'claude'), 'and the wall notice goes up');
   // Since 2026-09-30 a held wall is RE-CHECKED when nothing else is free (a
@@ -1777,13 +1792,259 @@ sweepRaceSetup();
     eq(res.moved, true, JSON.stringify(res));
     eq(swaps(), 'c@example.com');
   });
-  await t('★ the sweep marks its cooldown as not a rotation\'s, so an owner\'s switch right after is not held off (QA round 4)', () => {
-    ok(B.cooldownUntil() > NOW, 'the sweep armed the cooldown');
-    eq(B.swapMark(), B.cooldownUntil(), 'and marked it as its own');
+}
+console.log('\n7. A WORKER REPORT THE CHAT WAS READING dies on the limit (2026-10-06)');
+// ---------------------------------------------------------------------------
+// b@ hit its five hour limit while the chat lane was reading a worker report,
+// and a worker died on the same limit in the same seconds. The worker lane made
+// the swap; the chat turn was turned away by the cooldown, got no retry, and
+// showed "Claude run failed · You've hit your session limit" under the line that
+// reported the swap, which read as the swap failing. It had not.
+//
+// Two halves are proved HERE, against the real rotation and the real wall
+// episode: (a) a caller the cooldown turns away can learn how the rotation
+// behind it ended, including one still in flight; (b) a report that cannot be
+// re-read now is held where the lift's wake-up delivers it, exactly once. What
+// the chat lane does with them is bg-codex-wiring.test.mjs section 8c.
+
+const swapSetup = () => {
+  B.reset();
+  B.setActive('b@example.com');
+  B.setList([slot('b@example.com'), slot('a@example.com')]);
+  B.setProbes({ 'a@example.com': HEALTHY('a@example.com') });
+  B.setUsageRow(row({ fiveHour: win(100, iso(3 * HOUR)), sevenDay: win(40, iso(90 * HOUR)), scoped: [], extraUsage: null }, 'b@example.com'));
+};
+
+swapSetup();
+const before7 = await B.rotationBehindCooldown();
+rot = await B.rotateOffLimitedAccount(WALL);
+const second7 = await B.rotateOffLimitedAccount(WALL);
+const behind7 = await B.rotationBehindCooldown();
+await t('★ a rotation leaves its ending behind for the caller its cooldown turns away', () => {
+  eq(before7, null, 'nothing rotated yet, so there is nothing to report');
+  eq(rot.outcome, 'swapped');
+  eq(second7.outcome, 'cooldown', 'the worker that died seconds later is turned away, as before');
+  eq(second7.nextName, null, 'and the cooldown answer itself still names nothing');
+  eq(behind7?.outcome, 'swapped', 'the record says how the rotation behind it ended');
+  eq(behind7.activeName, 'b@example.com', 'from');
+  eq(behind7.nextName, 'a@example.com', 'to');
+  eq(swaps(), 'a@example.com', 'ONE swap for one wall');
+});
+
+await t('a landed record stands only while the cooldown it armed is running', () => {
+  // The harness cooldown is 30s. One millisecond past it the guard is open
+  // again, so a `cooldown` answer after that belongs to something else.
+  const ms = 30_000;
+  return Promise.all([B.rotationBehindCooldown(NOW + ms - 1), B.rotationBehindCooldown(NOW + ms)]).then(([inside, past]) => {
+    eq(inside?.outcome, 'swapped');
+    eq(past, null, 'stale: it must not name a swap from an older wall');
+  });
+});
+
+// THE RACE THE INCIDENT HAD. The worker's rotation is still inside its keychain
+// write when the chat turn dies: the cooldown is already armed (it is armed
+// before the first await), so the chat turn is told `cooldown` while the login
+// is still the limited one.
+swapSetup();
+let releaseSwap7;
+B.setSwapWait(new Promise((r) => (releaseSwap7 = r)));
+const workerRot7 = B.rotateOffLimitedAccount(WALL);
+// Let the first rotation reach its swap before the second caller arrives.
+for (let i = 0; i < 50 && !B.CALLS.some((c) => c.swapTo); i++) await new Promise((r) => setImmediate(r));
+const chatRot7 = await B.rotateOffLimitedAccount(WALL);
+const midFlight7 = { active: B.ACTIVE, landed: Boolean(B.landing()?.rot) };
+const waiting7 = B.rotationBehindCooldown();
+releaseSwap7();
+const adopted7 = await waiting7;
+await workerRot7;
+B.setSwapWait(null);
+await t('★ turned away MID SWAP: the wait returns the ending only once the swap has landed', () => {
+  eq(chatRot7.outcome, 'cooldown');
+  eq(midFlight7.active, 'b@example.com', 'the login was still the limited account when the cooldown answered');
+  eq(midFlight7.landed, false, 'so the record was still a promise, which is the whole reason to wait');
+  eq(adopted7?.outcome, 'swapped');
+  eq(adopted7.nextName, 'a@example.com');
+  eq(B.ACTIVE, 'a@example.com', 'and by then the login is the new account');
+  eq(swaps(), 'a@example.com', 'still one swap');
+});
+
+swapSetup();
+B.setSwapWait(new Promise(() => {})); // a keychain that never answers
+const stuck7 = B.rotateOffLimitedAccount(WALL);
+stuck7.catch(() => {});
+for (let i = 0; i < 50 && !B.CALLS.some((c) => c.swapTo); i++) await new Promise((r) => setImmediate(r));
+const gaveUp7 = await B.rotationBehindCooldown();
+B.setSwapWait(null);
+await t('a rotation slower than the wait reports nothing, rather than holding the chat lane', () => {
+  eq(gaveUp7, null, 'the caller falls back to the nameless cooldown answer');
+  ok(B.ROTATION_LANDING_WAIT_MS >= 30_000, 'the real bound covers a probe of every candidate plus the keychain write');
+});
+
+B.reset();
+B.setCooldownUntil(NOW + 20_000); // the walled-account sweep arms the same guard, and it is not a rotation
+const sweepArmed7 = await B.rotateOffLimitedAccount(WALL);
+await t('a cooldown NOTHING here rotated for has no record to borrow', async () => {
+  eq(sweepArmed7.outcome, 'cooldown');
+  eq(await B.rotationBehindCooldown(), null);
+});
+
+await t('★ handbackLimitPlan: every rotation ending maps to exactly one fate, and none of them drops the report', () => {
+  const R = { activeName: 'b@example.com', nextName: 'a@example.com', error: null };
+  const plan = (outcome, o = {}) => B.handbackLimitPlan(outcome ? { ...R, outcome } : null, { reports: 1, ...o });
+  // One re-read, on a swap or on a cooldown that stands for one.
+  for (const outcome of ['swapped', 'cooldown']) {
+    const p = plan(outcome);
+    eq(p.retry?.priority, true, `${outcome}: read again, ahead of the queue`);
+    eq(p.keep, undefined, `${outcome}: re-read, so it is not ALSO kept`);
+    ok(p.line.includes('Reading the worker report again'), p.line);
+  }
+  ok(plan('swapped').line.includes('Swapped to a@example.com'), 'the swap is named, both halves');
+  ok(plan('swapped').line.includes('Session limit on b@example.com'));
+  // THE CAP: the run that is itself the re-read gets no second one.
+  for (const outcome of ['swapped', 'cooldown']) {
+    const p = plan(outcome, { retried: true });
+    eq(p.retry, null, `${outcome} on the re-read: no third attempt, so no loop`);
+    eq(p.keep, 'parked', 'kept for the next turn instead');
+    ok(!/failed/i.test(p.line), `a second death is not reported as a failure of the swap: ${p.line}`);
+  }
+  // No account free, retried or not: held for the wake-up, never re-run into the wall.
+  for (const outcome of ['exhausted', 'paused']) {
+    for (const retried of [false, true]) {
+      const p = plan(outcome, { retried, resumesAt: NOW + HOUR, timeZone: 'America/Toronto', now: NOW });
+      eq(p.retry, null, `${outcome}: a re-read into the wall dies on it`);
+      eq(p.keep, 'wall');
+      ok(p.line.includes('no account free'), p.line);
+      ok(/Read at the reset · \d/.test(p.line), `it says when: ${p.line}`);
+      ok(!/[Ss]wapped/.test(p.line), `no swap happened, so none is claimed: ${p.line}`);
+    }
+  }
+  // The credentials would not write, or the rotation itself threw.
+  for (const p of [plan('swap_failed'), plan(null)]) {
+    eq(p.retry, null, 'there is no new account to read it on');
+    eq(p.keep, 'parked');
+    ok(p.line.includes('swap failed'), p.line);
+    ok(!/Swapped to/.test(p.line), p.line);
+  }
+  ok(plan('swap_failed').line.includes('Still on b@example.com'), 'which account the login is still on');
+  eq(plan('no_claude'), null, 'no Claude on the machine: nothing to rotate, nothing to say');
+});
+
+// THE WALLED CASE, end to end against the real episode. The report the chat
+// was reading dies on the last free account: nothing to swap to, the wall goes up,
+// and the report is HELD for the lift's wake-up.
+const MARK7 = {
+  items: [
+    {
+      runId: 'bg46-1791294000000',
+      task: 'LANE RULES (you are a background worker: headless)\n--- TASK ---\n# DA-TEAM-EVENT-BUTTON-1006\nship the button',
+      status: 'finished',
+      report: '/bridge/bg-reports/bg46-1791294000000.md',
+      draft: null,
+      flag: null,
+    },
+  ],
+};
+nextSetup();
+rot = await B.rotateOffLimitedAccount(WALL);
+const walledPlan7 = B.handbackLimitPlan(rot, { reports: 1, resumesAt: B.pausedUntil(), timeZone: 'America/Toronto', now: NOW });
+const kept7 = B.keepHandback(MARK7, walledPlan7.keep);
+await t('★ no account free: the report is held in the wall episode, and nowhere else', () => {
+  eq(rot.outcome, 'exhausted');
+  eq(walledPlan7.keep, 'wall');
+  eq(JSON.stringify(kept7), JSON.stringify({ held: 1, parked: 0 }));
+  const row7 = B.wallWake.current().workers.find((w) => w.runId === 'bg46-1791294000000');
+  ok(row7, 'recorded on disk, so a daemon restart mid wall does not lose it');
+  eq(row7.handback, 'held');
+  eq(row7.title, 'DA-TEAM-EVENT-BUTTON-1006', 'titled by the brief, not by the lane rules in front of it');
+  eq(B.parkedHandbacks.length, 0, 'NOT also on the parked list: two places is two deliveries');
+  eq(B.DISPATCHED.filter((d) => d.lane === 'main').length, 0, 'and nothing was re-run into the wall');
+});
+await t('the walled line says no account was free and names the reset the wall itself is waiting for', () => {
+  const clock = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Toronto', hour: 'numeric', minute: '2-digit', hour12: true })
+    .format(new Date(B.pausedUntil()))
+    .replace(/\s?([AP])M$/i, (_, x) => x.toLowerCase() + 'm');
+  eq(walledPlan7.line, `⛔ Session limit, no account free\n📥 Worker report held, not lost\n🕐 Read at the reset · ${clock}`);
+});
+toTheReset();
+B.DISPATCHED.length = 0;
+lift = await B.liftClaudeWall('reset', { sweep: true });
+const again7 = await B.liftClaudeWall('poll', { sweep: true });
+await t('★ ...and the lift delivers it exactly ONCE, as the report it is', () => {
+  eq(mainTurns().length, 1, JSON.stringify(B.DISPATCHED.map((d) => d.text.slice(0, 60))));
+  const text = mainTurns()[0].text;
+  eq(text.split('bg46-1791294000000 · DA-TEAM-EVENT-BUTTON-1006').length - 1, 1, 'listed once');
+  ok(text.includes('report: /bridge/bg-reports/bg46-1791294000000.md'), text);
+  ok(text.includes('handback: NOT delivered before now, held through the wall; this note is its delivery'), text);
+  eq(again7, null, 'a second lift of the same wall does not hand it over again');
+  eq(mainTurns().length, 1);
+});
+
+// What the episode will not take falls back to the parked list rather than
+// nowhere: no run id to key it by, or a Codex chat lane (which can still read).
+nextSetup();
+await B.rotateOffLimitedAccount(WALL);
+const noId7 = B.keepHandback({ items: [{ ...MARK7.items[0], runId: null }] }, 'wall');
+B.setChatEngine('codex');
+const codexLane7 = B.keepHandback(MARK7, 'wall');
+B.setChatEngine('claude');
+await t('a report the wall episode cannot hold is parked, never dropped', () => {
+  eq(JSON.stringify(noId7), JSON.stringify({ held: 0, parked: 1 }));
+  eq(JSON.stringify(codexLane7), JSON.stringify({ held: 0, parked: 1 }));
+  eq(B.parkedHandbacks.length, 2);
+  eq(B.parkedHandbacks[1].task, '# DA-TEAM-EVENT-BUTTON-1006 ship the button', 'the lane rules are stripped off the parked title');
+  eq(B.parkedHandbacks[1].report, '/bridge/bg-reports/bg46-1791294000000.md');
+  ok(B.chainState().lastParkedAt > 0, 'and the quiet spell counts from now');
+});
+
+rmSync(TMP, { recursive: true, force: true });
+
+// ---------------------------------------------------------------------------
+// A SCHEDULED SWITCH RACING A ROTATION THAT ENDS IN A WALL (QA round 3). The
+// switch waits for the rotation's landing; the rotation's own move at the wall
+// used to queue on the switch chain behind that same switch, so each waited on
+// the other until the 45 s deadline, and then the switch swapped onto the
+// account the rotation had just found spent and lifted the wall.
+// ---------------------------------------------------------------------------
+{
+  const GM = 'a@example.com';
+  const ZA = 'c@example.com';
+  const HE = 'b@example.com';
+  const spent = (name) => row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: win(100, iso(50 * HOUR)), scoped: [], extraUsage: null }, name);
+  B.reset();
+  B.setFuse(3000); // the landing wait, at a length a stall would hit
+  B.setActive(GM);
+  B.setList([slot(GM), slot(ZA), slot(HE)]);
+  B.setUsageRow(row({ fiveHour: win(100, iso(6 * HOUR)), sevenDay: win(100, iso(100 * HOUR)), scoped: [], extraUsage: null }));
+  let heCalls = 0;
+  // b@: the switch's own lookup does not answer ("could not be read just
+  // now", allowed); every later probe (the rotation's) reads it spent.
+  B.setProbes({ [ZA]: spent(ZA), [HE]: () => (heCalls++ === 0 ? null : spent(HE)) });
+  let open;
+  B.setProbeGate(new Promise((r) => (open = r)));
+  const t0 = performance.now();
+  const sched = B.switchAccountNow(HE, { via: 'schedule', scheduleId: 7 });
+  await new Promise((r) => setTimeout(r, 5));
+  const rot = B.rotateOffLimitedAccount(WALL);
+  await new Promise((r) => setTimeout(r, 5));
+  open();
+  const schedRes = await sched;
+  const tookMs = performance.now() - t0;
+  const rotRes = await rot;
+  const wallAfter = B.pausedUntil();
+  B.setProbeGate(null);
+  const second = await B.rotateOffLimitedAccount(WALL);
+  B.setFuse(20);
+  await t('★ a scheduled switch racing a rotation into a wall: no stall, refused on the fresh facts, the wall stands', () => {
+    ok(tookMs < 1500, `the switch took ${Math.round(tookMs)} ms against a 3000 ms landing wait (a stall)`);
+    eq(rotRes.outcome, 'exhausted', JSON.stringify(rotRes));
+    eq(schedRes.ok, false, JSON.stringify(schedRes));
+    ok(/b@example\.com is at its limit/.test(schedRes.reason || ''), JSON.stringify(schedRes));
+    eq(swaps().split(',').filter((x) => x === HE).length, 0, `nothing swapped onto the spent account: ${swaps()}`);
+    ok(wallAfter > NOW, 'the all-accounts wall is still up');
+    eq(second.outcome, 'paused', 'a second death on the same wall is a wall death, resumed at the lift');
   });
 }
 
-rmSync(TMP, { recursive: true, force: true });
 
 // ---------------------------------------------------------------------------
 if (failures.length) {

@@ -94,6 +94,7 @@ import {
   needsLoginNotice,
   chatRotatedLine,
   chatWalledRetryLine,
+  handbackLimitLine,
   bothWalledLine,
   enginesBackLine,
 } from './system-messages.mjs';
@@ -1222,6 +1223,129 @@ t('wall: the walled chat line says who is taking the message, or that it is park
     '⛔ Session limit, no account free\n🧠 Codex is taking this message',
   );
   eq(chatWalledRetryLine({}), '⛔ Session limit, no account free\n⏳ Your message is parked');
+});
+
+// ---------------------------------------------------------------------------
+// A WORKER REPORT THE ASSISTANT WAS READING hits the session limit (2026-10-06 10:08)
+// ---------------------------------------------------------------------------
+// What the user saw, in this order: "❌ Error · 18s · 1 step", then "🔄 Session limit
+// on ab@example.com, swapped to a@example.com", then "❌ Claude run
+// failed · You've hit your session limit · resets 1:20pm". They asked why the
+// swap had failed. It had not. handbackLimitLine is what the dead turn's bubble
+// becomes instead, on each of the four endings.
+const HB_TZ = 'America/Toronto';
+const HB_NOW = Date.UTC(2026, 9, 6, 14, 8, 0); // 10:08
+const HB_RESET = Date.UTC(2026, 9, 6, 17, 20, 0); // 1:20pm, the clock on their card
+const hb = (o = {}) => handbackLimitLine({ timeZone: HB_TZ, now: HB_NOW, ...o });
+const HB_SHAPES = () => [
+  [hb({ from: 'ab@example.com', to: 'a@example.com' }), 'handbackLimitLine/retry'],
+  [hb({}), 'handbackLimitLine/retry nameless'],
+  [hb({ from: 'x'.repeat(90), to: 'y'.repeat(90), reports: 20 }), 'handbackLimitLine/retry long names'],
+  [hb({ outcome: 'walled', resumesAt: HB_RESET }), 'handbackLimitLine/walled'],
+  [hb({ outcome: 'walled', reports: 6 }), 'handbackLimitLine/walled no clock'],
+  [hb({ outcome: 'walled', resumesAt: HB_RESET + 2 * 86_400_000, reports: 20 }), 'handbackLimitLine/walled days out'],
+  [hb({ outcome: 'swap_failed', from: 'ab@example.com', error: 'no captured credentials', resumesAt: HB_RESET }), 'handbackLimitLine/swap_failed'],
+  [hb({ outcome: 'swap_failed', from: 'x'.repeat(90), error: 'y'.repeat(400), reports: 20 }), 'handbackLimitLine/swap_failed worst case'],
+  [hb({ outcome: 'swap_failed' }), 'handbackLimitLine/swap_failed bare'],
+  [hb({ outcome: 'capped', to: 'b@example.com' }), 'handbackLimitLine/capped'],
+  [hb({ outcome: 'capped', to: 'y'.repeat(90), reports: 20 }), 'handbackLimitLine/capped long name'],
+  [hb({ outcome: 'capped' }), 'handbackLimitLine/capped nameless'],
+];
+
+t('handback: ★ the swap worked, so ONE line says the limit, the swap from A to B, and that the report is read again', () => {
+  eq(
+    hb({ from: 'ab@example.com', to: 'a@example.com' }),
+    '🔄 Session limit on ab@example.com\n👤 Swapped to a@example.com\n▶️ Reading the worker report again',
+  );
+  // The capped chain hands several reports over in one turn.
+  ok(hb({ from: 'a', to: 'b', reports: 3 }).endsWith('▶️ Reading the 3 worker reports again'));
+  eq(hb({ reports: 0 }), hb({ reports: 1 }), 'a nonsense count is one report, never "0 worker reports"');
+});
+
+t('handback: the retry line claims no swap it cannot see', () => {
+  // Something else rotated and its halves are not known here (chatRotatedLine
+  // has the same rule): it says the report is being read again, and no more.
+  eq(hb({}), '🔄 Session limit hit\n▶️ Reading the worker report again');
+  ok(!/[Ss]wapped/.test(hb({})));
+  ok(!/[Ss]wapped/.test(hb({ from: 'ab@example.com' })), 'the account that went out, with no destination line');
+  ok(!hb({}).includes('undefined'));
+});
+
+t('handback: ★ no account free says so plainly, and says when it resumes', () => {
+  eq(
+    hb({ outcome: 'walled', resumesAt: HB_RESET }),
+    '⛔ Session limit, no account free\n📥 Worker report held, not lost\n🕐 Read at the reset · 1:20pm',
+    'the clock on the card the user saw, in their own time zone',
+  );
+  // Another day carries its weekday, or "9:59am" reads as this morning.
+  ok(hb({ outcome: 'walled', resumesAt: HB_RESET + 2 * 86_400_000 }).endsWith('🕐 Read at the reset · Thu 1:20pm'));
+  // No clock known: it still says WHEN, in words, never "unknown".
+  eq(hb({ outcome: 'walled' }).split('\n')[2], '🕐 Read at the first reset');
+  eq(hb({ outcome: 'walled', reports: 6 }).split('\n')[1], '📥 6 worker reports held, not lost');
+});
+
+t('handback: ★ a swap that could not happen is said as a failed SWAP, with the account they are still on', () => {
+  eq(
+    hb({ outcome: 'swap_failed', from: 'ab@example.com', error: 'no captured credentials', resumesAt: HB_RESET }),
+    [
+      '⚠️ Session limit hit, swap failed',
+      'no captured credentials',
+      '👤 Still on ab@example.com',
+      '📥 Worker report kept, not lost',
+      '💬 Read on your next message',
+      '🕐 Limit resets 1:20pm',
+    ].join('\n'),
+  );
+  eq(
+    hb({ outcome: 'swap_failed' }),
+    '⚠️ Session limit hit, swap failed\n📥 Worker report kept, not lost\n💬 Read on your next message',
+    'an unknown account, cause or clock costs its line, not a guess',
+  );
+  ok(hb({ outcome: 'swap_failed', error: 'y'.repeat(400) }).split('\n')[1].length <= 40, 'a stack trace cannot become the message');
+});
+
+t('handback: the re-read died too: no third try is promised, and the report is kept', () => {
+  eq(
+    hb({ outcome: 'capped', to: 'b@example.com' }),
+    '🔄 Session limit hit again\n👤 Swapped to b@example.com\n📥 Worker report kept, not lost\n💬 Read on your next message',
+  );
+  eq(hb({ outcome: 'capped' }), '🔄 Session limit hit again\n📥 Worker report kept, not lost\n💬 Read on your next message');
+  ok(!/[Rr]eading|[Rr]etry/.test(hb({ outcome: 'capped', to: 'b' })), 'it must not say a read is under way');
+});
+
+t('handback: ★ NO shape can be read as "the swap worked but the run still failed"', () => {
+  // The whole complaint. Each shape is checked for the words that made the old
+  // pair of messages read that way.
+  for (const [s, where] of HB_SHAPES()) {
+    ok(!/Claude run failed|You've hit your session limit|❌|\bError\b/.test(s), `${where} carries the old failure card's words:\n${s}`);
+    // A line that names a swap must not ALSO say something failed, and a line
+    // that says the swap failed must not name a swap as done.
+    ok(!(/Swapped to/.test(s) && /failed/i.test(s)), `${where} says a swap happened and that something failed:\n${s}`);
+    // And the bare reset clock, the line the user read as "still limited", appears
+    // only where nothing was swapped onto.
+    if (/Swapped to/.test(s)) ok(!/resets|reset ·/i.test(s), `${where} puts a reset clock under a swap that worked:\n${s}`);
+  }
+});
+
+t('handback: ★ no shape leaves a wait glyph with no ending (rule 8)', () => {
+  // The dead turn's bubble is edited ONCE into one of these and never again, so
+  // a ⏳ here would be a wait nothing resolves. The retry shape uses ▶️: the
+  // re-read draws its own bubble, and that bubble is the wait with a ✅ or ❌.
+  // (A bare … is not the test: a clipped account name ends in one.)
+  for (const [s, where] of HB_SHAPES()) ok(!/⏳|ing…/.test(s), `${where} leaves a wait on screen:\n${s}`);
+  ok(hb({ from: 'a', to: 'b' }).split('\n').pop().startsWith('▶️ '), 'a start, not a wait');
+});
+
+t('handback: ★ every shape passes the house-style gates, worst case included', () => {
+  for (const [s, where] of HB_SHAPES()) {
+    houseStyle(s, where);
+    // Icon first on every line but the one raw error detail.
+    for (const line of s.split('\n')) {
+      if (where.includes('swap_failed') && line === s.split('\n')[1] && !/^\p{Extended_Pictographic}/u.test(line)) continue;
+      ok(/^\p{Extended_Pictographic}/u.test(line), `${where}: a line with no icon in front\n  ${line}`);
+    }
+    ok(!s.includes('undefined') && !s.includes('null') && !s.includes('NaN'), `${where}:\n${s}`);
+  }
 });
 
 t('wall: both engines out names BOTH clocks, glyph-labelled', () => {

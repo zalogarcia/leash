@@ -21,8 +21,7 @@
 //   5. the 2026-10-08 20:52Z false wall: charlie's 100 percent reading after
 //      the swap to delta, through the real noteStreamUsage and the real
 //      wallGuardTick. Neither the checkpoint nor the all-walled line fires,
-//      and a control with delta genuinely full shows the rig CAN fire (and
-//      that the selector was asked about the OTHER accounts only).
+//      and a control with delta genuinely full shows the rig CAN fire.
 //
 // bridge.mjs is never imported (that boots a daemon). Every file is under one
 // temp directory; nothing is sent anywhere (send records), no real keychain
@@ -30,7 +29,7 @@
 //
 //   node account-autoswitch-wiring.test.mjs
 
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, copyFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, copyFileSync, chmodSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -125,11 +124,7 @@ export const setPausedUntil = (v) => { rotationPausedUntil = v; };
 export const setCooldownUntil = (v) => { rotationCooldownUntil = v; };
 let wallLiftInflight = null;
 const ROTATION_COOLDOWN_MS = 90_000;
-// The real sleep, shortened: the clock here is frozen, so a wait for a
-// rotation's cooldown is bounded by its loop count, not by time.
-const sleep = (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 5)));
-${grab('SWITCH_COOLDOWN_POLL_MS', 'const')}
-const OWNER_TZ = 'America/New_York';
+const OWNER_TZ = 'America/Toronto';
 const OWNER_NAME = 'Owner';
 export let CONF = {};
 export const setConf = (v) => { CONF = v; };
@@ -233,6 +228,10 @@ ${grab('WALL_GUARD_PROBE_MS', 'const')}
 let wallGuardLastProbe = 0;
 let wallGuardInflight = null;
 let wallGuardLastSkip = null;
+let rotationLanding = null;
+${grab('ROTATION_LANDING_WAIT_MS', 'const')}
+${grab('rotationStarted')}
+${grab('rotationBehindCooldown')}
 ${grab('logAccountDecision')}
 ${grab('noteStreamUsage')}
 ${grab('pickHealthyAccount')}
@@ -250,7 +249,6 @@ ${grab('autoSwitchLastRefusal', 'const')}
 ${grab('autoSwitchLiveLookup', 'const')}
 ${grab('autoSwitchOwnerHold', 'const')}
 ${grab('armOwnerHold')}
-${grab('swapCooldownMark', 'const')}
 ${grab('accountSwitchChain', 'const')}
 ${grab('accountSwitchBusy', 'const')}
 ${grab('autoSwitchNow')}
@@ -273,9 +271,10 @@ const STEER_SOCK = ${JSON.stringify(P('steer.sock'))};
 ${grab('startSteerServer')}
 
 export { kickAutoSwitch, autoSwitchTick, switchAccountNow, checkSchedules, startSteerServer, wallGuardTick, noteStreamUsage, autoSwitchStatusLine, autoSwitchNow, lastAutoSwitch, fmtSchedule };
-export const setSwapMark = (v) => { swapCooldownMark = v; };
+export const landing = () => rotationLanding;
 export { armOwnerHold };
 export const ownerHold = () => autoSwitchOwnerHold;
+export const setLanding = (v) => { rotationLanding = v; };
 export const status = () => autoSwitchStatusLine(autoSwitchNow(), { last: lastAutoSwitch, timeZone: OWNER_TZ });
 export const resetRig = () => {
   rotationPausedUntil = 0;
@@ -290,7 +289,6 @@ export const resetRig = () => {
   autoSwitchLastRefusal = null;
   autoSwitchLiveLookup = null;
   autoSwitchOwnerHold = null;
-  swapCooldownMark = 0;
   wallGuardLastProbe = 0;
   wallGuardLastSkip = null;
 };
@@ -373,6 +371,9 @@ await t('★ AC1: alpha at 95% of its week, charlie free: ONE tick swaps the key
   H.BODY[CHARLIE] = body(0, null, 0, ZH_WEEK + 7 * 24 * HOUR);
   H.BODY[DELTA] = body(0, null, 3, ZH_WEEK + 7 * 24 * HOUR);
   await freshTracker();
+  eq(H.liveAccount.current(), ME);
+  // The live session reading, as a worker's stream carries it.
+  H.noteStreamUsage(event(0.12, RESET + HOUR, 0.95, ME_WEEK), ME);
   const writesBefore = H.KC.writes;
   const r = await H.kickAutoSwitch();
   await H.settle();
@@ -398,18 +399,26 @@ await t('★ AC3: the following ticks never swap back to alpha, whatever its ses
   const swapsBefore = H.KC.writes;
   H.SENT.length = 0;
   await freshTracker();
-  // 30 simulated minutes, one tick a minute. alpha stays at 95 percent of its
-  // week, charlie climbs slowly.
+  eq(H.liveAccount.current(), CHARLIE);
+  // 30 simulated minutes, one tick a minute. alpha's sessions keep reporting
+  // 95 percent (filed under alpha by its own weekly reset), charlie climbs slowly.
   for (let m = 1; m <= 30; m++) {
     H.setNow(RESET + 30_000 + m * MIN);
+    H.noteStreamUsage(event(0.12, RESET + HOUR, 0.95, ME_WEEK), CHARLIE);
     H.BODY[CHARLIE] = body(m, RESET + 5 * HOUR, Math.min(60, m * 2), ZH_WEEK + 7 * 24 * HOUR);
+    H.noteStreamUsage(event(m / 100, RESET + 5 * HOUR, Math.min(60, m * 2) / 100, ZH_WEEK + 7 * 24 * HOUR), CHARLIE);
     await H.kickAutoSwitch();
   }
   await H.settle();
   eq(H.KC.writes, swapsBefore, 'no swap in 30 ticks');
   eq(liveName(), CHARLIE);
   eq(H.SENT.length, 0, 'and no message');
+  ok(streamUsageHolds(ME, 95), 'alpha\'s numbers stayed filed under alpha');
 });
+function streamUsageHolds(name, week) {
+  // the store is the harness's live binding, read through the export
+  return H.streamUsage.get(name)?.usage?.sevenDay?.percent === week;
+}
 
 await t('★ AC3: when charlie itself crosses 90, it moves ONWARD to delta, never back to a full alpha', async () => {
   H.SENT.length = 0;
@@ -417,6 +426,7 @@ await t('★ AC3: when charlie itself crosses 90, it moves ONWARD to delta, neve
   H.setNow(at);
   H.BODY[CHARLIE] = body(91, RESET + 5 * HOUR, 40, ZH_WEEK + 7 * 24 * HOUR);
   H.BODY[ME] = body(0, null, 95, ME_WEEK);
+  H.noteStreamUsage(event(0.91, RESET + 5 * HOUR, 0.4, ZH_WEEK + 7 * 24 * HOUR), CHARLIE);
   await H.kickAutoSwitch();
   await H.settle();
   eq(liveName(), DELTA);
@@ -437,10 +447,12 @@ await t('a settle window after ANY swap: the owner\'s own swap holds the automat
   const r = await H.accounts.swapTo(ME);
   eq(r.ok, true);
   await freshTracker();
+  H.noteStreamUsage(event(0.12, RESET + 4 * HOUR, 0.95, ME_WEEK), ME);
   const res = await H.kickAutoSwitch();
   eq(res.switched, false);
   ok(/a swap landed \d+s ago, settling/.test(res.reason), res.reason);
   H.setNow(RESET + 3 * HOUR + 5 * MIN + 1000);
+  H.noteStreamUsage(event(0.13, RESET + 4 * HOUR, 0.95, ME_WEEK), ME);
   const res2 = await H.kickAutoSwitch();
   await H.settle();
   eq(res2.ok, true, JSON.stringify(res2));
@@ -455,6 +467,7 @@ await t('off in config.json: nothing is asked, nothing moves', async () => {
   H.BODY[ME] = body(12, RESET + 5 * HOUR, 95, ME_WEEK);
   H.BODY[CHARLIE] = body(0, null, 0, ZH_WEEK + 7 * 24 * HOUR);
   await freshTracker();
+  H.noteStreamUsage(event(0.12, RESET + 5 * HOUR, 0.95, ME_WEEK), ME);
   const before = H.KC.writes;
   const res = await H.kickAutoSwitch();
   eq([res.switched, res.reason], [false, 'off']);
@@ -463,15 +476,36 @@ await t('off in config.json: nothing is asked, nothing moves', async () => {
   eq(H.status(), '🔀 Account auto switch: off');
 });
 
-await t('below the threshold only the live lookup is made: no other account is asked', async () => {
+await t('below the threshold the tick costs one live lookup per five minutes, and nothing else', async () => {
   reset();
   H.setNow(RESET + 5 * HOUR);
   seedAccounts({ live: ME });
   H.BODY[ME] = body(30, RESET + 6 * HOUR, 50, ME_WEEK);
   await freshTracker();
-  const res = await H.kickAutoSwitch();
-  eq([res.switched, res.reason], [false, 'below the thresholds']);
-  eq(H.FETCHED, [ME]);
+  H.noteStreamUsage(event(0.3, RESET + 6 * HOUR, 0.5, ME_WEEK), ME);
+  for (let i = 0; i < 4; i++) {
+    H.setNow(RESET + 5 * HOUR + i * 50_000);
+    const res = await H.kickAutoSwitch();
+    eq([res.switched, res.reason], [false, 'below the thresholds']);
+  }
+  eq(H.FETCHED, [ME], 'one lookup on the live token in four ticks, no candidate asked');
+});
+
+await t('★ a window spent OUTSIDE the bridge (sessions say 85, the lookup says 93) still switches, within the five minute pace (QA round 7)', async () => {
+  reset();
+  H.setNow(RESET + 11 * HOUR);
+  seedAccounts({ live: ME, walled: { [GMAIL]: GMAIL_WEEK } });
+  H.BODY[ME] = body(10, RESET + 14 * HOUR, 93, ME_WEEK); // The owner's own terminals spent it
+  H.BODY[CHARLIE] = body(0, null, 5, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[DELTA] = body(0, null, 20, ZH_WEEK + 7 * 24 * HOUR);
+  await freshTracker();
+  H.noteStreamUsage(event(0.1, RESET + 14 * HOUR, 0.85, ME_WEEK), ME); // the bridge's own sessions last saw 85
+  const r = await H.kickAutoSwitch();
+  await H.settle();
+  eq(liveName(), CHARLIE, JSON.stringify(r));
+  eq(H.SENT.length, 1);
+  ok(H.SENT[0].includes('⬅️ From: alpha@example.test · 5h 10% · week 93%'), H.SENT[0]);
+  ok(H.LOGS.some((l) => l.includes('account_autoswitch · account=alpha@example.test') && l.includes('source=lookup')), 'decided on the lookup');
 });
 
 // ---------------------------------------------------------------------------
@@ -485,6 +519,7 @@ await t('★ 10-08: before 14:00Z nothing is free; the first tick after 14:00Z s
   H.BODY[CHARLIE] = body(0, null, 100, RESET);
   H.BODY[DELTA] = body(0, null, 100, RESET);
   await freshTracker();
+  H.noteStreamUsage(event(0.06, NOW0 + 90 * MIN, 0.95, ME_WEEK), ME);
   const before = await H.kickAutoSwitch();
   eq(before.switched, false);
   ok(before.reason.startsWith('no other account is free'), before.reason);
@@ -498,6 +533,7 @@ await t('★ 10-08: before 14:00Z nothing is free; the first tick after 14:00Z s
   H.setNow(RESET + 30_000);
   H.BODY[CHARLIE] = body(0, null, 0, ZH_WEEK);
   H.BODY[DELTA] = body(0, null, 0, ZH_WEEK);
+  H.noteStreamUsage(event(0.07, NOW0 + 90 * MIN, 0.95, ME_WEEK), ME);
   const after = await H.kickAutoSwitch();
   await H.settle();
   eq(after.ok, true, JSON.stringify(after));
@@ -743,9 +779,9 @@ await t('AC7 control: with delta GENUINELY at 100% of its own window, the same r
 });
 
 // ---------------------------------------------------------------------------
-// A FAILED AUTOMATIC SWAP: the keychain refuses the write. The automatic
-// switch pauses for PROBE_EVERY_MS and says so ONCE, instead of a refusal
-// every poll cycle until morning.
+// A FAILED AUTOMATIC SWAP (QA round 1): the keychain refuses the write. The
+// automatic switch pauses for PROBE_EVERY_MS and says so ONCE, instead of a
+// refusal every poll cycle until morning.
 // ---------------------------------------------------------------------------
 
 await t('★ a failed automatic swap is said once and retried only after a pause, then the switch lands when the keychain works', async () => {
@@ -757,8 +793,10 @@ await t('★ a failed automatic swap is said once and retried only after a pause
   H.BODY[DELTA] = body(97, RESET + 24 * HOUR, 30, ZH_WEEK + 7 * 24 * HOUR);
   H.BODY[GMAIL] = body(0, null, 95, GMAIL_WEEK + 7 * 24 * HOUR);
   await freshTracker();
+  H.noteStreamUsage(event(0.2, RESET + 24 * HOUR, 0.95, ME_WEEK), ME);
   H.KC.fail = true;
   const results = [];
+  // Four ticks fifty seconds apart, the daemon's idle cadence.
   for (let i = 0; i < 4; i++) {
     H.setNow(RESET + 20 * HOUR + i * 50_000);
     results.push(await H.kickAutoSwitch());
@@ -769,11 +807,13 @@ await t('★ a failed automatic swap is said once and retried only after a pause
   eq(H.LOGS.filter((l) => l.includes('] account_switch_refused · ')).length, 1, 'ONE attempt: the next three ticks wait out the pause');
   ok(results.slice(1).every((r) => r && r.switched === false && /last automatic swap failed/.test(r.reason)), JSON.stringify(results.slice(1)));
   eq(liveName(), ME, 'nothing moved');
+  // Past the pause the keychain still refuses: a second attempt, the same reason, no second message.
   H.setNow(RESET + 20 * HOUR + 6 * MIN);
   await H.kickAutoSwitch();
   await H.settle();
   eq(H.LOGS.filter((l) => l.includes('] account_switch_refused · ')).length, 2, 'retried after the pause');
   eq(H.SENT.length, 1, 'the same reason is not said twice');
+  // The keychain works again: the next try after the pause lands, with its one notice.
   H.KC.fail = false;
   H.setNow(RESET + 20 * HOUR + 12 * MIN);
   const r = await H.kickAutoSwitch();
@@ -783,93 +823,85 @@ await t('★ a failed automatic swap is said once and retried only after a pause
   ok(H.SENT[1].startsWith('🔀 Claude account switched · automatic'), H.SENT[1]);
 });
 
-await t('★ a scheduled switch while a ROTATION holds the cooldown waits it out, re-checks, then lands; a rotation that never lets go is refused once', async () => {
+await t('the live account parked over a threshold with nowhere to go is looked up once per five minutes, not every tick (QA round 2)', async () => {
   reset();
-  H.setNow(RESET + 8 * HOUR);
-  seedAccounts({ live: DELTA });
-  H.BODY[CHARLIE] = body(0, null, 10, ZH_WEEK + 7 * 24 * HOUR);
-  H.BODY[ME] = body(0, null, 10, ME_WEEK);
+  H.setNow(RESET + 30 * HOUR);
+  seedAccounts({ live: ME, walled: { [CHARLIE]: ZH_WEEK + 7 * 24 * HOUR, [DELTA]: ZH_WEEK + 7 * 24 * HOUR, [GMAIL]: GMAIL_WEEK + 7 * 24 * HOUR } });
+  H.BODY[ME] = body(20, RESET + 34 * HOUR, 96, ME_WEEK);
   await freshTracker();
-  // A rotation in flight armed the cooldown (this build has no landing record).
-  H.setCooldownUntil(Date.now() + 60_000);
-  const before = H.KC.writes;
-  H.setSched({ nextId: 1, items: [{ id: 11, kind: 'once', at: Date.now() - 1000, text: 'x', switchAccount: CHARLIE }] });
-  H.checkSchedules();
-  // It waits: nothing swapped while the rotation holds the cooldown.
-  await new Promise((r) => setTimeout(r, 60));
-  eq(H.KC.writes, before, 'no swap beside the rotation');
-  eq(H.SENT.length, 0, 'no message yet: it is waiting, not refused');
-  // The rotation's cooldown ends: the switch re-checks and lands.
-  H.setCooldownUntil(0);
+  H.noteStreamUsage(event(0.2, RESET + 34 * HOUR, 0.96, ME_WEEK), ME);
+  H.FETCHED.length = 0;
+  for (let i = 0; i < 4; i++) {
+    H.setNow(RESET + 30 * HOUR + i * 50_000);
+    const r = await H.kickAutoSwitch();
+    await H.settle();
+    eq(r?.switched, false, JSON.stringify(r));
+  }
+  eq(H.FETCHED.filter((n) => n === ME).length, 1, `one live lookup in four ticks: ${JSON.stringify(H.FETCHED)}`);
+  H.setNow(RESET + 30 * HOUR + 6 * MIN);
+  await H.kickAutoSwitch();
   await H.settle();
-  eq(liveName(), CHARLIE, JSON.stringify(H.SENT));
-  eq(H.SENT.length, 1);
-  eq(H.SENT[0].split('\n')[0], '🔀 Claude account switched · scheduled #11');
-  // Its own switch's cooldown does not hold the next one off.
-  H.SENT.length = 0;
-  H.setSched({ nextId: 1, items: [{ id: 13, kind: 'once', at: Date.now() - 1000, text: 'x', switchAccount: ME }] });
-  H.checkSchedules();
-  await H.settle();
-  eq(liveName(), ME, JSON.stringify(H.SENT));
-  eq(H.SENT.length, 1);
-  // A rotation cooldown that never lets go (the clock is frozen here): the bounded wait ends in ONE refusal.
-  H.SENT.length = 0;
-  H.setCooldownUntil(Date.now() + 60_000);
-  H.setSched({ nextId: 1, items: [{ id: 14, kind: 'once', at: Date.now() - 1000, text: 'x', switchAccount: CHARLIE }] });
-  H.checkSchedules();
-  await H.settle();
-  eq(liveName(), ME, 'nothing moved');
-  eq(H.SENT.length, 1);
-  ok(H.SENT[0].startsWith('🚫 Claude account switch refused · scheduled #14') && H.SENT[0].includes('a rotation is still moving the login'), H.SENT[0]);
+  eq(H.FETCHED.filter((n) => n === ME).length, 2, 'asked again after five minutes');
+  eq(liveName(), ME, 'nothing moved: every other account is walled');
 });
 
-await t('★ a rotation that has already LANDED (its cooldown marked) does not hold a scheduled switch: it goes at once (QA round 5)', async () => {
-  reset();
-  H.setNow(RESET + 8 * HOUR);
-  seedAccounts({ live: DELTA });
-  H.BODY[CHARLIE] = body(0, null, 10, ZH_WEEK + 7 * 24 * HOUR);
-  await freshTracker();
-  const until = Date.now() + 60_000;
-  H.setCooldownUntil(until);
-  H.setSwapMark(until); // the rotation landed and marked it
-  const t0 = performance.now();
-  H.setSched({ nextId: 1, items: [{ id: 15, kind: 'once', at: Date.now() - 1000, text: 'x', switchAccount: CHARLIE }] });
-  H.checkSchedules();
-  await H.settle();
-  ok(performance.now() - t0 < 2000, `it waited ${Math.round(performance.now() - t0)} ms`);
-  eq(liveName(), CHARLIE, JSON.stringify(H.SENT));
-  eq(H.SENT.length, 1);
-  eq(H.SENT[0].split('\n')[0], '🔀 Claude account switched · scheduled #15');
-});
-
-await t('★ an owner switch that fails inside a landed cooldown puts the mark back, so the next one does not wait on a rotation that is not there (QA round 6)', async () => {
+await t('★ a swap that THROWS (accounts.json not writable) is said once, settles the landing record, and the next switch is not held up (QA round 4)', async () => {
   reset();
   H.setNow(RESET + 9 * HOUR);
   seedAccounts({ live: DELTA });
   H.BODY[CHARLIE] = body(0, null, 10, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[ME] = body(0, null, 10, ME_WEEK);
   await freshTracker();
-  const until = Date.now() + 60_000;
-  H.setCooldownUntil(until);
-  H.setSwapMark(until); // a swap that landed moments ago
-  H.KC.fail = true;
-  const r1 = await H.switchAccountNow(CHARLIE, { via: 'command' });
-  await H.settle();
-  H.KC.fail = false;
-  eq(r1.ok, false, JSON.stringify(r1));
+  // The folder holding accounts.json goes read-only: the store's atomic write throws.
+  chmodSync(TMP, 0o500);
+  let r;
+  try {
+    r = await H.switchAccountNow(CHARLIE, { via: 'command' });
+    await H.settle();
+  } finally {
+    chmodSync(TMP, 0o700);
+  }
+  eq(r.ok, false, JSON.stringify(r));
+  ok(/the swap failed/.test(r.reason || ''), JSON.stringify(r));
+  eq(H.SENT.length, 1, 'one message for the failed switch');
+  ok(H.SENT[0].startsWith('🚫 Claude account switch refused · by command'), H.SENT[0]);
+  ok(H.SENT[0].includes(`↩️ Still on: ${liveName()}`), `the notice names where the login really is (${liveName()}): ${H.SENT[0]}`);
+  eq(H.landing()?.rot?.outcome, 'swap_failed', 'the landing record settled');
+  ok(!(H.rotationCooldownUntil > Date.now()), 'the cooldown came back');
+  // The next switch is not made to wait on a record that never lands.
+  H.SENT.length = 0;
   const t0 = performance.now();
-  const r2 = await H.switchAccountNow(CHARLIE, { via: 'command' });
+  const r2 = await H.switchAccountNow(ME, { via: 'command' });
   await H.settle();
-  ok(performance.now() - t0 < 2000, `the retry waited ${Math.round(performance.now() - t0)} ms`);
+  ok(performance.now() - t0 < 5000, `the next switch waited ${Math.round(performance.now() - t0)} ms`);
   eq(r2.ok, true, JSON.stringify(r2));
-  eq(liveName(), CHARLIE);
+  eq(liveName(), ME);
 });
 
-await t('★ an owner\'s switch onto an account already past the threshold is kept: the automatic switch leaves it alone until that window resets', async () => {
+await t('★ a landing record a rotation never settled (it threw) neither holds an owner switch up nor refuses it (QA round 5)', async () => {
+  reset();
+  H.setNow(RESET + 10 * HOUR);
+  seedAccounts({ live: DELTA });
+  H.BODY[CHARLIE] = body(0, null, 10, ZH_WEEK + 7 * 24 * HOUR);
+  await freshTracker();
+  // A rotation that started a minute ago and threw before landed(): its promise never settles.
+  H.setLanding({ startedAt: Date.now() - 60_000, landedAt: 0, rot: null, op: new Promise(() => {}) });
+  const t0 = performance.now();
+  const r = await H.switchAccountNow(CHARLIE, { via: 'command' });
+  await H.settle();
+  ok(performance.now() - t0 < 5000, `it waited ${Math.round(performance.now() - t0)} ms on a dead record`);
+  eq(r.ok, true, JSON.stringify(r));
+  eq(liveName(), CHARLIE);
+  eq(H.SENT.length, 1);
+  ok(H.SENT[0].startsWith('🔀 Claude account switched · by command'), H.SENT[0]);
+});
+
+await t('★ an owner\'s switch onto an account already past the threshold is kept: the automatic switch leaves it alone until that window resets (QA round 8)', async () => {
   reset();
   H.setNow(RESET + 12 * HOUR);
   seedAccounts({ live: DELTA, walled: { [GMAIL]: GMAIL_WEEK } });
   const zalWeek = ZH_WEEK + 7 * 24 * HOUR;
-  H.BODY[CHARLIE] = body(10, RESET + 15 * HOUR, 92, zalWeek);
+  H.BODY[CHARLIE] = body(10, RESET + 15 * HOUR, 92, zalWeek); // past the 90 week threshold
   H.BODY[DELTA] = body(5, RESET + 15 * HOUR, 10, ZH_WEEK + 7 * 24 * HOUR);
   H.BODY[ME] = body(0, null, 10, ME_WEEK);
   await freshTracker();
@@ -878,17 +910,25 @@ await t('★ an owner\'s switch onto an account already past the threshold is ke
   eq(r.ok, true, JSON.stringify(r));
   eq(liveName(), CHARLIE);
   ok(H.SENT[0].includes('already past the automatic switch threshold'), H.SENT[0]);
-  H.setNow(RESET + 12 * HOUR + 6 * MIN);
+  // Six minutes on (past the settle window), its sessions report the same 92 percent.
   await freshTracker();
+  H.setNow(RESET + 12 * HOUR + 6 * MIN);
+  H.noteStreamUsage(event(0.1, RESET + 15 * HOUR, 0.92, zalWeek), CHARLIE);
   H.SENT.length = 0;
   const tick = await H.kickAutoSwitch();
   await H.settle();
   eq(liveName(), CHARLIE, 'the owner\'s pick stands');
   eq(H.SENT.length, 0, 'no automatic notice');
   ok(/the owner chose charlie@example\.test past the threshold/.test(tick?.reason || ''), JSON.stringify(tick));
+  // Past the window that crossed, the hold is gone and the rule applies again.
+  H.setNow(zalWeek + MIN);
+  await freshTracker();
+  const after = await H.kickAutoSwitch();
+  await H.settle();
+  ok(!/the owner chose/.test(after?.reason || ''), JSON.stringify(after));
 });
 
-await t('★ the owner\'s hold is cleared by ANY later swap, so a return trip by the machinery is not held', async () => {
+await t('★ the owner\'s hold is cleared by ANY later swap, so a return trip by the machinery is not held (QA round 9)', async () => {
   reset();
   H.setNow(RESET + 13 * HOUR);
   seedAccounts({ live: DELTA, walled: { [GMAIL]: GMAIL_WEEK } });
@@ -900,39 +940,85 @@ await t('★ the owner\'s hold is cleared by ANY later swap, so a return trip by
   await H.switchAccountNow(CHARLIE, { via: 'command' });
   await H.settle();
   ok(H.ownerHold()?.name === CHARLIE, JSON.stringify(H.ownerHold()));
+  // +20 min the rotation (or /account) moves the login off, +40 min the machinery brings it back.
   H.setNow(RESET + 13 * HOUR + 20 * MIN);
   eq((await H.accounts.swapTo(DELTA)).ok, true);
   eq(H.ownerHold(), null, 'any landed swap clears the hold');
   H.setNow(RESET + 13 * HOUR + 40 * MIN);
   eq((await H.accounts.swapTo(CHARLIE)).ok, true);
+  // +50 min, past the settle window: the rule applies again and the login moves off charlie at 92 percent.
   H.setNow(RESET + 13 * HOUR + 50 * MIN);
-  H.setCooldownUntil(0);
   await freshTracker();
   H.SENT.length = 0;
   const r = await H.kickAutoSwitch();
   await H.settle();
   ok(liveName() !== CHARLIE, `the automatic switch is not held: ${JSON.stringify(r)}`);
+  ok(H.SENT[0]?.startsWith('🔀 Claude account switched · automatic'), JSON.stringify(H.SENT));
 });
 
-await t('★ a pick with no reading at hand is judged at the next tick on the live lookup, and kept when it is past the threshold', async () => {
+await t('★ a typed /account pick past the threshold is kept (armed from the reading peeked before the swap), and a pick with no reading at hand is judged at the next tick (QA round 9)', async () => {
+  for (const peeked of [true, false]) {
+    reset();
+    H.setNow(RESET + 14 * HOUR);
+    seedAccounts({ live: DELTA, walled: { [GMAIL]: GMAIL_WEEK } });
+    const zalWeek = ZH_WEEK + 7 * 24 * HOUR;
+    H.BODY[CHARLIE] = body(10, RESET + 17 * HOUR, 92, zalWeek);
+    H.BODY[DELTA] = body(5, RESET + 17 * HOUR, 10, ZH_WEEK + 7 * 24 * HOUR);
+    H.BODY[ME] = body(0, null, 10, ME_WEEK);
+    await freshTracker();
+    // What the /account arm does: the swap, then armOwnerHold with the peeked row (or none).
+    eq((await H.accounts.swapTo(CHARLIE)).ok, true);
+    H.armOwnerHold(CHARLIE, peeked ? H.BODY[CHARLIE] && { fiveHour: { percent: 10, resetsAt: new Date(RESET + 17 * HOUR).toISOString() }, sevenDay: { percent: 92, resetsAt: new Date(zalWeek).toISOString() }, scoped: [] } : null);
+    if (peeked) ok(H.ownerHold()?.until === zalWeek, JSON.stringify(H.ownerHold()));
+    else eq(H.ownerHold(), { name: CHARLIE, until: null });
+    H.setNow(RESET + 14 * HOUR + 6 * MIN);
+    await freshTracker();
+    H.SENT.length = 0;
+    const r = await H.kickAutoSwitch();
+    await H.settle();
+    eq(liveName(), CHARLIE, `peeked=${peeked}: the owner\'s pick stands: ${JSON.stringify(r)}`);
+    eq(H.SENT.length, 0);
+    ok(/the owner chose charlie@example\.test past the threshold/.test(r?.reason || ''), JSON.stringify(r));
+  }
+});
+
+await t('every owner path arms the hold: the typed /account arm and the account button hook call armOwnerHold, and the swap wrapper clears it', () => {
+  const src = SRC.join('\n');
+  ok(/const brief = accountUsage\.peek\(parts\[0\]\);\s*const r = await accounts\.swapTo\(parts\[0\]\);[\s\S]{0,400}?armOwnerHold\(r\.to \|\| parts\[0\], brief\?\.state === 'ok' \? brief\.usage : null\);/.test(src), 'the /account arm');
+  ok(/onSwapped: \(res\) => \{[\s\S]{0,400}?armOwnerHold\(res\?\.to \|\| null, seen\?\.state === 'ok' \? seen\.usage : null\);[\s\S]{0,80}?invalidateUsageCache\(\);/.test(src), 'the button hook, before the cache goes');
+  ok(/if \(res\?\.ok\) \{[\s\S]{0,400}?autoSwitchOwnerHold = null;/.test(src), 'the wrapper clears it on every landed swap');
+  ok(src.includes("if (via !== 'auto') armOwnerHold(name, toUsage);"), 'the scheduled and commanded switch');
+});
+
+await t('parked over the line with no account free: the standing-down line is said once, not once a minute (QA round 10)', async () => {
   reset();
-  H.setNow(RESET + 14 * HOUR);
-  seedAccounts({ live: DELTA, walled: { [GMAIL]: GMAIL_WEEK } });
-  const zalWeek = ZH_WEEK + 7 * 24 * HOUR;
-  H.BODY[CHARLIE] = body(10, RESET + 17 * HOUR, 92, zalWeek);
-  H.BODY[ME] = body(0, null, 10, ME_WEEK);
+  H.setNow(RESET + 15 * HOUR);
+  seedAccounts({ live: ME, walled: { [GMAIL]: GMAIL_WEEK, [DELTA]: ZH_WEEK + 7 * 24 * HOUR } });
+  H.BODY[ME] = body(20, RESET + 18 * HOUR, 96, ME_WEEK);
+  H.BODY[CHARLIE] = body(95, RESET + 17 * HOUR, 40, ZH_WEEK + 7 * 24 * HOUR); // probed, not free
   await freshTracker();
-  eq((await H.accounts.swapTo(CHARLIE)).ok, true);
-  H.armOwnerHold(CHARLIE, null); // what /account does with nothing in the cache
-  H.setNow(RESET + 14 * HOUR + 6 * MIN);
-  H.setCooldownUntil(0);
+  H.noteStreamUsage(event(0.2, RESET + 18 * HOUR, 0.96, ME_WEEK), ME);
+  for (const m of [0, 1, 3.5, 4.2, 4.8]) {
+    H.setNow(RESET + 15 * HOUR + m * MIN);
+    await H.kickAutoSwitch();
+    await H.settle();
+  }
+  const lines = H.LOGS.filter((l) => l.includes('] account_autoswitch_standing_down · '));
+  eq(lines.length, 1, lines.join('\n'));
+  eq(liveName(), ME);
+});
+
+await t('a wall more than a day out names its day in the dry run (live proof 2026-10-09: "walled until 01:00" for a Saturday reset)', async () => {
+  reset();
+  H.setNow(RESET + 14 * HOUR); // 2026-10-09T04:00Z
+  seedAccounts({ live: DELTA, walled: { [GMAIL]: Date.parse('2026-10-10T05:00:00Z'), [ME]: Date.parse('2026-10-13T06:00:01Z') } });
+  H.BODY[DELTA] = body(71, RESET + 15 * HOUR, 40, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[CHARLIE] = body(0, null, 30, ZH_WEEK + 7 * 24 * HOUR);
   await freshTracker();
-  H.SENT.length = 0;
-  const r = await H.kickAutoSwitch();
-  await H.settle();
-  eq(liveName(), CHARLIE, JSON.stringify(r));
-  ok(/the owner chose charlie@example\.test past the threshold/.test(r?.reason || ''), JSON.stringify(r));
-  eq(H.ownerHold()?.until, zalWeek);
+  const r = await H.autoSwitchTick(Date.now(), { dryRun: true });
+  const reasons = Object.fromEntries(r.candidates.map((c) => [c.name, c.verdict?.reason || '']));
+  ok(/^walled until Sat 10 Oct /.test(reasons[GMAIL]), reasons[GMAIL]);
+  ok(/^walled until Tue 13 Oct /.test(reasons[ME]), reasons[ME]);
 });
 
 // ---------- report ----------

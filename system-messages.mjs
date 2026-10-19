@@ -1327,6 +1327,68 @@ export function chatWalledRetryLine({ codexTaking = false } = {}) {
   ].join('\n');
 }
 
+/**
+ * A WORKER REPORT the assistant was reading hit the session limit (2026-10-06).
+ *
+ * What the dead turn's own bubble becomes, for all four endings. Until this
+ * existed that bubble said "❌ Error · 18s" and a second card under it said
+ * "Claude run failed · You've hit your session limit · resets 1:20pm", directly
+ * below the line reporting a swap that had worked: it read as the swap failing,
+ * and the report was only read because the user typed "Continue".
+ *
+ *   retry        the swap landed and the same report is being read again. The
+ *                last line is ▶️, not ⏳: the re-run draws its own bubble a
+ *                moment later, and THAT is the wait with an ending. This one is
+ *                a record of what happened and stays true forever.
+ *   walled       no account is free. The report is held for the wake-up at the
+ *                lift, and the line carries the clock it resumes at.
+ *   swap_failed  the credentials would not write, so they are still on the limited
+ *                account. Said as a failed SWAP, never as a failed run after a
+ *                good one. The report is kept for the next turn.
+ *   capped       the one automatic re-run died on a limit too. No third try,
+ *                which is the cap their own messages have; the report is kept.
+ *
+ * `reports` is how many worker reports the turn carried (the capped chain hands
+ * several over in one turn). Names are clipped to the bubble, as in
+ * chatRotatedLine, because a wrapped account name reads as two accounts.
+ */
+export function handbackLimitLine({ outcome = 'retry', from = '', to = '', error = '', resumesAt = null, reports = 1, timeZone = undefined, now = Date.now() } = {}) {
+  const n = Math.max(1, Math.floor(Number(reports) || 1));
+  const what = n === 1 ? 'worker report' : `${n} worker reports`;
+  const What = n === 1 ? 'Worker report' : `${n} worker reports`;
+  const clock = Number.isFinite(resumesAt) && resumesAt > 0 ? fmtResetClock(resumesAt, { timeZone, now, compact: true }) : null;
+  const kept = [`📥 ${What} kept, not lost`, '💬 Read on your next message'];
+  if (outcome === 'walled') {
+    return [
+      '⛔ Session limit, no account free',
+      `📥 ${What} held, not lost`,
+      clock ? `🕐 Read at the reset · ${clock}` : '🕐 Read at the first reset',
+    ].join('\n');
+  }
+  if (outcome === 'swap_failed') {
+    const lines = ['⚠️ Session limit hit, swap failed'];
+    const detail = clip(oneLine(error), 40);
+    if (detail) lines.push(detail);
+    if (from) lines.push(`👤 Still on ${clip(oneLine(from), 31)}`);
+    lines.push(...kept);
+    if (clock) lines.push(`🕐 Limit resets ${clock}`);
+    return lines.join('\n');
+  }
+  if (outcome === 'capped') {
+    const lines = ['🔄 Session limit hit again'];
+    if (to) lines.push(`👤 Swapped to ${clip(oneLine(to), 29)}`);
+    lines.push(...kept);
+    return lines.join('\n');
+  }
+  // NO NAMES when something else rotated and its halves are not known here
+  // (see chatRotatedLine): it claims no swap it cannot see, only that the
+  // report is being read again on whatever is live now.
+  const lines = [from ? `🔄 Session limit on ${clip(oneLine(from), 23)}` : '🔄 Session limit hit'];
+  if (to) lines.push(`👤 Swapped to ${clip(oneLine(to), 29)}`);
+  lines.push(`▶️ Reading the ${what} again`);
+  return lines.join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // /new: one message, one glyph
 // ---------------------------------------------------------------------------

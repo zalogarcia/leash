@@ -181,6 +181,7 @@ import {
   needsLoginNotice,
   chatRotatedLine,
   chatWalledRetryLine,
+  handbackLimitLine,
   bothWalledLine,
   enginesBackLine,
   accountLedgerBlock,
@@ -1840,10 +1841,12 @@ function editWorkerNotice(runId, patch, { keepAlive = false } = {}) {
 // carried so that a run which dies on a session limit can be re-dispatched as
 // the same message. Before they were threaded through, the chat lane's close
 // handler had the failure in hand and no way to say what it was a failure OF.
+// `handback` is the same kind of passenger: the worker reports this turn hands
+// to the assistant, so a limit death re-reads them once or keeps them (see queueItem).
 function runClaude(
   rawText,
   lane = LANES.main,
-  { prepend = '', kinds = [], images = [], priority = false, retried = false, replyQuote = null, schedule = null } = {},
+  { prepend = '', kinds = [], images = [], priority = false, retried = false, replyQuote = null, schedule = null, handback = null } = {},
 ) {
   const st = chatState();
   // THREE STRINGS, not two, once a reply is in play: what you TYPED (rawText),
@@ -2631,6 +2634,7 @@ function runClaude(
             priority,
             retried,
             replyQuote,
+            handback,
           })
         : null;
 
@@ -2751,6 +2755,9 @@ function runClaude(
           // the limit was hit, which account is live now and that the message
           // is being re-run: a second bubble repeating the first half and
           // contradicting the second is what made this look unhandled.
+          // A WORKER REPORT lands here on every ending (handbackLimitPlan):
+          // re-read after a swap, or kept for the wall's wake-up or the next
+          // turn. Its bubble says which, so it gets no failure card either.
           limitPlan.dispatch();
         } else {
           // Rotated, but nothing to re-run it on (internal traffic, a swap
@@ -2858,7 +2865,9 @@ function runClaude(
       // The assistant has finished with whatever reports it was handed, so the lines
       // still saying "reading it now…" can reach their last state. Chat lane
       // only: a background worker's own close says nothing about the assistant's turn.
-      if (lane === LANES.main) settleReadingNotices();
+      // EXCEPT a report this turn died on and is about to read again: its line
+      // stays on "reading it now…" until the re-read closes.
+      if (lane === LANES.main) settleReadingNotices(limitPlan?.rereading);
       resolve();
       // AUTO COMPACT, decided here and nowhere else: the chat lane has just
       // reached a terminal state, the queue has not been drained yet, and
@@ -4594,7 +4603,6 @@ async function sweepWalledActiveAccount() {
     return { checked: true, moved: false, error: res.error };
   }
   rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS;
-  swapCooldownMark = rotationCooldownUntil; // not a rotation's: an owner's switch need not wait it out
   invalidateUsageCache();
   console.log(
     `[bridge] the live account "${name}" was already known limited; moved to "${pick.name}" before anything ran on it`,
@@ -4674,7 +4682,6 @@ async function recheckDuringWall() {
     }
     moved = true;
     rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS;
-    swapCooldownMark = rotationCooldownUntil; // not a rotation's: an owner's switch need not wait it out
     invalidateUsageCache();
   }
   rotationPausedUntil = 0;
@@ -5072,15 +5079,6 @@ function armOwnerHold(name, usage) {
   const clocks = crossed.map((w) => w.resetsAtMs).filter((v) => Number.isFinite(v) && v > Date.now());
   autoSwitchOwnerHold = crossed.length ? { name, until: clocks.length ? Math.max(...clocks) : Date.now() + 5 * 3600_000 } : null;
 }
-// The rotation cooldown value of the last swap that has LANDED (a switch here,
-// the walled-account sweep, the wall's re-check, a rotation once its swap lands
-// or it raises the wall), so an owner's switch can tell a rotation still in
-// flight from the rest (there is no landing record in this build): a cooldown
-// that is not the mark belongs to a rotation still moving the login, and the
-// switch waits for it to land before it swaps.
-let swapCooldownMark = 0;
-// How often an owner's switch looks again while a rotation's cooldown is up.
-const SWITCH_COOLDOWN_POLL_MS = 1000;
 // The chain every switch runs on, so a scheduled switch arriving while the
 // automatic one is swapping waits its turn instead of racing it; and a count,
 // so the automatic tick can stand down while anything is queued on it.
@@ -5370,64 +5368,56 @@ async function doSwitchAccount(target, { via = 'auto', why = null, over = [], fr
     toUsage = v.usage || null;
     fromUsage = fromUsage || usableLiveReading(activeName);
     why = via;
-  }
-  // A ROTATION IN FLIGHT (or one that just landed) arms the cooldown before
-  // its own awaits. The owner's switch waits it out (bounded), then re-reads
-  // the login and re-checks its target, as the private build does on its
-  // landing record: a scheduled `once` entry is already consumed, so a refusal
-  // here would lose it. Nothing is awaited between the last check and the
-  // arming below.
-  //
-  // WAIT FOR IT TO LAND, not for its cooldown to run out (QA round 5): a
-  // rotation re-arms the cooldown when its swap lands and restores it when the
-  // swap fails, so the value CHANGING is the landing; a rotation that had
-  // already landed when this arrived holds the same value until it expires.
-  const rotationHolds = () => Date.now() < rotationCooldownUntil && rotationCooldownUntil !== swapCooldownMark;
-  if (via !== 'auto' && rotationHolds()) {
-    const seen = rotationCooldownUntil;
-    for (let i = 0; i < Math.ceil((ROTATION_COOLDOWN_MS + 5000) / SWITCH_COOLDOWN_POLL_MS) && rotationHolds() && rotationCooldownUntil === seen; i++) {
-      await sleep(SWITCH_COOLDOWN_POLL_MS);
-    }
-    const after = await accounts.activeAccount().catch(() => null);
-    activeName = after?.account?.name || liveAccount.current() || activeName;
-    if (rotationHolds() && rotationCooldownUntil === seen) return refuse('a rotation is still moving the login; nothing changed, ask again in a minute');
-    const v2 = switchTargetVerdict({ target, rows: accounts.describe(Date.now()), activeName, now: Date.now(), timeZone: OWNER_TZ });
-    if (!v2.ok) return refuse(v2.reason);
-    if (v2.noop) {
-      logAccountDecision({ decision: 'account_switch_noop', account: v2.name, via });
-      say(alreadyOnNotice({ name: v2.name, via, scheduleId }));
-      return { ok: true, noop: true, to: v2.name, from: activeName };
+    // A rotation still landing gets to finish first: its swap and this one
+    // must not interleave.
+    // A record older than the landing wait is a rotation that threw before it
+    // landed (QA round 5): not waited on, and never a reason to refuse.
+    const inFlight = (r) => Boolean(r && !r.rot && Date.now() - Number(r.startedAt) < ROTATION_LANDING_WAIT_MS);
+    if (inFlight(rotationLanding)) {
+      const waitedFor = rotationLanding;
+      await rotationBehindCooldown().catch(() => null);
+      // RE-READ after the wait (QA round 3): the rotation may have moved the
+      // login onto this very account, marked it walled, or raised the wall.
+      const after = await accounts.activeAccount().catch(() => null);
+      activeName = after?.account?.name || liveAccount.current() || activeName;
+      if (inFlight(rotationLanding) && rotationLanding !== waitedFor) return refuse('a rotation is moving the login right now; nothing changed, ask again in a minute');
+      const v2 = switchTargetVerdict({ target, rows: accounts.describe(Date.now()), activeName, now: Date.now(), timeZone: OWNER_TZ });
+      if (!v2.ok) return refuse(v2.reason);
+      if (v2.noop) {
+        logAccountDecision({ decision: 'account_switch_noop', account: v2.name, via });
+        say(alreadyOnNotice({ name: v2.name, via, scheduleId }));
+        return { ok: true, noop: true, to: v2.name, from: activeName };
+      }
     }
   }
   // ARMED BEFORE THE SWAP, like the rotation's guard: a worker that dies on the
-  // outgoing account's limit while this lands is told "already rotated",
-  // instead of rotating again and marking the account this just moved to.
+  // outgoing account's limit while this lands is told "already rotated" and
+  // waits on this record, instead of rotating again and marking the account
+  // this just moved to.
   const cooldownWas = rotationCooldownUntil;
-  const markWas = swapCooldownMark;
   rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS;
-  swapCooldownMark = rotationCooldownUntil;
+  const landed = rotationStarted(Date.now());
   let res;
   try {
     res = await accounts.swapTo(name, { refuseFlagged: true });
   } catch (e) {
     // A THROW (accounts.json unwritable, the disk full) is a failed swap too:
-    // the cooldown comes back, and it is said the way a refused swap is (the
-    // automatic switch pauses).
+    // the landing record settles (or every later owner switch would wait on it
+    // and be refused), the cooldown comes back, and it is said the way a
+    // refused swap is (the automatic switch pauses; QA round 4).
     rotationCooldownUntil = cooldownWas;
-    swapCooldownMark = markWas;
+    landed({ outcome: 'swap_failed', activeName, nextName: name, error: e.message, reset: null, lines: [] });
     // Where the login IS now: the store can throw after the keychain write.
     activeName = (await accounts.activeAccount().catch(() => null))?.account?.name || activeName;
     return refuse(`the swap failed: ${e.message}`);
   }
   if (!res.ok) {
-    // Both back: a landed cooldown still running stays marked as landed, so
-    // the next owner switch does not wait on a rotation that is not there.
     rotationCooldownUntil = cooldownWas;
-    swapCooldownMark = markWas;
+    landed({ outcome: 'swap_failed', activeName, nextName: name, error: res.error, reset: null, lines: [] });
     return refuse(res.needsLogin ? res.error : `the swap did not write: ${res.error}`);
   }
   rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS;
-  swapCooldownMark = rotationCooldownUntil;
+  landed({ outcome: 'swapped', activeName: res.from || activeName, nextName: name, error: null, reset: null, lines: [] });
   invalidateUsageCache();
   lastAutoSwitch = { to: name, at: Date.now(), via };
   autoSwitchLastRefusal = null;
@@ -5848,6 +5838,47 @@ function clearLimitsFromRows(rows, { via = null } = {}) {
   return cleared;
 }
 
+// THE ROTATION A COOLDOWN STANDS FOR (2026-10-06).
+//
+// One wall kills the chat lane and a worker inside the same seconds. The first
+// corpse rotates; the second is turned away with `cooldown`, which says only
+// "somebody is on it", not how it ended and not even whether it HAS ended: the
+// guard is armed before the first await, and the swap behind it shells out to
+// the keychain after probing every candidate. A caller that re-runs something
+// on the strength of `cooldown` alone can start it on the account that is still
+// limited. So the rotation that armed the guard leaves a record here: its
+// result once it lands, and until then a promise of it.
+let rotationLanding = null;
+// Longer than the lift's own sweep bound (WALL_LIFT_SWEEP_WAIT_MS): every
+// candidate probed once, a token refresh, and the keychain write.
+const ROTATION_LANDING_WAIT_MS = 45_000;
+
+function rotationStarted(now = Date.now()) {
+  const rec = { startedAt: now, landedAt: 0, rot: null, op: null };
+  let settle;
+  rec.op = new Promise((r) => (settle = r));
+  rotationLanding = rec;
+  return (rot) => {
+    rec.rot = rot;
+    rec.landedAt = Date.now();
+    settle(rot);
+    return rot;
+  };
+}
+
+/**
+ * How the rotation behind a `cooldown` answer ended, or null when nothing here
+ * can say: no rotation of this function's armed it (the walled-account sweep
+ * arms the same guard), it threw before landing, or it is slower than the wait.
+ * A landed record counts only while the cooldown it armed is still running.
+ */
+async function rotationBehindCooldown(now = Date.now()) {
+  const rec = rotationLanding;
+  if (!rec) return null;
+  if (!rec.rot) return withDeadline(rec.op, ROTATION_LANDING_WAIT_MS, null);
+  return now - rec.landedAt < ROTATION_COOLDOWN_MS ? rec.rot : null;
+}
+
 async function rotateOffLimitedAccount(detail) {
   const now = Date.now();
   const lines = [];
@@ -5885,6 +5916,10 @@ async function rotateOffLimitedAccount(detail) {
   // the store untouched.
   const cooldownWas = rotationCooldownUntil;
   rotationCooldownUntil = now + ROTATION_COOLDOWN_MS;
+  // RECORDED, so a caller this cooldown turns away can learn how the rotation
+  // behind it ended (rotationBehindCooldown). Every return below goes through
+  // `landed`.
+  const landed = rotationStarted(now);
 
   const active = await accounts.activeAccount();
   const activeName = active?.account?.name || null;
@@ -5943,9 +5978,6 @@ async function rotateOffLimitedAccount(detail) {
     }
     if (res.ok) {
       rotationCooldownUntil = Date.now() + ROTATION_COOLDOWN_MS;
-      // LANDED: an owner's switch waiting on this rotation may go now (the
-      // account switch's doSwitchAccount; the mark is what tells it).
-      swapCooldownMark = rotationCooldownUntil;
       // An automatic rotation changes which account is live just as much as
       // a manual /account <name> does, so the cached usage rows and the
       // cached "which account is active" answer are stale the moment it
@@ -5953,7 +5985,7 @@ async function rotateOffLimitedAccount(detail) {
       // for up to 60s after the swap: exactly when the numbers matter most.
       invalidateUsageCache();
       lines.push(`Swapped to account "${pick.name}". New workers will use it; workers already running are untouched.`);
-      return { outcome: 'swapped', activeName, nextName: pick.name, error: null, reset, lines };
+      return landed({ outcome: 'swapped', activeName, nextName: pick.name, error: null, reset, lines });
     }
     // NOTHING MOVED, so the guard must not hold the next caller off a swap
     // that could still work. Restored rather than zeroed: an earlier genuine
@@ -5965,7 +5997,7 @@ async function rotateOffLimitedAccount(detail) {
     // reason. The cycle exists to find headroom, not to work around a keychain.
     rotationCooldownUntil = cooldownWas;
     lines.push(`Swap to "${pick.name}" FAILED: ${res.error}. The account is unchanged.`);
-    return { outcome: 'swap_failed', activeName, nextName: pick.name, error: res.error, reset, lines };
+    return landed({ outcome: 'swap_failed', activeName, nextName: pick.name, error: res.error, reset, lines });
   }
 
   // The selector's clock, which already counts the walls its probes discovered
@@ -5986,9 +6018,7 @@ async function rotateOffLimitedAccount(detail) {
   // messages would resume up to a minute after the reset; this wakes the flush
   // at the reset itself and the poll remains the backstop if it is missed.
   armWallResume(earliest);
-  // LANDED (at a wall): an owner's switch waiting on this rotation may go now.
-  swapCooldownMark = rotationCooldownUntil;
-  return { outcome: 'exhausted', activeName, nextName: null, error: null, reset, lines };
+  return landed({ outcome: 'exhausted', activeName, nextName: null, error: null, reset, lines });
 }
 
 /**
@@ -6083,17 +6113,25 @@ async function handleLimitDeath(task, outcome, runId, steers = [], draft = null,
  *     no path from either branch back into this function. It used to bail
  *     instead, which is how a walled message reached the phone as a raw ❌.
  */
-function chatLimitRetryPlan(rot, { priority = false, retried = false, wake = false, codexTaking = false, codexCanTake = false } = {}) {
+function chatLimitRetryPlan(rot, { priority = false, retried = false, wake = false, handback = null, codexTaking = false, codexCanTake = false } = {}) {
+  // A WORKER REPORT THE ASSISTANT WAS READING has its own plan, decided before anything
+  // below: one re-read after a swap, and kept rather than dropped on every
+  // other ending. See handbackLimitPlan.
+  if (handback) return handbackLimitPlan(rot, { retried, ...handback });
+
   // Nothing was rotated, or the credentials would not write: either way there
   // is no new account to try, so the failure stands as it is.
   if (!rot || rot.outcome === 'no_claude' || rot.outcome === 'swap_failed') return null;
 
   const walled = rot.outcome === 'exhausted' || rot.outcome === 'paused';
-  // INTERNAL TRAFFIC KEEPS ITS OWN FAILURE. A worker handback, a scheduled
-  // task and a compaction each own live messages this function knows nothing
-  // about (the "reading it now…" line, the compact notice), and a silent
-  // re-run underneath them settles the wrong one. The rotation already
-  // happened, which is the half that was missing; only the retry is theirs.
+  // INTERNAL TRAFFIC KEEPS ITS OWN FAILURE. A compaction owns a live message
+  // this function knows nothing about (the compact notice), and a silent
+  // re-run underneath it settles the wrong one. The rotation already
+  // happened, which is the half that was missing; only the retry is the
+  // user's. (A worker handback was on this list until 2026-10-06: it carries
+  // its own mark now and never reaches this line. A scheduled task never did:
+  // it runs on a background lane, so its limit death is a worker's,
+  // handleLimitDeath.)
   //
   // EXCEPT THE WALL WAKE-UP (liftClaudeWall), claimed once per wall: dead on
   // an account that walled under it and rotated onto a free one, it gets the
@@ -6129,6 +6167,82 @@ function chatLimitRetryPlan(rot, { priority = false, retried = false, wake = fal
 }
 
 /**
+ * THE SAME DECISION FOR A WORKER REPORT THE ASSISTANT WAS READING (2026-10-06). Pure.
+ *
+ * A handback turn is priority traffic, so it used to keep its own failure: the
+ * rotation swapped accounts, the report was dropped, and the card under the
+ * swap line said "Claude run failed · You've hit your session limit", which
+ * read as the swap failing. The user typed "Continue" to get the report read.
+ *
+ * Returns null only when there is no Claude to speak of. Otherwise { line,
+ * retry, keep }, and a report is NEVER dropped:
+ *
+ *   • swapped, or a cooldown standing for a swap: ONE re-read on the account
+ *     that is live now. `retry` is the dispatchPrompt options, as for their own
+ *     message, and the cap is the same: a run that is itself the re-read gets
+ *     no second one.
+ *   • every account walled: `keep: 'wall'`. Re-reading into the wall would die
+ *     on it, so the report is held for the lift's wake-up, the path every
+ *     handback takes while a wall is up (holdHandbackForWall).
+ *   • the swap would not write, the rotation threw, or the re-read died too:
+ *     `keep: 'parked'`. It goes on the capped chain's list, which their next
+ *     message or a quiet spell hands over (flushParkedHandbacks).
+ *
+ * No path leads from a kept report straight back into a run, so nothing here
+ * can loop: the wall hold waits for a reset and the parked list for a message
+ * or ten quiet minutes, three times at most between two of their messages.
+ */
+function handbackLimitPlan(rot, { retried = false, reports = 1, resumesAt = null, timeZone = undefined, now = Date.now() } = {}) {
+  if (rot?.outcome === 'no_claude') return null;
+  const say = (outcome, extra = {}) => handbackLimitLine({ outcome, reports, timeZone, now, ...extra });
+  if (!rot || rot.outcome === 'swap_failed') {
+    return { line: say('swap_failed', { from: rot?.activeName || '', error: rot?.error || '', resumesAt }), retry: null, keep: 'parked' };
+  }
+  if (rot.outcome === 'exhausted' || rot.outcome === 'paused') {
+    return { line: say('walled', { resumesAt }), retry: null, keep: 'wall' };
+  }
+  // THE RE-READ DIED TOO. A swap is named only when THIS death made one: a
+  // `borrowed` ending is the swap the re-read was already running on, so
+  // "swapped to" would name the account it just died on.
+  if (retried) return { line: say('capped', { to: rot.borrowed ? '' : rot.nextName || '' }), retry: null, keep: 'parked' };
+  return { line: say('retry', { from: rot.activeName || '', to: rot.nextName || '' }), retry: { priority: true } };
+}
+
+/**
+ * A WORKER REPORT THAT WAS NOT READ AND IS NOT BEING RE-READ NOW is kept.
+ *
+ * `where` is the plan's. 'wall' holds each report in the wall episode, which is
+ * on disk and whose one wake-up at the lift delivers it. Whatever the episode
+ * will not take (no run id, a full episode, a Codex chat lane) and every other
+ * ending goes on the capped chain's parked list. One place or the other, never
+ * both: a report in two places is a report delivered twice.
+ *
+ * Returns how many went to each, for the log line and the tests.
+ */
+function keepHandback(mark, where) {
+  const kept = { held: 0, parked: 0 };
+  for (const it of mark?.items || []) {
+    if (where === 'wall' && holdHandbackForWall({ runId: it.runId, task: it.task, status: it.status, report: it.report, draft: it.draft, flag: it.flag })) {
+      kept.held++;
+      continue;
+    }
+    parkedHandbacks.push({
+      runId: it.runId || null,
+      task: clip(oneLine(stripLaneRules(String(it.task ?? ''))), 200),
+      status: it.status,
+      report: it.report || null,
+      draft: it.draft || null,
+      flag: it.flag || null,
+    });
+    kept.parked++;
+  }
+  // The quiet spell counts from here, as it does for a report the cap parks.
+  if (kept.parked) lastParkedAt = Date.now();
+  console.log(`[bridge] handback not read (session limit): ${kept.held} held for the wall, ${kept.parked} parked`);
+  return kept;
+}
+
+/**
  * A CHAT-LANE CLAUDE RUN FAILED. Rotate if it was a session limit, and say
  * what happens to the message.
  *
@@ -6144,17 +6258,38 @@ function chatLimitRetryPlan(rot, { priority = false, retried = false, wake = fal
  */
 async function handleChatLimitFailure(detail, ctx = {}) {
   if (!isLimitSignal(detail)) return null;
-  const { text = '', lane = LANES.main, images = [], kinds = [], prepend = '', priority = false, retried = false, replyQuote = null } = ctx;
-  const rot = await rotateOffLimitedAccount(detail).catch((e) => {
+  const { text = '', lane = LANES.main, images = [], kinds = [], prepend = '', priority = false, retried = false, replyQuote = null, handback = null } = ctx;
+  let rot = await rotateOffLimitedAccount(detail).catch((e) => {
     console.error('[bridge] chat account rotation failed:', e.message);
     return null;
   });
+  // A WORKER REPORT TURNED AWAY BY THE COOLDOWN waits for the rotation behind
+  // it and takes ITS ending. This is the 2026-10-06 case exactly: a worker died
+  // on the same limit in the same seconds and made the swap, so the report the assistant
+  // was reading got `cooldown`. Re-reading on that word alone can start on the
+  // account that is still limited (the swap may not have landed yet), and it
+  // cannot tell a swap from a wall or from a write that failed. Only for a
+  // handback: their own message keeps the path it has.
+  if (handback && rot?.outcome === 'cooldown') {
+    const behind = await rotationBehindCooldown();
+    // `borrowed`: this death did not make that swap. See handbackLimitPlan.
+    if (behind) rot = { ...behind, borrowed: true };
+  }
+  // WHEN IT RESUMES, for the two endings that cannot re-read now: the wall's
+  // own clock, or the limited account's reset when the swap would not write.
+  const walledNow = rot?.outcome === 'exhausted' || rot?.outcome === 'paused';
+  const resumesAt = walledNow
+    ? rotationPausedUntil || null
+    : rot?.outcome === 'swap_failed' && rot.reset && !rot.reset.guessed
+      ? Number(rot.reset.resetsAt) * 1000
+      : null;
   const plan = chatLimitRetryPlan(rot, {
     priority,
     retried,
     // The wake-up leads its own turn and the Codex catch-up it folds into; in
     // front of a parked message it is a prepend, and that message retries anyway.
     wake: priority && String(text).startsWith(WALL_WAKE_TAG),
+    handback: handback ? { reports: handback.items?.length || 1, resumesAt, timeZone: OWNER_TZ } : null,
     codexTaking: codexTakingChat(),
     codexCanTake: codexCanTakeChat(),
   });
@@ -6165,9 +6300,17 @@ async function handleChatLimitFailure(detail, ctx = {}) {
   // storing it in the ring as an assistant turn. `line` null means "keep the
   // ordinary ❌ header", `dispatch` null means "send the ordinary failure".
   if (!plan) return { line: null, dispatch: null };
+  // A WORKER REPORT KEPT, NOT RE-READ (handbackLimitPlan). `dispatch` is still
+  // set, so the caller takes the "handled" arm and sends no failure card: the
+  // line above says what happened and where the report is now.
+  if (!plan.retry) return { line: plan.line, dispatch: () => keepHandback(handback, plan.keep) };
   const toCodex = Boolean(plan.retry.allowCodexFallback);
   return {
     line: plan.line,
+    // The worker lines that are on "reading it now…" for this report stay there
+    // through the re-read: settling them as the dead turn closes would say the assistant
+    // had finished with a report it is about to open again.
+    rereading: handback ? (handback.items || []).map((it) => it.runId).filter(Boolean) : null,
     dispatch: () => {
       // THE HANDOFF BLOCK GOES WITH THE MESSAGE. takeHandoffPrefix already
       // consumed it for the attempt that just died, so without this an
@@ -6179,6 +6322,9 @@ async function handleChatLimitFailure(detail, ctx = {}) {
       // handoff: only what follows it is (liftClaudeWall). If this death raised
       // the wall again, the episode carries the note's content forward.
       const handoff = withoutWallWakeNote(prepend);
+      // One line in the daemon log per re-read, so "did the bridge read it
+      // again by itself" is answered from the log and not from their screenshot.
+      if (handback) console.log(`[bridge] handback read again after a session limit: ${(handback.items || []).map((it) => it.runId || 'no run id').join(', ')}`);
       if (toCodex && handoff) {
         const st = chatState();
         st.handoffPending = true;
@@ -6195,6 +6341,9 @@ async function handleChatLimitFailure(detail, ctx = {}) {
         // instead, and a retry that loses it asks the question the feature
         // exists to stop asking.
         replyQuote,
+        // The mark rides the re-read too: it is what makes a second limit
+        // death keep the report instead of dropping it.
+        handback,
       });
     },
   };
@@ -6708,7 +6857,11 @@ function flushParkedHandbacks(reason = 'message') {
       closing,
     ].join('\n'),
     LANES.main,
-    { priority: true },
+    // MARKED with the reports it carries. The list was spliced out above, so a
+    // turn that dies on a session limit used to take every one of them with
+    // it; the mark re-reads the turn once after a swap, and otherwise puts
+    // them back where they were (keepHandback).
+    { priority: true, handback: { items: parked } },
   );
   return true;
 }
@@ -6805,8 +6958,17 @@ function handBackToChat(task, output, status, runId, steers = [], { engine = 'cl
     //
     // Nothing is lost: every outcome is already persisted to bg-results.jsonl,
     // and the full text is on disk at full.file. The assistant picks the parked reports up
-    // on their next message, which resets the streak.
-    parkedHandbacks.push({ task: clip(oneLine(task), 200), status, report: full?.file || null });
+    // on the user's next message, which resets the streak.
+    parkedHandbacks.push({
+      // The run id and the draft path ride along since 2026-10-06: they are
+      // what the wall episode needs if the turn that finally hands this over
+      // dies on a wall (keepHandback).
+      runId: runId || null,
+      task: clip(oneLine(task), 200),
+      status,
+      report: full?.file || null,
+      draft: draft?.file || null,
+    });
     lastParkedAt = Date.now();
     if (!handbackCapNotified) {
       handbackCapNotified = true;
@@ -6880,7 +7042,15 @@ function handBackToChat(task, output, status, runId, steers = [], { engine = 'cl
   if (editWorkerNotice(runId, { phase: 'reading', chars: full?.chars ?? null }, { keepAlive: true })) {
     readingNotices.add(runId);
   }
-  dispatchPrompt(note, LANES.main, { priority: true });
+  // MARKED AS A WORKER REPORT (see queueItem). Until 2026-10-06 this was bare
+  // priority traffic, and a turn that died on a session limit dropped the
+  // report: the bridge swapped accounts and then showed "Claude run failed"
+  // under the swap line, which read as the swap failing, and the user had to
+  // type "Continue" to get it read. The mark is what lets the limit path read
+  // it again once on the new account, or keep it for the wall's wake-up or the
+  // next turn (handbackLimitPlan).
+  const mark = { items: [{ runId: runId || null, task, status, report: full?.file || null, draft: draft?.file || null }] };
+  dispatchPrompt(note, LANES.main, { priority: true, handback: mark });
 }
 
 // Worker lines sitting in the "reading it now…" phase. Flipped back to their
@@ -6888,10 +7058,17 @@ function handBackToChat(task, output, status, runId, steers = [], { engine = 'cl
 // actually finished with the report.
 const readingNotices = new Set();
 
-function settleReadingNotices() {
+// `keep` is the run ids whose report is being READ AGAIN (a turn that died on
+// a session limit and was re-dispatched after the swap): the assistant has not finished
+// with those, so their lines stay as they are and the re-read's close settles
+// them. Only ids that are actually in the set are kept, so a stale id cannot
+// strand a line that was never reading.
+function settleReadingNotices(keep = null) {
   if (!readingNotices.size) return;
-  for (const runId of readingNotices) editWorkerNotice(runId, { phase: 'done' });
+  const stay = new Set((keep || []).filter((id) => readingNotices.has(id)));
+  for (const runId of readingNotices) if (!stay.has(runId)) editWorkerNotice(runId, { phase: 'done' });
   readingNotices.clear();
+  for (const runId of stay) readingNotices.add(runId);
 }
 
 // ---------------------------------------------------------------------------
@@ -12197,7 +12374,7 @@ function pickLane(prompt) {
 // (grab() in bg-codex-wiring.test.mjs) and its extractor stops at the first
 // unindented line, so a signature wrapped onto a `) {` of its own is grabbed
 // truncated and the whole harness fails to parse.
-function queueItem(text, { images = [], kinds = [], forcedEngine = null, priority = false, allowCodexFallback = false, retried = false, prepend = null, replyQuote = null, schedule = null } = {}) {
+function queueItem(text, { images = [], kinds = [], forcedEngine = null, priority = false, allowCodexFallback = false, retried = false, prepend = null, replyQuote = null, schedule = null, handback = null } = {}) {
   // `kinds` is what ARRIVED, not what is being sent to a model: the run bubble's
   // first frame says "📎 3 photos" so a slow album is visibly landing rather
   // than silently missing.
@@ -12225,6 +12402,12 @@ function queueItem(text, { images = [], kinds = [], forcedEngine = null, priorit
     // reason as the two above: a busy lane drains this item from a different
     // call, and the mark is what tells a hook this run is unattended.
     schedule: schedule || null,
+    // THE WORKER REPORT MARK, { items: [{ runId, task, status, report, draft,
+    // flag }] }, set only by handBackToChat and flushParkedHandbacks: which
+    // worker reports this turn hands to M. Carried for the same reason again,
+    // and read in one place: a turn that dies on a session limit is re-read
+    // once or kept by this mark, never dropped (handbackLimitPlan).
+    handback: handback || null,
   };
 }
 const asQueueItem = (v) => (typeof v === 'string' ? queueItem(v) : v);
@@ -12443,7 +12626,7 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
 // priority = a completed worker's report: never drop it for queue limits, and
 // jump the line so results surface before newer user prompts.
 // One line for the same reason as queueItem above: grab() extracts it by source.
-function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallback = false, images = [], kinds = [], retried = false, prepend = null, replyQuote = null, schedule = null } = {}) {
+function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallback = false, images = [], kinds = [], retried = false, prepend = null, replyQuote = null, schedule = null, handback = null } = {}) {
   // A `codex:` or `claude:` prefix on a typed message pins THIS message's
   // engine, beating both /engine and the config. Stripped before dispatch so
   // the model never sees the routing instruction as part of its prompt.
@@ -12459,7 +12642,7 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
   const p2 = parseEnginePrefix(p1.text.replace(/^\s*bg:\s*/i, ''));
   const forcedEngine = p1.engine || p2.engine;
   const text = p2.text;
-  const item = queueItem(text, { images, kinds, forcedEngine, priority, allowCodexFallback, retried, prepend, replyQuote, schedule });
+  const item = queueItem(text, { images, kinds, forcedEngine, priority, allowCodexFallback, retried, prepend, replyQuote, schedule, handback });
   // NO ENGINE WILL TAKE THIS. Only for a message they typed: internal traffic
   // ignores the wall by construction (see engineForItem). Spawning here
   // produces two failures a minute on a lane that cannot answer, so the message
@@ -12615,6 +12798,8 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
     replyQuote,
     // A scheduled run is marked in its worker's env (worker-env.mjs).
     schedule,
+    // A worker report keeps its mark into the run (see queueItem).
+    handback,
   }).catch((e) => console.error('[bridge] runClaude error:', e));
 }
 
@@ -12685,6 +12870,8 @@ function drainQueue(lane) {
     replyQuote: item.replyQuote || null,
     // And a queued SCHEDULED run is still marked as one.
     schedule: item.schedule || null,
+    // And a queued WORKER REPORT is still marked as one.
+    handback: item.handback || null,
   }).catch((e) => console.error('[bridge] runClaude error:', e));
 }
 
