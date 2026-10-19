@@ -546,6 +546,37 @@ await at('ps prints the daemon-rendered table and exits 0', async () => {
   eq(received.at(-1).op, 'ps');
 });
 
+await at('\u2605 ps with ANY argument refuses instead of dispatching a worker', async () => {
+  // The gate on ps is `argv.length === 1`, so before this arm existed every
+  // extra token fell through to the dispatch path and spent a real background
+  // agent on the typo: `node bg.mjs ps --json` queued a job whose whole brief
+  // was "ps --json", and the worker reran the typo and chained more of them
+  // (three burned during a usage-limit crunch, 2026-09-19). Cover both shapes
+  // a typist actually produces: a flag, and a target that belongs to steer.
+  received.length = 0;
+  rmSync(QUEUE, { force: true });
+  for (const args of [['ps', '--json'], ['ps', 'bg53'], ['ps', '--help']]) {
+    const r = await run(args);
+    eq(r.code, 1, `${args.join(' ')}: ${r.stdout}${r.stderr}`);
+    ok(/ps takes no arguments/.test(r.stderr), `${args.join(' ')}: ${r.stderr}`);
+    ok(!/handed to background lane/.test(r.stdout), `${args.join(' ')} must NOT dispatch`);
+  }
+  eq(received.length, 0, 'a refusal must answer before the socket, so it works with no daemon');
+  let queued = [];
+  try {
+    queued = JSON.parse(readFileSync(QUEUE, 'utf8'));
+  } catch {
+    /* no queue file at all is the same answer */
+  }
+  eq(queued.length, 0, '\u2605 a mistyped ps must never become a background job');
+});
+
+await at('bare ps still works, so the guard did not eat the subcommand', async () => {
+  const r = await run(['ps']);
+  eq(r.code, 0, r.stderr);
+  ok(r.stdout.includes('RUNID'), r.stdout);
+});
+
 await at('a delivered steer prints the one-line ack and exits 0', async () => {
   const r = await run(['steer', 'bg2', 'skip', 'the', 'browser', 'step']);
   eq(r.code, 0, r.stderr);
@@ -634,6 +665,39 @@ await at('ps against a cold socket also exits 2, never a fake empty list', async
   rmSync(cold, { recursive: true, force: true });
 });
 
+// A FLAG IS NEVER A BRIEF. `node bg.mjs --help` once dispatched a real worker
+// whose whole job was the string "--help" (2026-09-13). These run against a
+// COLD socket on purpose: the guard must answer before any daemon call, so a
+// typist gets usage whether or not the bridge is up.
+await at('★ --help prints usage and dispatches nothing, even with no daemon', async () => {
+  const cold = mkdtempSync(path.join(tmpdir(), 'bg-flag-help-'));
+  copyFileSync(path.join(DIR, 'bg.mjs'), path.join(cold, 'bg.mjs'));
+  const r = await new Promise((resolve) => {
+    execFile(process.execPath, [path.join(cold, 'bg.mjs'), '--help'], { cwd: cold }, (err, stdout, stderr) =>
+      resolve({ code: err ? (err.code ?? 1) : 0, stdout: String(stdout), stderr: String(stderr) }),
+    );
+  });
+  eq(r.code, 0, r.stdout + r.stderr);
+  ok(/usage:/.test(r.stdout), 'it must print usage');
+  ok(/node bg\.mjs ps/.test(r.stdout), 'usage should list the subcommands');
+  ok(!/handed to background lane/.test(r.stdout), 'it must NOT dispatch');
+  rmSync(cold, { recursive: true, force: true });
+});
+
+await at('★ an unknown flag refuses with exit 1 rather than becoming a job', async () => {
+  const cold = mkdtempSync(path.join(tmpdir(), 'bg-flag-bad-'));
+  copyFileSync(path.join(DIR, 'bg.mjs'), path.join(cold, 'bg.mjs'));
+  const r = await new Promise((resolve) => {
+    execFile(process.execPath, [path.join(cold, 'bg.mjs'), '--nonsense'], { cwd: cold }, (err, stdout, stderr) =>
+      resolve({ code: err ? (err.code ?? 1) : 0, stdout: String(stdout), stderr: String(stderr) }),
+    );
+  });
+  eq(r.code, 1, r.stdout + r.stderr);
+  ok(/is not a flag this command takes/.test(r.stderr), r.stderr);
+  ok(!/handed to background lane/.test(r.stdout), 'it must NOT dispatch');
+  rmSync(cold, { recursive: true, force: true });
+});
+
 // A STEER WITH NO TARGET IS NEVER A BRIEF. `bg.mjs steer "$RUN" --file x` with
 // an empty $RUN queued the steer text as a new job (2026-09-30). Cold socket on
 // purpose: the refusal must come before any daemon call.
@@ -652,6 +716,24 @@ await at('★ steer or btw with a missing, empty or flag-shaped target refuses a
     ok(!/handed to (the )?background lane/.test(r.stdout), JSON.stringify(args) + ' must NOT dispatch');
     ok(!existsSync(path.join(cold, 'bg-queue.json')), JSON.stringify(args) + ' must not write the queue');
   }
+  rmSync(cold, { recursive: true, force: true });
+});
+
+// The two real flags must still reach the dispatch path: a guard that ate
+// --file would break every brief this CLI exists for. A cold socket makes the
+// proof cheap: reaching the daemon at all is exit 2, not a usage refusal.
+await at('--file still dispatches (reaches the daemon, not the flag guard)', async () => {
+  const cold = mkdtempSync(path.join(tmpdir(), 'bg-flag-file-'));
+  copyFileSync(path.join(DIR, 'bg.mjs'), path.join(cold, 'bg.mjs'));
+  const brief = path.join(cold, 'brief.md');
+  writeFileSync(brief, 'do the thing');
+  const r = await new Promise((resolve) => {
+    execFile(process.execPath, [path.join(cold, 'bg.mjs'), '--file', brief], { cwd: cold }, (err, stdout, stderr) =>
+      resolve({ code: err ? (err.code ?? 1) : 0, stdout: String(stdout), stderr: String(stderr) }),
+    );
+  });
+  ok(!/is not a flag this command takes/.test(r.stderr), 'the guard must not eat --file');
+  ok(!/^usage:/m.test(r.stdout), 'the guard must not answer for --file');
   rmSync(cold, { recursive: true, force: true });
 });
 

@@ -4,6 +4,7 @@
 //   node bg.mjs "run the full test suite and report what fails"
 //   node bg.mjs --file ./brief.md                   (preferred for real briefs)
 //   node bg.mjs --engine codex --file ./brief.md    (run it on OpenAI Codex, not Claude)
+//   node bg.mjs --repo my-repo-x --file ./brief.md  (pin the working dir / Codex sandbox root)
 //   node bg.mjs --now --file ./brief.md             (start it past the concurrency cap)
 //   node bg.mjs "codex: review the last commit"     (same thing, inline prefix)
 //   node bg.mjs --engine claude --file /tmp/b.md    (pin to Claude on a Codex-first install)
@@ -46,7 +47,7 @@
 // only thing watching the worker's stream. Availability is IDENTICAL to steer,
 // so the STEER column of `bg.mjs ps` answers both questions.
 
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync, renameSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -148,6 +149,28 @@ if (argv[0] === 'ps' && argv.length === 1) {
   console.log(res.table || (res.workers || []).map((w) => `${w.runId} ${w.lane} ${w.pid}`).join('\n') || 'no background workers running');
   process.exit(0);
 }
+// AND THE HALF THAT KEEPS A TYPO FROM BECOMING A WORKER. `ps` takes no
+// arguments, so the gate above is `argv.length === 1` and ANYTHING after it
+// fell through to the dispatch path below: `node bg.mjs ps --json` spawned a
+// background agent whose entire brief was the string "ps --json", which then
+// re-ran the typo and chained more of them (three workers burned during a
+// usage-limit crunch, 2026-09-19). Same shape as the `btw` arm below, and the
+// same reasoning: a brief that OPENS with the bare word `ps` is not a use
+// anyone has, and the quoted form (`bg.mjs "ps output looks wrong, dig in"`)
+// is one argv element that never reaches this test.
+if (argv[0] === 'ps') {
+  console.error(
+    [
+      `bg.mjs: ps takes no arguments (got ${argv.slice(1).map((a) => JSON.stringify(a)).join(' ')}).`,
+      '',
+      'usage: node bg.mjs ps        what is running, right now',
+      '',
+      'There is no --json and no target filter. A flag after `ps` used to fall',
+      'through and dispatch a background worker whose brief was the typo.',
+    ].join('\n'),
+  );
+  process.exit(1);
+}
 
 // `steer` and `btw` are the same subcommand shape over the same socket and
 // differ only in the op and the framing the daemon applies, so they are one
@@ -218,6 +241,33 @@ if (argv[0] === 'btw') {
     ].join('\n'),
   );
   process.exit(1);
+}
+
+// A FLAG-SHAPED FIRST ARGUMENT IS NEVER A BRIEF. This CLI's first form is
+// `node bg.mjs "<brief>"`, so anything that is not `ps`, `steer` or `btw` is
+// prose, and `node bg.mjs --help` dispatched a real background worker whose
+// entire job was the string "--help" (2026-09-13, stood down by steer). Nobody
+// typing a flag means "go do this"; the flags this command really takes are
+// handled below and never arrive first except with a value. Print the usage
+// the typist was asking for instead of burning a worker on it.
+const KNOWN_FLAGS = new Set(['--file', '--engine', '--repo', '--cwd', '--now']);
+if (typeof argv[0] === 'string' && argv[0].startsWith('-') && !KNOWN_FLAGS.has(argv[0])) {
+  const usage = [
+    'usage:',
+    '  node bg.mjs "<brief>"                                   hand a job to a background worker',
+    '  node bg.mjs --file <path>                               preferred for real briefs',
+    '  node bg.mjs --engine codex --file <path>                run it on OpenAI Codex',
+    '  node bg.mjs --repo <name|path> --file <path>            pin the working dir (Codex sandbox root)',
+    '  node bg.mjs --now --file <path>                         start it past the concurrency cap',
+    '  node bg.mjs steer <lane|runId|pid|latest> "<text>"      one more instruction, mid run',
+    '  node bg.mjs steer <target> --file <path>',
+    '  node bg.mjs btw <lane|runId|pid|latest> "<question>"    a side question, answered in one message',
+    '  node bg.mjs ps                                          what is running, right now',
+  ].join('\n');
+  const known = argv[0] === '--help' || argv[0] === '-h';
+  if (!known) console.error(`bg.mjs: ${argv[0]} is not a flag this command takes, and a flag is never read as a brief.`);
+  console.log(usage);
+  process.exit(known ? 0 : 1);
 }
 
 // THE CLAUDE ACCOUNT, switched by the daemon. The daemon does the swap single
@@ -318,7 +368,76 @@ if (engineFlag !== -1) {
   dispatchArgs.splice(engineFlag, 2);
 }
 
-let text = payload(dispatchArgs, 'usage: node bg.mjs [--engine codex] [--now] --file <path-to-brief>');
+// --repo / --cwd: STATE the working directory instead of letting it be inferred.
+//
+// A Codex job's sandbox WRITE ROOT is its cwd, and without this flag the daemon
+// has to guess it from the brief's prose: briefRepo reads a `Repo:` line if
+// there is one, else the first path under the workspace in the opening lines,
+// and codexCwdForBrief only honours the name if that directory already EXISTS.
+// Two ways that bit, both measured 2026-09-16:
+//   - a brief that told Codex to create its own worktree named a directory that
+//     did not exist yet, so the root fell back to the parent repo. One job
+//     refused outright after 49k tokens of billed reading; a second created the
+//     worktree anyway and had to be steered off it.
+//   - a brief whose opening lines mention a SECOND repo path can hand the root
+//     to the wrong one, silently.
+// An explicit flag removes the inference entirely. Both spellings are accepted
+// because the thing being named is a repo to a human and a cwd to the daemon.
+//
+// Validated HERE, at enqueue, on purpose: a directory that does not exist must
+// cost one line of stderr now, not a dispatched job that discovers it minutes
+// later and burns a model's context finding out. Nothing is queued on failure.
+const HOME = process.env.HOME || '';
+// A bare name resolves under the workspace, read the way the daemon reads it
+// (BRIDGE_DEFAULT_CWD, then config.json defaultCwd, else ~/dev when it exists,
+// else the home directory).
+function workspaceDir() {
+  let dir = process.env.BRIDGE_DEFAULT_CWD;
+  if (!dir) {
+    try {
+      dir = JSON.parse(readFileSync(process.env.BRIDGE_CONFIG || path.join(SCRIPT_DIR, 'config.json'), 'utf8'))?.defaultCwd;
+    } catch {
+      dir = '';
+    }
+  }
+  if (dir) return dir.startsWith('~/') ? path.join(HOME, dir.slice(2)) : dir;
+  return existsSync(path.join(HOME, 'dev')) ? path.join(HOME, 'dev') : HOME;
+}
+let cwd = null;
+for (const flag of ['--repo', '--cwd']) {
+  const i = dispatchArgs.indexOf(flag);
+  if (i === -1) continue;
+  const raw = String(dispatchArgs[i + 1] ?? '').trim();
+  if (!raw || raw.startsWith('-')) {
+    console.error(`bg.mjs: ${flag} takes a repo name under the workspace or a path (got ${JSON.stringify(dispatchArgs[i + 1] ?? '')})`);
+    process.exit(1);
+  }
+  // A bare name is resolved under the workspace, which is where the repos and
+  // their worktrees live. Anything with a slash is taken as a path, `~/` expanded.
+  const expanded = raw.startsWith('~/') ? path.join(HOME, raw.slice(2)) : raw;
+  const resolved = expanded.includes('/') ? path.resolve(expanded) : path.join(workspaceDir(), expanded);
+  let dir = false;
+  try {
+    dir = statSync(resolved).isDirectory();
+  } catch {
+    dir = false;
+  }
+  if (!dir) {
+    console.error(
+      [
+        `bg.mjs: ${flag} ${JSON.stringify(raw)} resolves to ${resolved}, which is not an existing directory.`,
+        'Create it first. For a per-agent worktree:',
+        '  git -C <workspace>/<repo> worktree add <workspace>/<repo>-<slug> -b <branch> origin/main',
+        'Nothing was queued.',
+      ].join('\n'),
+    );
+    process.exit(1);
+  }
+  cwd = resolved;
+  dispatchArgs.splice(i, 2);
+}
+
+let text = payload(dispatchArgs, 'usage: node bg.mjs [--engine codex] [--now] [--repo <name|path>] --file <path-to-brief>');
 
 // `codex: do the thing` / `claude: do the thing` are the engine siblings of the
 // `bg:` prefix, for when typing a flag is more friction than the job is worth.
@@ -335,6 +454,7 @@ if (!text) {
       'usage: node bg.mjs "<task>"   |   node bg.mjs --file <path-to-brief>',
       '       node bg.mjs --engine codex|claude --file <path>   (pick the engine for this job)',
       '       node bg.mjs --now --file <path>                   (start it past the concurrency cap)',
+      '       node bg.mjs --repo <name|path> --file <path>       (pin the working dir, required for parallel Codex jobs)',
       '       node bg.mjs "codex: <task>" | "claude: <task>"    (same, inline prefix)',
       '       node bg.mjs steer <lane|runId|pid|latest> "<text>" | --file <path>',
       '       node bg.mjs btw <lane|runId|pid|latest> "<question>" | --file <path>',
@@ -421,7 +541,7 @@ for (let attempt = 0; attempt < 5; attempt++) {
   } catch {
     /* missing or mid-rename — treat as empty and retry on failure */
   }
-  items.push({ text, queuedAt, ...(engine ? { engine } : {}), ...(now ? { now: true } : {}), ...scheduled });
+  items.push({ text, queuedAt, ...(engine ? { engine } : {}), ...(cwd ? { cwd } : {}), ...(now ? { now: true } : {}), ...scheduled });
   try {
     writeFileSync(TMP, JSON.stringify(items, null, 2));
     renameSync(TMP, FILE);

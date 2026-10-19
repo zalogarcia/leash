@@ -10482,14 +10482,27 @@ function drainBgHandoff() {
     // while three doc surfaces promised it would wait for the reset instead.
     const fallbackSlashCommand = unchosenCodex(decision) && BG_COMMAND_RE.test(stripLaneRules(text).trimStart());
     if (decision.engine === 'codex' && !fallbackSlashCommand) {
-      const repo = briefRepo(text, { workspaceDir: DEFAULT_CWD, fallbackDir: chatState().cwd });
+      // `--repo` / `--cwd` on the queue item is the DECLARED working directory,
+      // and it wins over every form of inference. bg.mjs already proved the
+      // directory exists before it queued the job, so there is nothing left to
+      // guess. This is what makes N parallel Codex jobs on ONE repo safe: each
+      // is pinned to its own worktree, so they cannot share a working tree.
+      // Without it the root came from the brief's prose (a `Repo:` line, else the
+      // first path under the workspace in the opening lines), which two jobs on
+      // 2026-09-16 resolved to the wrong directory, one of them after 49k tokens
+      // of billed reading. Re-checked here rather than trusted: the queue can
+      // outlive a `git worktree remove`.
+      const declaredCwd = typeof it === 'object' && it?.cwd && existsSync(it.cwd) ? it.cwd : null;
+      const repo = declaredCwd ? path.basename(declaredCwd) : briefRepo(text, { workspaceDir: DEFAULT_CWD, fallbackDir: chatState().cwd });
       // Same rule as the notice's repo line: the brief names the repo, and a
       // workspace-write run confined to that directory is the point.
-      const codexCwd = codexCwdForBrief(repo, {
-        devDir: DEFAULT_CWD,
-        fallbackCwd: chatState().cwd,
-        exists: existsSync,
-      });
+      const codexCwd =
+        declaredCwd ||
+        codexCwdForBrief(repo, {
+          devDir: DEFAULT_CWD,
+          fallbackCwd: chatState().cwd,
+          exists: existsSync,
+        });
       const active = bgLanes.filter((l) => l.current || l.queue.length || l.finishing).length + codexRuns.size + 1;
       const queued = bgLanes.reduce((n, l) => n + l.queue.length, 0);
       // DISPATCH FIRST, then decorate: the queue file was already claimed above,
