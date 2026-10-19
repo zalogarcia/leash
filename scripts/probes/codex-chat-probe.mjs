@@ -58,6 +58,8 @@ import { briefTitle, stripLaneRules } from ${url('bg-notify.mjs')};
 import { execFallbackLine, shouldFallBackToExec } from ${url('codex-appserver.mjs')};
 import { pathsFromCodexLog } from ${url('engine-handoff.mjs')};
 import { codexChatSandbox } from ${url('engine-state.mjs')};
+import { codexWritingPrompt } from ${url('codex-writing.mjs')};
+import { codexWorkerContext } from ${url('codex-worker-env.mjs')};
 const { existsSync, mkdirSync, writeFileSync, readFileSync } = fs;
 export const SENT = [];
 export const RESULTS = [];
@@ -122,6 +124,13 @@ const runCodexChatTurn = () => {
 const noteCodexWall = () => Date.now() + 3600000;
 const clearCodexWall = () => {};
 let codexPausedUntil = 0;
+// This probe measures Codex. Taking over on Claude would change its subject.
+const retryCodexOnClaude = () => false;
+// Two more seams on the turn's failure path, neither the subject: no worker
+// report rides a probe turn (keepHandback has nothing to keep), and the Claude
+// wall is daemon bookkeeping the probe does not stand up.
+const keepHandback = () => ({ held: 0, parked: 0 });
+const claudeRateWalled = () => false;
 `;
 
 const B = await import(

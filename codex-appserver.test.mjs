@@ -584,6 +584,23 @@ t('the restart continuation says the files are intact and forbids starting over'
 console.log('\n8b. the log an app-server job leaves, in `codex exec --json` shape');
 // ---------------------------------------------------------------------------
 
+t('thread logs preserve explicit native agent role and parent metadata', () => {
+  const event = execEventForLog({ method: 'thread/started', params: { thread: { id: 'child', agentRole: 'qa-agent', source: { subAgent: { thread_spawn: { parent_thread_id: 'root' } } } } } });
+  deep(event, { type: 'thread.started', thread_id: 'child', codex_agent_metadata: true, agent_role: 'qa-agent', parent_thread_id: 'root' });
+});
+
+t('root thread metadata has no invented agent role', () => {
+  const event = execEventForLog({ method: 'thread/started', params: { thread: { id: 'root' } } });
+  eq(event.agent_role, null);
+  eq(event.parent_thread_id, null);
+  eq(event.codex_agent_metadata, true);
+});
+
+t('tool log events retain the owning thread for verifier correlation', () => {
+  const event = execEventForLog({ method: 'item/started', params: { threadId: 'root', item: { type: 'commandExecution', id: 'tool-1' } } });
+  eq(event.thread_id, 'root');
+});
+
 t('★ a streamed item lands in the log in the shape lastActFromExecLog reads', () => {
   // The whole point: three readers already parse the exec stream, so the
   // app-server writes THAT and none of them learns a second protocol.

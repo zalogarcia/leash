@@ -13,6 +13,10 @@
 // everywhere in this file, and the ONE thing it is used for here is the short
 // app-server round trip that reads the Codex plan windows.
 import { execFile, spawn as spawnProcess } from 'node:child_process';
+import { codexWritingPrompt, setCodexReplyRules } from './codex-writing.mjs';
+import { codexWorkerContext } from './codex-worker-env.mjs';
+import { recoverCodexDraft, discardCodexDraft } from './codex-report-recovery.mjs';
+import { codexFailoverPlan } from './codex-failover.mjs';
 import {
   readFileSync,
   writeFileSync,
@@ -550,6 +554,10 @@ const CODEX_MODEL = conf('codexModel', '') || null; // empty = the CLI's own def
 // config.json to pin the chat lane back to `codex exec` (the fallback path is
 // kept intact and is reached automatically on an older CLI anyway).
 const CODEX_APP_SERVER = String(conf('codexAppServer', 'true')) !== 'false';
+// THE REPLY RULES every Codex turn carries (codex-writing.mjs): the shape a
+// reply needs on a phone, by default. `codexReplyRules` in config.json replaces
+// them with your own; an empty string sends Codex turns with no rules at all.
+setCodexReplyRules(conf('codexReplyRules'));
 // NO EM DASHES ON THE WAY OUT. The owner's standing rule for their own copy, and Codex
 // writes them by default where Claude has been trained off them, so a two-engine
 // bridge answers in two registers unless something normalizes at the funnel.
@@ -1474,7 +1482,11 @@ async function startCompaction({ auto = false, pct = null } = {}) {
   // priority: the queue path, NEVER the steer path. Steered into a running
   // task, the summary would come back under that task's rawText and the
   // COMPACT_MARKER check in the close handler would never fire.
-  dispatchPrompt(COMPACT_PROMPT, LANES.main, { priority: true });
+  // PINNED to Claude: compaction summarises a CLAUDE session, and its marker is
+  // handled only by the Claude close handler. Unpinned, a Claude wall would
+  // route it to the Codex chat lane, which would send them an unasked summary
+  // and leave the compact notice waiting forever. Pinned, it waits for the reset.
+  dispatchPrompt(`claude: ${COMPACT_PROMPT}`, LANES.main, { priority: true });
   return { ok: true };
 }
 
@@ -1846,7 +1858,7 @@ function editWorkerNotice(runId, patch, { keepAlive = false } = {}) {
 function runClaude(
   rawText,
   lane = LANES.main,
-  { prepend = '', kinds = [], images = [], priority = false, retried = false, replyQuote = null, schedule = null, handback = null } = {},
+  { prepend = '', kinds = [], images = [], priority = false, retried = false, replyQuote = null, schedule = null, handback = null, cwd: requestedCwd = null } = {},
 ) {
   const st = chatState();
   // THREE STRINGS, not two, once a reply is in play: what you TYPED (rawText),
@@ -1896,7 +1908,9 @@ function runClaude(
     // session save (they run concurrently and finish independently).
     const genKey = `gen_${lane.name}`;
     const startGen = st[genKey] || 0;
-    const cwd = existsSync(st.cwd) ? st.cwd : HOME;
+    // A requested cwd must be a DIRECTORY: a file passes existsSync and then
+    // makes spawn throw ENOTDIR with the lane already claimed.
+    const cwd = requestedCwd && (() => { try { return statSync(requestedCwd).isDirectory(); } catch { return false; } })() ? requestedCwd : existsSync(st.cwd) ? st.cwd : HOME;
     const startedAt = run.startedAt;
     const progress = []; // everything, shown while running
     const toolLines = []; // tool activity only, shown in the final "Done" edit (answer text would duplicate the result message)
@@ -6899,7 +6913,7 @@ function holdHandbackForWall({ runId, task, status, report = null, draft = null,
   // gone and the second still walls every account. Not the ledger once the
   // user has chosen a login by hand: chat turns run on it, so a report held
   // then would wait hours for a ledger clock.
-  const hold = (claudeRateWalled() || (ledgerAllWalled() && !wallVouched())) && chatLaneEngine() !== 'codex';
+  const hold = (claudeRateWalled() || (ledgerAllWalled() && !wallVouched())) && chatLaneEngine() !== 'codex' && !codexTakingChat();
   if (!hold && !wallDeath) return false;
   const recorded = wallWake.worker({
     runId,
@@ -7218,11 +7232,10 @@ function engineFor(lane, forcedEngine = null, { ignoreWall = false } = {}) {
     config: ENGINE_CONFIG,
     claudeAvailable: CLAUDE_AVAILABLE,
     codexAvailable: CODEX_AVAILABLE,
-    // `ignoreWall` is for INTERNAL traffic. The rate-limit fallback is a
-    // degraded answer for a message the owner is waiting on; a worker report or
-    // a scheduled task must follow the SETTLED engine choice and nothing else,
-    // or a wall silently reroutes the assistant's own reports to a stranger.
-    rotationPausedUntil: ignoreWall ? 0 : rotationPausedUntil,
+    codexPausedUntil,
+    // Internal reports and owner tasks both need a healthy engine. A wall
+    // changes routing for both, without changing the saved lane preference.
+    rotationPausedUntil,
     now: Date.now(),
     codexFallback: codexFallbackOn(),
   });
@@ -7883,23 +7896,106 @@ function codexOutcomeFromDisk(runId) {
   return outcome;
 }
 
-// The Codex twin of reportBgOutcome, minus the account rotation: a Codex failure
-// is not a Claude limit and must never rotate an account. Same order for the
-// same reason, the durable row first, then the note to the chat lane.
-function reportCodexOutcome(task, outcome, runId, { mode = 'ask', cwd = null, reason = null, pausedUntil = null, steers = [] } = {}) {
+// The Codex twin of reportBgOutcome, minus the account rotation. Same order for
+// the same reasons: the owner's own ping first (never lost to a formatting bug in the
+// handback), then the durable row, then the note to M.
+function retryCodexOnClaude(task, outcome, { mode = 'edit', preActivity = false, bootstrap = false, cwd = null, images = [], schedule = null, background = false, prompt = null, notice = null, handback = null } = {}) {
+  const plan = codexFailoverPlan(outcome, { mode, preActivity, bootstrap, claudeAvailable: CLAUDE_AVAILABLE, claudePausedUntil: rotationPausedUntil });
+  if (!plan || claudeRateWalled()) return false;
+  const prefix = `Codex could not start this task. Continue it on Claude. Working directory: ${cwd || chatState().cwd}. ${plan.readOnly ? 'This is a read-only request: do not change files.' : 'Preserve the original task and its limits.'}`;
+  // The task runs as itself; the prepend carries only what the task text does
+  // not already say (a quote, a handoff block, steers), so it is not sent twice.
+  const extra = prompt && String(prompt).trim() !== stripLaneRules(String(task || '')).trim() ? String(prompt) : '';
+  // `notice` is the Codex error the owner would otherwise never see: one
+  // message, the reason first, then who is answering instead.
+  const prepend = [prefix, extra].filter(Boolean).join('\n\n');
+  // A BACKGROUND TAKEOVER GOES THROUGH THE DROP BOX, pinned to Claude, never
+  // straight onto a lane: the drain is where the admission cap, the resume
+  // pace, the worker card and the wall hold live, so N Codex jobs failing at
+  // once become N queued Claude jobs, not N uncapped workers. Deferred a tick
+  // so a takeover raised inside a drain does not re-enter it.
+  if (background) {
+    const queued = appendBgQueueItem({
+      text: `claude: ${task}`,
+      engine: 'claude',
+      prepend,
+      ...(cwd ? { cwd } : {}),
+      ...(schedule && schedule.id != null ? { scheduleId: schedule.id, ...(schedule.allowWrite === true ? { allowWrite: true } : {}) } : {}),
+    });
+    if (queued) {
+      send([notice, '🔄 Claude is taking over this task.'].filter(Boolean).join('\n'), { markdown: false }).catch(() => {});
+      setImmediate(() => drainBgHandoff());
+      return true;
+    }
+    console.error('[bridge] the Claude takeover could not be queued; starting it directly');
+  }
+  const lane = background ? getBgLane() : LANES.main;
+  // `notice` is the Codex error the owner would otherwise never see: one
+  // message, the reason first, then who is answering instead.
+  send([notice, '🔄 Claude is taking over this task.'].filter(Boolean).join('\n'), { markdown: false }).catch(() => {});
+  // THE OWNER'S MESSAGE STAYS THEIRS: on an idle chat lane it is dispatched as
+  // an owner turn, so a Claude limit death re-runs it after the swap like any
+  // message they typed. A worker report keeps its mark (read again or kept, never
+  // dropped). Priority only where it must queue rather than steer.
+  const priority = background || Boolean(handback) || Boolean(lane.current);
+  dispatchPrompt(`claude: ${task}`, lane, { priority, images, schedule, cwd, prepend, handback });
+  return true;
+}
+
+/**
+ * One item onto the drop box (bg-queue.json), the same atomic write bg.mjs and
+ * queueScheduledRun use, so the drain picks it up with its cap and its hold.
+ * Returns false when the write failed (the caller then starts it directly).
+ */
+function appendBgQueueItem(item) {
+  let items = [];
+  try {
+    const raw = JSON.parse(readFileSync(BG_QUEUE_FILE, 'utf8'));
+    if (Array.isArray(raw)) items = raw;
+  } catch {
+    items = []; // no file, or a half-written one: this job is the queue
+  }
+  items.push({ ...item, queuedAt: new Date().toISOString() });
+  try {
+    const tmp = `${BG_QUEUE_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(items, null, 2));
+    renameSync(tmp, BG_QUEUE_FILE);
+    return true;
+  } catch (e) {
+    console.error('[bridge] could not queue a job:', e.message);
+    return false;
+  }
+}
+
+function reportCodexOutcome(task, outcome, runId, { mode = 'ask', cwd = null, reason = null, pausedUntil = null, steers = [], preActivity = false, bootstrap = false, schedule = null, prompt = null } = {}) {
+  // `ask` here is a /codex QUESTION (background jobs run in `edit`, reviews in
+  // `review`), so its takeover answers in the chat, like the known-wall path.
+  if (retryCodexOnClaude(task, outcome, { mode, cwd, preActivity, bootstrap, schedule, background: mode !== 'ask', prompt: [prompt || task, steeredInBlock(steers)].filter(Boolean).join('\n\n') })) {
+    notifyOwnerBgFinished(task, 'failed', runId);
+    recordBgResult(task, 'Codex could not start; continued on Claude.', null);
+    discardCodexDraft({ cwd, runId, mode });
+    return;
+  }
+  outcome = recoverCodexDraft(outcome, { cwd, runId, mode });
   const id = bgReportId(runId);
   notifyOwnerBgFinished(task, outcome.status, runId);
   if (outcome.record != null) recordBgResult(task, outcome.record, bgReportPath(id));
-  // THE WALL CASE. Every other background outcome reaches you through the
-  // assistant, who turns it into words. During a total limit wall it cannot run
-  // at all: the handback would spawn claude, die on the limit, and you would get
-  // a start ping and a red error bubble but never the answer, in exactly the
-  // situation this engine exists for. So while the wall is up the answer goes
-  // straight to you, and the pair is PARKED for the assistant rather than handed
-  // to a lane that cannot take it (parked, not queued, is what stops it being
-  // answered a second time an hour later).
-  if (Date.now() < rotationPausedUntil) {
+  // THE WALL CASE. Every other background outcome reaches the owner through the
+  // assistant, who turns it into words. During a total limit wall it cannot run at all: the
+  // handback would spawn claude, die on the limit, and they would get a start
+  // ping, a completion tick and a red error bubble but never the answer, in
+  // exactly the situation this engine exists for. So while the wall is up the
+  // answer goes straight to them, and the pair is PARKED for the assistant rather than
+  // handed to a lane that cannot take it (parked, not queued, is what stops it
+  // being answered a second time an hour later).
+  // Straight to them only while Claude is walled AND no Codex chat lane will
+  // relay it: Codex out, or the fallback off (`/codex off`) on a Claude chat
+  // lane. Otherwise the Codex chat summarises it like the assistant would. (QA round 3:
+  // with the fallback off a /codex answer was held for Claude's reset.)
+  const codexWillRelay = CODEX_AVAILABLE && !codexWalled() && (codexFallbackOn() || chatLaneEngine() === 'codex');
+  if (Date.now() < rotationPausedUntil && !codexWillRelay) {
     deliverCodexDirect(task, outcome, id);
+    discardCodexDraft({ cwd, runId, mode });
     return;
   }
   // `steers` is EMPTY for an exec run and cannot be otherwise: it has no stdin to
@@ -7910,6 +8006,7 @@ function reportCodexOutcome(task, outcome, runId, { mode = 'ask', cwd = null, re
     engine: 'codex',
     codex: { mode, cwd, tokens: outcome.tokens, reason, pausedUntil },
   });
+  discardCodexDraft({ cwd, runId, mode });
 }
 
 // How much of a Codex answer goes to you directly. Long worker output is
@@ -7927,16 +8024,13 @@ function deliverCodexDirect(task, outcome, id) {
   // Same normalizer as sendResult: this path exists because Claude cannot run, so
   // nothing downstream would otherwise clean it up.
   const text = normalizeDashes(String(outcome.answer || ''), { enabled: NO_DASHES });
-  const cost = fmtCodexTokens(outcome.tokens);
-  send(
+  sendResult(
     [
       prefix,
       '',
       text.slice(0, CODEX_DIRECT_LIMIT),
       ...(text.length > CODEX_DIRECT_LIMIT && full ? ['', `(full answer: ${full.file})`] : []),
-      ...(cost ? ['', `(${cost})`] : []),
     ].join('\n'),
-    { markdown: false },
   ).catch(() => {});
   if (parkedCodexChats.length < PARKED_CODEX_MAX) {
     parkedCodexChats.push({ prompt: task, answer: outcome.status === 'finished' ? outcome.answer : null });
@@ -7951,7 +8045,7 @@ function deliverCodexDirect(task, outcome, id) {
  * instead of handing the report to a chat lane that cannot run.
  */
 // eslint-disable-next-line max-len -- one line on purpose: bg-codex-wiring.test.mjs extracts this function by source and stops at the first unindented line, which a wrapped signature's `) {` would be.
-function runCodex(rawText, { mode = 'ask', cwd = null, reviewScope = 'uncommitted', reason = null, pausedUntil = null, announce = true, onAnswer = null, threadId = null, images = [], sandbox = null, network = false, onStart = null, trackThread = false, outputSchema = null, prompt: sendText = null } = {}) {
+function runCodex(rawText, { mode = 'ask', cwd = null, reviewScope = 'uncommitted', reason = null, pausedUntil = null, announce = true, onAnswer = null, threadId = null, images = [], sandbox = null, network = false, onStart = null, trackThread = false, outputSchema = null, prompt: sendText = null, background = false, schedule = null } = {}) {
   // NOT bare Date.now(): drainBgHandoff dispatches a queued batch in one
   // synchronous loop, and two Codex runs in the same millisecond would share an
   // id, a log, a -o file and a report. Claude workers dodge this by lane name;
@@ -7974,8 +8068,12 @@ function runCodex(rawText, { mode = 'ask', cwd = null, reviewScope = 'uncommitte
   // bg-results row all read as though the daemon had asked the question (QA,
   // 2026-09-08). Everything that DESCRIBES the run keeps using rawText, which is
   // what you typed.
-  const prompt = stripLaneRules(String(sendText ?? rawText ?? '')).trim();
   const runCwd = cwd && existsSync(cwd) ? cwd : DEFAULT_CWD;
+  const worker = codexWorkerContext(process.env, { background, cwd: runCwd, runId, startedAt, schedule, mode });
+  // `brief` is the task as given. `prompt` adds the Codex-only house rules and
+  // draft instruction, so a Claude takeover is handed `brief`, never `prompt`.
+  const brief = stripLaneRules(String(sendText ?? rawText ?? '')).trim();
+  const prompt = codexWritingPrompt([brief, worker.instructions].filter(Boolean).join('\n\n'));
   try {
     mkdirSync(RUNS_DIR, { recursive: true });
     writeFileSync(promptFile, prompt); // the brief, for reading back later
@@ -8020,18 +8118,18 @@ function runCodex(rawText, { mode = 'ask', cwd = null, reviewScope = 'uncommitte
     // env is inherited whole and UNTOUCHED: codex finds its own credentials in
     // ~/.codex/auth.json. Nothing here reads or forwards a key, and no key is
     // ever placed in argv (which would show up in `ps` and in the registry).
-    ({ child } = spawnWorker(CODEX_BIN, args, { cwd: runCwd, env: { ...process.env }, logPath }));
+    ({ child } = spawnWorker(CODEX_BIN, args, { cwd: runCwd, env: worker.env, logPath }));
   } catch (e) {
     const detail = e.message;
     console.error('[bridge] codex failed to launch:', detail);
-    const outcome = { status: 'failed', answer: `Codex FAILED to launch: ${detail}`, record: `FAILED: ${detail}`, tokens: null };
+    const outcome = { status: 'failed', answer: `Codex FAILED to launch: ${detail}`, record: `FAILED: ${detail}`, tokens: null, bootstrap: true };
     // A SYNCHRONOUS spawn throw (an unwritable runs dir) never reaches finish(),
     // so the sidecar written a few lines above would keep saying "running" for a
     // run that never started. The common missing-binary case does NOT come
     // through here: it arrives as an async 'error' event, which does reach it.
     finalizeCodexMeta(startedAt, outcome);
     if (onAnswer) onAnswer(outcome, null);
-    else reportCodexOutcome(rawText, outcome, runId, { mode, cwd: runCwd, reason, pausedUntil });
+    else reportCodexOutcome(rawText, outcome, runId, { mode, cwd: runCwd, reason, pausedUntil, preActivity: true, bootstrap: true, schedule, prompt: brief });
     return null;
   }
   const run = {
@@ -8113,7 +8211,7 @@ function runCodex(rawText, { mode = 'ask', cwd = null, reviewScope = 'uncommitte
     codexRuns.delete(runId);
     closeStdin(child);
     const outcome = launchError
-      ? { status: 'failed', answer: `Codex FAILED: ${launchError}`, record: `FAILED: ${launchError}`, tokens: null }
+      ? { status: 'failed', answer: `Codex FAILED: ${launchError}`, record: `FAILED: ${launchError}`, tokens: null, bootstrap: true }
       : codexOutcome({
           lastText: readTextIf(lastFile),
           logText: readTextIf(logPath),
@@ -8139,7 +8237,7 @@ function runCodex(rawText, { mode = 'ask', cwd = null, reviewScope = 'uncommitte
       }
       return;
     }
-    reportCodexOutcome(rawText, outcome, runId, { mode, cwd: runCwd, reason, pausedUntil });
+    reportCodexOutcome(rawText, outcome, runId, { mode, cwd: runCwd, reason, pausedUntil, preActivity: Boolean(launchError), bootstrap: Boolean(launchError), schedule, prompt: brief });
   };
   child.on('error', (e) => finish(null, codexLaunchError(e)));
   child.on('close', (code) => finish(code));
@@ -8217,7 +8315,7 @@ const CODEX_INTERRUPT_GRACE_MS = 30_000;
 // ---------------------------------------------------------------------------
 
 // eslint-disable-next-line max-len -- one line on purpose: bg-codex-wiring.test.mjs extracts this function by source and stops at the first unindented line, which a wrapped signature's `) {` would be.
-function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = null, pausedUntil = null, announce = true, network = false, carriesHandoff = false, prompt: sendText = null, resume = null } = {}) {
+function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = null, pausedUntil = null, announce = true, network = false, carriesHandoff = false, prompt: sendText = null, resume = null, schedule = null } = {}) {
   const resuming = Boolean(resume?.threadId);
   // A resumed job keeps its OWN id, so its report, its prompt file and its
   // bg-results row stay the ones the job started with. Only a fresh job mints
@@ -8225,8 +8323,12 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
   const startedAt = Number(resume?.startedAt) || freeCodexStart(Date.now(), (id) => codexRuns.has(id));
   const runId = codexRunId(startedAt);
   const { log: logPath, last: lastFile, prompt: promptFile } = codexPaths(RUNS_DIR, startedAt);
-  const prompt = stripLaneRules(String(sendText ?? rawText ?? '')).trim();
   const runCwd = cwd && existsSync(cwd) ? cwd : DEFAULT_CWD;
+  const worker = codexWorkerContext(process.env, { background: true, cwd: runCwd, runId, startedAt, schedule, mode });
+  // `brief` is the task as given. `prompt` adds the Codex-only house rules and
+  // draft instruction, so a Claude takeover is handed `brief`, never `prompt`.
+  const brief = stripLaneRules(String(sendText ?? rawText ?? '')).trim();
+  const prompt = codexWritingPrompt([brief, worker.instructions].filter(Boolean).join('\n\n'));
   try {
     mkdirSync(RUNS_DIR, { recursive: true });
     // NOT rewritten on a resume: the brief on disk is the one the job was given,
@@ -8361,7 +8463,7 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
       }
     }
     console.log(appServerLogLine('handback', { runId, threadId: run.threadId, status: outcome.status }));
-    reportCodexOutcome(rawText, outcome, runId, { mode, cwd: runCwd, reason, pausedUntil, steers: run.steers });
+    reportCodexOutcome(rawText, outcome, runId, { mode, cwd: runCwd, reason, pausedUntil, steers: run.steers, preActivity: !resuming && !run.activityStarted, bootstrap: outcome.bootstrap === true, schedule, prompt: brief });
   };
 
   // A side-question answer is not this job's output: it is addressed to whoever
@@ -8393,6 +8495,7 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
   };
 
   const onNotification = (msg) => {
+    if (/^item\/(started|completed)$/.test(msg?.method || '') && !['agentMessage', 'userMessage'].includes(msg?.params?.item?.type)) run.activityStarted = true;
     appendEvent(execEventForLog(msg, { usage: tokens }));
     const ev = mapNotification(msg, { home: HOME });
     if (!ev) return;
@@ -8642,7 +8745,7 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
     const myAttempt = attempt;
     let c = null;
     try {
-      c = await startAppServerChild({ onDeath: onServerDeath });
+      c = await startAppServerChild({ onDeath: onServerDeath, env: worker.env });
     } catch (e) {
       spawning = false;
       // A CHILD THAT NEVER CAME UP IS STILL A DEATH. Deduped by attempt, because
@@ -8652,7 +8755,7 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
       // at all, an old CLI leaves every future job dying here one at a time
       // instead of falling back to exec, which is the fallback's whole job.
       recordDeath();
-      finish(codexAppServerDeathOutcome({ reason: `the Codex app-server could not start: ${e.message}`, partial: answer, tokens }));
+      finish({ ...codexAppServerDeathOutcome({ reason: `the Codex app-server could not start: ${e.message}`, partial: answer, tokens }), bootstrap: true });
       return;
     }
     spawning = false;
@@ -8681,6 +8784,10 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
         cwd: runCwd,
         model: model || null,
         effort: codexEffort || null,
+        scheduleId: schedule?.id ?? null,
+        draftPath: worker.draftPath,
+        network: netOn,
+        carriesHandoff,
         steers: run.steers,
         btwPending: run.btw.list().map(btwRecordForDisk),
       });
@@ -8700,7 +8807,7 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
           // A CONTINUATION IS NOT THE BRIEF AGAIN. Re-sending the brief to a
           // thread that has already done half of it is how a resumed job starts
           // over, which is the one thing the resume exists to avoid.
-          text: continuing ? RESTART_CONTINUATION : prompt,
+          text: continuing ? codexWritingPrompt(RESTART_CONTINUATION) : prompt,
           model,
           effort: codexEffort,
           sandbox,
@@ -8788,12 +8895,13 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
  * `codex exec`, which is the fallback and not the past.
  */
 // eslint-disable-next-line max-len -- one line on purpose: bg-codex-wiring.test.mjs extracts this function by source and stops at the first unindented line, which a wrapped signature's `) {` would be.
-function startCodexJob(rawText, { mode = 'edit', cwd = null, reason = null, pausedUntil = null, announce = true, prompt = null, network = false, carriesHandoff = false } = {}) {
+function startCodexJob(rawText, { mode = 'edit', cwd = null, reason = null, pausedUntil = null, announce = true, prompt = null, network = null, carriesHandoff = false, schedule = null } = {}) {
+  const netOn = !carriesHandoff && (network == null ? confBool('codexBackgroundNetwork', false) : network === true);
   const transport = bgCodexTransport({ mode, fallback: codexAppServerState().fallback });
   if (transport === 'appserver') {
-    return runCodexAppServerJob(rawText, { mode, cwd, reason, pausedUntil, announce, prompt, network, carriesHandoff });
+    return runCodexAppServerJob(rawText, { mode, cwd, reason, pausedUntil, announce, prompt, network: netOn, carriesHandoff, schedule });
   }
-  return runCodex(rawText, { mode, cwd, reason, pausedUntil, announce, prompt, network });
+  return runCodex(rawText, { mode, cwd, reason, pausedUntil, announce, prompt, network: netOn, background: true, schedule });
 }
 
 /**
@@ -8832,6 +8940,9 @@ function recoverCodexAppServerJob(id, rec) {
     cwd: rec.cwd || null,
     announce: false, // the resume line below is this run's announcement
     resume: { threadId: rec.threadId, startedAt },
+    schedule: rec.scheduleId == null ? null : { id: rec.scheduleId, allowWrite: scheduleApprovesWrites(rec.scheduleId) },
+    network: rec.network === true,
+    carriesHandoff: rec.carriesHandoff === true,
   });
   if (run) {
     // PUSHED, not reassigned: start() is already in flight and its registry row
@@ -8967,39 +9078,6 @@ function stopCodexRuns() {
 const PARKED_CODEX_MAX = 10; // bound the note; a wall lasts hours, not days
 const parkedCodexChats = [];
 
-function runCodexChatFallback(text, decision, { images = [], prompt = null } = {}) {
-  const st = chatState();
-  const prefix = codexFallbackPrefix(decision.pausedUntil, { timeZone: OWNER_TZ });
-  // `prompt` is what is SENT (your words behind the bubble you replied to) and
-  // `text` is what you TYPED. The records stay on your own words: a parked
-  // catch-up, a /status line and a bg-results row describing the turn by a
-  // quote of the daemon would read as though the daemon had asked it.
-  runCodex(text, {
-    prompt: prompt || text,
-    mode: 'ask', // read-only: a degraded answer must not also be a silent edit
-    cwd: existsSync(st.cwd) ? st.cwd : DEFAULT_CWD,
-    images: (images || []).filter(isCodexImage),
-    reason: decision.reason,
-    pausedUntil: decision.pausedUntil,
-    announce: false, // the answer itself is the notification here
-    onAnswer: (outcome) => {
-      const raw = outcome.status === 'finished' ? outcome.answer : `${outcome.answer}\n\n(Claude is limited, so there is no fallback for the fallback.)`;
-      // This path uses send(), not sendResult(), so it was the ONE Codex reply
-      // that reached the phone un-normalized (QA finding). It goes out during a
-      // total wall, which is exactly when nothing downstream can clean it up.
-      const answer = normalizeDashes(raw, { enabled: NO_DASHES });
-      const cost = fmtCodexTokens(outcome.tokens);
-      send(`${prefix}\n\n${answer}${cost ? `\n\n(${cost})` : ''}`, { markdown: false }).catch(() => {});
-      if (parkedCodexChats.length < PARKED_CODEX_MAX) {
-        parkedCodexChats.push({ prompt: text, answer: outcome.status === 'finished' ? outcome.answer : null });
-      }
-      // Durable row, same as any other background outcome, so /status history and
-      // bg-results.jsonl do not lose the fact that this was answered at all.
-      if (outcome.record != null) recordBgResult(`[codex chat fallback] ${text}`, outcome.record, null);
-    },
-  });
-}
-
 // ---------------------------------------------------------------------------
 // THE CODEX APP-SERVER: ONE CHILD PER DAEMON
 //
@@ -9078,7 +9156,7 @@ function noteCodexAppServerDeath() {
  * deaths on the job. Both need the same spawn, the same handshake and the same
  * deadline on every call, and two copies of that would drift.
  */
-function startAppServerChild({ onDeath = () => {}, latchInitFailure = false } = {}) {
+function startAppServerChild({ onDeath = () => {}, latchInitFailure = false, env = null } = {}) {
   // THE LATCH IS THE CHAT LANE'S, AND IT IS PERMANENT, so only the caller whose
   // failure really is evidence about the BINARY may set it. A background job's
   // child failing to hand shake is evidence about that spawn: five of them
@@ -9094,7 +9172,7 @@ function startAppServerChild({ onDeath = () => {}, latchInitFailure = false } = 
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawnProcess(CODEX_BIN, [...APP_SERVER_ARGS], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env } });
+      child = spawnProcess(CODEX_BIN, [...APP_SERVER_ARGS], { stdio: ['pipe', 'pipe', 'pipe'], env: env || codexWorkerContext(process.env).env });
     } catch (e) {
       latch();
       reject(new Error(`codex app-server failed to start: ${e.message}`));
@@ -9320,7 +9398,7 @@ const codexFallbackToldAbout = new Set();
  * `retriedCold` is set by the one automatic retry: see the dead-thread branch
  * in onAnswer.
  */
-function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = false, carriesHandoff = false, fellBack = null, alreadyRinged = false } = {}) {
+function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = false, carriesHandoff = false, fellBack = null, alreadyRinged = false, handback = null } = {}) {
   const st = chatState();
   const lane = LANES.main;
   // Claimed synchronously, before any await, for the same reason runClaude does
@@ -9425,7 +9503,7 @@ function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = f
         // same chat, both billed, with /stop reaching only one of them.
         // Stays on THIS transport: a cold retry that switched rails would
         // change two things at once and make the next failure unreadable.
-        runCodexChatExec(rawText, { images, prompt, retriedCold: true, carriesHandoff });
+        runCodexChatExec(rawText, { images, prompt, retriedCold: true, carriesHandoff, handback });
         if (progressMsgId != null) {
           // Terminal for THIS bubble: the retry opens its own, and nothing
           // ticks this one again.
@@ -9468,6 +9546,7 @@ function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = f
             { final: true },
           );
         }
+        if (retryCodexOnClaude(rawText, outcome, { mode: 'chat', preActivity: !/\"type\"\s*:\s*\"item.started\"/.test(readTextIf(run.logPath || null)), bootstrap: outcome.bootstrap === true, cwd, images, prompt, handback, notice: outcome.status === 'failed' ? codexChatError(outcome, { until: codexPausedUntil || null, timeZone: OWNER_TZ }) : null })) return;
         if (outcome.status === 'finished' && outcome.answer) {
           recordChatTurn({
             engine: 'codex',
@@ -9480,6 +9559,10 @@ function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = f
           });
           await sendResult(outcome.answer).catch(() => {});
         } else {
+          // A worker report this failed turn was carrying is put back, never
+          // dropped: held for the wall's wake-up while Claude is walled, else
+          // parked for the next turn (the same rule as a Claude limit death).
+          if (handback) keepHandback(handback, claudeRateWalled() ? 'wall' : 'park');
           await send(
             codexChatError(outcome, { until: codexPausedUntil || null, timeZone: OWNER_TZ }),
             { markdown: false },
@@ -9588,7 +9671,7 @@ function runCodexChatExec(rawText, { images = [], prompt = null, retriedCold = f
 // tally, and it is written here on the same schedule the exec path writes it.
 // ---------------------------------------------------------------------------
 
-function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff = false } = {}) {
+function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff = false, handback = null } = {}) {
   const st = chatState();
   const lane = LANES.main;
   // Same id shape as an exec run (codex-<startedAt>), so /account, the spend
@@ -9732,6 +9815,7 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
       : run.stopped
         ? { status: 'stopped', answer: '', tokens }
         : { status: 'finished', answer, tokens };
+    let keptReading = null; // run ids whose report this turn could not read (kept, still reading)
     try {
       finalizeCodexMeta(startedAt, outcome);
       // The wall, from the classified failure, exactly as the exec path does it:
@@ -9757,6 +9841,11 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
           { final: true },
         );
       }
+      if (!run.stopped && retryCodexOnClaude(rawText, outcome, { mode: 'chat', preActivity: !run.activityStarted, bootstrap: !run.activityStarted && outcome.failure === 'other', cwd, images, prompt, handback, notice: outcome.status === 'failed' ? codexChatError(outcome, { until: codexPausedUntil || null, timeZone: OWNER_TZ }) : null })) {
+        // Claude reads the report now, so its lines stay "reading" for Claude's close to settle.
+        if (handback) keptReading = (handback.items || []).map((i) => i.runId).filter(Boolean);
+        return;
+      }
       if (run.stopped) {
         await send('🛑 Task stopped.').catch(() => {});
       } else if (outcome.status === 'finished' && answer) {
@@ -9765,6 +9854,12 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
       } else if (outcome.status === 'finished') {
         await send('⚠️ The Codex turn ended with no answer.', { markdown: false }).catch(() => {});
       } else {
+        // A worker report this failed turn was carrying is put back, never
+        // dropped, and its line keeps saying it is being read (see the exec path).
+        if (handback) {
+          keepHandback(handback, claudeRateWalled() ? 'wall' : 'park');
+          keptReading = (handback.items || []).map((i) => i.runId).filter(Boolean);
+        }
         await send(codexChatError(outcome, { until: codexPausedUntil || null, timeZone: OWNER_TZ }), {
           markdown: false,
         }).catch(() => {});
@@ -9778,7 +9873,7 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
       // them. Without this, every worker line on a Codex chat lane settles at
       // "reading it now…" and stays there for the life of the daemon, because
       // the only other call site is runClaude's close handler.
-      if (lane === LANES.main) settleReadingNotices();
+      if (lane === LANES.main) settleReadingNotices(keptReading);
       drainQueue(lane);
     }
   };
@@ -9796,6 +9891,7 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
   // shared, and a stray item drawn into this bubble would be a lie about what
   // this turn did.
   const onNotification = (msg) => {
+    if (/^item\/(started|completed)$/.test(msg?.method || '') && !['agentMessage', 'userMessage'].includes(msg?.params?.item?.type)) run.activityStarted = true;
     const ev = mapNotification(msg, { home: HOME });
     if (!ev) return;
     if (ev.threadId && threadId && ev.threadId !== threadId) return;
@@ -9977,12 +10073,15 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
       // the lane again and ran it anyway, seconds after telling them it stopped
       // (QA finding). The exec run would also own a lane the stopped run had
       // already released, so /stop could reach only one of the two.
+      // Codex is still here on exec, so exec answers first (the lane's chosen
+      // engine); Claude stands in only if that one-shot cannot start either
+      // (runCodexChatExec's own retryCodexOnClaude, on a bootstrap failure).
       if (run.stopped) {
         await send('🛑 Task stopped.').catch(() => {});
         drainQueue(lane);
         return;
       }
-      runCodexChatExec(rawText, { images, prompt, carriesHandoff, fellBack: codexAppServerState().reason || 'init_failed', alreadyRinged: true });
+      runCodexChatExec(rawText, { images, prompt, carriesHandoff, fellBack: codexAppServerState().reason || 'init_failed', alreadyRinged: true, handback });
       return;
     }
     if (run.stopped) {
@@ -10021,7 +10120,7 @@ function runCodexChatTurn(rawText, { images = [], prompt = null, carriesHandoff 
       const res = await client.call((id) =>
         turnStartRequest(id, {
           threadId,
-          text: prompt || rawText,
+          text: codexWritingPrompt(prompt || rawText),
           images: imgs,
           model,
           effort: codexEffort,
@@ -10122,10 +10221,12 @@ function bothEnginesWalledLine() {
  * that never ran. Any term added to one of these belongs in the other.
  */
 function canRunHeldItem(it) {
-  if (codexWalled() && claudeWalled()) return false;
-  const codexWillNotTakeThis = BG_COMMAND_RE.test(String(it?.text || '').trimStart());
-  if (claudeRateWalled() && (!codexTakingChat() || codexWillNotTakeThis)) return false;
-  return true;
+  const decision = engineFor(it?.heldOnBg ? 'bg' : 'chat', it?.forcedEngine || null);
+  if (decision.error || !decision.engine) return false;
+  // A Claude slash command the fallback would hand to Codex is not runnable
+  // there (see dispatchPrompt's hold): it waits for Claude.
+  if (decision.engine === 'codex' && unchosenCodex(decision) && BG_COMMAND_RE.test(String(it?.text || '').trimStart())) return false;
+  return decision.engine === 'codex' ? CODEX_AVAILABLE && !codexWalled() : !claudeWalled();
 }
 
 /** Is any engine free for an ordinary typed message? For the callers with no item in hand. */
@@ -10198,7 +10299,11 @@ function flushParkedWalledChats({ fold = null } = {}) {
     // priority turn instead, queued behind the running one.
     const note = fold && !folded && !it.heldOnBg && !LANES.main.current ? fold(items.length) : null;
     if (note) folded = true;
-    dispatchPrompt(it.text, it.heldOnBg ? getBgLane() : undefined, {
+    dispatchPrompt(it.forcedEngine ? `${it.forcedEngine}: ${it.text}` : it.text, it.heldOnBg ? getBgLane() : undefined, {
+      priority: Boolean(it.priority),
+      schedule: it.schedule || null,
+      handback: it.handback || null,
+      cwd: it.cwd || null,
       allowCodexFallback: true,
       images: it.images,
       kinds: it.kinds || [],
@@ -10227,14 +10332,21 @@ function flushParkedWalledChats({ fold = null } = {}) {
 function flushParkedWalledJobs() {
   const held = readHeldBgJobs();
   if (!held.length) return;
-  // A HELD JOB IS CLAUDE-BOUND BY CONSTRUCTION (the drain only holds a job
-  // resolveEngine left on Claude), so it waits for the reset itself rather than
-  // for "any engine": releasing it into a Codex that cannot run it would put it
-  // straight back. That is why this reads the rate wall and not noEngineForChat.
-  if (claudeRateWalled()) return;
+  // Resolve each job again. A healthy engine can take unpinned work while a
+  // pinned job stays behind its own engine's wall.
+  const ready = [];
+  const waiting = [];
+  for (const it of held) {
+    const text = typeof it === 'string' ? it : it?.text;
+    const pre = parseEnginePrefix(text || '');
+    const forcedEngine = (typeof it === 'object' && it?.engine) || pre.engine || null;
+    const runnable = text && canRunHeldItem({ heldOnBg: true, forcedEngine });
+    (runnable ? ready : waiting).push(it);
+  }
+  if (!ready.length) return;
   logAccountDecision({
     decision: 'resume_after_reset',
-    count: held.length,
+    count: ready.length,
     reason: 'background jobs held behind the wall',
   });
   let queued = [];
@@ -10244,7 +10356,7 @@ function flushParkedWalledJobs() {
   } catch {
     queued = []; // no file, or a half-written one: the held items are the queue
   }
-  const merged = [...held, ...queued];
+  const merged = [...ready, ...queued];
   try {
     const tmp = `${BG_QUEUE_FILE}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(merged));
@@ -10257,7 +10369,7 @@ function flushParkedWalledJobs() {
   // held brief to one failed write; this order can at worst run one twice,
   // and a duplicate run is recoverable where a destroyed brief is not.
   try {
-    writeHeldBgJobs([]);
+    writeHeldBgJobs(waiting);
   } catch (e) {
     console.error('[bridge] the hold file would not clear; a held job may run twice:', e.message);
   }
@@ -10265,8 +10377,10 @@ function flushParkedWalledJobs() {
   // rather than into a message of its own: each job that starts draws its own
   // worker card a moment later, and a line between the two saying the same
   // thing is the duplication the live-message rules exist to remove.
-  pendWallResolution('claude', { resumed: held.length });
-  settleWall('claude', { resumed: held.length });
+  if (!claudeRateWalled()) {
+    pendWallResolution('claude', { resumed: ready.length });
+    settleWall('claude', { resumed: ready.length });
+  }
   drainBgHandoff();
 }
 
@@ -10453,7 +10567,7 @@ function drainBgHandoff() {
     // when the wall lifts, so it resumes through this same drain: its worker
     // card, its repo resolution, its lint and its run id all come from the one
     // path that knows how to build them, rather than from a second copy here.
-    if (decision.engine === 'claude' && decision.pausedUntil) {
+    if (decision.pausedUntil && (decision.engine === 'claude' || codexWalled())) {
       if (holdBgJob(typeof it === 'object' && it ? it : { text: queuedText })) {
         logAccountDecision({
           decision: 'all_accounts_walled_until',
@@ -10480,6 +10594,8 @@ function drainBgHandoff() {
     // this the drop-box path handed the literal text "/autopilot ship the thing"
     // to a model that has never heard of it, holding workspace-write on a repo,
     // while three doc surfaces promised it would wait for the reset instead.
+    // (The private sibling hands it over: there the Claude workflows are
+    // projected into Codex as skills, which a fresh install does not have.)
     const fallbackSlashCommand = unchosenCodex(decision) && BG_COMMAND_RE.test(stripLaneRules(text).trimStart());
     if (decision.engine === 'codex' && !fallbackSlashCommand) {
       // `--repo` / `--cwd` on the queue item is the DECLARED working directory,
@@ -10514,6 +10630,9 @@ function drainBgHandoff() {
         cwd: codexCwd,
         reason: decision.reason,
         pausedUntil: decision.pausedUntil,
+        schedule: typeof it === 'object' && it?.scheduleId != null
+          ? { id: it.scheduleId, allowWrite: it.allowWrite === true && scheduleApprovesWrites(it.scheduleId) }
+          : null,
       });
       // CLAUDE-ONLY CONTENT IN A CODEX BRIEF (case 26). bg.mjs strips the LANE
       // RULES header for a Codex job and nothing else, so a brief written for a
@@ -10557,7 +10676,7 @@ function drainBgHandoff() {
             return { elapsedSec, steps: run.steps || 0, lastAct: run.lastAct || null };
           },
           lint.length
-            ? `\n⚠️ This brief names ${lint.length} thing${lint.length === 1 ? '' : 's'} Codex does not have:\n${lint.map((l) => `  • ${l}`).join('\n')}`
+            ? `\n⚠️ Codex will adapt these steps:\n${lint.map((l) => `  • ${l}`).join('\n')}`
             : '',
         ).catch(() => {});
       } catch (e) {
@@ -10628,7 +10747,20 @@ function drainBgHandoff() {
       typeof it === 'object' && it?.scheduleId != null
         ? { id: it.scheduleId, allowWrite: it.allowWrite === true && scheduleApprovesWrites(it.scheduleId) }
         : null;
-    dispatchPrompt(text, lane, { priority: true, schedule }); // already claimed out of the file: must not be dropped
+    // ONLY A DECLARED directory (`--repo` / `--cwd`, which bg.mjs proved exists)
+    // moves a Claude worker; otherwise it keeps the chat cwd as it always has.
+    // Never the brief inference: its first `~/dev/<x>` can be a FILE
+    // (`~/dev/CLAUDE.md`), and a file as cwd makes spawn throw ENOTDIR after
+    // runClaude has claimed the lane, which loses the job and wedges the lane.
+    const declaredCwd = typeof it === 'object' && it?.cwd ? it.cwd : null;
+    const cwd = declaredCwd && (() => { try { return statSync(declaredCwd).isDirectory(); } catch { return false; } })() ? declaredCwd : null;
+    // A CLAUDE PIN IS FORWARDED: dispatchPrompt resolves the engine again, and
+    // without the prefix a job pinned to Claude (`--engine claude`, or a Claude
+    // takeover of a failed Codex job) would follow `/engine bg codex` back onto
+    // Codex. `prepend` is a takeover's note, carried on the queue item.
+    const pinnedClaude = ((typeof it === 'object' && it?.engine) || pre.engine) === 'claude';
+    const itemPrepend = typeof it === 'object' && typeof it?.prepend === 'string' && it.prepend ? it.prepend : null;
+    dispatchPrompt(pinnedClaude ? `claude: ${text}` : text, lane, { priority: true, schedule, cwd, prepend: itemPrepend }); // a declared job directory survives on either engine
     running++; // this worker is live from here on, so the next item sees a fuller pool
     if (typeof it === 'object' && it?.resumeOf) pacedRunning++; // and a resume counts toward the next resume's pace
     // THE WALL GUARD'S DISPATCH RECORD, the drop box half: the directory pin
@@ -11210,7 +11342,7 @@ Commands:
 /steer <lane|runId|pid|latest> <instruction> · one more instruction into a RUNNING worker, keeping the context it built (killing it throws it away) · bare /steer lists them
 /btw [target] <question> · ask a RUNNING worker a SIDE question: answered here, its plan untouched · none means latest
 /engine [bg] claude|codex · which engine each lane runs on · bare /engine shows both, the config defaults, the Codex model/effort and sandbox · a "codex:" or "claude:" prefix pins one message
-/codex <question> · ask OpenAI Codex: read-only, in the current cwd, on this chat's thread, billed separately so it answers when Claude is walled · review [<repo>] [vs <branch>] · its own review over a diff · model [<name>|default] · effort [low|medium|high|xhigh|default] · network on|off · doctor (install/auth/network) · on|off · the fallback: while EVERY Claude account is rate limited, bg jobs run on Codex and chat gets a degraded answer, not silence (default: on)
+/codex <question> · ask OpenAI Codex: read-only, in the current cwd, on this chat's thread; Claude answers if Codex is out · review [<repo>] [vs <branch>] · its own review over a diff · model [<name>|default] · effort [low|medium|high|xhigh|default] · network on|off · doctor (install/auth/network) · on|off · the fallback: while EVERY Claude account is rate limited, bg jobs and chat continue on Codex (default: on)
 /stop [bg|all] · kill the running task (chat lane by default)
 /restart · restart the daemon (if something feels stuck)
 /logs · last lines of the daemon log
@@ -11821,8 +11953,8 @@ async function handleCommand(text, msg = null) {
         saveState();
         await send(
           low === 'on'
-            ? '🧠 Codex fallback ON. While every Claude account is limited: background jobs run on Codex, and a chat message gets a degraded Codex answer instead of nothing.'
-            : '🧠 Codex fallback OFF. While every Claude account is limited, work waits for the reset. /codex <question> still runs on demand.',
+            ? '🧠 Codex fallback ON. While every Claude account is limited: background jobs run on Codex, and chat messages continue on Codex.'
+            : '🧠 Codex fallback OFF. While every Claude account is limited, work waits for the reset, as it did before. /codex <question> still runs on demand.',
           { markdown: false },
         );
         return;
@@ -11860,6 +11992,11 @@ async function handleCommand(text, msg = null) {
         );
         return;
       }
+      // EVERY remaining path here spawns Codex. When Codex is missing or walled
+      // a healthy Claude takes the same read-only request (retryCodexOnClaude);
+      // only when it cannot does the missing-binary line answer. Without that
+      // line a missing binary produced a start notice, two artifact files and a
+      // `spawn ENOENT` report handed to the assistant as a turn spent summarising nothing.
       // /codex review [<repo>] [vs <branch>] runs the CLI's own review harness over
       // a diff, on the same lane as everything else here. Still read-only: a
       // review reads a diff and says what is wrong with it, it does not fix it.
@@ -11883,6 +12020,12 @@ async function handleCommand(text, msg = null) {
         });
         if (target.error) {
           await send(`❌ ${target.error}`, { markdown: false });
+          return;
+        }
+        const reviewTask = `Read-only code review in ${target.dir}: inspect ${parsed.branch ? `the diff against ${parsed.branch}` : 'uncommitted changes'}. Read .claude/VERIFY.md and report concrete bugs with file and line references. Do not edit files.`;
+        if ((!CODEX_AVAILABLE || codexWalled()) && retryCodexOnClaude(reviewTask, { status: 'failed', failure: 'rate_limit' }, { mode: 'review', cwd: target.dir, background: true })) return;
+        if (!CODEX_AVAILABLE) {
+          await send(CODEX_MISSING_LINE, { markdown: false });
           return;
         }
         runCodex(codexReviewTask({ dir: target.dir, branch: parsed.branch }), {
@@ -11913,9 +12056,16 @@ async function handleCommand(text, msg = null) {
         );
         return;
       }
+      // Still read-only when Claude stands in: the takeover's prepend says so.
+      const askCwd = existsSync(st.cwd) ? st.cwd : HOME;
+      if ((!CODEX_AVAILABLE || codexWalled()) && retryCodexOnClaude(a, { status: 'failed', failure: 'rate_limit' }, { mode: 'ask', cwd: askCwd, images: attached })) return;
+      if (!CODEX_AVAILABLE) {
+        await send(CODEX_MISSING_LINE, { markdown: false });
+        return;
+      }
       runCodex(a, {
         mode: 'ask',
-        cwd: existsSync(st.cwd) ? st.cwd : HOME,
+        cwd: askCwd,
         reason: 'explicit',
         threadId: st.codexThreadId || null,
         images: attached,
@@ -12390,7 +12540,7 @@ function pickLane(prompt) {
 // (grab() in bg-codex-wiring.test.mjs) and its extractor stops at the first
 // unindented line, so a signature wrapped onto a `) {` of its own is grabbed
 // truncated and the whole harness fails to parse.
-function queueItem(text, { images = [], kinds = [], forcedEngine = null, priority = false, allowCodexFallback = false, retried = false, prepend = null, replyQuote = null, schedule = null, handback = null } = {}) {
+function queueItem(text, { images = [], kinds = [], forcedEngine = null, priority = false, allowCodexFallback = false, retried = false, prepend = null, replyQuote = null, schedule = null, handback = null, cwd = null } = {}) {
   // `kinds` is what ARRIVED, not what is being sent to a model: the run bubble's
   // first frame says "📎 3 photos" so a slow album is visibly landing rather
   // than silently missing.
@@ -12424,6 +12574,7 @@ function queueItem(text, { images = [], kinds = [], forcedEngine = null, priorit
     // and read in one place: a turn that dies on a session limit is re-read
     // once or kept by this mark, never dropped (handbackLimitPlan).
     handback: handback || null,
+    cwd: cwd || null,
   };
 }
 const asQueueItem = (v) => (typeof v === 'string' ? queueItem(v) : v);
@@ -12484,7 +12635,7 @@ function trackQueueAck(item, lane, msgId, body) {
 }
 
 /**
- * Terminal. `state` is 'started' or 'dropped'.
+ * Terminal. `state` is 'started', 'held' or 'dropped'.
  *
  * The ack is sent asynchronously, so a lane that frees up in the same tick can
  * get here BEFORE the message exists. Recording the outcome on the item then
@@ -12499,7 +12650,7 @@ function resolveQueueAck(item, state) {
   const msgId = item.ackMsgId;
   item.ackMsgId = null;
   const waitedSec = item.queuedAt ? Math.round((Date.now() - item.queuedAt) / 1000) : null;
-  const text = state === 'dropped' ? queueDropped() : queueStarted({ waitedSec });
+  const text = state === 'held' ? '⏸ Waiting for an available engine.' : state === 'dropped' ? queueDropped() : queueStarted({ waitedSec });
   // Terminal, as the docblock above says: the ack has no state after this one.
   editProgress(msgId, escHtml(text), () => text, { final: true }).catch(() => {});
 }
@@ -12507,11 +12658,11 @@ function resolveQueueAck(item, state) {
 /**
  * WHICH ENGINE, for one message about to run on one IDLE lane.
  *
- * `ignoreWall` is the difference between the owner's own message and internal
- * traffic. The rate-limit fallback is a degraded answer for a message they are
- * sitting there waiting on; a worker report or a scheduled task diverted to a
- * thread-less Codex run would be handed to a model that has never heard of this
- * bridge, and parked for an assistant that has already been given it.
+ * A wall now routes internal traffic too (worker reports, scheduled tasks):
+ * a walled Claude hands them to the Codex chat lane, which continues the chat
+ * thread and summarises them under the same writing rules. `ignoreWall` is
+ * still passed but engineFor no longer reads it. Anything that must stay on
+ * Claude pins itself with a `claude:` prefix (compaction does).
  */
 function engineForItem(lane, item) {
   return engineFor(lane.isBg ? 'bg' : 'chat', item.forcedEngine, {
@@ -12558,14 +12709,37 @@ function takeHandoffPrefix(engine) {
   });
 }
 
+function automaticChatHandoff(engine) {
+  const ring = readChatRing();
+  const from = ring[ring.length - 1]?.engine;
+  if (!from || from === engine || chatState().handoffPending) return '';
+  const handoff = recordedHandoff(from);
+  return handoff ? renderHandoffBlock(handoff, { toEngine: engine, ownerName: OWNER_NAME, cwd: chatState().cwd }) : '';
+}
+
+// The Codex wall episodes the "Claude is taking over" line was already sent for.
+const claudeTakeoverToldFor = new Set();
+
 function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
   const text = item.text;
+  const automaticHandoff = !laneBusy && lane === LANES.main && decision.engine ? automaticChatHandoff(decision.engine) : '';
+  if (automaticHandoff) item.prepend = [automaticHandoff, item.prepend].filter(Boolean).join('\n\n');
+  // Said ONCE per Codex wall (once per daemon run for a missing binary), not
+  // on every message, report and scheduled task the wall reroutes.
+  if (!laneBusy && decision.engine === 'claude' && ['codex_missing', 'codex_limited'].includes(decision.reason)) {
+    const episode = decision.reason === 'codex_missing' ? 'missing' : String(codexPausedUntil);
+    if (!claudeTakeoverToldFor.has(episode)) {
+      claudeTakeoverToldFor.add(episode);
+      send('🔄 Codex is unavailable, so Claude is taking these over.', { markdown: false }).catch(() => {});
+    }
+  }
   // WHAT YOU TYPED stays `text`, and every routing test below reads that: is it
   // a Claude slash command, which repo does the brief name. `sent` is the same
   // message with the quoted bubble joined on, and only a runner ever sees it,
   // so a reply to a bubble containing "/autopilot" or a repo name cannot
   // decide anything. See reply-quote.mjs.
-  const sent = composeWithQuote(item.replyQuote?.block || '', text);
+  const quoted = composeWithQuote(item.replyQuote?.block || '', text);
+  const sent = item.prepend ? `${item.prepend}\n\n${quoted}` : quoted;
   // Internal payloads are NEVER refused: a handback with nowhere to go must
   // still reach the owner, which is what deliverWithoutClaude on the Claude
   // path below does. Only a message they typed gets an error bubble.
@@ -12578,7 +12752,7 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
   }
   // THE CHAT LANE ON CODEX. A settled preference (or an explicit prefix) is a
   // conversation with a thread, not a rescue: it goes to runCodexChat, which
-  // resumes. Only `claude_limited` is the degraded, thread-less fallback.
+  // resumes, including a turn that takes over during a Claude wall.
   //
   // ONLY WHEN THE LANE IS FREE. Without the guard a second message would claim
   // lane.current out from under the first and BOTH runs would continue: two
@@ -12588,16 +12762,18 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
   // meant to produce.
   if (decision.engine === 'codex' && lane === LANES.main) {
     if (laneBusy) return 'fallthrough';
-    if (decision.reason === 'claude_limited') runCodexChatFallback(text, decision, { images: item.images, prompt: sent });
-    else {
+    {
       const prefix = item.priority ? '' : takeHandoffPrefix('codex');
       runCodexChat(text, {
         images: item.images,
+        // A worker report keeps its mark into a Codex turn too: a turn that
+        // fails puts it back (keepHandback) instead of dropping it.
+        handback: item.handback || null,
         // null means "send what you typed". A handoff block, a quote, or both
         // make it something else, and in that order: the carried-over context
         // first, then what you were pointing at, then your words.
         prompt: prefix ? `${prefix}\n\n${sent}` : sent === text ? null : sent,
-        carriesHandoff: Boolean(prefix),
+        carriesHandoff: Boolean(prefix || automaticHandoff),
       });
     }
     return 'started';
@@ -12606,8 +12782,9 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
   // the same treatment as one handed over through bg.mjs: run it rather than
   // spawn a worker into the wall, watch it die, and spend 90s on a salvage.
   // A Claude SLASH COMMAND is the exception and still waits: /autopilot, /goal
-  // and friends are Claude Code commands, and Codex has no idea what they are,
-  // so routing one there would produce confident nonsense.
+  // and friends are Claude Code commands, and Codex has no idea what they are
+  // unless it was asked for by name, so routing one there would produce
+  // confident nonsense.
   const unchosenSlashCommand = unchosenCodex(decision) && BG_COMMAND_RE.test(text.trimStart());
   if (decision.engine === 'codex' && lane.isBg && !unchosenSlashCommand) {
     // rawText = what you typed, so the start notice, /status and the bg-results
@@ -12615,11 +12792,12 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
     // front, which is the only part Codex reads.
     startCodexJob(text, {
       prompt: sent,
+      schedule: item.schedule || null,
       mode: 'edit',
       // Same repo resolution as the bg.mjs drop-box path: workspace-write is
       // rooted at ONE directory, so a `bg:` job about another repo has to run
       // there or it edits same-named files in the wrong tree.
-      cwd: codexCwdForBrief(briefRepo(text, { workspaceDir: DEFAULT_CWD, fallbackDir: chatState().cwd }), {
+      cwd: item.cwd && existsSync(item.cwd) ? item.cwd : codexCwdForBrief(briefRepo(text, { workspaceDir: DEFAULT_CWD, fallbackDir: chatState().cwd }), {
         devDir: DEFAULT_CWD,
         fallbackCwd: existsSync(chatState().cwd) ? chatState().cwd : DEFAULT_CWD,
         exists: existsSync,
@@ -12642,7 +12820,7 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
 // priority = a completed worker's report: never drop it for queue limits, and
 // jump the line so results surface before newer user prompts.
 // One line for the same reason as queueItem above: grab() extracts it by source.
-function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallback = false, images = [], kinds = [], retried = false, prepend = null, replyQuote = null, schedule = null, handback = null } = {}) {
+function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallback = false, images = [], kinds = [], retried = false, prepend = null, replyQuote = null, schedule = null, handback = null, cwd = null } = {}) {
   // A `codex:` or `claude:` prefix on a typed message pins THIS message's
   // engine, beating both /engine and the config. Stripped before dispatch so
   // the model never sees the routing instruction as part of its prompt.
@@ -12658,7 +12836,7 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
   const p2 = parseEnginePrefix(p1.text.replace(/^\s*bg:\s*/i, ''));
   const forcedEngine = p1.engine || p2.engine;
   const text = p2.text;
-  const item = queueItem(text, { images, kinds, forcedEngine, priority, allowCodexFallback, retried, prepend, replyQuote, schedule, handback });
+  const item = queueItem(text, { images, kinds, forcedEngine, priority, allowCodexFallback, retried, prepend, replyQuote, schedule, handback, cwd });
   // NO ENGINE WILL TAKE THIS. Only for a message they typed: internal traffic
   // ignores the wall by construction (see engineForItem). Spawning here
   // produces two failures a minute on a lane that cannot answer, so the message
@@ -12679,23 +12857,24 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
   // commands and startResolvedRun deliberately refuses to hand one over. So the
   // fallback that would otherwise rescue the message does not apply, and
   // without this the command spawned into the wall, died, and cost a salvage.
-  // The docs already promised it would "wait for the reset"; this is what makes
-  // that true.
-  const codexWillNotTakeThis = BG_COMMAND_RE.test(text.trimStart());
-  const holdIt =
-    !priority &&
-    allowCodexFallback &&
-    !forcedEngine &&
-    // BOTH ENGINES OUT, including the machine with no `claude` and a walled
-    // Codex: the only engine it has is coming back, so the message waits.
-    ((codexWalled() && claudeWalled()) ||
-      // OR a Claude RATE wall with nothing willing to cover it. Not
-      // claudeWalled(): with no claude binary at all there is no reset to wait
-      // for, and that case has its own answer further down (Codex, or the
-      // refusal that names what the message needs).
-      (claudeRateWalled() && (!codexTakingChat() || codexWillNotTakeThis)));
+  // The docs already promised it would "wait for the reset"; this is what
+  // makes that true. A slash command the fallback would hand to Codex waits
+  // with the rest (startResolvedRun refuses it on an unchosen Codex).
+  const pendingDecision = engineForItem(lane, item);
+  const codexWillNotTakeThis = unchosenCodex(pendingDecision) && BG_COMMAND_RE.test(text.trimStart());
+  const holdIt = Boolean(pendingDecision.pausedUntil) &&
+    (pendingDecision.engine === 'claude' || codexWalled() || codexWillNotTakeThis);
   if (holdIt) {
-    if (parkedWalledChats.length < PARKED_WALLED_MAX) {
+    // A WORKER REPORT IS KEPT, not parked with the chat messages: held for
+    // the wall's wake-up (on disk, wall-wake.json) when a wall episode is open,
+    // else parked for the next turn, exactly as a turn that died on the wall
+    // would have kept it. Parked here it lived only in memory.
+    if (item.handback) {
+      keepHandback(item.handback, 'wall');
+      armWallResume(Number(pendingDecision.pausedUntil) / 1000);
+      return;
+    }
+    if (parkedWalledChats.length < PARKED_WALLED_MAX || priority) {
       // `heldOnBg` so the flush can put it back where it was going. The `bg:`
       // prefix is already stripped off `text` by now, so nothing else in the
       // item remembers which lane this was for.
@@ -12816,6 +12995,7 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
     schedule,
     // A worker report keeps its mark into the run (see queueItem).
     handback,
+    cwd,
   }).catch((e) => console.error('[bridge] runClaude error:', e));
 }
 
@@ -12849,10 +13029,6 @@ function deliverWithoutClaude(text) {
 function drainQueue(lane) {
   if (lane.current || !lane.queue.length) return;
   const item = asQueueItem(lane.queue.shift());
-  // ITS TURN CAME. Resolved here rather than at each of the three ways a run
-  // can start below, because this shift is the single moment that is true on
-  // all of them, including the refusal arm that drains straight past it.
-  resolveQueueAck(item, 'started');
   if (lane.priorityCount > 0) lane.priorityCount--;
   // THE ENGINE IS RESOLVED HERE TOO, from the item's own inputs. This used to
   // call runClaude unconditionally, so a message queued behind a Codex chat
@@ -12861,6 +13037,18 @@ function drainQueue(lane) {
   // unsummarised. A `codex:` prefix honoured at the busy check was lost here
   // too. Same decision, same function, as the dispatch that queued it.
   const decision = engineForItem(lane, item);
+  if (decision.pausedUntil && (decision.engine === 'claude' || codexWalled())) {
+    // This item was accepted before the current turn discovered the wall.
+    // Preserve it even if the hold is full, including its schedule and reply.
+    // A worker report goes to the on-disk keep instead (see dispatchPrompt).
+    if (item.handback) keepHandback(item.handback, 'wall');
+    else parkedWalledChats.push({ ...item, heldOnBg: Boolean(lane.isBg) });
+    resolveQueueAck(item, 'held');
+    armWallResume(Number(decision.pausedUntil) / 1000);
+    drainQueue(lane);
+    return;
+  }
+  resolveQueueAck(item, 'started');
   const outcome = startResolvedRun(decision, lane, item, { laneBusy: false });
   if (outcome === 'started') return;
   if (outcome === 'refused') {
@@ -12888,6 +13076,7 @@ function drainQueue(lane) {
     schedule: item.schedule || null,
     // And a queued WORKER REPORT is still marked as one.
     handback: item.handback || null,
+    cwd: item.cwd || null,
   }).catch((e) => console.error('[bridge] runClaude error:', e));
 }
 

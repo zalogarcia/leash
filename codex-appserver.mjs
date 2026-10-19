@@ -652,16 +652,25 @@ export function execEventForLog(msg, { usage = null } = {}) {
   if (!msg || typeof msg !== 'object' || !msg.method) return null;
   const p = msg.params || {};
   switch (msg.method) {
-    case 'thread/started':
-      return { type: 'thread.started', thread_id: p.thread?.id || null };
+    case 'thread/started': {
+      const child = p.thread?.source?.subAgent?.thread_spawn;
+      const role = p.thread?.agentRole ?? child?.agent_role;
+      return {
+        type: 'thread.started',
+        thread_id: p.thread?.id || null,
+        codex_agent_metadata: true,
+        agent_role: typeof role === 'string' ? role : null,
+        parent_thread_id: typeof child?.parent_thread_id === 'string' ? child.parent_thread_id : null,
+      };
+    }
     case 'turn/started':
-      return { type: 'turn.started', turn_id: p.turn?.id || null };
+      return { type: 'turn.started', thread_id: p.threadId || null, turn_id: p.turn?.id || null };
     case 'item/started':
-      return { type: 'item.started', item: execItemFromCodexItem(p.item) };
+      return { type: 'item.started', thread_id: p.threadId || null, item: execItemFromCodexItem(p.item) };
     case 'item/completed':
-      return { type: 'item.completed', item: execItemFromCodexItem(p.item) };
+      return { type: 'item.completed', thread_id: p.threadId || null, item: execItemFromCodexItem(p.item) };
     case 'turn/completed': {
-      const ev = { type: 'turn.completed', status: p.turn?.status || 'completed' };
+      const ev = { type: 'turn.completed', thread_id: p.threadId || null, status: p.turn?.status || 'completed' };
       if (usage) {
         ev.usage = {
           input_tokens: Number(usage.input_tokens) || 0,
@@ -671,7 +680,7 @@ export function execEventForLog(msg, { usage = null } = {}) {
       return ev;
     }
     case 'error':
-      return { type: 'error', message: String(p.error?.message || 'the Codex turn failed') };
+      return { type: 'error', thread_id: p.threadId || null, message: String(p.error?.message || 'the Codex turn failed') };
     default:
       return null;
   }

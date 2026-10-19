@@ -350,18 +350,13 @@ t('★ both markers are emitted, and the raw JSON never is', () => {
   ok(/VOID/.test(block), 'the untrusted-input framing is what makes this safe to inject');
 });
 
-t('★ the tools the incoming engine does not have are named, from a constant map', () => {
-  const said = unavailableTools('codex', ['Agent', 'skills', 'the memory dir', 'supabase-mcp']);
-  ok(said.some((x) => /subagents/.test(x)), JSON.stringify(said));
-  ok(said.some((x) => /skills/.test(x)), JSON.stringify(said));
-  ok(said.some((x) => /memory dir/.test(x)), JSON.stringify(said));
-  ok(said.some((x) => /MCP server is configured/.test(x)), JSON.stringify(said));
-  // Nothing in the Claude set is unavailable ON Claude.
+t('projected agents, skills, memory and configured MCP do not produce false absence warnings', () => {
+  eq(unavailableTools('codex', ['Agent', 'skills', 'the memory dir', 'supabase-mcp']).length, 0);
   eq(unavailableTools('claude', ['Agent', 'skills', 'the memory dir', 'supabase-mcp']).length, 0);
   eq(unavailableTools('codex', []).length, 0);
 });
 
-t('★ paths outside the cwd are named, because Codex genuinely cannot reach them', () => {
+t('★ paths outside the writable cwd are named without denying read access', () => {
   // Structural: workspace-write is rooted at ONE directory and `codex exec
   // resume` takes no --add-dir (measured).
   const out = unreachablePaths('/Users/z/dev/x', ['/Users/z/dev/x/foo.ts', '/Users/z/dev/y/z.ts', '/Users/z/dev/y/z.ts']);
@@ -374,7 +369,7 @@ t('★ paths outside the cwd are named, because Codex genuinely cannot reach the
   eq(unreachablePaths('/Users/z/dev/x', null).length, 0);
 });
 
-t('the unreachable line is only for Codex: Claude reads anywhere on this Mac', () => {
+t('the writable workspace reminder is only for Codex', () => {
   const block = renderHandoffBlock(sample(), { toEngine: 'claude', cwd: '/Users/z/dev/x' });
   ok(!/Cannot be reached/.test(block), block);
 });
@@ -445,7 +440,7 @@ t('a handoff carrying nothing but the cwd says so rather than printing a blank',
 });
 
 t('★ the switch line names the missing tools in one word each', () => {
-  eq(unavailableToolLabels('codex', ['Task', 'Skill', 'mcp__supabase__execute_sql']).join(', '), 'subagents, skills, MCP');
+  eq(unavailableToolLabels('codex', ['Task', 'Skill', 'mcp__supabase__execute_sql']).join(', '), '');
   eq(unavailableToolLabels('claude', ['Task']).length, 0, 'Claude has all of them');
 });
 

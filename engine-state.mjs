@@ -15,14 +15,14 @@
 // Resolution order, highest first: an explicit per-job engine, then the chat's
 // stored setting, then the config default, then claude. Availability can veto
 // any of them (a missing binary is not a preference), and the rate-limit
-// fallback can promote claude to codex, but ONLY for a lane that expressed no
-// preference and only while every Claude account is walled.
+// fallback can promote claude to codex while every Claude account is walled,
+// except for an explicit per-job Claude pin. A missing or
+// limited Codex engine can use healthy Claude. If both windows are closed,
+// the decision retains a runnable engine and its reset time for the hold.
 //
-// THE LOOP GUARD is structural rather than a check: nothing in this module can
-// see whether a previous run FAILED. A Codex failure therefore cannot make the
-// next decision come out claude, and a Claude failure cannot make it come out
-// codex except through rotationPausedUntil, which only a real account wall
-// sets. There is no input here to ping-pong on.
+// Runtime retries pin Claude explicitly and keep fallback disabled in their
+// dispatch. This resolver also preserves explicit Claude pins, so a retry
+// cannot bounce back to Codex if the second engine fails.
 //
 // Pure: no filesystem, no process, no clock of its own. bridge.mjs passes the
 // state and the availability in, which is what makes engine-state.test.mjs able
@@ -95,8 +95,11 @@ export function bgEngine({ chat = {}, config = {} } = {}) {
  * WHICH ENGINE RUNS THIS. The one decision every entry point shares.
  *
  * `lane`: 'chat' | 'bg'.
- * `forcedEngine`: from a `codex:`/`claude:` prefix or `--engine`. Beats
- *   everything, including a wall and including the config.
+ * `forcedEngine`: from a `codex:`/`claude:` prefix or `--engine`. Beats the
+ *   lane setting and the config. A Claude pin also beats a Claude wall (it
+ *   waits for the reset). A Codex pin does NOT wait for a Codex wall: a
+ *   healthy Claude takes it (reason 'codex_limited'), which is the two way
+ *   parity the owner asked for; with both walled it is held until either is back.
  * `claudeAvailable` / `codexAvailable`: is the binary on PATH. A preference for
  *   an engine that is not installed is not a preference, it is a crash waiting
  *   to happen, so availability vetoes last and says so.
@@ -107,6 +110,10 @@ export function bgEngine({ chat = {}, config = {} } = {}) {
  *          'config'         the install default
  *          'claude_limited' the rate-limit fallback promoted it
  *          'claude_missing' there is no claude binary to run
+ *          'codex_limited'  Codex is walled, Claude takes it (or, with no
+ *                           Claude, it waits for the Codex reset)
+ *          'codex_missing'  there is no codex binary, Claude takes it
+ *          'both_limited'   wanted Codex, both walled: held until either is back
  *          null             plain claude, nothing to explain
  *   error  'codex_missing' | 'claude_missing' when NOTHING can run it.
  *
@@ -122,6 +129,7 @@ export function resolveEngine({
   config = {},
   claudeAvailable = true,
   codexAvailable = true,
+  codexPausedUntil = 0,
   rotationPausedUntil = 0,
   now = Date.now(),
   codexFallback = true,
@@ -132,7 +140,20 @@ export function resolveEngine({
   const wanted = forced || settled;
 
   if (wanted === 'codex') {
-    if (!codexAvailable) return { engine: null, reason: null, pausedUntil: null, error: 'codex_missing' };
+    const codexPaused = Number(codexPausedUntil) > Number(now) ? Number(codexPausedUntil) : 0;
+    if (!codexAvailable || codexPaused) {
+      const claudePaused = Number(rotationPausedUntil) > Number(now);
+      if (claudeAvailable && !claudePaused) {
+        return { engine: 'claude', reason: codexAvailable ? 'codex_limited' : 'codex_missing', pausedUntil: null, error: null };
+      }
+      if (claudeAvailable && claudePaused) {
+        return { engine: 'claude', reason: 'both_limited', pausedUntil: Number(rotationPausedUntil), error: null };
+      }
+      if (codexAvailable && codexPaused) {
+        return { engine: 'codex', reason: 'codex_limited', pausedUntil: codexPaused, error: null };
+      }
+      return { engine: null, reason: null, pausedUntil: codexPaused || null, error: codexAvailable ? 'codex_limited' : 'codex_missing' };
+    }
     const reason = forced ? 'explicit' : explicitlySet ? 'setting' : 'config';
     return { engine: 'codex', reason, pausedUntil: null, error: null };
   }
@@ -144,12 +165,13 @@ export function resolveEngine({
     // No binary at all. Codex is not a "fallback" in this case, it is the only
     // engine this machine has, so it runs whatever the caller's preference was.
     if (!codexAvailable) return { engine: null, reason: null, pausedUntil: null, error: 'claude_missing' };
-    return { engine: 'codex', reason: 'claude_missing', pausedUntil: null, error: null };
+    const codexPause = Number(codexPausedUntil) > Number(now) ? Number(codexPausedUntil) : null;
+    return { engine: 'codex', reason: 'claude_missing', pausedUntil: codexPause, error: null };
   }
 
-  // The rate-limit fallback. Only for a lane that expressed NO preference: a
-  // job pinned to claude by name waits for the reset exactly as it used to.
-  if (!forced && paused && codexFallback && codexAvailable) {
+  // The rate-limit fallback covers lane preferences too. An explicit per-job
+  // Claude pin stays put, including a guarded reverse retry.
+  if (!forced && paused && codexFallback && codexAvailable && Number(codexPausedUntil) <= Number(now)) {
     return { engine: 'codex', reason: 'claude_limited', pausedUntil: paused, error: null };
   }
   return {

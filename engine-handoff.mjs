@@ -448,18 +448,13 @@ export function resolveHandoffSource({ fresh = false, model = null, recorded = n
 // ---------------------------------------------------------------------------
 // WHAT THE INCOMING ENGINE DOES NOT HAVE
 //
-// Deterministic, from a constant map, never asked of a model (case 17). The
-// wording is what was MEASURED on this Mac: ~/.codex/skills is empty, the Codex
-// memory store has zero rows, and `codex doctor` reports no MCP servers
-// configured. So these are supported-but-unconfigured rather than absent, and
-// the line says which.
+// Engine names alone do not prove a missing capability. Check the running
+// tool inventory and authentication instead.
 // ---------------------------------------------------------------------------
-const CLAUDE_ONLY_TOOLS = [
-  { re: /^(agent|task)$|subagent|qa-agent|safe-planner|bug-fix|outcomes-grader|frontend-specialist|live-test|brainstorm/i, say: 'the Agent tool and subagents', short: 'subagents' },
-  { re: /skill/i, say: '~/.claude skills', short: 'skills' },
-  { re: /memor/i, say: 'the memory dir', short: 'memory' },
-  { re: /mcp|supabase|playwright|context7|leadconnector/i, say: 'no MCP server is configured for Codex on this machine (codex doctor)', short: 'MCP' },
-];
+// Do not infer missing tools from the engine name. Codex 0.160 supports
+// native agents, local skills and configured MCP servers. Authentication and
+// tool availability must be checked by the running agent.
+const CLAUDE_ONLY_TOOLS = [];
 
 export function unavailableTools(engine, tools = []) {
   if (engine !== 'codex') return [];
@@ -488,7 +483,7 @@ export function unavailableToolLabels(engine, tools = []) {
 }
 
 /**
- * The paths the incoming sandbox cannot reach.
+ * Paths outside the incoming writable directory.
  *
  * Structural, not a policy: Codex workspace-write is rooted at ONE directory
  * and `codex exec resume` takes no --add-dir (measured), so a task that touched
@@ -538,7 +533,7 @@ export function renderHandoffBlock(h, { toEngine = 'claude', ownerName = 'the ow
     // of fact about this machine, not something the previous engine said.
     ...(missing.length ? [`Not available on ${toEngine}: ${missing.join(', ')}.`] : []),
     ...(unreachable.length
-      ? [`Cannot be reached from this sandbox (outside ${cwd || safe.cwd}): ${unreachable.join(', ')}`]
+      ? [`Writes need another approved workspace (outside ${cwd || safe.cwd}; these paths remain readable): ${unreachable.join(', ')}`]
       : []),
   ].join('\n');
 }

@@ -65,6 +65,10 @@ import {
 } from ${url('codex-appserver.mjs')};
 import { codexChatError, codexPaths, codexRunId, freeCodexStart, isCodexImage } from ${url('bg-codex.mjs')};
 import { codexChatSandbox } from ${url('engine-state.mjs')};
+import { codexWritingPrompt } from ${url('codex-writing.mjs')};
+import { codexWorkerContext } from ${url('codex-worker-env.mjs')};
+import { queueAck, queueFull, queueRunningNow } from ${url('system-messages.mjs')};
+import { briefTitle, stripLaneRules } from ${url('bg-lane-rules.mjs')};
 import { clip, oneLine, renderEntry, renderTail, quoteBlock, thinkingWord, fmtElapsed } from ${url('progress-render.mjs')};
 const { existsSync, mkdirSync, writeFileSync, readFileSync } = fs;
 export const SENT = [];
@@ -100,6 +104,13 @@ const editProgress = (id, html, plain) => { PROGRESS.push('EDIT    ' + plain());
 export const codexRuns = new Map();
 const noteCodexWall = () => Date.now() + 3600000;
 const clearCodexWall = () => {};
+// This probe measures Codex. Taking over on Claude would change its subject.
+const retryCodexOnClaude = () => false;
+// Two more seams on the turn's failure path, neither the subject: no worker
+// report rides a probe turn (keepHandback has nothing to keep), and the Claude
+// wall is daemon bookkeeping the probe does not stand up.
+const keepHandback = () => ({ held: 0, parked: 0 });
+const claudeRateWalled = () => false;
 export let codexPausedUntil = 0;
 const RUNS_DIR = ${JSON.stringify(RUNS)};
 const CODEX_BIN = 'codex';

@@ -227,12 +227,12 @@ t('★ no claude and no codex: refused cleanly, not crashed', () => {
   eq(d.error, 'claude_missing');
 });
 
-t('★ no codex binary + engine codex: refused cleanly, and NOT silently on claude', () => {
+t('★ no codex binary + engine codex: healthy Claude takes the task', () => {
   // Silently running on Claude would be worse than the error: the owner asked
   // for a cross-family answer and would get a same-family one without knowing.
   const d = R({ chat: { engineChat: 'codex' }, codexAvailable: false });
-  eq(d.engine, null);
-  eq(d.error, 'codex_missing');
+  eq(d.engine, 'claude');
+  eq(d.reason, 'codex_missing');
 });
 
 t('no codex binary + a claude lane + a wall: it waits, it does not error', () => {
@@ -242,8 +242,34 @@ t('no codex binary + a claude lane + a wall: it waits, it does not error', () =>
   eq(d.pausedUntil, WALL);
 });
 
-t('a forced codex on a machine without it is still refused', () => {
-  eq(R({ forcedEngine: 'codex', codexAvailable: false }).error, 'codex_missing');
+t('a forced codex on a machine without it can fall back to healthy Claude', () => {
+  eq(R({ forcedEngine: 'codex', codexAvailable: false }).engine, 'claude');
+});
+t('a known Codex wall falls back once to healthy Claude', () => {
+  eq(R({ forcedEngine: 'codex', codexPausedUntil: WALL }).reason, 'codex_limited');
+});
+t('both engine walls refuse instead of ping pong', () => {
+  const held = R({ forcedEngine: 'codex', codexPausedUntil: WALL, rotationPausedUntil: WALL });
+  eq(held.engine, 'claude');
+  eq(held.pausedUntil, WALL);
+  eq(held.error, null);
+});
+t('a Claude default waits when both windows are closed', () => {
+  const held = R({ codexPausedUntil: WALL, rotationPausedUntil: WALL });
+  eq(held.engine, 'claude');
+  eq(held.pausedUntil, WALL);
+});
+t('a missing Codex binary preserves work behind the Claude wall', () => {
+  const held = R({ forcedEngine: 'codex', codexAvailable: false, rotationPausedUntil: WALL });
+  eq(held.engine, 'claude');
+  eq(held.pausedUntil, WALL);
+  eq(held.error, null);
+});
+t('a Codex-only install retains its window reset for the hold', () => {
+  const held = R({ claudeAvailable: false, codexAvailable: true, codexPausedUntil: WALL });
+  eq(held.engine, 'codex');
+  eq(held.pausedUntil, WALL);
+  eq(held.error, null);
 });
 
 // ---------------------------------------------------------------------------

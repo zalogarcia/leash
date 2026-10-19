@@ -3,7 +3,7 @@
 //
 //   node bg.mjs "run the full test suite and report what fails"
 //   node bg.mjs --file ./brief.md                   (preferred for real briefs)
-//   node bg.mjs --engine codex --file ./brief.md    (run it on OpenAI Codex, not Claude)
+//   node bg.mjs --engine codex --file ./brief.md    (run it on OpenAI Codex; Claude takes it if Codex is walled or missing)
 //   node bg.mjs --repo my-repo-x --file ./brief.md  (pin the working dir / Codex sandbox root)
 //   node bg.mjs --now --file ./brief.md             (start it past the concurrency cap)
 //   node bg.mjs "codex: review the last commit"     (same thing, inline prefix)
@@ -256,7 +256,7 @@ if (typeof argv[0] === 'string' && argv[0].startsWith('-') && !KNOWN_FLAGS.has(a
     'usage:',
     '  node bg.mjs "<brief>"                                   hand a job to a background worker',
     '  node bg.mjs --file <path>                               preferred for real briefs',
-    '  node bg.mjs --engine codex --file <path>                run it on OpenAI Codex',
+    '  node bg.mjs --engine codex --file <path>                run it on OpenAI Codex (Claude if Codex is out)',
     '  node bg.mjs --repo <name|path> --file <path>            pin the working dir (Codex sandbox root)',
     '  node bg.mjs --now --file <path>                         start it past the concurrency cap',
     '  node bg.mjs steer <lane|runId|pid|latest> "<text>"      one more instruction, mid run',

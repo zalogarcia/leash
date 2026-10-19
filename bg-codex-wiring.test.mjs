@@ -25,6 +25,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { codexReviewScope, codexReviewTask, isCodexImage } from './bg-codex.mjs';
+import { codexWritingPrompt } from './codex-writing.mjs';
 import { RESTART_CONTINUATION, execFallbackLine, lastActFromExecLog } from './codex-appserver.mjs';
 // The real parser and the real phrase list, so section 8b asserts the chat
 // lane marks the reset the MESSAGE carried rather than a number of its own.
@@ -72,6 +73,7 @@ for a in "$@"; do
   prev="$a"
 done
 prompt=$(cat)
+if [[ "$prompt" == 'REPLY RULES'* ]]; then prompt="\${prompt#*$'\\n\\n'}"; fi
 if [ -n "\${CODEX_FAKE_SLEEP:-}" ]; then sleep "$CODEX_FAKE_SLEEP"; fi
 echo '{"type":"thread.started","thread_id":"t1"}'
 echo "{\\"type\\":\\"item.completed\\",\\"item\\":{\\"type\\":\\"agent_message\\",\\"text\\":\\"FAKE:\${prompt}\\"}}"
@@ -104,6 +106,9 @@ function grab(name, kind = 'function') {
 
 const url = (f) => JSON.stringify(pathToFileURL(path.join(DIR, f)).href);
 const HARNESS = `
+const retryCodexOnClaude = () => false;
+const codexWorkerContext = (env) => ({ env, instructions: '' });
+import { codexWritingPrompt } from ${url('codex-writing.mjs')};
 import fs from 'node:fs';
 import { spawnWorker } from ${url('detached-workers.mjs')};
 import {
@@ -248,7 +253,7 @@ await t('the answer landed in the log file, and the log has no credential in it'
 await t('the brief is written next to the log so a dead run can still be salvaged', () => {
   const prompt = path.join(RUNS, `codex-${askRun.startedAt}.prompt.md`);
   ok(existsSync(prompt), `no prompt file at ${prompt}`);
-  eq(readFileSync(prompt, 'utf8'), 'what does bg.mjs do');
+  eq(readFileSync(prompt, 'utf8'), codexWritingPrompt('what does bg.mjs do'));
 });
 
 // ---------------------------------------------------------------------------
@@ -280,7 +285,7 @@ await t('★ but every RECORD of the run stays on what you typed', () => {
 
 await t('the salvage file holds the SENT text, which is the one a rerun needs', () => {
   const p = path.join(RUNS, `codex-${replyRun.startedAt}.prompt.md`);
-  eq(readFileSync(p, 'utf8'), `${QUOTE_BLOCK}\n\nsend it`);
+  eq(readFileSync(p, 'utf8'), codexWritingPrompt(`${QUOTE_BLOCK}\n\nsend it`));
 });
 
 // ---------------------------------------------------------------------------
@@ -478,6 +483,7 @@ const D = await import(
     encodeURIComponent(
       [
         `
+const retryCodexOnClaude = () => false;
 import { codexFallbackPrefix, fmtCodexTokens } from ${url('bg-codex.mjs')};
 // The REAL normalizer, not a stub: whether a dash survives the direct-delivery
 // path is exactly what one of the tests below asserts.
@@ -489,11 +495,26 @@ export const HANDBACKS = [];
 export const RECORDED = [];
 export const parkedCodexChats = [];
 export const PARKED_CODEX_MAX = 10;
+export let CODEX_AVAILABLE = false;
+export let codexPausedUntil = 0;
+export const setCodexAvailable = (v) => { CODEX_AVAILABLE = v; };
+const codexWalled = () => Date.now() < codexPausedUntil;
+export let FALLBACK_ON = true;
+export let CHAT_ENGINE = 'claude';
+export const setFallback = (v) => { FALLBACK_ON = v; };
+export const setChatEngine = (v) => { CHAT_ENGINE = v; };
+const codexFallbackOn = () => FALLBACK_ON;
+const chatLaneEngine = () => CHAT_ENGINE;
+const recoverCodexDraft = (outcome) => outcome;
+export const DISCARDED = [];
+const discardCodexDraft = (args) => { DISCARDED.push(args); return true; };
+const steeredInBlock = () => '';
 const send = (t) => { SENT.push(t); return Promise.resolve(); };
+const sendResult = send;
 const OWNER_TZ = 'UTC';
 export let rotationPausedUntil = 0;
 export const setWall = (v) => { rotationPausedUntil = v; };
-export const reset = () => { SENT.length = 0; HANDBACKS.length = 0; RECORDED.length = 0; parkedCodexChats.length = 0; NO_DASHES = false; };
+export const reset = () => { SENT.length = 0; HANDBACKS.length = 0; RECORDED.length = 0; DISCARDED.length = 0; parkedCodexChats.length = 0; NO_DASHES = false; };
 const bgReportId = (id) => String(id);
 const bgReportPath = (id) => '/tmp/report-' + id + '.md';
 const notifyOwnerBgFinished = (task, status, runId) => { SENT.push('PING ' + status + ' ' + runId); };
@@ -531,7 +552,7 @@ await t('★ while walled, the answer goes STRAIGHT to the owner instead of to a
   const bubble = D.SENT.find((t) => t.includes('the answer that was asked for'));
   ok(bubble, `the answer never reached the owner: ${JSON.stringify(D.SENT)}`);
   ok(bubble.startsWith('🧠 Codex fallback · '), bubble.slice(0, 60));
-  ok(bubble.includes('100 in / 5 out tokens'), 'the cost line is the only signal that this was billed');
+  ok(!bubble.includes('100 in / 5 out tokens'), 'billing stays out of the owner reply');
 });
 
 await t('and it is parked ONCE for M, framed as context rather than a question to answer', () => {
@@ -542,6 +563,59 @@ await t('and it is parked ONCE for M, framed as context rather than a question t
 
 await t('a durable row is still written either way', () => {
   eq(D.RECORDED.length, 1, 'a walled answer must not vanish from bg-results.jsonl');
+});
+
+D.reset();
+D.setCodexAvailable(true);
+D.setWall(Date.parse('2126-01-01T00:00:00Z'));
+D.reportCodexOutcome('what changed today', OUTCOME, 'codex-healthy', { mode: 'ask', cwd: '/repo' });
+await t('healthy Codex chat summarizes a report during the Claude wall', () => {
+  eq(D.HANDBACKS.length, 1);
+  eq(D.parkedCodexChats.length, 0);
+  ok(!D.SENT.some((text) => text.includes(OUTCOME.answer)), 'the worker report must reach the chat before owner delivery');
+});
+// `/codex off` and a Claude chat lane: no Codex chat will relay it, so the
+// answer goes straight to them, as it did before the parity change (QA round 3:
+// it was held for Claude's reset instead).
+D.reset();
+D.setFallback(false);
+D.reportCodexOutcome('what changed today', OUTCOME, 'codex-off', { mode: 'ask', cwd: '/repo' });
+await t('with the fallback off during a Claude wall, a Codex answer still reaches them directly', () => {
+  eq(D.HANDBACKS.length, 0, 'held for a Claude reset they are waiting out');
+  ok(D.SENT.some((text) => text.includes(OUTCOME.answer)), JSON.stringify(D.SENT));
+});
+// ...unless their chat lane IS Codex: then it summarises, fallback or not.
+D.reset();
+D.setChatEngine('codex');
+D.reportCodexOutcome('what changed today', OUTCOME, 'codex-lane', { mode: 'ask', cwd: '/repo' });
+await t('a Codex chat lane relays it even with the fallback off', () => {
+  eq(D.HANDBACKS.length, 1);
+});
+D.setFallback(true);
+D.setChatEngine('claude');
+D.setCodexAvailable(false);
+
+// THE DRAFT IS AN UNTRACKED FILE IN HIS REPO (codex-worker-env.mjs puts it in
+// the job's cwd, the only place the sandbox can write). Once the outcome has
+// been read it is removed on both delivery paths, or every Codex edit job
+// leaves a `.bridge-codex-*.draft.md` behind in `git status`.
+D.reset();
+D.setWall(0);
+D.reportCodexOutcome('edit the thing', OUTCOME, 'codex-edit-1', { mode: 'edit', cwd: '/repo' });
+await t('an edit job draft is discarded after the handback', () => {
+  eq(D.HANDBACKS.length, 1);
+  eq(D.DISCARDED.length, 1);
+  eq(D.DISCARDED[0].cwd, '/repo');
+  eq(D.DISCARDED[0].runId, 'codex-edit-1');
+  eq(D.DISCARDED[0].mode, 'edit');
+});
+D.reset();
+D.setWall(Date.parse('2126-01-01T00:00:00Z'));
+D.reportCodexOutcome('edit the thing', OUTCOME, 'codex-edit-2', { mode: 'edit', cwd: '/repo' });
+await t('and after a direct delivery while both engines are out', () => {
+  eq(D.HANDBACKS.length, 0);
+  eq(D.DISCARDED.length, 1);
+  eq(D.DISCARDED[0].runId, 'codex-edit-2');
 });
 
 D.reset();
@@ -598,7 +672,8 @@ const engineFor = (lane, forcedEngine = null, { ignoreWall = false } = {}) =>
     config: ENGINE_CFG,
     claudeAvailable: CLAUDE_AVAILABLE,
     codexAvailable: CODEX_AVAILABLE,
-    rotationPausedUntil: ignoreWall ? 0 : rotationPausedUntil,
+    codexPausedUntil,
+    rotationPausedUntil,
     now: Date.now(),
     codexFallback: codexFallbackValue,
   });
@@ -627,6 +702,7 @@ const deliverWithoutClaude = (t) => { SENT.push('NO CLAUDE: ' + t); };
 // only. The harness keeps the same shape so the "first message only" rule is
 // asserted against the real dispatch rather than a mirror of it.
 export const HANDOFF = { pending: false, block: '' };
+const automaticChatHandoff = () => '';
 const takeHandoffPrefix = () => {
   if (!HANDOFF.pending) return '';
   HANDOFF.pending = false;
@@ -785,6 +861,7 @@ export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wa
         grab('trackQueueAck'),
         grab('resolveQueueAck'),
         grab('engineForItem'),
+        grab('claudeTakeoverToldFor', 'const'),
         grab('startResolvedRun'),
         grab('dispatchPrompt'),
         grab('drainQueue'),
@@ -816,10 +893,10 @@ P.reset();
 P.setWall(WALL);
 P.dispatchPrompt('is the deploy green', undefined, { allowCodexFallback: true });
 
-await t('★ a typed chat message during the wall goes to the Codex chat fallback, not to Claude', () => {
-  eq(P.CHAT_FALLBACK.length, 1);
+await t('a typed chat message during the wall resumes the persistent Codex lane', () => {
+  eq(P.CODEX_CHAT.length, 1);
   eq(P.CLAUDE.length, 0, 'dispatching to Claude here is a guaranteed red bubble');
-  eq(P.CHAT_FALLBACK[0].decision.reason, 'claude_limited');
+  eq(P.CODEX_CHAT[0].text, 'is the deploy green');
 });
 
 P.reset();
@@ -853,13 +930,14 @@ P.reset();
 P.setWall(WALL);
 P.dispatchPrompt('[Report from your own background worker]', P.LANES.main, { priority: true });
 
-await t('★ internal priority traffic is never diverted, even mid-wall', () => {
+await t('internal priority traffic uses healthy Codex during the Claude wall', () => {
   // Worker handbacks, watchdog alerts, scheduled tasks and compaction all come
   // through here with priority. Sending one of those to Codex would hand a
   // report to a model that has no idea what the bridge is.
   eq(P.CODEX.length, 0);
   eq(P.CHAT_FALLBACK.length, 0);
-  eq(P.CLAUDE.length, 1);
+  eq(P.CLAUDE.length, 0);
+  eq(P.CODEX_CHAT.length, 1);
 });
 
 P.reset();
@@ -1029,9 +1107,8 @@ await t('★ with no account free the wall goes up exactly as the worker path ra
 });
 
 await t('★ the message is re-dispatched once and Codex answers it', () => {
-  eq(P.CHAT_FALLBACK.length, 1, 'the existing chat fallback is what takes it');
-  eq(P.CHAT_FALLBACK[0].text, 'why is the deploy red');
-  eq(P.CHAT_FALLBACK[0].decision.reason, 'claude_limited', 'this reason is what stamps the [Codex fallback…] prefix');
+  eq(P.CODEX_CHAT.length, 1, 'the persistent chat lane takes it');
+  eq(P.CODEX_CHAT[0].text, 'why is the deploy red');
   eq(P.CLAUDE.length, 0, 'a second Claude run here is a guaranteed second red bubble');
 });
 
@@ -1061,7 +1138,7 @@ retryWalled?.dispatch();
 
 await t('★ a retry that WALLS falls through to Codex rather than dying silently', () => {
   ok(retryWalled, 'the wall path is terminal, so it is not a loop and is allowed');
-  eq(P.CHAT_FALLBACK.length, 1);
+  eq(P.CODEX_CHAT.length, 1);
   eq(P.CLAUDE.length, 0);
 });
 
@@ -1130,6 +1207,31 @@ const afterFailedSwap = await P.rotateOffLimitedAccount(LIMIT_STDERR);
 await t('a failed swap rolls the guard back rather than blocking the next attempt', () => {
   eq(afterFailedSwap.outcome, 'swapped');
   eq(P.ACC.swapped.length, 2, 'the retry actually reached swapTo');
+});
+
+// --- the takeover line, once per Codex wall ---------------------------------
+// A chat lane set to Codex, Codex walled, Claude healthy: every message runs
+// on Claude, and the "Claude is taking these over" line is said ONCE for the
+// wall, not once per message (QA round 3: one extra bubble per message for an
+// hour). A new wall is a new episode and says it again.
+P.reset();
+P.setEngines({ chat: { engineChat: 'codex' } });
+const CODEX_WALL_1 = Date.now() + 3600_000;
+P.setCodexWall(CODEX_WALL_1);
+for (const msg of ['one', 'two', 'three']) {
+  P.dispatchPrompt(msg, undefined, { allowCodexFallback: true });
+  P.LANES.main.current = null; // each runs to completion before the next
+}
+const takeoverLines = () => P.SENT.filter((t) => String(t).includes('Claude is taking these over')).length;
+await t('a Codex wall announces the Claude takeover once, not per message', () => {
+  eq(P.CLAUDE.length, 3, 'all three ran on Claude');
+  eq(takeoverLines(), 1);
+});
+P.setCodexWall(CODEX_WALL_1 + 60_000);
+P.dispatchPrompt('four', undefined, { allowCodexFallback: true });
+P.LANES.main.current = null;
+await t('and a new Codex wall says it again', () => {
+  eq(takeoverLines(), 2);
 });
 
 // --- a parked message keeps its cap ----------------------------------------
@@ -1508,7 +1610,7 @@ P.setWall(Date.now() + 3600_000, true); // Codex comes back, Claude still walled
 P.flushParkedWalledChats();
 
 await t('★ a mixed hold releases the ordinary message and keeps the command', () => {
-  eq(P.CHAT_FALLBACK.length, 1, 'the question gets its degraded answer');
+  eq(P.CODEX_CHAT.length, 1, 'the question continues on the Codex chat lane');
   eq(P.parkedWalledChats.length, 1, 'and the command waits for the reset it actually needs');
   eq(P.parkedWalledChats[0].text, '/goal ship the thing');
 });
@@ -2248,6 +2350,7 @@ const chatState = () => ({ cwd: CHAT_CWD });
 export const codexRuns = new Map();
 export let rotationPausedUntil = 0;
 let installed = true;
+const codexWalled = () => false;
 let fallback = true;
 export const setWall = (until, opts = {}) => {
   rotationPausedUntil = until;
@@ -2366,7 +2469,7 @@ await t('★ case 26: a Claude-shaped brief handed to Codex is RUN, and the warn
   // model, billed by the token and then improvised around.
   eq(DRAIN.CODEX.length, 1, 'an explicit engine choice must still be honoured');
   const said = DRAIN.SENT.join('\n');
-  ok(/does not have/.test(said), said);
+  ok(/will adapt these steps/.test(said), said);
   ok(/qa-agent/.test(said), said);
   ok(/opus/.test(said), said);
 });
@@ -2426,6 +2529,7 @@ for a in "$@"; do
 done
 prompt=$(cat)
 # The MEASURED dead-thread failure, reproduced exactly: exit 1, the error on
+if [[ "$prompt" == 'REPLY RULES'* ]]; then prompt="\${prompt#*$'\\n\\n'}"; fi
 # stderr, and no thread.started event at all.
 if [ -n "\${CODEX_FAKE_DEAD_THREAD:-}" ] && [ -n "$is_resume" ]; then
   echo 'Error: thread/resume: thread/resume failed: no rollout found for thread id th-abc-123 (code -32600)' >&2
@@ -2445,6 +2549,9 @@ const C = await import(
     encodeURIComponent(
       [
         `
+const retryCodexOnClaude = () => false;
+const codexWorkerContext = (env) => ({ env, instructions: '' });
+import { codexWritingPrompt } from ${url('codex-writing.mjs')};
 import fs from 'node:fs';
 import { spawnWorker } from ${url('detached-workers.mjs')};
 import {
@@ -2920,11 +3027,11 @@ await t('★ bridge.mjs still parses, and the boot path consults the detection',
   ok(/if \(!CLAUDE_AVAILABLE\) \{\n\s*console\.log\('\[bridge\] limit death on a machine with no claude/.test(src), 'rotation is not skipped');
 });
 
-await t('★ with no codex, a codex lane refuses cleanly rather than running on Claude', async () => {
+await t('with no Codex, a Codex lane uses healthy Claude', async () => {
   const { resolveEngine: re } = await import('./engine-state.mjs');
   const d = re({ lane: 'chat', chat: { engineChat: 'codex' }, claudeAvailable: true, codexAvailable: false });
-  eq(d.engine, null);
-  eq(d.error, 'codex_missing');
+  eq(d.engine, 'claude');
+  eq(d.reason, 'codex_missing');
   // And every entry point has a line to send back rather than a stack trace.
   const src = SRC.join('\n');
   const missingChecks = (src.match(/decision\.error === 'codex_missing'/g) || []).length;
@@ -3031,10 +3138,10 @@ P.reset();
 P.setEngines({ codexAvailable: false, chat: { engineChat: 'codex' } });
 P.dispatchPrompt('what is in this repo', undefined, { allowCodexFallback: true });
 
-await t('a chat lane set to a codex that is not installed says so, and runs nothing', () => {
+await t('a missing Codex chat engine uses healthy Claude and names the change', () => {
   eq(P.CODEX_CHAT.length, 0);
-  eq(P.CLAUDE.length, 0, 'silently answering from the same family is worse than an error');
-  ok(P.SENT.join('\n').includes('not installed'), P.SENT.join('\n'));
+  eq(P.CLAUDE.length, 1, 'healthy Claude takes the task');
+  ok(P.SENT.join('\n').includes('Claude'), P.SENT.join('\n'));
 });
 
 // --- the drop-box must never destroy a claimed brief ----------------------
@@ -3043,16 +3150,12 @@ DRAIN.setWall(0, { installed: false });
 queueItems({ text: laneRules('# TASK: rebuild the index\n'), engine: 'codex' });
 DRAIN.drainBgHandoff();
 
-await t('★ a brief no engine can run is REFUSED BY NAME and still recorded', () => {
+await t('a claimed Codex brief uses healthy Claude when Codex is absent', () => {
   // The queue file is claimed before the loop, so a bare `continue` destroyed
   // the brief with no dispatch, no row and no report.
   eq(DRAIN.CODEX.length, 0);
-  eq(DRAIN.CLAUDE.length, 0);
-  const said = DRAIN.SENT.join('\n');
-  ok(said.includes('not installed'), said);
-  ok(said.includes('rebuild the index'), `the refusal did not name the job: ${said}`);
-  eq(DRAIN.RECORDED.length, 1, 'nothing was left in bg-results.jsonl');
-  ok(/no engine available/.test(DRAIN.RECORDED[0].record), JSON.stringify(DRAIN.RECORDED[0]));
+  eq(DRAIN.CLAUDE.length, 1, 'the available engine takes the claimed brief');
+  eq(DRAIN.RECORDED.length, 0, 'a running job is not recorded as refused');
 });
 
 await t('the wiring for a Codex-first machine keeps every internal turn deliverable', () => {
@@ -3161,7 +3264,7 @@ P.flushParkedWalledChats();
 
 await t('★ whichever engine returns first runs the parked message, by itself', () => {
   eq(P.parkedWalledChats.length, 0, 'it stayed parked after a wall lifted');
-  eq(P.CHAT_FALLBACK.length, 1, 'Claude is still walled, so this is the degraded Codex answer');
+  eq(P.CODEX_CHAT.length, 1, 'Claude is still walled, so Codex resumes the conversation');
 });
 
 await t('★ the wall notice BECOMES the back line rather than being followed by one', () => {
@@ -3187,9 +3290,10 @@ P.setWall(WALL);
 P.setCodexWall(WALL);
 P.dispatchPrompt('[Report from your own background worker: it finished.]', P.LANES.main, { priority: true });
 
-await t('internal traffic is never parked by the walls: it ignores them by construction', () => {
-  eq(P.parkedWalledChats.length, 0, 'a worker report parked behind two walls is a report nobody reads');
-  eq(P.CLAUDE.length, 1);
+await t('internal traffic is preserved when both engines are walled', () => {
+  eq(P.parkedWalledChats.length, 1, 'the report waits until an engine can summarize it');
+  eq(P.CLAUDE.length, 0);
+  eq(P.parkedWalledChats[0].priority, true);
 });
 
 P.reset();
@@ -3346,13 +3450,13 @@ P.reset();
 P.setWall(WALL);
 P.dispatchPrompt('[Report from your own background worker: it finished.]', P.LANES.main, { priority: true });
 
-await t('but a WALL still never diverts internal traffic: priority ignores it by construction', () => {
+await t('internal reports are summarized by healthy Codex during a Claude wall', () => {
   // The rate-limit fallback is a degraded answer for a message they are waiting
   // on. A report diverted there would be handed to a thread-less Codex run
   // that has never heard of this bridge, and parked for an M who already has it.
   eq(P.CHAT_FALLBACK.length, 0);
-  eq(P.CODEX_CHAT.length, 0);
-  eq(P.CLAUDE.length, 1);
+  eq(P.CODEX_CHAT.length, 1);
+  eq(P.CLAUDE.length, 0);
 });
 
 P.reset();
@@ -3613,13 +3717,13 @@ await t('and it names the paths the incoming Codex sandbox cannot reach', () => 
   ok(/1 file outside ~\/dev\/x, Codex cannot reach it/.test(S.switchView(sw.view).text), S.switchView(sw.view).text);
 });
 
-await t('★ a tool the incoming engine does not have is named in one word', () => {
+await t('projected skills and native agents produce no missing-tools warning', () => {
   S.reset();
   S.STATE.sessionId = 'a-real-session';
   S.recordChatTurn({ engine: 'claude', role: 'user', text: 'run the audit' });
   S.recordChatTurn({ engine: 'claude', role: 'assistant', text: 'dispatched', tools: ['Task', 'Skill'] });
   const v = S.switchHandoff({ leaving: 'claude', arriving: 'codex', fresh: false }).view;
-  eq(v.warnings.missingTools.join(', '), 'subagents, skills', JSON.stringify(v.warnings));
+  eq(v.warnings.missingTools, undefined, JSON.stringify(v.warnings));
 });
 
 await t('★ the capture turn is offered only when the gate allows it', () => {
@@ -4152,7 +4256,6 @@ await t('★ the changed functions NO harness executes reference only names brid
     // re-arm, which no harness executes.
     pollLoop: ['kickWalledSweep', 'WALLED_ACTIVE_SWEEP_MS', 'lastWalledActiveSweep', 'wallLiftInflight', 'wallWakeDue', 'liftClaudeWall'],
     main: ['wallWake', 'armWallResume', 'accounts'],
-    runCodexChatFallback: ['normalizeDashes', 'NO_DASHES'],
     handBackToChat: ['normalizeDashes', 'NO_DASHES', 'holdHandbackForWall'],
     deliverCodexDirect: ['normalizeDashes', 'NO_DASHES'],
     sendResult: ['normalizeDashes', 'NO_DASHES'],
@@ -4259,6 +4362,11 @@ process.stdin.on('data', (d) => {
       const hold = Number(knob('holdMs') || 60);
       setTimeout(() => {
         if (turnId === null) return; // interrupted
+        if (knob('failTurn')) {
+          note('turn/completed', { threadId, turn: { id: turnId, items: [], status: 'failed', error: { message: 'You have hit your usage limit (429)' } } });
+          turnId = null;
+          return;
+        }
         const answer = 'FAKE:' + text + (steered.length ? ' | STEERED:' + steered.join(',') : '');
         note('thread/tokenUsage/updated', { threadId, turnId, tokenUsage: { last: { inputTokens: 41, outputTokens: 7 }, total: { inputTokens: 41, outputTokens: 7 }, modelContextWindow: 258400 } });
         note('item/completed', { threadId, turnId, completedAtMs: Date.now(), item: { type: 'agentMessage', id: 'a1', text: answer } });
@@ -4292,6 +4400,9 @@ const AS = await import(
     encodeURIComponent(
       [
         `
+const retryCodexOnClaude = () => false;
+const codexWorkerContext = (env) => ({ env, instructions: '' });
+import { codexWritingPrompt } from ${url('codex-writing.mjs')};
 import fs from 'node:fs';
 import { spawn as spawnProcess } from 'node:child_process';
 import {
@@ -4317,7 +4428,15 @@ export const DRAINED = [];
 // now…" when M's turn ends, so this harness has to provide it: without it the
 // finally threw and the lane was never given back.
 export const READING_SETTLED = [];
-const settleReadingNotices = () => { READING_SETTLED.push(Date.now()); };
+export const READING_KEPT = [];
+const settleReadingNotices = (keep = null) => { READING_SETTLED.push(Date.now()); READING_KEPT.push(keep); };
+// A worker report a failed Codex turn was carrying is put back (keepHandback),
+// never dropped: recorded here with where it went.
+export const KEPT_HANDBACKS = [];
+const keepHandback = (mark, where) => { KEPT_HANDBACKS.push({ mark, where }); return { held: 0, parked: (mark?.items || []).length }; };
+export let CLAUDE_RATE_WALLED = false;
+export const setClaudeRateWalled = (v) => { CLAUDE_RATE_WALLED = v; };
+const claudeRateWalled = () => CLAUDE_RATE_WALLED;
 export const WALL = [];
 export const STATE = { cwd: ${JSON.stringify(TMP)}, yolo: true };
 const send = (t) => { SENT.push(t); return Promise.resolve(); };
@@ -4811,6 +4930,41 @@ await t('the fallback line names the reason and promises no steering', () => {
 AS.reset();
 AS.killCodexAppServer();
 
+// ★ A WORKER REPORT ON A CODEX TURN THAT FAILS IS KEPT, NOT DROPPED. During a
+// Claude wall a finished worker's report is handed to the Codex chat lane; if
+// that turn then fails (the ChatGPT window closes now), the report must go
+// back where a Claude limit death puts it, and its "reading it now" line must
+// stay up, or the assistant never reads it and the owner sees only an error.
+const REPORT_MARK = { items: [{ runId: 'bg-77', task: 'the overnight job', status: 'finished', report: '/tmp/bg-77.md' }] };
+for (const [walled, where] of [[true, 'wall'], [false, 'park']]) {
+  AS.KEPT_HANDBACKS.length = 0;
+  AS.READING_KEPT.length = 0;
+  AS.setClaudeRateWalled(walled);
+  knobs({ failTurn: true });
+  AS.runCodexChat('[Report from your own background worker] the overnight job finished', { handback: REPORT_MARK });
+  await asSettled();
+  await waitFor(() => AS.READING_KEPT.length > 0, 8000, 'the turn to settle its reading lines');
+  knobs();
+  await t(`a failed Codex turn keeps the worker report it carried (Claude ${walled ? 'walled: held for the wake-up' : 'healthy: parked'})`, () => {
+    eq(AS.KEPT_HANDBACKS.length, 1, 'the report was dropped');
+    eq(AS.KEPT_HANDBACKS[0].mark, REPORT_MARK);
+    eq(AS.KEPT_HANDBACKS[0].where, where);
+    eq(JSON.stringify(AS.READING_KEPT.at(-1)), JSON.stringify(['bg-77']), 'its line was settled as if read');
+    ok(AS.SENT.some((t) => /usage limit|limit/i.test(t)), `the owner was not told why: ${JSON.stringify(AS.SENT)}`);
+  });
+  AS.reset();
+}
+AS.setClaudeRateWalled(false);
+AS.KEPT_HANDBACKS.length = 0;
+AS.runCodexChat('[Report from your own background worker] a clean one', { handback: REPORT_MARK });
+await asSettled();
+await t('a Codex turn that answers keeps nothing back', () => {
+  eq(AS.KEPT_HANDBACKS.length, 0);
+  ok(AS.RESULTS.some((t) => t.startsWith('FAKE:')), JSON.stringify(AS.RESULTS));
+});
+AS.reset();
+AS.killCodexAppServer();
+
 // ---------------------------------------------------------------------------
 console.log('\n20. the queue ack, kept alive');
 // ---------------------------------------------------------------------------
@@ -5059,6 +5213,13 @@ writeFileSync(
 chmodSync(FAKE_BGAS_BIN, 0o755);
 
 const BGAS_HARNESS = `
+const retryCodexOnClaude = () => false;
+const conf = (_key, fallback) => fallback;
+// The real code reads its booleans through confBool; with no config here every
+// one of them is its fallback.
+const confBool = (_key, fallback) => Boolean(fallback);
+const codexWorkerContext = (env) => ({ env, instructions: '' });
+import { codexWritingPrompt } from ${url('codex-writing.mjs')};
 import fs from 'node:fs';
 import { spawn as spawnProcess } from 'node:child_process';
 import {
@@ -5247,7 +5408,7 @@ await t(
       false,
       "the same network rule the exec path runs under",
     );
-    eq(turn.params.input[0].text, "ship the bridge change");
+    eq(turn.params.input[0].text, codexWritingPrompt("ship the bridge change"));
     eq(turn.params.cwd, BGAS_DIR);
   },
 );
@@ -5295,7 +5456,7 @@ await t(
   () => {
     eq(outA.outcome.status, "finished");
     ok(
-      outA.outcome.answer.startsWith("ANSWER for: ship the bridge change"),
+      outA.outcome.answer.startsWith("ANSWER for: REPLY RULES"),
       outA.outcome.answer,
     );
     eq(outA.meta.mode, "edit");
@@ -5345,7 +5506,7 @@ await t("★ the log it left is readable by the exec-stream readers", () => {
 
 await t("the brief is written beside the log, and the answer too", () => {
   const base = path.join(BGAS_RUNS, `codex-${jobA.startedAt}`);
-  eq(readFileSync(`${base}.prompt.md`, "utf8"), "ship the bridge change");
+  eq(readFileSync(`${base}.prompt.md`, "utf8"), codexWritingPrompt("ship the bridge change"));
   ok(
     readFileSync(`${base}.last.md`, "utf8").startsWith("ANSWER for:"),
     "a salvage reads the answer here",
@@ -5752,7 +5913,7 @@ await t(
     );
     const turns = calls().filter((c) => c.method === "turn/start");
     const text = turns[1].params.input[0].text;
-    eq(text, RESTART_CONTINUATION);
+    eq(text, codexWritingPrompt(RESTART_CONTINUATION));
     ok(
       !text.includes("the death case"),
       "re-sending the brief is how a resumed job starts over",
@@ -5863,7 +6024,7 @@ await t(
   "★ and its first turn is the continuation, never the brief again",
   () => {
     const turn = calls().find((c) => c.method === "turn/start");
-    eq(turn.params.input[0].text, RESTART_CONTINUATION);
+    eq(turn.params.input[0].text, codexWritingPrompt(RESTART_CONTINUATION));
   },
 );
 

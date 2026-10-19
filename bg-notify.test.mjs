@@ -951,6 +951,9 @@ const engineFor = (lane, forcedEngine = null) =>
     codexFallback: codexFallbackValue,
   });
 export const CODEX_STARTED = [];
+const CODEX_AVAILABLE = true;
+const codexWalled = () => false;
+const claudeWalled = () => rotationPausedUntil > Date.now();
 export let rotationPausedUntil = 0;
 let codexFallbackValue = true;
 export const setLimitWall = (until, fallback = true) => { rotationPausedUntil = until; codexFallbackValue = fallback; };
@@ -1028,6 +1031,7 @@ const B = await import(
         grabFn('requeueDeferredBgJobs'),
         grabFn('drainBgHandoff'),
         grabFn('flushParkedWalledJobs'),
+        grabFn('canRunHeldItem'),
         grabFn('notifyOwnerBgFinished'),
         // checkSchedules calls this when the pool is full. The cap is 99 here
         // so the && short-circuits and it is never reached, but a harness that

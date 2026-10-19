@@ -139,6 +139,7 @@ const dispatchPrompt = (text, lane, opts = {}) => { DISPATCHED.push(text); DISPA
 export let ENGINE = (forced) => ({ engine: forced || 'claude', reason: forced ? 'explicit' : 'default' });
 export const setEngine = (fn) => { ENGINE = fn; };
 const engineFor = (lane, forced) => ENGINE(forced);
+const codexWalled = () => false;
 const unchosenCodex = (d) => d.reason === 'claude_limited' || d.reason === 'claude_missing';
 const BG_COMMAND_RE = /^\\/(goal|autopilot|qa-loop|bug|go-live|autopilot-merge)\\b/i;
 

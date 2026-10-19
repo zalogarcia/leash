@@ -113,6 +113,9 @@ const M = await import(
         `let CHAT_ENGINE = 'claude';`,
         `export const setChatEngine = (v) => { CHAT_ENGINE = v; };`,
         `const chatLaneEngine = () => CHAT_ENGINE;`,
+        `let CODEX_CAN_TAKE = false;`,
+        `export const setCodexCanTake = (v) => { CODEX_CAN_TAKE = v; };`,
+        `const codexTakingChat = () => CODEX_CAN_TAKE;`,
         `export const ROT = { outcome: 'swapped' };`,
         `let NO_DASHES = false;`,
         `export const setNoDashes = (v) => { NO_DASHES = v; };`,
@@ -1106,6 +1109,23 @@ t('a wall with nothing to hold a report in parks it, never drops it', () => {
 M.setWalled(false);
 M.resetWallWake();
 M.resetChain();
+
+t('a healthy Codex summarizes reports while the settled Claude lane is walled', () => {
+  M.resetChain();
+  M.resetWallWake();
+  M.wallWake.raised({ until: Date.now() + 3600_000 });
+  M.setWalled(true);
+  M.setChatEngine('claude');
+  M.setCodexCanTake(true);
+  const before = M.dispatched.length;
+  M.handBackToChat('# Report during wall', 'REPORT BODY', 'finished', 'codex-1790000000700');
+  eq(M.dispatched.length, before + 1);
+  ok(!M.wallWake.current().workers.some((w) => w.runId === 'codex-1790000000700' && w.handback === 'held'));
+  M.setCodexCanTake(false);
+  M.setWalled(false);
+  M.resetWallWake();
+  M.resetChain();
+});
 
 console.log(`\n${pass} passed, ${failures.length} failed\n`);
 if (failures.length) {

@@ -40,8 +40,17 @@ import {
   shouldRouteToCodex,
   codexAppServerDeathOutcome,
   codexAppServerOutcome,
+  CODEX_VERIFIED_VERSION,
+  classifyCodexFailure,
+  codexChatError,
+  codexDoctorReport,
+  codexFailureRemedy,
+  lintCodexBrief,
+  redactTokens,
+  DOCTOR_MAX,
 } from './bg-codex.mjs';
 import { parseRunId } from './bg-steer.mjs';
+import { execEventForLog } from './codex-appserver.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -548,13 +557,15 @@ t('the start notice explains a fallback run', () => {
   ok(s.includes('because every Claude account is limited until 17:40'), s);
 });
 
-t('the handback header says CODEX, says DATA, and prices the run', () => {
+t('the handback header says CODEX and DATA without leaking token counts', () => {
   const h = codexHandbackHeader({ ownerName: 'Sam', status: 'finished', mode: 'ask', cwd: '/repo', tokens: { input_tokens: 100, output_tokens: 5 } });
   ok(/CODEX/.test(h), h);
   ok(/NOT Claude/.test(h), h);
   ok(/DATA for you to verify/.test(h), h);
-  ok(h.includes('100 in / 5 out tokens'), h);
-  ok(h.includes('no access to this conversation'), h);
+  ok(!/\d[\d,]* in \/ \d[\d,]* out tokens/.test(h) && !h.includes('API spend'), h);
+  ok(h.includes('without this conversation history'), h);
+  ok(h.includes('does not load Claude Code\'s memory or skills by itself'), h);
+  ok(!h.includes('your memory dir or your skills'), h);
 });
 
 t('an edit-mode handback warns that it already wrote to disk', () => {
@@ -620,6 +631,134 @@ t('a short parked pair is untouched, and never says the owner "asked"', () => {
   ok(!/clipped/.test(n), 'a short pair must not be decorated with a clip marker');
 });
 
+t('the report is bounded: a broken install prints paths for pages', () => {
+  const r = codexDoctorReport({ text: 'x'.repeat(20000), code: 0 });
+  ok(r.length < DOCTOR_MAX + 200, `${r.length} chars`);
+  ok(r.includes('truncated'), r);
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n14. why a Codex run failed, and what to do about it');
+// ---------------------------------------------------------------------------
+// Every failure used to be one sentence of raw CLI text for four problems with
+// four different fixes. The dead-thread string below is MEASURED, not guessed:
+// `codex exec resume <a uuid nothing has> ... --json "ping"` exits 1 with it,
+// before any model call, so it cost nothing to capture.
+
+t('★ a thread OpenAI no longer has is classified, so the chat can heal itself', () => {
+  const measured =
+    'thread/resume: thread/resume failed: no rollout found for thread id ' +
+    '00000000-0000-0000-0000-000000000000 (code -32600)';
+  eq(classifyCodexFailure(measured), 'thread_gone');
+  // The word "failed" is in that string too, so ORDER is load-bearing: matched
+  // as anything else, the one self-healing case wedges the chat forever.
+  eq(classifyCodexFailure('Error: ' + measured), 'thread_gone');
+});
+
+t('an auth failure is its own class, with its own fix', () => {
+  eq(classifyCodexFailure('401 Unauthorized'), 'auth');
+  eq(classifyCodexFailure('not logged in: run codex login'), 'auth');
+  eq(classifyCodexFailure('the refresh token has expired'), 'auth');
+});
+
+t('a rate limit is its own class, and it is not an auth problem', () => {
+  eq(classifyCodexFailure('429 Too Many Requests'), 'rate_limit');
+  eq(classifyCodexFailure("You've hit your usage limit for this 5 hour window"), 'rate_limit');
+  eq(classifyCodexFailure('rate limit exceeded'), 'rate_limit');
+});
+
+t('anything else stays `other`, and reads exactly as it did before', () => {
+  eq(classifyCodexFailure('error[E0433]: failed to resolve: use of undeclared crate'), 'other');
+  eq(classifyCodexFailure(''), 'other');
+  eq(classifyCodexFailure(null), 'other');
+});
+
+t('each class carries its own one-line remedy, and `other` carries none', () => {
+  ok(/\/new/.test(codexFailureRemedy('thread_gone')), codexFailureRemedy('thread_gone'));
+  ok(/codex login/.test(codexFailureRemedy('auth')), codexFailureRemedy('auth'));
+  const at = codexFailureRemedy('rate_limit', { until: Date.parse('2026-09-04T07:15:00Z'), timeZone: 'UTC' });
+  ok(at.includes('07:15'), at);
+  // With no clock, it must not invent one.
+  ok(!/\d\d:\d\d/.test(codexFailureRemedy('rate_limit')), codexFailureRemedy('rate_limit'));
+  eq(codexFailureRemedy('other'), null);
+});
+
+t('the class travels on the outcome, so nothing downstream re-matches the string', () => {
+  const out = codexOutcome({ logText: '{"type":"error","message":"401 Unauthorized"}', code: 1 });
+  eq(out.status, 'failed');
+  eq(out.failure, 'auth');
+  eq(codexOutcome({ lastText: 'fine', code: 0 }).failure, null, 'a healthy run has no failure class');
+});
+
+t('a KILL carries no class: a /stop must never clear a thread or set a wall', () => {
+  const out = codexOutcome({ logText: '', code: null, killed: true, killReason: 'a /stop from Telegram' });
+  eq(out.status, 'failed');
+  eq(out.failure, null);
+});
+
+t('★ the chat error renders the remedy, not just the raw CLI sentence', () => {
+  const out = codexOutcome({ logText: '{"type":"error","message":"no rollout found for thread id x"}', code: 1 });
+  const line = codexChatError(out);
+  ok(line.includes('no rollout found'), line);
+  ok(line.includes('/new'), `the owner is told what broke and not what to do: ${line}`);
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n15. linting a brief bound for Codex');
+// ---------------------------------------------------------------------------
+
+t('★ Claude-only primitives in a brief are flagged, one warning each', () => {
+  const brief = [
+    'Dispatch a qa-agent over the diff with model: "opus".',
+    'Then have a subagent read the Supabase MCP tables and run /autopilot.',
+  ].join('\n');
+  const warns = lintCodexBrief(brief);
+  ok(warns.some((w) => /qa-agent/i.test(w)), JSON.stringify(warns));
+  ok(warns.some((w) => /fresh Codex agent/.test(w)), JSON.stringify(warns));
+  ok(warns.some((w) => /opus/i.test(w)), JSON.stringify(warns));
+  ok(warns.some((w) => /MCP/i.test(w)), JSON.stringify(warns));
+  ok(warns.some((w) => /slash command/i.test(w)), JSON.stringify(warns));
+  ok(!warns.some((w) => /no Agent tool|no fan-out/.test(w)), 'Codex has native agents: a subagent is no longer an error');
+});
+
+t('a clean brief passes with nothing to say', () => {
+  eq(lintCodexBrief('# TASK: fix the retry loop in src/encoder.ts and run npm test').length, 0);
+  eq(lintCodexBrief('').length, 0);
+  eq(lintCodexBrief(null).length, 0);
+});
+
+t('the CLI version every flag here was measured against is stated, not implied', () => {
+  // The boot canary compares `codex --version` against this. A CLI that drops
+  // one of the measured flags is otherwise an opaque exit 2.
+  ok(/^\d+\.\d+\.\d+$/.test(CODEX_VERIFIED_VERSION), CODEX_VERIFIED_VERSION);
+});
+
+t('★ the new credential shapes this Mac actually uses are redacted too', () => {
+  // The QA pass fed the list five shapes in daily use here and all five went
+  // through verbatim. It stopped being a doctor-report filter the moment it
+  // became the scrubber for a new on-disk record of the conversation and for
+  // text injected into the other engine's privileged prompt.
+  const shape = (...p) => p.join('');
+  const cases = {
+    supabase: shape('sb', '_secret_', '9aQxs8Kd0PLm2vAb'),
+    'supabase pat': shape('sbp', '_', '9aQxs8Kd0PLm2vAb'),
+    aws: shape('AKIA', 'IOSFODNN7EXAMPLE'),
+    slack: shape('xoxb', '-', '123456789012-abcdefghijkl'),
+    google: shape('ya29', '.', 'a0AfH6SMBxxxxxxxxxxxx'),
+    gitlab: shape('glpat', '-', 'abcdefghijklmnop'),
+  };
+  for (const [name, secret] of Object.entries(cases)) {
+    const got = redactTokens(`my key is ${secret} ok`);
+    ok(!got.includes(secret), `${name} went through verbatim: ${got}`);
+    ok(got.includes('[redacted]'), `${name}: ${got}`);
+    ok(got.startsWith('my key is '), `${name} lost the words around it: ${got}`);
+  }
+});
+
+t('and an ordinary sentence is left completely alone', () => {
+  const plain = 'we decided on no queue, the retry is in-process in foo.ts';
+  eq(redactTokens(plain), plain);
+});
 
 // ---------------------------------------------------------------------------
 // 9. a background job on the app-server
