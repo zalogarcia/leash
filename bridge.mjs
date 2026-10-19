@@ -11964,9 +11964,12 @@ async function handleCommand(text, msg = null) {
         saveState();
         await send(`✅ Claude model override cleared, back to ${DEFAULT_MODEL || 'the CLI default'}.`, { markdown: false });
       } else {
-        st.model = m;
+        // The CLI alias `haiku` still answered from Haiku 4.5 on 2026-10-08
+        // (CLI 2.1.292), so the shortcut is pinned to the full Haiku 5.5 id.
+        const id = m.toLowerCase() === 'haiku' ? 'claude-haiku-5-5' : m;
+        st.model = id;
         saveState();
-        await send(`✅ Claude model set to ${m} for future runs (session continues).`, { markdown: false });
+        await send(`✅ Claude model set to ${id} for future runs (session continues).`, { markdown: false });
       }
       return;
     }
@@ -12348,7 +12351,7 @@ function buildMediaPrompt(files, caption) {
   const head = `[${files.length} attachment${files.length > 1 ? 's' : ''} sent over Telegram, saved locally:]\n${list}`;
   return caption
     ? `${caption}\n\n${head}`
-    : `${head}\n\nNo caption was included. Look at the attachment(s) and reply with a brief description, then await instructions.`;
+    : `${head}\n\nNo caption was included. If your last message asked the owner for a screenshot, a photo or a visual check, this is most likely their answer to it: read it as that answer and act on it (for example, close the check it settles). Otherwise look at the attachment(s) and reply with a brief description, then await instructions.`;
 }
 
 // Route long-running commands (and anything prefixed "bg:") to the background
@@ -13270,6 +13273,14 @@ async function main() {
   }
   await tg('setMyCommands', { commands: BOT_COMMANDS }).catch((e) =>
     console.error('[bridge] setMyCommands failed:', e.message),
+  );
+  // A CHAT-scoped list outranks the default one Telegram just received, so a
+  // stale override silently freezes the menu: /account and /usage were both
+  // registered and neither appeared, because a chat-scoped list from an
+  // earlier build was still winning. The daemon only ever writes the default
+  // scope, so anything at chat scope is by definition stale: drop it every boot.
+  await tg('deleteMyCommands', { scope: { type: 'chat', chat_id: Number(CHAT_ID) } }).catch((e) =>
+    console.error('[bridge] deleteMyCommands (chat scope) failed:', e.message),
   );
   // Watchdog, pass 0: RE-ATTACH before reaping. Background workers are detached,
   // so a restart leaves them RUNNING — they must be resumed, not buried. The
