@@ -96,9 +96,13 @@ export const codexRuns = new Map();
 export const REGISTRY = new Map();
 const inflight = { read: () => Object.fromEntries(REGISTRY), add: (id, r) => REGISTRY.set(id, r) };
 export const watchdog = { reattachedIds: new Set() };
+// A SEAM, not the subject: the wall guard's job store, which the resume pace
+// reads to count the resumed jobs running. No job here is a resume.
+const wallGuard = { jobOf: () => null };
 `,
   grab('bgWorkerDescriptors'),
   grab('runningBgWorkers'),
+  grab('runningResumedWorkers'),
   grab('queuedBgJobRows'),
   grab('publicWorker', 'const'),
   grab('steerInto'),
