@@ -62,6 +62,7 @@ import {
   newSessionLine,
   attachmentNoun,
   attachmentAck,
+  unreadableMessageNotice,
   steeredInAck,
   replyQuoteFrameNote,
   attachmentFrameNote,
@@ -2034,6 +2035,43 @@ t('attachments: nothing to say prints nothing', () => {
   eq(attachmentFrameNote([]), null);
   eq(attachmentFrameNote(undefined), null);
   eq(attachmentAck(undefined), null);
+});
+
+t('unreadable: ★ it says the message was not read, what kind it was and that it was saved', () => {
+  eq(
+    unreadableMessageNotice({ kind: 'sticker', saved: true, name: 'the assistant' }),
+    ['📭 Message not read', 'Kind · sticker', 'The bridge cannot read this kind yet', 'Saved for the assistant to look at', 'Text, photos, videos, voice and files work'].join('\n'),
+  );
+});
+
+t('unreadable: a failed save is said, never promised', () => {
+  const n = unreadableMessageNotice({ kind: 'poll', saved: false });
+  ok(n.includes('It could not be saved'), n);
+  ok(!/Saved for/.test(n), n);
+});
+
+t('unreadable: with no kind to name, the line is left out rather than left blank', () => {
+  const n = unreadableMessageNotice({});
+  eq(n.split('\n').length, 4);
+  ok(!n.includes('Kind'), n);
+  ok(!n.includes('undefined'), n);
+  ok(unreadableMessageNotice({ name: '' }).includes('Saved for the assistant to look at'), 'a nameless install still says who it is for');
+});
+
+t('unreadable: ★ house style, on the longest kind and the longest name', () => {
+  for (const [args, where] of [
+    [{ kind: 'sticker' }, 'unreadableMessageNotice'],
+    [{ kind: 'formatted message with no words' }, 'unreadableMessageNotice/rich'],
+    [{ kind: 'x'.repeat(200), name: 'y'.repeat(200) }, 'unreadableMessageNotice/long'],
+    [{ kind: 'a kind\nover two lines', saved: false }, 'unreadableMessageNotice/unsaved'],
+    [{}, 'unreadableMessageNotice/bare'],
+  ]) {
+    const n = unreadableMessageNotice(args);
+    houseStyle(n, where);
+    ok(n.startsWith('📭 '), 'icon first');
+    ok(n.split('\n').every((l) => l.trim()), `${where}: an empty line`);
+    ok(n.split('\n').length <= 5, `${where}: a kind spilled onto a line of its own`);
+  }
 });
 
 t('attachments: ★ house style', () => {

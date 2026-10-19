@@ -190,12 +190,19 @@ import {
   enginesBackLine,
   accountLedgerBlock,
   holdFullLine,
+  unreadableMessageNotice,
 } from './system-messages.mjs';
 // Read only, and shelled out to ONLY from the /status arm below. Never on a
 // poll: a tmux read on every tick would be five subprocesses a second for a
 // block nobody is looking at.
 import { readPeers, sortPeers, PEER_MAX } from './peers.mjs';
 import { buildReplyQuote, composeWithQuote } from './reply-quote.mjs';
+// A long or formatted message arrives as `rich_message` with no `text` (Bot API
+// 10.1). rich-message.mjs reads it back as words; inbound.mjs names what
+// arrived, writes the one log line per message, and keeps the bookkeeping for a
+// kind nothing here reads.
+import { flattenRichMessage, richPromptText } from './rich-message.mjs';
+import { inboundKind, inboundLogLine, messageKeys, unknownLogLine, unknownKindLabel, unknownFileName, unknownFilesToPrune, isSavedUnknown, UNKNOWN_KEEP } from './inbound.mjs';
 // The background concurrency cap. Pure decisions only: the wiring that makes
 // this daemon obey them is proven by bg-concurrency-wiring.test.mjs.
 import { hasSlot, maxConcurrentWorkers, mergeRequeue, queueRows, queuedBlock } from './bg-admission.mjs';
@@ -11356,7 +11363,7 @@ Custom /commands pass through to Claude Code: /autopilot, /bug, /qa-loop, /plan,
 
 Background workers: long jobs (/goal, /autopilot, /qa-loop, /bug, /go-live), scheduled tasks and anything prefixed "bg:" get a 🌙 worker each, another spawns when all are busy, and past the worker cap jobs wait for a slot, so the 🤖 chat lane stays free. Each is a fresh self-contained session (no history between jobs) with an hour-scale timeout, not the chat lane's ${Math.round(TASK_TIMEOUT_MS / 60000)}-minute ceiling.
 
-Attachments: photos, videos and files (≤20MB each) land in the inbox and go to Claude; a caption (or a text right after) is the instruction. Voice notes are transcribed (OpenAI speech to text) and run as prompts. A message sent mid-task is steered INTO the run, as in Claude Code: folded in, or answered right after. What cannot be steered queues (max 5); /stop kills the task and drops the queue. Model: ${DEFAULT_MODEL || 'CLI default'} (effort ${DEFAULT_EFFORT || 'CLI default'}).
+Attachments: photos, videos and files (≤20MB each) land in the inbox and go to Claude; a caption (or a text right after) is the instruction. Voice notes are transcribed (OpenAI speech to text) and run as prompts. Long or formatted messages are read as plain text. A message sent mid-task is steered INTO the run, as in Claude Code: folded in, or answered right after. What cannot be steered queues (max 5); /stop kills the task and drops the queue. Model: ${DEFAULT_MODEL || 'CLI default'} (effort ${DEFAULT_EFFORT || 'CLI default'}).
 
 Notes: one chat-lane task at a time (workers never refused) · messages older than ${Math.round(STALE_SEC / 60)} min are skipped · only while this machine is awake.`;
 
@@ -13112,7 +13119,9 @@ function flushGroup(grp) {
 
 async function handleMedia(msg) {
   const media = pickMedia(msg);
-  const caption = msg.caption?.trim() || '';
+  // A file whose words came as a rich message keeps them: with no plain
+  // caption, the flattened rich message is the caption.
+  const caption = msg.caption?.trim() || flattenRichMessage(msg.rich_message);
   // A photo or a file can be a reply too: the caption is the instruction and
   // the bubble you replied to is what it is about.
   const replyQuote = buildReplyQuote(msg, { botName: BRIDGE_NAME, botId: BOT_ID, timeZone: OWNER_TZ });
@@ -13222,6 +13231,48 @@ async function handleMedia(msg) {
 
 // ---------- update handling ----------
 
+/**
+ * A MESSAGE NOTHING HERE READS is kept, not dropped: the raw JSON goes into the
+ * inbox as `<ts>_unknown_<message_id>.json`, and only the newest UNKNOWN_KEEP of
+ * those stay. Returns the file name, or null when the write failed (the notice
+ * then says so instead of promising a file that is not there).
+ */
+function saveUnknownMessage(msg) {
+  const name = unknownFileName(Date.now(), msg?.message_id);
+  try {
+    mkdirSync(INBOX_DIR, { recursive: true });
+    writeFileSync(path.join(INBOX_DIR, name), JSON.stringify(msg, null, 2));
+  } catch (e) {
+    console.error('[bridge] could not save an unreadable message:', e.message);
+    return null;
+  }
+  try {
+    // Files this function wrote, and only those. The name picks the candidates
+    // and the CONTENT confirms each one, because an attachment they sent that is
+    // called `unknown_5.json` is saved under a name the pattern also matches.
+    for (const old of unknownFilesToPrune(readdirSync(INBOX_DIR), UNKNOWN_KEEP)) {
+      const file = path.join(INBOX_DIR, old);
+      if (isSavedUnknown(old, readFileSync(file, 'utf8'))) unlinkSync(file);
+    }
+  } catch (e) {
+    console.error('[bridge] could not prune saved unreadable messages:', e.message);
+  }
+  return name;
+}
+
+/**
+ * No `text`, no words in a `rich_message`, nothing pickMedia knows. It used to
+ * get "Send text, photos, videos, voice notes or files." and vanish. Now it is
+ * saved, logged by its field NAMES (never a value), and they are told once what
+ * happened to it. No turn is started: an engine cannot answer a message it was
+ * not handed.
+ */
+async function handleUnknownMessage(msg) {
+  const savedAs = saveUnknownMessage(msg);
+  console.log(unknownLogLine({ at: Date.now(), messageId: msg?.message_id, keys: messageKeys(msg), savedAs }));
+  await send(unreadableMessageNotice({ kind: unknownKindLabel(msg), saved: Boolean(savedAs), name: BRIDGE_NAME }), { markdown: false });
+}
+
 async function handleUpdate(update) {
   // A button tap under an /account reply. Authorization, decoding and the
   // decision of what the tap means all live in account-buttons.mjs; this
@@ -13242,24 +13293,43 @@ async function handleUpdate(update) {
   // hold, at most once a quarter hour, so a silent bot is never mistaken for a
   // dead one and restarted in the hope of waking it.
   if (gov().coolingDown()) gov().noticeOwner().catch(() => {});
+  // WHAT ARRIVED, read once and in the order it is acted on: plain `text`, then
+  // a file, then a RICH MESSAGE (a long or formatted text from a Telegram app
+  // carries `rich_message` and no `text`, Bot API 10.1), then a kind nothing
+  // here reads. `richText` is the rich message as the prompt it becomes, and it
+  // is only read when there is no text and no file.
+  const media = msg.text ? null : pickMedia(msg);
+  const richText = msg.text || media ? '' : richPromptText(msg.rich_message);
+  const kind = inboundKind({ text: msg.text, media, richText });
+  const isRich = kind === 'rich';
+  // ONE LINE PER MESSAGE, before anything can skip it: the id, the kind and a
+  // character count, never the content. "Did it arrive" is one grep.
+  console.log(inboundLogLine({ at: Date.now(), messageId: msg.message_id, kind, chars: isRich ? richText.length : msg.text?.length }));
   const ageSec = Date.now() / 1000 - (msg.date || 0);
   if (ageSec > STALE_SEC) {
-    const what = msg.text || `<${pickMedia(msg)?.kind || 'media'}>`;
-    console.log(`[bridge] skipping stale message (${Math.round(ageSec / 60)} min old): ${what.slice(0, 60)}`);
+    // The log keeps what it always kept for a text and names the kind for
+    // everything else; the notice to them shows the words of a rich message too.
+    const logWhat = msg.text || `<${media?.kind || (isRich ? 'rich message' : 'media')}>`;
+    const what = msg.text || richText || logWhat;
+    console.log(`[bridge] skipping stale message (${Math.round(ageSec / 60)} min old): ${logWhat.slice(0, 60)}`);
     await send(`⏭️ Skipped a stale message (${Math.round(ageSec / 60)}m old)\n"${clip(oneLine(what), 60)}"`, {
       markdown: false,
     }).catch(() => {});
     return;
   }
-  if (!msg.text) {
-    if (pickMedia(msg)) {
+  if (kind !== 'text' && !isRich) {
+    if (media) {
       ownerMessageSinceBoot = true; // a file is a message too, for the wake-up
       await handleMedia(msg);
-    } else await send('Send text, photos, videos, voice notes or files.', { markdown: false });
+    } else await handleUnknownMessage(msg);
     return;
   }
+  // FROM HERE A RICH MESSAGE IS A TEXT MESSAGE: same lane choice, same reply
+  // quote, same steering into a running turn, same queue, same chat ring entry.
+  // `body` is the only thing that differs, and it is the words either way.
+  const body = isRich ? richText : msg.text;
   // A real message from the owner ends any worker-report chain, restores the
-  // quiet auto-resume budget, and hands over whatever was parked. Labels only:
+  // quiet auto-resume budget, and hands over whatever was parked. Labels only,
   // the outcomes are on disk.
   autoResumesSinceMessage = 0;
   flushParkedHandbacks('message');
@@ -13268,8 +13338,10 @@ async function handleUpdate(update) {
   // routes on it, and no lookup is involved, so a reply to a message sent
   // before the last restart works exactly like a reply to a fresh one.
   const replyQuote = buildReplyQuote(msg, { botName: BRIDGE_NAME, botId: BOT_ID, timeZone: OWNER_TZ });
-  const firstToken = msg.text.trim().split(/\s+/)[0].toLowerCase().replace(/@\w+$/, '');
-  if (RESERVED_COMMANDS.has(firstToken)) {
+  const firstToken = body.trim().split(/\s+/)[0].toLowerCase().replace(/@\w+$/, '');
+  // PLAIN TEXT ONLY. A rich message is never a daemon command: a formatted
+  // note that happens to open with "/stop" is a note, and it goes to the chat.
+  if (!isRich && RESERVED_COMMANDS.has(firstToken)) {
     // The daemon's own commands are unchanged: /status is about the daemon, not
     // about whatever you happened to reply to. /codex keeps reading the reply
     // itself, to re-attach a photo.
@@ -13283,7 +13355,7 @@ async function handleUpdate(update) {
   // Code; custom slash commands (/autopilot, /bug, /qa-loop, …) work headless.
   // Menu-picked commands arrive with underscores (Telegram forbids hyphens in
   // command names) — translate the first token back: /qa_loop → /qa-loop.
-  let text = msg.text;
+  let text = body;
   if (firstToken.startsWith('/') && firstToken.includes('_')) {
     text = text.replace(/^\/[a-z0-9_]+/i, (c) => c.replace(/_/g, '-'));
   }

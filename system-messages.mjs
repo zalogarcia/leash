@@ -1773,6 +1773,35 @@ export function attachmentFrameNote(kinds = []) {
 }
 
 // ---------------------------------------------------------------------------
+// A MESSAGE THE BRIDGE CANNOT READ
+// ---------------------------------------------------------------------------
+
+/**
+ * A kind of message nothing here reads (a sticker, a poll, a location, or the
+ * next kind Telegram adds).
+ *
+ * It used to be "Send text, photos, videos, voice notes or files.", which says
+ * what they could have sent and not what happened to what they DID send. On
+ * 2026-10-12 that line answered one long text four times, because the text had
+ * arrived as a rich message, and nothing told them the message itself was the
+ * problem. So this one says three things: it was not read, what kind it was,
+ * and that the raw message is on disk for the assistant to look at. `saved` is
+ * false when the write failed, and the line says that instead of a promise.
+ *
+ * No turn is started for it: an engine cannot answer a message it was not
+ * handed.
+ */
+export function unreadableMessageNotice({ kind = '', saved = true, name = 'the assistant' } = {}) {
+  const lines = ['📭 Message not read'];
+  const what = clip(oneLine(kind), 31);
+  if (what) lines.push(`Kind · ${what}`);
+  lines.push('The bridge cannot read this kind yet');
+  lines.push(saved ? `Saved for ${clip(oneLine(name) || 'the assistant', 22)} to look at` : 'It could not be saved');
+  lines.push('Text, photos, videos, voice and files work');
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // A REPLY TO A BUBBLE
 // ---------------------------------------------------------------------------
 //

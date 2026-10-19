@@ -26,6 +26,8 @@
 //
 // Pure functions. See reply-quote.test.mjs.
 
+import { flattenRichMessage } from './rich-message.mjs';
+
 /** Characters of the replied to message that ride into the prompt. */
 export const REPLY_QUOTE_MAX = 1500;
 
@@ -172,7 +174,10 @@ export function buildReplyQuote(msg, { botName = 'the bot', botId = null, timeZo
   // pointed at the sentence you meant, and re-quoting the whole bubble over the
   // top of that throws away the most precise thing in the update.
   const partialText = collapse(msg?.quote?.text || '');
-  const fullText = collapse(replied.text || replied.caption || '');
+  // THREE PLACES A BUBBLE KEEPS ITS WORDS. A long or formatted message is a
+  // rich message with no `text` at all (Bot API 10.1), so without the third
+  // source a reply to one read "no text" about a bubble full of it.
+  const fullText = collapse(replied.text || replied.caption || flattenRichMessage(replied.rich_message) || '');
   const source = partialText || fullText;
   // A selection of the WHOLE bubble is not a fragment. Telegram sends
   // `quote.text` for any selection, including one that covers everything, and
