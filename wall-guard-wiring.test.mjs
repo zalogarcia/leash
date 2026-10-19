@@ -25,8 +25,7 @@
 //   node wall-guard-wiring.test.mjs
 //
 // The private sibling has its own copy of this suite: the two bridge.mjs files
-// differ (this one reads the live usage through the cached lookup, and has no
-// salvage tool to name), so the suite is not shared.
+// differ (this one has no salvage tool to name), so the suite is not shared.
 
 import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -148,13 +147,14 @@ export const settle = () => Promise.all([...pendingOps]);
 export let DRAINS = 0;
 const drainBgHandoff = () => { DRAINS++; };
 
-// THE LIVE ACCOUNT AND ITS READING, as this daemon reads them: the cached
-// usage lookup for the live login (accountUsage.activeOnly, below).
+// THE LIVE ACCOUNT AND ITS READING, as the daemon has them: the tracker's
+// name for the live login and the live sessions' newest reading for it.
 export let LIVE = 'acct-a';
 export const setLive = (v) => { LIVE = v; };
+const liveAccount = { current: () => LIVE };
 export let READINGS = {};
 export const setReadings = (v) => { READINGS = v; };
-export let ACTIVE_ONLY_CALLS = 0;
+const streamUsage = { get: (n) => (READINGS[n] ? { usage: READINGS[n], at: NOW_MS, verified: true } : null) };
 
 // THE LEDGER and the probes: the REAL selector decides "another account free".
 export let LIST = [];
@@ -169,10 +169,7 @@ const accounts = {
   clearLimit: (name) => { const i = LIST.findIndex((a) => a.name === name); if (i >= 0) LIST[i] = { ...LIST[i], limitedUntil: null }; return { ok: true }; },
 };
 export const PROBED = [];
-const accountUsage = {
-  one: async (name) => { PROBED.push(name); return PROBES[name] ?? null; },
-  activeOnly: async () => { ACTIVE_ONLY_CALLS++; return { active: { name: LIVE }, row: READINGS[LIVE] ? { name: LIVE, state: 'ok', usage: READINGS[LIVE] } : null }; },
-};
+const accountUsage = { one: async (name) => { PROBED.push(name); return PROBES[name] ?? null; } };
 let limitRecheck = createRecheckLimiter();
 const flagLoginsFromRows = () => [];
 const flagNeedsLogin = () => false;
@@ -255,6 +252,9 @@ ${grab('pickHealthyAccount')}
 ${grab('bgWorkerDescriptors')}
 ${grab('steerInto')}
 ${grab('handleSteerRequest')}
+let lastAccountSwap = null;
+${grab('liveSince')}
+${grab('usableLiveReading')}
 ${grab('wallGuardNow')}
 ${grab('kickWallGuard')}
 ${grab('wallGuardSkip')}
@@ -327,7 +327,6 @@ console.log('\n1. the trigger, wired: what holds the steer back');
 B.setList(walledList());
 B.setReadings({ 'acct-a': reading(94) });
 await t('below the threshold: nothing is steered and the selector is never asked', async () => {
-  ok(B.ACTIVE_ONLY_CALLS === 0, 'nothing read before the first tick');
   const r = await B.wallGuardTick();
   eq([r.fired, r.reason], [false, 'below threshold']);
   eq(B.PROBED.length, 0);
@@ -481,6 +480,7 @@ const ORIGINAL = BRIEF('SHIP-THE-WIDGET-1006');
 const D1 = `bg56-${TS.d1}`;
 writeFileSync(P(`runs/${D1}.jsonl`), ['{"type":"assistant"}', '{"type":"user","content":"[feat/widget 4f3c2a1] WIP checkpoint: widget half done\\n 3 files changed"}', ''].join('\n'));
 writeFileSync(P(`reports/${D1}.draft.md`), '# draft\n\n## RESUME NOTE\n- done: half\n');
+B.wallGuard.job(D1, { account: 'acct-a' }); // the spawn half
 B.noteWallGuardJob(D1, { text: ORIGINAL, cwd: P('worktree-widget') }); // the drop box half
 B.noteWallDeath(D1, ORIGINAL, { finalReportSeen: false, account: 'acct-a' });
 B.wallWake.worker({ runId: D1, title: 'SHIP-THE-WIDGET-1006', died: true, handback: 'held' });

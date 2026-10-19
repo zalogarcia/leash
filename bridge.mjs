@@ -63,6 +63,7 @@ import {
 } from './wake-up.mjs';
 import { createAccountStore, fingerprint, isLimitSignal, parseResetTime } from './accounts.mjs';
 import { selectAccount, PROBE_TIMEOUT_MS, createRecheckLimiter, limitClearVerdict } from './account-selector.mjs';
+import { createStreamUsage, createLiveAccountTracker } from './stream-usage.mjs';
 import {
   autoSwitchSettings,
   autoSwitchStatusLine,
@@ -2054,6 +2055,9 @@ function runClaude(
       startedAt: isBgLane ? startedAt : null,
       schedule: isBgLane ? schedule : null,
     });
+    // Which account this process starts on, as far as the daemon knows: the
+    // live session usage readings it emits are filed by it (noteStreamUsage).
+    const spawnAccount = liveAccount.current();
     const { child } = spawnWorker(CLAUDE_BIN, args, { cwd, env: childEnv, logPath });
     run.child = child;
     run.logPath = logPath; // /status and any future salvage want to find the log
@@ -2082,6 +2086,10 @@ function runClaude(
         // every surface then shows nothing rather than a guess.
         model: st.model || DEFAULT_MODEL || null,
         effort: DEFAULT_EFFORT || null,
+        // The account it was spawned on, for a re-attach after a restart to
+        // file its usage readings by (noteStreamUsage). Absent on records from
+        // before this field, which then count as unknown.
+        account: spawnAccount,
       });
       // THE WALL GUARD'S DISPATCH RECORD (wall-guard.mjs): the facts a resume
       // after an all-accounts wall must carry over that the brief does not. The
@@ -2089,7 +2097,10 @@ function runClaude(
       // attended, and the hooks that hold an unattended run's writes would not
       // hold its. Best effort: a record that fails costs a resume, never a run.
       try {
-        if (schedule?.id != null) wallGuard.job(`${lane.name || 'bg'}-${startedAt}`, { scheduleId: schedule.id, allowWrite: schedule.allowWrite === true });
+        wallGuard.job(`${lane.name || 'bg'}-${startedAt}`, {
+          account: spawnAccount || null,
+          ...(schedule?.id != null ? { scheduleId: schedule.id, allowWrite: schedule.allowWrite === true } : {}),
+        });
       } catch (e) {
         console.error('[bridge] wall guard dispatch record failed:', e.message);
       }
@@ -2440,6 +2451,9 @@ function runClaude(
         // the moment resultEvent is set (this line and that guard are the same
         // statement, one written to the child and one to the caller).
         child.stdin.end();
+      } else if (ev.type === 'rate_limit_event') {
+        // The plan usage numbers, after every API response. See noteStreamUsage.
+        noteStreamUsage(ev, spawnAccount);
       }
     };
 
@@ -3146,6 +3160,12 @@ const watchdog = createWorkerWatchdog({
   tailIntervalMs: BG_TAIL_MS,
   reattachPollMs: REATTACH_POLL_MS,
   onDeadWorkers,
+  // A survivor's plan usage readings. Backlog lines were read live by the
+  // daemon before this one, and stamping them with the time of the restart
+  // would present an hours-old reading as fresh.
+  onEvent: (ev, { backlog, rec }) => {
+    if (!backlog && ev?.type === 'rate_limit_event') noteStreamUsage(ev, rec?.account ?? null);
+  },
   // reportBgOutcome is declared below; the arrow defers the lookup to call time.
   //
   // A CODEX survivor needs its own reconstruction: the module rebuilt `outcome`
@@ -3833,23 +3853,80 @@ const accounts = createAccountStore({
   identify: async (accessToken) => (await fetchProfile(accessToken))?.email || null,
 });
 // LIVE plan usage per account (5h block + weekly window), straight from
-// Anthropic's OAuth usage endpoint — what /usage renders and what /status's
-// one-line summary reads. 60s TTL inside the module, so /status asking on
-// every call costs nothing.
-const accountUsage = createAccountUsage({ store: accounts });
-// EVERY SWAP THAT LANDS, from any path (the rotation, /account, its buttons,
-// the automatic switch): the automatic switch's settle window counts from it.
+// Anthropic's OAuth usage endpoint. The rotation above is reactive: it learns
+// an account is out of headroom by watching a worker die on it. These numbers
+// are the same information BEFORE the death, and they are what /usage renders.
+// 60s TTL inside the module, so /status asking on every call costs nothing.
+//
+// THE SAME NUMBERS FROM THE LIVE SESSIONS. Every Claude stream this daemon
+// spawns carries a rate_limit_event after each API response, and from Claude
+// Code 2.1.280 every one of those processes also polls the usage endpoint on
+// the live account's token, so on a busy day the endpoint answers US 429 for an
+// hour (2026-09-27: /account showed a warning where the bars should be). The
+// newest reading per account is kept in usage-stream.json (stream-usage.mjs,
+// whose header carries the rule for WHOSE reading it is) and handed to the
+// reader: the display paths opt in with { stream: true }, the rotation paths
+// (usageResetFor, the pickHealthyAccount probe) do not. onUsage feeds every
+// successful lookup back in, which is how a reading is told apart by account.
+const STREAM_USAGE_FILE = path.join(SCRIPT_DIR, 'usage-stream.json');
+const streamUsage = createStreamUsage({ file: STREAM_USAGE_FILE });
+const accountUsage = createAccountUsage({
+  store: accounts,
+  streamReading: (name) => streamUsage.get(name),
+  onUsage: (name, usage) => streamUsage.learn(name, usage),
+});
+const liveAccount = createLiveAccountTracker({
+  readCredentials: () => accounts.readCredentials(),
+  resolveActive: () => accountUsage.resolveActive(),
+  fingerprint,
+});
+// A swap changes the live account NOW, and the tracker would otherwise keep the
+// outgoing name for up to its 15s TTL, filing the incoming account's readings
+// under it. Wrapped once here so every swap site is covered: the rotation, the
+// /account command, the /account buttons (account-buttons.mjs calls
+// store.swapTo on this same object) and the automatic switch.
 const swapToStore = accounts.swapTo;
 accounts.swapTo = async (...args) => {
-  const res = await swapToStore(...args);
-  if (res?.ok) {
-    lastAccountSwap = { from: res.from || null, to: res.to || null, at: Date.now() };
-    // The owner's hold belongs to the stint he chose; an owner's path arms it
-    // again after this returns (armOwnerHold).
-    autoSwitchOwnerHold = null;
+  // The tracker's name from BEFORE the swap: the store's `from` is null when it
+  // could not fingerprint the outgoing blob, and rule 5 needs the name.
+  const liveBefore = liveAccount.current();
+  try {
+    const res = await swapToStore(...args);
+    // EVERY SWAP THAT LANDS, from any path: the automatic switch's settle
+    // window counts from it, and the live session readings must know which
+    // account the outgoing sessions are still on (stream-usage.mjs rule 5:
+    // the 2026-10-08 false wall).
+    if (res?.ok) {
+      const from = res.from || (liveBefore && liveBefore !== res.to ? liveBefore : null);
+      lastAccountSwap = { from, to: res.to || null, at: Date.now() };
+      // The owner's hold belongs to the stint they chose; an owner's path arms
+      // it again after this returns (armOwnerHold).
+      autoSwitchOwnerHold = null;
+      streamUsage.noteSwap(lastAccountSwap);
+    }
+    return res;
+  } finally {
+    // On failure too: a swap that half happened (its rollback did not take)
+    // is exactly when the live account is least known.
+    liveAccount.invalidate();
   }
-  return res;
 };
+// One parsed stream event from any Claude process this daemon spawned (the
+// chat lane's pipe, a background lane's log tail, a re-attached survivor's
+// tail). Never throws into the line handler: a missing reading costs a
+// /account warning, a throw here would cost the run its result line.
+//
+// `spawnName` is the account the tracker named when the process was SPAWNED
+// (null when unknown, as for a worker from before this field existed). With no
+// anchor to prove whose a reading is, it is only filed under the live account
+// when the two agree: see the attribution rule in stream-usage.mjs.
+function noteStreamUsage(ev, spawnName = null) {
+  try {
+    streamUsage.note(ev, { liveName: liveAccount.current(), spawnName });
+  } catch (e) {
+    console.error(`[bridge] live session usage reading not recorded: ${e.message}`);
+  }
+}
 
 // THE CODEX ACCOUNT. Same idea one engine over: the ChatGPT login `codex` runs
 // on has its own two rate-limit windows, its own plan and its own bill, and
@@ -4966,6 +5043,10 @@ let autoSwitchLastSkip = null;
 // would otherwise send a refusal every minute until morning.
 let autoSwitchBackoffUntil = 0;
 let autoSwitchLastRefusal = null;
+// The live account's last confirming lookup, { name, at, row }: asked at most
+// every PROBE_EVERY_MS, like the candidates, so a live account parked over a
+// threshold with nowhere to go is not looked up every poll cycle (QA round 2).
+let autoSwitchLiveLookup = null;
 // AN OWNER'S PICK PAST THE THRESHOLD, { name, until }: a switch the owner
 // made (scheduled, by command, a typed /account, an account button) onto an
 // account already over an automatic threshold is the owner's choice, so the
@@ -5034,6 +5115,33 @@ function lastSwapAt() {
     if (Number.isFinite(t) && (newest === null || t > newest)) newest = t;
   }
   return newest;
+}
+
+/** When `name` became the live login (its slot's `lastActiveAt`, stamped by every swap onto it). */
+function liveSince(name) {
+  if (lastAccountSwap?.to === name) return lastAccountSwap.at;
+  const slot = accounts.listAccounts().find((a) => a.name === name);
+  const t = Date.parse(slot?.lastActiveAt || '');
+  return Number.isFinite(t) ? t : null;
+}
+
+/**
+ * THE LIVE ACCOUNT'S READING, only when it is provably that account's.
+ *
+ * The 2026-10-08 20:52Z false wall: one account's 5 hour wall was filed under
+ * the account swapped onto right after the swap, and the wall guard acted on
+ * it. stream-usage.mjs now files it correctly; this is the second fence, for
+ * everything that ACTS on a reading: a reading whose open five hour window is
+ * another account's (`consistent` false), or one received before this account
+ * became the live login, is not this account's live state and is not used.
+ */
+function usableLiveReading(name) {
+  if (!name) return null;
+  const r = streamUsage.get(name);
+  if (!r || r.consistent === false) return null;
+  const since = liveSince(name);
+  if (since !== null && r.at < since) return null;
+  return r.usage;
 }
 
 function autoSwitchSkip(reason, key = null) {
@@ -5132,20 +5240,37 @@ async function autoSwitchTick(now = Date.now(), { dryRun = false } = {}) {
   if (accountSwitchBusy) gates.push('a switch is running');
   if (now < autoSwitchBackoffUntil) gates.push('the last automatic swap failed, waiting before the next try');
   if (gates.length && !dryRun) return autoSwitchSkip(gates[0]);
-  // The live account and its numbers, from one lookup on the live token
-  // (cached for a minute inside account-usage.mjs).
-  const snap = await withDeadline(accountUsage.activeOnly(), PROBE_TIMEOUT_MS + 1000, null);
-  const name = snap?.active?.name || null;
+  const name = liveAccount.current();
   if (!name && !dryRun) return autoSwitchSkip('the live account is not identified yet');
-  const heldUsage = snap?.row?.state === 'ok' && snap.row.usage ? snap.row.usage : null;
+  const sessionUsage = usableLiveReading(name);
+  // THE LOOKUP, paced. Made with the live token, so it is this account's for
+  // certain; throttled (429) or down, the session reading stands on its own
+  // (it already passed usableLiveReading).
+  const okRow = (r) => Boolean(r && r.state === 'ok' && r.name === name && r.usage && r.source?.kind !== 'stream');
+  let row = null;
+  if (name) {
+    const prev = autoSwitchLiveLookup?.name === name ? autoSwitchLiveLookup : null;
+    const age = prev ? Date.now() - prev.at : Infinity;
+    const contradicted =
+      prev && sessionUsage && overThreshold(sessionUsage, settings, now).length > 0 && okRow(prev.row) && !overThreshold(prev.row.usage, settings, now).length && age >= 60_000;
+    if (dryRun || !prev || age >= AUTO_SWITCH_RETRY_MS || contradicted) {
+      row = await withDeadline(accountUsage.one(name), PROBE_TIMEOUT_MS + 1000, null);
+      autoSwitchLiveLookup = { name, at: Date.now(), row };
+    } else row = prev.row;
+  }
+  let usage = sessionUsage;
+  let source = usage ? 'live session reading' : 'none';
+  if (okRow(row)) {
+    usage = row.usage;
+    const age = Date.now() - autoSwitchLiveLookup.at;
+    source = age > 1000 ? `lookup ${Math.round(age / 1000)}s old` : 'lookup';
+  }
   // THE OWNER'S HOLD: a pick judged now when no reading was at hand then.
-  if (autoSwitchOwnerHold?.name === name && autoSwitchOwnerHold.until === null && heldUsage) armOwnerHold(name, heldUsage);
+  if (autoSwitchOwnerHold?.name === name && autoSwitchOwnerHold.until === null && usage) armOwnerHold(name, usage);
   if (autoSwitchOwnerHold && autoSwitchOwnerHold.name === name && now < autoSwitchOwnerHold.until) {
     gates.push(`the owner chose ${name} past the threshold; left alone until ${fmtResetClock(autoSwitchOwnerHold.until, { timeZone: OWNER_TZ })}`);
     if (!dryRun) return autoSwitchSkip(gates[gates.length - 1]);
   }
-  const usage = snap?.row?.state === 'ok' && snap.row.usage ? snap.row.usage : null;
-  const source = usage ? 'lookup' : 'none';
   if (!dryRun && !usage) return autoSwitchSkip('no usable reading for the live account');
   if (!dryRun && !overThreshold(usage, settings, now).length) return autoSwitchSkip('below the thresholds');
   const at = Date.now();
@@ -5156,8 +5281,7 @@ async function autoSwitchTick(now = Date.now(), { dryRun = false } = {}) {
   // RE-READ after the awaits: a rotation, a wall or another switch may have
   // landed meanwhile, and the login may already have moved.
   const t2 = Date.now();
-  const nowLive = (await accounts.activeAccount().catch(() => null))?.account?.name || null;
-  if (t2 < rotationPausedUntil || t2 < rotationCooldownUntil || accountSwitchBusy || nowLive !== name) {
+  if (t2 < rotationPausedUntil || t2 < rotationCooldownUntil || accountSwitchBusy || liveAccount.current() !== name) {
     return autoSwitchSkip('the login moved while this was deciding');
   }
   autoSwitchLastSkip = null;
@@ -5198,7 +5322,7 @@ function switchAccountNow(target, opts = {}) {
 async function doSwitchAccount(target, { via = 'auto', why = null, over = [], fromName = null, fromUsage = null, toUsage = null, scheduleId = null } = {}) {
   const say = (text) => send(text, { markdown: false }).catch((e) => console.error(`[bridge] account switch notice not delivered: ${e.message}`));
   const active = await accounts.activeAccount().catch(() => null);
-  let activeName = active?.account?.name || null;
+  let activeName = active?.account?.name || liveAccount.current() || null;
   const refuse = (reason) => {
     logAccountDecision({ decision: 'account_switch_refused', account: target, via, reason });
     // An automatic swap that failed pauses the automatic switch and says so
@@ -5218,7 +5342,7 @@ async function doSwitchAccount(target, { via = 'auto', why = null, over = [], fr
   // rotation's wins and this one stands down quietly.
   if (via === 'auto') {
     const t = Date.now();
-    if (t < rotationCooldownUntil || t < rotationPausedUntil || (fromName && activeName !== fromName)) {
+    if (t < rotationCooldownUntil || t < rotationPausedUntil || (fromName && liveAccount.current() !== fromName)) {
       logAccountDecision({ decision: 'account_autoswitch_standing_down', account: fromName, reason: 'the login moved while this was deciding' });
       return { ok: false, to: target, from: activeName, reason: 'the login moved while this was deciding' };
     }
@@ -5244,7 +5368,7 @@ async function doSwitchAccount(target, { via = 'auto', why = null, over = [], fr
     name = v.name;
     note = v.note || null;
     toUsage = v.usage || null;
-    fromUsage = fromUsage || accountUsage.peek(activeName)?.usage || null;
+    fromUsage = fromUsage || usableLiveReading(activeName);
     why = via;
   }
   // A ROTATION IN FLIGHT (or one that just landed) arms the cooldown before
@@ -5265,7 +5389,7 @@ async function doSwitchAccount(target, { via = 'auto', why = null, over = [], fr
       await sleep(SWITCH_COOLDOWN_POLL_MS);
     }
     const after = await accounts.activeAccount().catch(() => null);
-    activeName = after?.account?.name || activeName;
+    activeName = after?.account?.name || liveAccount.current() || activeName;
     if (rotationHolds() && rotationCooldownUntil === seen) return refuse('a rotation is still moving the login; nothing changed, ask again in a minute');
     const v2 = switchTargetVerdict({ target, rows: accounts.describe(Date.now()), activeName, now: Date.now(), timeZone: OWNER_TZ });
     if (!v2.ok) return refuse(v2.reason);
@@ -5444,12 +5568,11 @@ async function wallGuardTick(now = Date.now()) {
   // The wall is already up: what was running has died or is held, and a
   // checkpoint now would land in a run that cannot act on it.
   if (now < rotationPausedUntil) return { fired: false, reason: 'wall up' };
-  // Nothing to tell, nothing to read: the usage lookup is a network request.
-  if (!bgWorkerDescriptors().some((w) => (w.engine || 'claude') === 'claude')) return wallGuardSkip('no Claude worker running');
-  const snap = await withDeadline(accountUsage.activeOnly(), 3_000, null);
-  const account = snap?.active?.name || null;
-  const usage = snap?.row?.usage || null;
-  now = Date.now();
+  const account = liveAccount.current();
+  // Only a reading that is provably this account's (usableLiveReading): the
+  // 2026-10-08 20:52Z false wall acted on one account's 100 percent filed
+  // under another seconds after the swap.
+  const usage = account ? usableLiveReading(account) : null;
   const pre = checkpointCandidates({ settings, usage, account, now, workers: bgWorkerDescriptors() });
   if (!pre.ready) return wallGuardSkip(pre.reason);
   const left = checkpointCandidates({ settings, usage, account, now, workers: bgWorkerDescriptors(), steered: wallGuard.handled(pre.key) });
@@ -6193,7 +6316,7 @@ async function renderAccountView(status = null) {
   //
   // The three accounts are read CONCURRENTLY inside all(); deadlined here so
   // an unreachable API costs the usage lines, not the /account reply.
-  const snapshot = await withDeadline(accountUsage.all(), 6_000, null);
+  const snapshot = await withDeadline(accountUsage.all({ stream: true }), 6_000, null);
   // A walled slot that now reads with room is freed BEFORE the view renders,
   // so the view does not say "limited" next to a 0% bar (2026-09-30). `rows`
   // is re-read when a wall clears or a login is flagged; neither clearLimit
@@ -10738,7 +10861,7 @@ async function gatherUsage() {
   // message, and the report is the same report either way.
   const pending = await pendingMessage('Reading plan usage');
   try {
-    const snapshot = await accountUsage.all();
+    const snapshot = await accountUsage.all({ stream: true });
     // Same rule as /account: a walled slot whose own fresh reading shows room
     // everywhere is freed from the reading this view already made.
     const cleared = clearLimitsFromRows(snapshot.rows, { via: '/usage' });
@@ -11254,7 +11377,7 @@ async function handleCommand(text, msg = null) {
       // deadlined here, so a slow or unreachable API costs the line, not the
       // reply: usageLine() returns null and the line is omitted entirely
       // rather than printing an error into a "what is running right now" view.
-      const liveUsage = await withDeadline(accountUsage.activeOnly(), 2_500);
+      const liveUsage = await withDeadline(accountUsage.activeOnly({ stream: true }), 2_500);
       // The sessions on this machine the daemon did not spawn. Same deadline
       // shape as the usage row above and for the same reason: a wedged tmux
       // server costs this block and nothing else. readPeers already caps each of
@@ -12829,10 +12952,11 @@ async function pollLoop() {
         lastDriftCheck = Date.now();
         const op = accounts
           .checkDrift()
+          // A drift re-assert or re-bank moved the live login: re-resolve it.
           .then((r) => {
-            // A drift re-assert or re-bank moved the live login: the cached
-            // usage rows predate the move, and one of them may carry a
-            // dead-login verdict about the login that just landed.
+            if (r?.drifted) liveAccount.invalidate();
+            // The cached usage rows predate the move too, and one of them may
+            // carry a dead-login verdict about the login that just landed.
             if (r?.drifted) invalidateUsageCache();
           })
           .catch((e) => console.error('[bridge] account drift check failed:', e.message));
@@ -12983,6 +13107,9 @@ async function main() {
     if (rec?.engine === 'codex' && rec?.transport === 'appserver') recoverCodexAppServerJob(id, rec);
     else if (rec?.engine === 'codex') adoptCodexSurvivor(id, rec);
   }
+  // Name the live account before the first stream event needs it, so the
+  // first readings after a boot are not dropped for want of one.
+  liveAccount.refresh().catch(() => {});
   const survivors = reattachLiveWorkers();
   if (survivors) console.log(`[bridge] ${survivors} background worker(s) survived the restart — re-attached`);
   // Steering is available for the whole life of the daemon, including while it is
@@ -13086,7 +13213,12 @@ if (IS_ENTRYPOINT) {
   // draining. Node unlinks a bound pipe for us on a clean close, but only for a
   // socket THIS process bound, and only on some of these paths. Doing it here,
   // ownership checked, makes the .pid file go with it either way.
-  process.on('exit', () => releaseSteerSockIfOurs('exit'));
+  process.on('exit', () => {
+    // The coalesced usage-stream.json write, so a restart keeps the last few
+    // seconds of live session readings too. Synchronous, as 'exit' requires.
+    streamUsage.flush();
+    releaseSteerSockIfOurs('exit');
+  });
 
   main().catch((e) => {
     console.error('[bridge] fatal:', e);

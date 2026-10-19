@@ -272,8 +272,11 @@ const codexFallbackOn = () => false;
 const codexSettingsNow = () => ({});
 const unclaimedLine = () => null;
 const NO_ACCOUNTS_VIEW = 'no accounts';
+export const activeOnlyArgs = [];
+export const probeArgs = [];
 const accountUsage = {
-  activeOnly: async () => {
+  activeOnly: async (...args) => {
+    activeOnlyArgs.push(args);
     CALLS.push({ activeOnly: true });
     if (usageThrows) throw new Error('usage API unreachable');
     if (usageHangs) return new Promise(() => {});
@@ -282,7 +285,8 @@ const accountUsage = {
   // The /account view's reads (renderAccountView).
   all: async () => ALL_SNAPSHOT,
   resolveActive: async () => ({ name: ACTIVE }),
-  one: async (name) => {
+  one: async (name, ...rest) => {
+    probeArgs.push(rest);
     probeCalls.push(name);
     if (probeGate) await probeGate;
     if (probeThrows) throw new Error('usage API unreachable');
@@ -734,6 +738,29 @@ rot = await B.rotateOffLimitedAccount(WALL);
 await t('a probe that never answers is deadlined, not waited on', () => {
   eq(rot.outcome, 'swapped');
   ok(PROBE_TIMEOUT_MS <= 5000, `the probe deadline stays at five seconds, not ${PROBE_TIMEOUT_MS}`);
+});
+
+// The live session readings (stream-usage.mjs) are for the DISPLAY paths only.
+// Both rotation reads must reach the usage lookup exactly as they did before:
+// a reading is at best as old as the last request made on its account, and the
+// probe and usageResetFor exist to refuse a stale bill of health.
+// ---------------------------------------------------------------------------
+B.reset();
+B.activeOnlyArgs.length = 0;
+B.probeArgs.length = 0;
+B.setUsageRow(row({ fiveHour: win(100, iso(2 * HOUR)), sevenDay: win(40, iso(90 * HOUR)), scoped: [], extraUsage: null }));
+await B.usageResetFor('a@example.com');
+B.setList(THREE());
+B.setProbes({ 'c@example.com': HEALTHY('c@example.com') });
+await B.pickHealthyAccount({ activeName: 'a@example.com' });
+await t('★ usageResetFor and the pickHealthyAccount probe never opt into live session readings', () => {
+  ok(B.activeOnlyArgs.length >= 1, 'usageResetFor did not read the usage at all');
+  ok(
+    B.activeOnlyArgs.every((a) => !a.some((o) => o && o.stream)),
+    `usageResetFor asked for stream readings: ${JSON.stringify(B.activeOnlyArgs)}`,
+  );
+  ok(B.probeArgs.length >= 1, 'the probe did not run');
+  ok(B.probeArgs.every((a) => !a.some((o) => o && o.stream)), `the probe asked for stream readings: ${JSON.stringify(B.probeArgs)}`);
 });
 
 // The wall notice's rows come off the ledger.

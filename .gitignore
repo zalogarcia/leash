@@ -34,3 +34,5 @@ wall-wake.json
 wall-wake.json.*.tmp
 wall-guard.json
 wall-guard.json.*.tmp
+usage-stream.json
+usage-stream.json.tmp

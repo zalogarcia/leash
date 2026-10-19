@@ -18,9 +18,11 @@
 //   4. `node bg.mjs account switch|check` as a REAL process against the REAL
 //      steer server (startSteerServer + handleSteerRequest sliced out), on a
 //      socket in a temp dir.
-//   5. the wall guard asks the selector about the OTHER accounts only, and
-//      its log line says so (no_other_account_free), never that every
-//      account is walled while the live one was not asked.
+//   5. the 2026-10-08 20:52Z false wall: charlie's 100 percent reading after
+//      the swap to delta, through the real noteStreamUsage and the real
+//      wallGuardTick. Neither the checkpoint nor the all-walled line fires,
+//      and a control with delta genuinely full shows the rig CAN fire (and
+//      that the selector was asked about the OTHER accounts only).
 //
 // bridge.mjs is never imported (that boots a daemon). Every file is under one
 // temp directory; nothing is sent anywhere (send records), no real keychain
@@ -90,8 +92,8 @@ const RESET = Date.parse('2026-10-08T14:00:00Z');
 const NOW0 = RESET - 10 * MIN;
 const ME = 'alpha@example.test';
 const GMAIL = 'bravo@example.test';
-const ZALO = 'charlie@example.test';
-const HELLO = 'delta@example.test';
+const CHARLIE = 'charlie@example.test';
+const DELTA = 'delta@example.test';
 
 const HARNESS = `
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -100,6 +102,7 @@ import path from 'node:path';
 import { createAccountStore, fingerprint, isLimited, loginFlag } from ${url('accounts.mjs')};
 import { createKeychainStore } from ${url('credential-store.mjs')};
 import { createAccountUsage, fmtResetClock, invalidateUsageCache, fetchProfile } from ${url('account-usage.mjs')};
+import { createStreamUsage, createLiveAccountTracker } from ${url('stream-usage.mjs')};
 import { selectAccount, PROBE_TIMEOUT_MS, createRecheckLimiter, limitClearVerdict } from ${url('account-selector.mjs')};
 import { autoSwitchSettings, autoSwitchStatusLine, autoSwitchDecision, candidateVerdict, probeDue, overThreshold, readingLine, switchTargetVerdict, autoSwitchNotice, switchRefusedNotice, alreadyOnNotice, EVIDENCE_MAX_AGE_MS as AUTO_SWITCH_EVIDENCE_MS, PROBE_EVERY_MS as AUTO_SWITCH_RETRY_MS } from ${url('account-autoswitch.mjs')};
 import { wallGuardSettings, checkpointCandidates, checkpointDecision, checkpointSteerText, checkpointNotice, nextAccountAfter, createWallGuardStore } from ${url('wall-guard.mjs')};
@@ -176,10 +179,22 @@ const fakeFetch = async (u, opts = {}) => {
   if (!b) return { ok: false, status: 500, headers: { get: () => null }, json: async () => ({}) };
   return { ok: true, status: 200, json: async () => b };
 };
+// A FRESH store per test (resetRig): the test clock jumps backwards between
+// tests, and a reading held from a later minute would outrank every new one.
+let streamN = 0;
+const newStream = () => createStreamUsage({ file: ${JSON.stringify(P('usage-stream'))} + '-' + streamN++ + '.json', log: (m) => LOGS.push('[stream-usage] ' + m), persistDelayMs: 3600_000 });
+export let streamUsage = newStream();
 export const accountUsage = createAccountUsage({
   store: accounts,
   fetchImpl: fakeFetch,
   log: (m) => LOGS.push('[account-usage] ' + m),
+  streamReading: (name) => streamUsage.get(name),
+  onUsage: (name, usage) => streamUsage.learn(name, usage),
+});
+export const liveAccount = createLiveAccountTracker({
+  readCredentials: () => accounts.readCredentials(),
+  resolveActive: () => accountUsage.resolveActive(),
+  fingerprint,
 });
 ${grabSwapWrapper()}
 
@@ -219,6 +234,7 @@ let wallGuardLastProbe = 0;
 let wallGuardInflight = null;
 let wallGuardLastSkip = null;
 ${grab('logAccountDecision')}
+${grab('noteStreamUsage')}
 ${grab('pickHealthyAccount')}
 ${grab('wallGuardNow')}
 ${grab('kickWallGuard')}
@@ -231,6 +247,7 @@ ${grab('autoSwitchInflight', 'const')}
 ${grab('autoSwitchLastSkip', 'const')}
 ${grab('autoSwitchBackoffUntil', 'const')}
 ${grab('autoSwitchLastRefusal', 'const')}
+${grab('autoSwitchLiveLookup', 'const')}
 ${grab('autoSwitchOwnerHold', 'const')}
 ${grab('armOwnerHold')}
 ${grab('swapCooldownMark', 'const')}
@@ -238,6 +255,8 @@ ${grab('accountSwitchChain', 'const')}
 ${grab('accountSwitchBusy', 'const')}
 ${grab('autoSwitchNow')}
 ${grab('lastSwapAt')}
+${grab('liveSince')}
+${grab('usableLiveReading')}
 ${grab('autoSwitchSkip')}
 ${grab('kickAutoSwitch')}
 ${grab('autoSwitchCandidates')}
@@ -253,7 +272,7 @@ ${grab('checkSchedules')}
 const STEER_SOCK = ${JSON.stringify(P('steer.sock'))};
 ${grab('startSteerServer')}
 
-export { kickAutoSwitch, autoSwitchTick, switchAccountNow, checkSchedules, startSteerServer, wallGuardTick, autoSwitchStatusLine, autoSwitchNow, lastAutoSwitch, fmtSchedule };
+export { kickAutoSwitch, autoSwitchTick, switchAccountNow, checkSchedules, startSteerServer, wallGuardTick, noteStreamUsage, autoSwitchStatusLine, autoSwitchNow, lastAutoSwitch, fmtSchedule };
 export const setSwapMark = (v) => { swapCooldownMark = v; };
 export { armOwnerHold };
 export const ownerHold = () => autoSwitchOwnerHold;
@@ -264,10 +283,12 @@ export const resetRig = () => {
   lastAccountSwap = null;
   lastAutoSwitch = null;
   autoSwitchProbes.clear();
+  streamUsage = newStream();
   invalidateUsageCache();
   autoSwitchLastSkip = null;
   autoSwitchBackoffUntil = 0;
   autoSwitchLastRefusal = null;
+  autoSwitchLiveLookup = null;
   autoSwitchOwnerHold = null;
   swapCooldownMark = 0;
   wallGuardLastProbe = 0;
@@ -291,7 +312,7 @@ const oauthFor = (name) => ({
   scopes: ['user:inference', 'user:profile'],
   subscriptionType: 'max',
 });
-const NAMES = [GMAIL, ME, ZALO, HELLO];
+const NAMES = [GMAIL, ME, CHARLIE, DELTA];
 const MCP = { mcpOAuth: { 'leadconnector|abc': { accessToken: 'mcp-token-kept' } } };
 function seedAccounts({ live = ME, walled = {}, flagged = {} } = {}) {
   const list = NAMES.map((name, i) => ({
@@ -328,7 +349,7 @@ const event = (five, fiveReset, week, weekReset) => ({
   },
 });
 async function freshTracker() {
-  // Leash reads the live account from the credential store on every lookup.
+  await H.liveAccount.refresh();
 }
 const reset = () => {
   H.resetRig();
@@ -349,14 +370,14 @@ await t('★ AC1: alpha at 95% of its week, charlie free: ONE tick swaps the key
   H.setNow(RESET + 30_000);
   seedAccounts({ live: ME, walled: { [GMAIL]: GMAIL_WEEK } });
   H.BODY[ME] = body(12, RESET + HOUR, 95, ME_WEEK);
-  H.BODY[ZALO] = body(0, null, 0, ZH_WEEK + 7 * 24 * HOUR);
-  H.BODY[HELLO] = body(0, null, 3, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[CHARLIE] = body(0, null, 0, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[DELTA] = body(0, null, 3, ZH_WEEK + 7 * 24 * HOUR);
   await freshTracker();
   const writesBefore = H.KC.writes;
   const r = await H.kickAutoSwitch();
   await H.settle();
   eq(r.ok, true, JSON.stringify(r));
-  eq(liveName(), ZALO, 'the keychain now holds charlie');
+  eq(liveName(), CHARLIE, 'the keychain now holds charlie');
   eq(H.KC.writes, writesBefore + 1, 'exactly one keychain write');
   eq(H.KC.blob.mcpOAuth, MCP.mcpOAuth, 'the MCP logins in the same blob are untouched');
   eq(H.SENT.length, 1, `one notice, got: ${JSON.stringify(H.SENT)}`);
@@ -381,12 +402,12 @@ await t('★ AC3: the following ticks never swap back to alpha, whatever its ses
   // week, charlie climbs slowly.
   for (let m = 1; m <= 30; m++) {
     H.setNow(RESET + 30_000 + m * MIN);
-    H.BODY[ZALO] = body(m, RESET + 5 * HOUR, Math.min(60, m * 2), ZH_WEEK + 7 * 24 * HOUR);
+    H.BODY[CHARLIE] = body(m, RESET + 5 * HOUR, Math.min(60, m * 2), ZH_WEEK + 7 * 24 * HOUR);
     await H.kickAutoSwitch();
   }
   await H.settle();
   eq(H.KC.writes, swapsBefore, 'no swap in 30 ticks');
-  eq(liveName(), ZALO);
+  eq(liveName(), CHARLIE);
   eq(H.SENT.length, 0, 'and no message');
 });
 
@@ -394,11 +415,11 @@ await t('★ AC3: when charlie itself crosses 90, it moves ONWARD to delta, neve
   H.SENT.length = 0;
   const at = RESET + 2 * HOUR;
   H.setNow(at);
-  H.BODY[ZALO] = body(91, RESET + 5 * HOUR, 40, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[CHARLIE] = body(91, RESET + 5 * HOUR, 40, ZH_WEEK + 7 * 24 * HOUR);
   H.BODY[ME] = body(0, null, 95, ME_WEEK);
   await H.kickAutoSwitch();
   await H.settle();
-  eq(liveName(), HELLO);
+  eq(liveName(), DELTA);
   eq(H.SENT.length, 1);
   ok(H.SENT[0].includes('❓ Why: 91% of the 5 hour window (threshold 90%)'), H.SENT[0]);
 });
@@ -408,11 +429,11 @@ await t('a settle window after ANY swap: the owner\'s own swap holds the automat
   H.setNow(RESET + 3 * HOUR);
   seedAccounts({ live: ME });
   H.BODY[ME] = body(12, RESET + 4 * HOUR, 95, ME_WEEK);
-  H.BODY[ZALO] = body(0, null, 0, ZH_WEEK + 7 * 24 * HOUR);
-  H.BODY[HELLO] = body(0, null, 3, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[CHARLIE] = body(0, null, 0, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[DELTA] = body(0, null, 3, ZH_WEEK + 7 * 24 * HOUR);
   H.BODY[GMAIL] = body(0, null, 100, GMAIL_WEEK);
   // The owner swaps to alpha by hand (the /account path is accounts.swapTo too).
-  seedAccounts({ live: ZALO });
+  seedAccounts({ live: CHARLIE });
   const r = await H.accounts.swapTo(ME);
   eq(r.ok, true);
   await freshTracker();
@@ -423,7 +444,7 @@ await t('a settle window after ANY swap: the owner\'s own swap holds the automat
   const res2 = await H.kickAutoSwitch();
   await H.settle();
   eq(res2.ok, true, JSON.stringify(res2));
-  eq(liveName(), ZALO);
+  eq(liveName(), CHARLIE);
 });
 
 await t('off in config.json: nothing is asked, nothing moves', async () => {
@@ -432,7 +453,7 @@ await t('off in config.json: nothing is asked, nothing moves', async () => {
   seedAccounts({ live: ME });
   H.setConf({ accountAutoSwitch: { enabled: false } });
   H.BODY[ME] = body(12, RESET + 5 * HOUR, 95, ME_WEEK);
-  H.BODY[ZALO] = body(0, null, 0, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[CHARLIE] = body(0, null, 0, ZH_WEEK + 7 * 24 * HOUR);
   await freshTracker();
   const before = H.KC.writes;
   const res = await H.kickAutoSwitch();
@@ -461,8 +482,8 @@ await t('★ 10-08: before 14:00Z nothing is free; the first tick after 14:00Z s
   H.setNow(NOW0); // 13:50Z
   seedAccounts({ live: ME, walled: { [GMAIL]: GMAIL_WEEK } });
   H.BODY[ME] = body(6, NOW0 + 90 * MIN, 95, ME_WEEK);
-  H.BODY[ZALO] = body(0, null, 100, RESET);
-  H.BODY[HELLO] = body(0, null, 100, RESET);
+  H.BODY[CHARLIE] = body(0, null, 100, RESET);
+  H.BODY[DELTA] = body(0, null, 100, RESET);
   await freshTracker();
   const before = await H.kickAutoSwitch();
   eq(before.switched, false);
@@ -472,15 +493,15 @@ await t('★ 10-08: before 14:00Z nothing is free; the first tick after 14:00Z s
   H.setNow(NOW0 + 5 * MIN - 1000);
   H.FETCHED.length = 0;
   await H.kickAutoSwitch();
-  ok(!H.FETCHED.includes(ZALO), 'charlie is not asked again before its reset');
+  ok(!H.FETCHED.includes(CHARLIE), 'charlie is not asked again before its reset');
   // 14:00:30Z: both weeks have reset.
   H.setNow(RESET + 30_000);
-  H.BODY[ZALO] = body(0, null, 0, ZH_WEEK);
-  H.BODY[HELLO] = body(0, null, 0, ZH_WEEK);
+  H.BODY[CHARLIE] = body(0, null, 0, ZH_WEEK);
+  H.BODY[DELTA] = body(0, null, 0, ZH_WEEK);
   const after = await H.kickAutoSwitch();
   await H.settle();
   eq(after.ok, true, JSON.stringify(after));
-  eq(liveName(), ZALO, 'charlie is first in list order on equal headroom');
+  eq(liveName(), CHARLIE, 'charlie is first in list order on equal headroom');
   ok(H.SENT.at(-1).includes('❓ Why: a reset freed charlie@example.test · 95% of the weekly window (threshold 90%)'), H.SENT.at(-1));
 });
 
@@ -490,19 +511,19 @@ await t('★ 10-08: before 14:00Z nothing is free; the first tick after 14:00Z s
 await t('★ AC2: a scheduled switch fires through checkSchedules and moves the login', async () => {
   reset();
   H.setNow(RESET + 6 * HOUR);
-  seedAccounts({ live: HELLO });
-  H.BODY[ZALO] = body(0, null, 10, ZH_WEEK + 7 * 24 * HOUR);
+  seedAccounts({ live: DELTA });
+  H.BODY[CHARLIE] = body(0, null, 10, ZH_WEEK + 7 * 24 * HOUR);
   await freshTracker();
-  H.setSched({ nextId: 1, items: [{ id: 214, kind: 'once', at: Date.now() - 1000, text: 'switch the Claude account to charlie', switchAccount: ZALO }] });
+  H.setSched({ nextId: 1, items: [{ id: 214, kind: 'once', at: Date.now() - 1000, text: 'switch the Claude account to charlie', switchAccount: CHARLIE }] });
   H.checkSchedules();
   await H.settle();
-  eq(liveName(), ZALO);
+  eq(liveName(), CHARLIE);
   eq(H.SCHED.items.length, 0, 'the once item is consumed');
   eq(H.SENT.length, 1);
   eq(H.SENT[0].split('\n')[0], '🔀 Claude account switched · scheduled #214');
   ok(H.SENT[0].includes('❓ Why: you scheduled it') && H.SENT[0].includes('📝 Note: 5h 0% · week 10%'), H.SENT[0]);
   ok(H.status().endsWith('(schedule)'), H.status());
-  eq(H.fmtSchedule({ id: 3, kind: 'daily', at: '09:00', text: 'x', switchAccount: ZALO }), '#3 · daily 09:00 · 🔀 switch account · charlie@example.test');
+  eq(H.fmtSchedule({ id: 3, kind: 'daily', at: '09:00', text: 'x', switchAccount: CHARLIE }), '#3 · daily 09:00 · 🔀 switch account · charlie@example.test');
 });
 
 await t('★ AC2: a scheduled switch to a walled, flagged or unknown account is refused with ONE message and nothing moves', async () => {
@@ -513,14 +534,14 @@ await t('★ AC2: a scheduled switch to a walled, flagged or unknown account is 
   ]) {
     reset();
     H.setNow(RESET + 7 * HOUR);
-    seedAccounts({ live: HELLO, ...setup });
+    seedAccounts({ live: DELTA, ...setup });
     await freshTracker();
     const before = H.KC.writes;
     H.setSched({ nextId: 1, items: [{ id: 9, kind: 'once', at: Date.now() - 1000, text: 'x', switchAccount: target }] });
     H.checkSchedules();
     await H.settle();
     eq(H.KC.writes, before, `${target}: no keychain write`);
-    eq(liveName(), HELLO);
+    eq(liveName(), DELTA);
     eq(H.SENT.length, 1, `${target}: one message`);
     eq(H.SENT[0].split('\n')[0], '🚫 Claude account switch refused · scheduled #9');
     ok(H.SENT[0].includes(want), H.SENT[0]);
@@ -531,22 +552,22 @@ await t('★ AC2: a scheduled switch to a walled, flagged or unknown account is 
 await t('a scheduled switch to an account a fresh lookup shows spent is refused too', async () => {
   reset();
   H.setNow(RESET + 8 * HOUR);
-  seedAccounts({ live: HELLO });
-  H.BODY[ZALO] = body(100, RESET + 9 * HOUR, 40, ZH_WEEK + 7 * 24 * HOUR);
+  seedAccounts({ live: DELTA });
+  H.BODY[CHARLIE] = body(100, RESET + 9 * HOUR, 40, ZH_WEEK + 7 * 24 * HOUR);
   await freshTracker();
-  const r = await H.switchAccountNow(ZALO, { via: 'schedule', scheduleId: 11 });
+  const r = await H.switchAccountNow(CHARLIE, { via: 'schedule', scheduleId: 11 });
   eq(r.ok, false);
   ok(r.reason.startsWith('charlie@example.test has spent the 5 hour window until'), r.reason);
-  eq(liveName(), HELLO);
+  eq(liveName(), DELTA);
 });
 
 await t('a scheduled switch to the account already live says so once and writes nothing', async () => {
   reset();
   H.setNow(RESET + 9 * HOUR);
-  seedAccounts({ live: ZALO });
+  seedAccounts({ live: CHARLIE });
   await freshTracker();
   const before = H.KC.writes;
-  const r = await H.switchAccountNow(ZALO, { via: 'schedule', scheduleId: 12 });
+  const r = await H.switchAccountNow(CHARLIE, { via: 'schedule', scheduleId: 12 });
   eq([r.ok, r.noop], [true, true]);
   eq(H.KC.writes, before);
   eq(H.SENT, ['🔀 Claude account switch · scheduled #12\n✅ Already on: charlie@example.test\n💤 Nothing changed']);
@@ -571,13 +592,13 @@ await t('★ `bg.mjs account switch <name>` from the chat lane moves the login t
   reset();
   H.setNow(RESET + 10 * HOUR);
   seedAccounts({ live: ME });
-  H.BODY[HELLO] = body(4, RESET + 12 * HOUR, 18, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[DELTA] = body(4, RESET + 12 * HOUR, 18, ZH_WEEK + 7 * 24 * HOUR);
   await freshTracker();
-  const r = await cli(['account', 'switch', HELLO], { LEASH_LANE: 'chat' });
+  const r = await cli(['account', 'switch', DELTA], { LEASH_LANE: 'chat' });
   eq(r.code, 0, r.stderr);
   eq(r.stdout.trim(), 'switched to delta@example.test (from alpha@example.test)');
   await H.settle();
-  eq(liveName(), HELLO);
+  eq(liveName(), DELTA);
   eq(H.SENT.length, 1);
   eq(H.SENT[0].split('\n')[0], '🔀 Claude account switched · by command');
 });
@@ -589,7 +610,7 @@ await t('★ `bg.mjs account switch` from a background worker or a scheduled run
   await freshTracker();
   const before = H.KC.writes;
   for (const env of [{ LEASH_LANE: 'bg' }, { LEASH_TRIGGER: 'schedule' }]) {
-    const r = await cli(['account', 'switch', HELLO], env);
+    const r = await cli(['account', 'switch', DELTA], env);
     eq(r.code, 1, JSON.stringify(env));
     ok(r.stderr.includes("only the owner's own lanes can"), r.stderr);
   }
@@ -617,8 +638,8 @@ await t('★ `bg.mjs account check` prints the decision with the real readings a
   H.setNow(RESET + 13 * HOUR);
   seedAccounts({ live: ME, walled: { [GMAIL]: GMAIL_WEEK } });
   H.BODY[ME] = body(20, RESET + 14 * HOUR, 95, ME_WEEK);
-  H.BODY[ZALO] = body(0, null, 5, ZH_WEEK + 7 * 24 * HOUR);
-  H.BODY[HELLO] = body(97, RESET + 14 * HOUR, 30, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[CHARLIE] = body(0, null, 5, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[DELTA] = body(97, RESET + 14 * HOUR, 30, ZH_WEEK + 7 * 24 * HOUR);
   await freshTracker();
   const before = H.KC.writes;
   const r = await cli(['account', 'check']);
@@ -653,27 +674,72 @@ await t('`bg.mjs account` with a wrong shape is a usage error, and a prose brief
 server.close();
 
 // ---------------------------------------------------------------------------
-// 5. THE WALL GUARD'S QUESTION IS ABOUT THE OTHER ACCOUNTS
+// 5. THE 2026-10-08 20:52Z FALSE WALL (acceptance criterion 7)
 // ---------------------------------------------------------------------------
-await t('★ the guard fires with every other account walled, and logs no_other_account_free, never all_accounts_walled_until', async () => {
+const T_SWAP = Date.parse('2026-10-08T20:52:15Z');
+const CHARLIE_5H = Date.parse('2026-10-09T00:00:00Z');
+const DELTA_5H = Date.parse('2026-10-09T01:50:00Z');
+async function oct8Evening() {
   reset();
-  const at = Date.parse('2026-10-08T20:52:30Z');
-  H.setNow(at);
+  H.setNow(T_SWAP - 2 * MIN);
   seedAccounts({
-    live: HELLO,
-    walled: { [GMAIL]: Date.parse('2026-10-10T05:00:00Z'), [ME]: Date.parse('2026-10-13T06:00:01Z'), [ZALO]: Date.parse('2026-10-09T00:00:00Z') },
+    live: CHARLIE,
+    walled: { [GMAIL]: Date.parse('2026-10-10T05:00:00Z'), [ME]: Date.parse('2026-10-13T06:00:01Z') },
   });
-  H.BODY[HELLO] = body(100, Date.parse('2026-10-09T01:50:00Z'), 20, Date.parse('2026-10-15T14:00:00Z'));
+  // The lookups of that minute: charlie at its 5 hour wall, delta fresh.
+  H.BODY[CHARLIE] = body(99, CHARLIE_5H, 28, Date.parse('2026-10-15T14:00:00.411Z'));
+  H.BODY[DELTA] = body(2, DELTA_5H, 15, Date.parse('2026-10-15T14:00:00.040Z'));
+  await H.accountUsage.one(CHARLIE);
+  await H.accountUsage.one(DELTA);
+  await freshTracker();
+  // charlie hits the wall; the rotation marks it and swaps to delta.
+  H.setNow(T_SWAP);
+  H.accounts.markLimited(CHARLIE, Math.floor(CHARLIE_5H / 1000), { source: 'the wall message' });
+  const r = await H.accounts.swapTo(DELTA, { refuseFlagged: true });
+  eq(r.ok, true);
+  await freshTracker();
+  eq([liveName(), H.liveAccount.current()], [DELTA, DELTA], H.LOGS.filter((l) => l.startsWith('[accounts]')).join(' | '));
   H.setWorkers([{ runId: 'bg2-1791487899544', lane: 'bg2', title: 'a worker', engine: 'claude', steerable: true }]);
+  H.setNow(T_SWAP + 15_000);
+}
+
+await t('★ AC7: charlie\'s 100% reading after the swap goes to charlie; the wall guard does not fire and the all-walled line is not logged', async () => {
+  await oct8Evening();
+  // A session STILL on charlie's credentials reports the wall, spawned on charlie.
+  H.noteStreamUsage(event(1.0, CHARLIE_5H, 0.28, Date.parse('2026-10-15T14:00:00Z')), CHARLIE);
+  // ...and one spawned after the swap (spawn = live = delta), the case the old rule could not refuse.
+  H.noteStreamUsage(event(1.0, CHARLIE_5H, 0.28, Date.parse('2026-10-15T14:00:00Z')), DELTA);
+  eq(H.streamUsage.get(CHARLIE)?.usage?.fiveHour?.percent, 100, 'filed under charlie');
+  const delta = H.streamUsage.get(DELTA);
+  ok(!delta || delta.usage.fiveHour.percent < 90, `nothing over the threshold may be held for delta: ${JSON.stringify(delta)}`);
+  const g = await H.wallGuardTick();
+  await H.settle();
+  eq(g.fired, false, JSON.stringify(g));
+  eq(H.STEERED.length, 0, 'no CHECKPOINT NOW to any worker');
+  ok(!H.LOGS.some((l) => l.includes('all_accounts_walled_until')), `no all-walled line: ${H.LOGS.filter((l) => l.includes('walled')).join(' | ')}`);
+  ok(!H.LOGS.some((l) => l.includes('wall_guard_checkpoint')), 'no checkpoint decision');
+  eq(H.SENT.length, 0, 'nothing told to the owner');
+  // And the automatic switch reads the same numbers: delta is fine, no move.
+  const a = await H.kickAutoSwitch();
+  eq(a.switched, false);
+  eq(liveName(), DELTA);
+});
+
+await t('AC7 control: with delta GENUINELY at 100% of its own window, the same rig does fire (the guard is reachable)', async () => {
+  await oct8Evening();
+  // delta's own window, full: its own 5 hour reset (01:50Z).
+  H.noteStreamUsage(event(1.0, DELTA_5H, 0.2, Date.parse('2026-10-15T14:00:00Z')), DELTA);
+  eq(H.streamUsage.get(DELTA)?.usage?.fiveHour?.percent, 100);
+  // The selector's probes (others only): bravo and alpha walled, charlie walled in the ledger.
   const g = await H.wallGuardTick();
   await H.settle();
   eq(g.fired, true, JSON.stringify(g));
-  ok(H.LOGS.some((l) => l.includes('no_other_account_free')), H.LOGS.join(' | '));
-  ok(!H.LOGS.some((l) => l.includes('all_accounts_walled_until')), 'never the all-walled line while the live account was not asked');
-  // And the automatic switch finds nowhere to go, so it does not move.
-  const a = await H.kickAutoSwitch();
-  eq(a.switched, false);
-  eq(liveName(), HELLO);
+  eq(H.STEERED.length, 1);
+  ok(H.STEERED[0].text.startsWith('CHECKPOINT NOW'), H.STEERED[0].text.slice(0, 40));
+  ok(H.LOGS.some((l) => l.includes('wall_guard_checkpoint · account=delta@example.test')), 'the checkpoint line names delta');
+  // The selector was asked about the OTHER accounts only, and says so.
+  ok(H.LOGS.some((l) => l.includes('no_other_account_free')), `the others-only line: ${H.LOGS.filter((l) => l.includes('free') || l.includes('walled')).join(' | ')}`);
+  ok(!H.LOGS.some((l) => l.includes('all_accounts_walled_until')), 'and never the all-walled line while the live account was not asked');
 });
 
 // ---------------------------------------------------------------------------
@@ -687,8 +753,8 @@ await t('★ a failed automatic swap is said once and retried only after a pause
   H.setNow(RESET + 20 * HOUR);
   seedAccounts({ live: ME });
   H.BODY[ME] = body(20, RESET + 24 * HOUR, 95, ME_WEEK);
-  H.BODY[ZALO] = body(0, null, 5, ZH_WEEK + 7 * 24 * HOUR);
-  H.BODY[HELLO] = body(97, RESET + 24 * HOUR, 30, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[CHARLIE] = body(0, null, 5, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[DELTA] = body(97, RESET + 24 * HOUR, 30, ZH_WEEK + 7 * 24 * HOUR);
   H.BODY[GMAIL] = body(0, null, 95, GMAIL_WEEK + 7 * 24 * HOUR);
   await freshTracker();
   H.KC.fail = true;
@@ -712,7 +778,7 @@ await t('★ a failed automatic swap is said once and retried only after a pause
   H.setNow(RESET + 20 * HOUR + 12 * MIN);
   const r = await H.kickAutoSwitch();
   await H.settle();
-  eq(liveName(), ZALO, JSON.stringify(r));
+  eq(liveName(), CHARLIE, JSON.stringify(r));
   eq(H.SENT.length, 2);
   ok(H.SENT[1].startsWith('🔀 Claude account switched · automatic'), H.SENT[1]);
 });
@@ -720,14 +786,14 @@ await t('★ a failed automatic swap is said once and retried only after a pause
 await t('★ a scheduled switch while a ROTATION holds the cooldown waits it out, re-checks, then lands; a rotation that never lets go is refused once', async () => {
   reset();
   H.setNow(RESET + 8 * HOUR);
-  seedAccounts({ live: HELLO });
-  H.BODY[ZALO] = body(0, null, 10, ZH_WEEK + 7 * 24 * HOUR);
+  seedAccounts({ live: DELTA });
+  H.BODY[CHARLIE] = body(0, null, 10, ZH_WEEK + 7 * 24 * HOUR);
   H.BODY[ME] = body(0, null, 10, ME_WEEK);
   await freshTracker();
   // A rotation in flight armed the cooldown (this build has no landing record).
   H.setCooldownUntil(Date.now() + 60_000);
   const before = H.KC.writes;
-  H.setSched({ nextId: 1, items: [{ id: 11, kind: 'once', at: Date.now() - 1000, text: 'x', switchAccount: ZALO }] });
+  H.setSched({ nextId: 1, items: [{ id: 11, kind: 'once', at: Date.now() - 1000, text: 'x', switchAccount: CHARLIE }] });
   H.checkSchedules();
   // It waits: nothing swapped while the rotation holds the cooldown.
   await new Promise((r) => setTimeout(r, 60));
@@ -736,7 +802,7 @@ await t('★ a scheduled switch while a ROTATION holds the cooldown waits it out
   // The rotation's cooldown ends: the switch re-checks and lands.
   H.setCooldownUntil(0);
   await H.settle();
-  eq(liveName(), ZALO, JSON.stringify(H.SENT));
+  eq(liveName(), CHARLIE, JSON.stringify(H.SENT));
   eq(H.SENT.length, 1);
   eq(H.SENT[0].split('\n')[0], '🔀 Claude account switched · scheduled #11');
   // Its own switch's cooldown does not hold the next one off.
@@ -749,7 +815,7 @@ await t('★ a scheduled switch while a ROTATION holds the cooldown waits it out
   // A rotation cooldown that never lets go (the clock is frozen here): the bounded wait ends in ONE refusal.
   H.SENT.length = 0;
   H.setCooldownUntil(Date.now() + 60_000);
-  H.setSched({ nextId: 1, items: [{ id: 14, kind: 'once', at: Date.now() - 1000, text: 'x', switchAccount: ZALO }] });
+  H.setSched({ nextId: 1, items: [{ id: 14, kind: 'once', at: Date.now() - 1000, text: 'x', switchAccount: CHARLIE }] });
   H.checkSchedules();
   await H.settle();
   eq(liveName(), ME, 'nothing moved');
@@ -760,18 +826,18 @@ await t('★ a scheduled switch while a ROTATION holds the cooldown waits it out
 await t('★ a rotation that has already LANDED (its cooldown marked) does not hold a scheduled switch: it goes at once (QA round 5)', async () => {
   reset();
   H.setNow(RESET + 8 * HOUR);
-  seedAccounts({ live: HELLO });
-  H.BODY[ZALO] = body(0, null, 10, ZH_WEEK + 7 * 24 * HOUR);
+  seedAccounts({ live: DELTA });
+  H.BODY[CHARLIE] = body(0, null, 10, ZH_WEEK + 7 * 24 * HOUR);
   await freshTracker();
   const until = Date.now() + 60_000;
   H.setCooldownUntil(until);
   H.setSwapMark(until); // the rotation landed and marked it
   const t0 = performance.now();
-  H.setSched({ nextId: 1, items: [{ id: 15, kind: 'once', at: Date.now() - 1000, text: 'x', switchAccount: ZALO }] });
+  H.setSched({ nextId: 1, items: [{ id: 15, kind: 'once', at: Date.now() - 1000, text: 'x', switchAccount: CHARLIE }] });
   H.checkSchedules();
   await H.settle();
   ok(performance.now() - t0 < 2000, `it waited ${Math.round(performance.now() - t0)} ms`);
-  eq(liveName(), ZALO, JSON.stringify(H.SENT));
+  eq(liveName(), CHARLIE, JSON.stringify(H.SENT));
   eq(H.SENT.length, 1);
   eq(H.SENT[0].split('\n')[0], '🔀 Claude account switched · scheduled #15');
 });
@@ -779,45 +845,45 @@ await t('★ a rotation that has already LANDED (its cooldown marked) does not h
 await t('★ an owner switch that fails inside a landed cooldown puts the mark back, so the next one does not wait on a rotation that is not there (QA round 6)', async () => {
   reset();
   H.setNow(RESET + 9 * HOUR);
-  seedAccounts({ live: HELLO });
-  H.BODY[ZALO] = body(0, null, 10, ZH_WEEK + 7 * 24 * HOUR);
+  seedAccounts({ live: DELTA });
+  H.BODY[CHARLIE] = body(0, null, 10, ZH_WEEK + 7 * 24 * HOUR);
   await freshTracker();
   const until = Date.now() + 60_000;
   H.setCooldownUntil(until);
   H.setSwapMark(until); // a swap that landed moments ago
   H.KC.fail = true;
-  const r1 = await H.switchAccountNow(ZALO, { via: 'command' });
+  const r1 = await H.switchAccountNow(CHARLIE, { via: 'command' });
   await H.settle();
   H.KC.fail = false;
   eq(r1.ok, false, JSON.stringify(r1));
   const t0 = performance.now();
-  const r2 = await H.switchAccountNow(ZALO, { via: 'command' });
+  const r2 = await H.switchAccountNow(CHARLIE, { via: 'command' });
   await H.settle();
   ok(performance.now() - t0 < 2000, `the retry waited ${Math.round(performance.now() - t0)} ms`);
   eq(r2.ok, true, JSON.stringify(r2));
-  eq(liveName(), ZALO);
+  eq(liveName(), CHARLIE);
 });
 
 await t('★ an owner\'s switch onto an account already past the threshold is kept: the automatic switch leaves it alone until that window resets', async () => {
   reset();
   H.setNow(RESET + 12 * HOUR);
-  seedAccounts({ live: HELLO, walled: { [GMAIL]: GMAIL_WEEK } });
+  seedAccounts({ live: DELTA, walled: { [GMAIL]: GMAIL_WEEK } });
   const zalWeek = ZH_WEEK + 7 * 24 * HOUR;
-  H.BODY[ZALO] = body(10, RESET + 15 * HOUR, 92, zalWeek);
-  H.BODY[HELLO] = body(5, RESET + 15 * HOUR, 10, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[CHARLIE] = body(10, RESET + 15 * HOUR, 92, zalWeek);
+  H.BODY[DELTA] = body(5, RESET + 15 * HOUR, 10, ZH_WEEK + 7 * 24 * HOUR);
   H.BODY[ME] = body(0, null, 10, ME_WEEK);
   await freshTracker();
-  const r = await H.switchAccountNow(ZALO, { via: 'command' });
+  const r = await H.switchAccountNow(CHARLIE, { via: 'command' });
   await H.settle();
   eq(r.ok, true, JSON.stringify(r));
-  eq(liveName(), ZALO);
+  eq(liveName(), CHARLIE);
   ok(H.SENT[0].includes('already past the automatic switch threshold'), H.SENT[0]);
   H.setNow(RESET + 12 * HOUR + 6 * MIN);
   await freshTracker();
   H.SENT.length = 0;
   const tick = await H.kickAutoSwitch();
   await H.settle();
-  eq(liveName(), ZALO, 'the owner\'s pick stands');
+  eq(liveName(), CHARLIE, 'the owner\'s pick stands');
   eq(H.SENT.length, 0, 'no automatic notice');
   ok(/the owner chose charlie@example\.test past the threshold/.test(tick?.reason || ''), JSON.stringify(tick));
 });
@@ -825,46 +891,46 @@ await t('★ an owner\'s switch onto an account already past the threshold is ke
 await t('★ the owner\'s hold is cleared by ANY later swap, so a return trip by the machinery is not held', async () => {
   reset();
   H.setNow(RESET + 13 * HOUR);
-  seedAccounts({ live: HELLO, walled: { [GMAIL]: GMAIL_WEEK } });
+  seedAccounts({ live: DELTA, walled: { [GMAIL]: GMAIL_WEEK } });
   const zalWeek = ZH_WEEK + 7 * 24 * HOUR;
-  H.BODY[ZALO] = body(10, RESET + 16 * HOUR, 92, zalWeek);
-  H.BODY[HELLO] = body(5, RESET + 16 * HOUR, 10, ZH_WEEK + 7 * 24 * HOUR);
+  H.BODY[CHARLIE] = body(10, RESET + 16 * HOUR, 92, zalWeek);
+  H.BODY[DELTA] = body(5, RESET + 16 * HOUR, 10, ZH_WEEK + 7 * 24 * HOUR);
   H.BODY[ME] = body(0, null, 10, ME_WEEK);
   await freshTracker();
-  await H.switchAccountNow(ZALO, { via: 'command' });
+  await H.switchAccountNow(CHARLIE, { via: 'command' });
   await H.settle();
-  ok(H.ownerHold()?.name === ZALO, JSON.stringify(H.ownerHold()));
+  ok(H.ownerHold()?.name === CHARLIE, JSON.stringify(H.ownerHold()));
   H.setNow(RESET + 13 * HOUR + 20 * MIN);
-  eq((await H.accounts.swapTo(HELLO)).ok, true);
+  eq((await H.accounts.swapTo(DELTA)).ok, true);
   eq(H.ownerHold(), null, 'any landed swap clears the hold');
   H.setNow(RESET + 13 * HOUR + 40 * MIN);
-  eq((await H.accounts.swapTo(ZALO)).ok, true);
+  eq((await H.accounts.swapTo(CHARLIE)).ok, true);
   H.setNow(RESET + 13 * HOUR + 50 * MIN);
   H.setCooldownUntil(0);
   await freshTracker();
   H.SENT.length = 0;
   const r = await H.kickAutoSwitch();
   await H.settle();
-  ok(liveName() !== ZALO, `the automatic switch is not held: ${JSON.stringify(r)}`);
+  ok(liveName() !== CHARLIE, `the automatic switch is not held: ${JSON.stringify(r)}`);
 });
 
 await t('★ a pick with no reading at hand is judged at the next tick on the live lookup, and kept when it is past the threshold', async () => {
   reset();
   H.setNow(RESET + 14 * HOUR);
-  seedAccounts({ live: HELLO, walled: { [GMAIL]: GMAIL_WEEK } });
+  seedAccounts({ live: DELTA, walled: { [GMAIL]: GMAIL_WEEK } });
   const zalWeek = ZH_WEEK + 7 * 24 * HOUR;
-  H.BODY[ZALO] = body(10, RESET + 17 * HOUR, 92, zalWeek);
+  H.BODY[CHARLIE] = body(10, RESET + 17 * HOUR, 92, zalWeek);
   H.BODY[ME] = body(0, null, 10, ME_WEEK);
   await freshTracker();
-  eq((await H.accounts.swapTo(ZALO)).ok, true);
-  H.armOwnerHold(ZALO, null); // what /account does with nothing in the cache
+  eq((await H.accounts.swapTo(CHARLIE)).ok, true);
+  H.armOwnerHold(CHARLIE, null); // what /account does with nothing in the cache
   H.setNow(RESET + 14 * HOUR + 6 * MIN);
   H.setCooldownUntil(0);
   await freshTracker();
   H.SENT.length = 0;
   const r = await H.kickAutoSwitch();
   await H.settle();
-  eq(liveName(), ZALO, JSON.stringify(r));
+  eq(liveName(), CHARLIE, JSON.stringify(r));
   ok(/the owner chose charlie@example\.test past the threshold/.test(r?.reason || ''), JSON.stringify(r));
   eq(H.ownerHold()?.until, zalWeek);
 });
