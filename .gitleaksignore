@@ -1,0 +1,2 @@
+# bg-codex.test.mjs feeds the redactor fake key-shaped strings (AWS documented example key, made-up Supabase value); none is a real credential.
+deb1f6aa287218138911b6838220fc8b199ce114:bg-codex.test.mjs:generic-api-key:743
