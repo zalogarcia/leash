@@ -747,6 +747,25 @@ t('a plain reminder is never capped: it spawns nothing', () => {
   eq(B.SENT[0], '⏰ Reminder: call the accountant');
 });
 
+t('★ a scheduled Claude slash command during a Claude wall goes to the drop box, not straight to a lane (QA round 3 of the port)', () => {
+  B.resetPool();
+  B.setCap(3);
+  writeQueue([]);
+  B.setEngine(() => ({ engine: 'codex', reason: 'claude_limited', pausedUntil: Date.now() + 3600_000 }));
+  B.setSchedules([schedule({ text: '/goal ship the nightly fix' })]);
+  B.checkSchedules();
+  eq(B.DISPATCHED.length, 0, 'not dispatched: from here it would sit in memory with the schedule consumed');
+  const q = readQueue();
+  eq(q.length, 1, 'durable in the drop box, where the drain holds it on disk');
+  eq(q[0].scheduleId, 8);
+  // and an ordinary scheduled brief in the same wall still dispatches (to Codex)
+  writeQueue([]);
+  B.setSchedules([schedule()]);
+  B.checkSchedules();
+  eq(B.DISPATCHED.length, 1, 'an ordinary brief is not held back');
+  B.setEngine((forced) => ({ engine: forced || 'claude', reason: forced ? 'explicit' : 'default' }));
+});
+
 t('a scheduled run settled to Codex is not capped, same as the drop box', () => {
   B.resetPool();
   B.setCap(1);

@@ -11753,11 +11753,20 @@ function checkSchedules() {
         // slot frees, `bg.mjs ps` lists it while it waits, and a daemon restart
         // does not lose it because the drop box is a file.
         let schedEngine = 'claude';
+        let schedReason = null;
         try {
-          schedEngine = engineFor('bg').engine || 'claude';
+          const d = engineFor('bg');
+          schedEngine = d.engine || 'claude';
+          schedReason = d.reason || null;
         } catch {
           /* the settled view is decoration; 'claude' is the capped case, so the cap holds */
         }
+        // A CLAUDE SLASH COMMAND during a Claude wall waits for Claude (an
+        // unchosen Codex never gets one). Through the drop box, so the drain's
+        // hold keeps it ON DISK (slashWaitsForClaude) and the lift resumes it
+        // through the cap and its card; dispatched from here it would sit in
+        // memory with the schedule already consumed (QA round 3 of the port).
+        const schedSlashWaits = schedReason === 'claude_limited' && BG_COMMAND_RE.test(stripLaneRules(String(s.text || '')).trimStart());
         // THE SAME VERDICT the drain gives (admissionVerdict): the count, and
         // since 2026-10-13 the machine load and the usage window too (P2). A
         // schedule has no bypass: nobody is at the keyboard at 03:00.
@@ -11772,7 +11781,7 @@ function checkSchedules() {
           usage: adm.usage,
           fmtClock: adm.fmtClock,
         });
-        const queuedItem = !schedVerdict.admit ? queueScheduledRun(s) : null;
+        const queuedItem = !schedVerdict.admit || schedSlashWaits ? queueScheduledRun(s) : null;
         if (queuedItem) {
           // QUEUED, then the notice, the same order as a dispatch: the job is
           // already durable before anything composes a message about it.
@@ -11781,7 +11790,13 @@ function checkSchedules() {
           // waits, and the drain edits THIS message into the job's worker card
           // when it starts (noteBgWaiting / takeBgWaiting), so its ⏳ resolves
           // on the same message, through a restart too (bg-wait.mjs).
-          noteBgWaiting(queuedItem, schedVerdict, { engine: schedEngine, scheduleWhen: describeWhen(s) });
+          noteBgWaiting(
+            queuedItem,
+            schedSlashWaits && schedVerdict.admit
+              ? { kind: 'wall', text: 'waiting: a Claude command, it starts after the Claude reset' }
+              : schedVerdict,
+            { engine: schedEngine, scheduleWhen: describeWhen(s) },
+          );
           continue;
         }
         // scheduled work must never block chat, and must not be dropped on a
@@ -13572,7 +13587,7 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
   if (decision.reason === 'claude_missing' && lane.isBg && BG_COMMAND_RE.test(stripLaneRules(text).trimStart())) {
     // A drop box job was already told why by its own card; it is refused
     // without a second message rather than spawned at a missing binary. A
-    // scheduled run has no such card, so it gets the line.
+    // scheduled run's ⏰ card does not say why, so it gets the line as well.
     if (item.priority && !item.schedule) {
       console.error('[bridge] a Claude command with no claude on this machine was not run');
       return 'refused';
