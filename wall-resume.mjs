@@ -286,7 +286,8 @@ export function resumeTiming({ readyAt = null, now = Date.now(), withinMinutes =
  * THE RESUME NOTE, the bridge's words in front of the original brief. Every
  * field is the caller's fact or null; the note says "none" rather than guess.
  * `writesCommand` is the command that lists the dead run's production writes
- * on this machine, or null, in which case the run log is named instead.
+ * and the Telegram messages it sent on this machine, or null, in which case
+ * the run log is named instead.
  */
 export function resumeNote({ runId = '', endedClock = null, account = null, count = 1, max = 2, draft = null, report = null, checkpoint = null, writesCommand = null, runLog = null } = {}) {
   const lines = [
@@ -298,7 +299,7 @@ export function resumeNote({ runId = '', endedClock = null, account = null, coun
     `- Its checkpoint note and draft report: ${draft ? `${draft} (read its RESUME NOTE section first)` : 'none was written'}`,
     `- Its full report: ${report || 'none was written'}`,
     `- Its checkpoint commit: ${checkpoint?.sha ? `${checkpoint.sha} on branch ${checkpoint.branch}` : 'none found in its log (still look for a "WIP checkpoint" commit or a .patch file the note names)'}`,
-    `- Its production writes: ${writesCommand ? `run \`${writesCommand}\`` : runLog ? `read its run log for every write it made: ${runLog}` : 'no run log is on disk, so verify the live state of anything it may have written'}`,
+    `- Its production writes and the Telegram messages it already sent: ${writesCommand ? `run \`${writesCommand}\`. Do not send again a message listed there.` : runLog ? `read its run log for every write it made and every Telegram message it sent, and do not send one of those again: ${runLog}` : 'no run log is on disk, so verify the live state of anything it may have written (the messages it sent cannot be listed without the log)'}`,
     '',
     'Rules for this run:',
     '1. Read the checkpoint note and the git state FIRST (git status, git log, the branch named above, any patch file the note names) and continue from there. Do not redo finished work.',

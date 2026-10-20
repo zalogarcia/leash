@@ -94,6 +94,29 @@ t('with nothing known, the note says none rather than guessing, and names the ru
   ok(/draft report: none was written/.test(n) && /none found in its log/.test(n) && /read its run log/.test(n), n);
 });
 
+// 2026-10-10: the command that lists a dead run's writes lists its Telegram
+// sends too, and the note did not say so. A resumed worker that does not
+// know a message went out can send it to the owner a second time.
+t('★ with the writes command, the note names the Telegram messages already sent and forbids a second send', () => {
+  ok(/production writes and the Telegram messages it already sent: run `list-writes bg3-1791290000003`\. Do not send again a message listed there\./.test(NOTE), NOTE);
+  ok(!/read its run log/.test(NOTE) && !/no run log is on disk/.test(NOTE), 'the command wins over the other two branches');
+  const both = resumeNote({ runId: 'bg3-1', writesCommand: 'list-writes bg3-1', runLog: '/tmp/runs/bg3-1.jsonl' });
+  ok(/run `list-writes bg3-1`\. Do not send again/.test(both) && !/read its run log/.test(both), both);
+});
+
+t('★ with a run log and no command, the note names the sends in the log and forbids a second send', () => {
+  const n = resumeNote({ runId: 'bg-1791290000001', runLog: '/tmp/runs/bg-1791290000001.jsonl' });
+  ok(/production writes and the Telegram messages it already sent: read its run log for every write it made and every Telegram message it sent, and do not send one of those again: \/tmp\/runs\/bg-1791290000001\.jsonl$/m.test(n), n);
+  ok(!DASHES.test(n));
+});
+
+t('with no run log, the note stays true: it points at no list, and says the sends cannot be listed', () => {
+  const n = resumeNote({ runId: 'bg-1791290000001' });
+  ok(/production writes and the Telegram messages it already sent: no run log is on disk, so verify the live state of anything it may have written \(the messages it sent cannot be listed without the log\)$/m.test(n), n);
+  ok(!/listed there/.test(n) && !/read its run log/.test(n), 'no list exists, so none is named');
+  ok(!DASHES.test(n));
+});
+
 t('★ a resume of a resume rebuilds from the ORIGINAL, never stacking notes', () => {
   const r1task = R1.text.slice(RULES.length);
   const R2 = resumeBrief({ text: R1.text, task: r1task, title: 'ignored', count: 2, max: 2, note: '## RESUME NOTE (written by the bridge; read it before anything else)\nsecond' });

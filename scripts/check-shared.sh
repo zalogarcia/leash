@@ -53,6 +53,11 @@ SHARED_MODULES=(
   usage-limits.mjs
   usage-limits.test.mjs
   accounts.mjs
+  model-limits.mjs
+  model-limits.test.mjs
+  stream-usage.mjs
+  stream-usage.test.mjs
+  fixtures/model-owner-rig.mjs
   accounts.test.mjs
   account-usage.mjs
   account-usage.test.mjs

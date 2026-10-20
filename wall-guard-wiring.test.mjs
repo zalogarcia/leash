@@ -567,7 +567,7 @@ await t('★ the note names the draft, the checkpoint commit read off the log, a
   const task = stripLaneRules(QUEUE[0].text);
   ok(task.includes(P(`reports/${D1}.draft.md`)), 'the draft path');
   ok(task.includes('4f3c2a1 on branch feat/widget'), 'the checkpoint commit');
-  ok(task.includes(`read its run log for every write it made: ${P(`runs/${D1}.jsonl`)}`), 'no salvage tool here: the run log is named');
+  ok(task.includes(`read its run log for every write it made and every Telegram message it sent, and do not send one of those again: ${P(`runs/${D1}.jsonl`)}`), 'no salvage tool here: the run log is named, sends included');
   ok(task.includes('it was on acct-a'), 'the account it died on');
 });
 
