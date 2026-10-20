@@ -108,6 +108,9 @@ function drainHarness(settings, item) {
     parkedWalledChats: state.held,
     armWallResume: (at) => state.timers.push(at),
     startResolvedRun: (decision, _lane, queued) => { state.starts.push({ decision, queued }); return 'started'; },
+    // A queued Claude slash command waits for Claude here too (this build).
+    BG_COMMAND_RE: new Function(`${source.match(/^const BG_COMMAND_RE = .*$/m)[0]}\nreturn BG_COMMAND_RE;`)(),
+    stripLaneRules,
   };
   const drain = new Function(...Object.keys(bindings), `${extract('drainQueue')}\nreturn drainQueue;`)(...Object.values(bindings));
   drain(lane);
@@ -135,6 +138,11 @@ test('queue draining keeps a walled worker report through keepHandback, not the 
   assert.deepEqual(state.acks, ['held']);
   assert.deepEqual(state.starts, []);
   assert.equal(lane.queue.length, 0);
+});
+test('a queued Claude slash command is held during a Claude wall, not started on Codex', () => {
+  const { state } = drainHarness({ rotationPausedUntil: future }, { text: '/goal ship it' });
+  assert.deepEqual(state.starts, []);
+  assert.equal(state.held.length, 1);
 });
 test('queue draining still starts healthy Codex during a Claude wall', () => {
   const { state } = drainHarness({ rotationPausedUntil: future }, { text: 'follow-up' });

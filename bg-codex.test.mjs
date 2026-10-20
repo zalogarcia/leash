@@ -733,7 +733,7 @@ t('the CLI version every flag here was measured against is stated, not implied',
   ok(/^\d+\.\d+\.\d+$/.test(CODEX_VERIFIED_VERSION), CODEX_VERIFIED_VERSION);
 });
 
-t('★ the new credential shapes this Mac actually uses are redacted too', () => {
+t('★ the newer credential shapes in real use are redacted too', () => {
   // The QA pass fed the list five shapes in daily use here and all five went
   // through verbatim. It stopped being a doctor-report filter the moment it
   // became the scrubber for a new on-disk record of the conversation and for

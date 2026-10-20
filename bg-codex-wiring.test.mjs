@@ -599,7 +599,7 @@ D.setFallback(true);
 D.setChatEngine('claude');
 D.setCodexAvailable(false);
 
-// THE DRAFT IS AN UNTRACKED FILE IN HIS REPO (codex-worker-env.mjs puts it in
+// THE DRAFT IS AN UNTRACKED FILE IN THE USER'S REPO (codex-worker-env.mjs puts it in
 // the job's cwd, the only place the sandbox can write). Once the outcome has
 // been read it is removed on both delivery paths, or every Codex edit job
 // leaves a `.bridge-codex-*.draft.md` behind in `git status`.
@@ -2332,6 +2332,13 @@ const bridgeJobsRunning = (n = 0) => Number(n) || 0;
 const noteBgWaiting = () => {};
 const takeBgWaiting = () => null;
 const writeGrants = { issue: () => null, verify: () => false };
+// THE ON-DISK JOB HOLD and the wall notice it raises: recorded, so a test can
+// see a job held HERE rather than started or parked in memory.
+export const HELD = [];
+const holdBgJob = (it) => { HELD.push(it); return true; };
+const raiseClaudeWall = () => Promise.resolve();
+const armWallResume = () => {};
+const logAccountDecision = () => {};
 // The live worker line. Real builder, recorded transport: this file is about
 // WHICH ENGINE the drain picks, and the notice rides along so a shape change
 // cannot silently stop the drain from putting one up at all.
@@ -2429,7 +2436,7 @@ const engineFor = (lane, forcedEngine = null) =>
     codexFallback: fallback,
   });
 export const reset = () => {
-  SENT.length = 0; CODEX.length = 0; CLAUDE.length = 0; RECORDED.length = 0;
+  SENT.length = 0; CODEX.length = 0; CLAUDE.length = 0; RECORDED.length = 0; HELD.length = 0;
   EDITS.length = 0; LIVE.clear(); workerNotices.clear(); msgSeq = 0;
   rotationPausedUntil = 0; installed = true; fallback = true;
   ENGINE_CFG = {}; CHAT_ENGINE_STATE = {};
@@ -2469,12 +2476,12 @@ await t('★ a Claude slash command handed over during the wall does NOT reach C
   // text "/autopilot ship the checkout fix" with write access to a repo, by a
   // model that has never heard of the command.
   eq(DRAIN.CODEX.length, 0, 'Codex cannot run a Claude slash command');
-  eq(DRAIN.CLAUDE.length, 1, 'it waits on the Claude lane instead');
-});
-
-await t('and the notice says WHY it is sitting still', () => {
-  // A job on a walled lane does nothing for hours; silence reads as "dropped".
-  ok(/waits for the reset/.test(DRAIN.SENT.join('\n')), DRAIN.SENT.join('\n'));
+  // HELD ON DISK (QA round 2 of the port): the brief is already claimed out of
+  // the queue file, so the in-memory chat park would lose it to a restart and
+  // release it past the cap at the lift. The drain's own hold keeps it, and the
+  // lift resumes it through this drain.
+  eq(DRAIN.HELD.length, 1, 'held in the on-disk job hold');
+  eq(DRAIN.CLAUDE.length, 0, 'and not spawned into the wall');
 });
 
 DRAIN.reset();
@@ -3136,6 +3143,25 @@ await t('★ a Claude slash command is refused on a Codex-first machine, not run
   // Codex run rooted at the workspace.
   eq(P.CODEX.length, 0, 'Codex was handed a command it has never heard of, with write access');
   ok(P.SENT.join('\n').includes('needs Claude'), P.SENT.join('\n'));
+});
+
+// THE SAME MACHINE, internal traffic (QA round 2 of the port): a scheduled run's
+// slash command has no card of its own, so it is told; a drop box one was told
+// by its card, so it is refused quietly. Neither reaches Codex.
+P.reset();
+P.setEngines({ claudeAvailable: false });
+P.dispatchPrompt('/goal nightly cleanup of the repo', P.getBgLane(), { priority: true, schedule: { id: 3 } });
+await t('★ no claude: a SCHEDULED slash command is refused with the line, not run on Codex', () => {
+  eq(P.CODEX.length, 0);
+  ok(P.SENT.join('\n').includes('needs Claude'), P.SENT.join('\n'));
+});
+P.reset();
+P.setEngines({ claudeAvailable: false });
+P.dispatchPrompt('LANE RULES (headless).\n\n--- TASK ---\n/autopilot ship it', P.getBgLane(), { priority: true });
+await t('no claude: a drop box slash command is refused quietly (its card already said so), not run on Codex', () => {
+  eq(P.CODEX.length, 0);
+  eq(P.CLAUDE.length, 0);
+  ok(!P.SENT.join('\n').includes('needs Claude'), P.SENT.join('\n'));
 });
 
 P.reset();

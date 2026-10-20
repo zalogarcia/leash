@@ -8345,7 +8345,7 @@ function codexOutcomeFromDisk(runId) {
 
 // The Codex twin of reportBgOutcome, minus the account rotation. Same order for
 // the same reasons: the owner's own ping first (never lost to a formatting bug in the
-// handback), then the durable row, then the note to M.
+// handback), then the durable row, then the note to the assistant.
 function retryCodexOnClaude(task, outcome, { mode = 'edit', preActivity = false, bootstrap = false, cwd = null, images = [], schedule = null, background = false, prompt = null, notice = null, handback = null } = {}) {
   const plan = codexFailoverPlan(outcome, { mode, preActivity, bootstrap, claudeAvailable: CLAUDE_AVAILABLE, claudePausedUntil: rotationPausedUntil });
   if (!plan || claudeRateWalled()) return false;
@@ -10686,7 +10686,9 @@ function canRunHeldItem(it) {
   // there (see dispatchPrompt's hold): it waits for Claude.
   // Matched on the STRIPPED text: a drop box brief carries the LANE RULES
   // header in front, and the anchored pattern would never see its first line.
-  if (decision.engine === 'codex' && unchosenCodex(decision) && BG_COMMAND_RE.test(stripLaneRules(String(it?.text || '')).trimStart())) return false;
+  // A real Claude wall only: with no claude binary nothing comes back for it,
+  // so it is released and refused with a line rather than held forever.
+  if (decision.engine === 'codex' && decision.reason === 'claude_limited' && BG_COMMAND_RE.test(stripLaneRules(String(it?.text || '')).trimStart())) return false;
   return decision.engine === 'codex' ? CODEX_AVAILABLE && !codexWalled() : !claudeWalled();
 }
 
@@ -11266,7 +11268,14 @@ function drainBgHandoff() {
     // when the wall lifts, so it resumes through this same drain: its worker
     // card, its repo resolution, its lint and its run id all come from the one
     // path that knows how to build them, rather than from a second copy here.
-    if (decision.pausedUntil && (decision.engine === 'claude' || codexWalled())) {
+    //
+    // A Claude SLASH COMMAND the fallback would hand to Codex is the third
+    // case (see fallbackSlashCommand below): it waits for Claude too, and it is
+    // held HERE, on disk, so a restart before the reset cannot lose it and the
+    // lift resumes it through this drain, its cap and its card.
+    const slashWaitsForClaude =
+      decision.reason === 'claude_limited' && unchosenCodex(decision) && BG_COMMAND_RE.test(stripLaneRules(text).trimStart());
+    if (decision.pausedUntil && (decision.engine === 'claude' || codexWalled() || slashWaitsForClaude)) {
       if (holdBgJob(typeof it === 'object' && it ? it : { text: queuedText })) {
         // A line already up for this job now says what it waits on; no new one
         // (the wall's own notice counts what it holds).
@@ -11586,7 +11595,7 @@ function loadSchedules() {
   try {
     raw = readFileSync(SCHEDULES_FILE, 'utf8');
   } catch {
-    return { nextId: 0, items: [], unreadable: true }; // no file yet — normal
+    return { nextId: 0, items: [], unreadable: true }; // no file yet: normal
   }
   try {
     const d = JSON.parse(raw);
@@ -13317,9 +13326,9 @@ function queueItem(text, { images = [], kinds = [], forcedEngine = null, priorit
     // reason as the two above: a busy lane drains this item from a different
     // call, and the mark is what tells a hook this run is unattended.
     schedule: schedule || null,
-    // THE WORKER REPORT MARK, { items: [{ runId, task, status, report, draft,
-    // flag }] }, set only by handBackToChat and flushParkedHandbacks: which
-    // worker reports this turn hands to M. Carried for the same reason again,
+    // THE WORKER REPORT MARK, { items: [{ runId, task, status, report, draft }] },
+    // set only by handBackToChat and flushParkedHandbacks: which worker reports
+    // this turn hands to the assistant. Carried for the same reason again,
     // and read in one place: a turn that dies on a session limit is re-read
     // once or kept by this mark, never dropped (handbackLimitPlan).
     handback: handback || null,
@@ -13561,10 +13570,10 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
   // A slash command on a machine with no Claude: it will never run, and sitting
   // silently in a lane that cannot start is worse than being told.
   if (decision.reason === 'claude_missing' && lane.isBg && BG_COMMAND_RE.test(stripLaneRules(text).trimStart())) {
-    // Internal traffic (a drop box job) was already told why by its own notice;
-    // it is refused without a second message rather than spawned at a missing
-    // binary.
-    if (item.priority) {
+    // A drop box job was already told why by its own card; it is refused
+    // without a second message rather than spawned at a missing binary. A
+    // scheduled run has no such card, so it gets the line.
+    if (item.priority && !item.schedule) {
       console.error('[bridge] a Claude command with no claude on this machine was not run');
       return 'refused';
     }
@@ -13619,7 +13628,9 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
   // makes that true. A slash command the fallback would hand to Codex waits
   // with the rest (startResolvedRun refuses it on an unchosen Codex).
   const pendingDecision = engineForItem(lane, item);
-  const codexWillNotTakeThis = unchosenCodex(pendingDecision) && BG_COMMAND_RE.test(stripLaneRules(text).trimStart());
+  // A real Claude wall only: with no claude binary there is no reset to wait
+  // for, and startResolvedRun refuses the command with a line instead.
+  const codexWillNotTakeThis = pendingDecision.reason === 'claude_limited' && BG_COMMAND_RE.test(stripLaneRules(text).trimStart());
   const holdIt = Boolean(pendingDecision.pausedUntil) &&
     (pendingDecision.engine === 'claude' || codexWalled() || codexWillNotTakeThis);
   if (holdIt) {
@@ -13796,7 +13807,8 @@ function drainQueue(lane) {
   // unsummarised. A `codex:` prefix honoured at the busy check was lost here
   // too. Same decision, same function, as the dispatch that queued it.
   const decision = engineForItem(lane, item);
-  if (decision.pausedUntil && (decision.engine === 'claude' || codexWalled())) {
+  const slashWaitsForClaude = decision.reason === 'claude_limited' && BG_COMMAND_RE.test(stripLaneRules(item.text || '').trimStart());
+  if (decision.pausedUntil && (decision.engine === 'claude' || codexWalled() || slashWaitsForClaude)) {
     // This item was accepted before the current turn discovered the wall.
     // Preserve it even if the hold is full, including its schedule and reply.
     // A worker report goes to the on-disk keep instead (see dispatchPrompt).

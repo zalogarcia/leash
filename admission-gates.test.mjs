@@ -212,7 +212,7 @@ const job = (name, extra = {}) => ({ text: `LANE RULES\n\n--- TASK ---\n\n# ${na
 const busy = (n) => {
   for (let i = 0; i < n; i++) B.startFakeWorker(`busy ${i}`);
 };
-// 14 cores and 2 per core, the shape of this Mac: the limit is 28.
+// 14 cores and 2 per core, a typical laptop: the limit is 28.
 const LOAD = (load1) => ({ load1, ncpu: 14, loadPerCore: 2 });
 const HOLD = { account: 'b@', percent: 93, label: 'the 5 hour window', resetsAtMs: Date.UTC(2026, 9, 13, 19, 0) };
 

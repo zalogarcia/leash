@@ -503,7 +503,7 @@ await t('★ a window spent OUTSIDE the bridge (sessions say 85, the lookup says
   reset();
   H.setNow(RESET + 11 * HOUR);
   seedAccounts({ live: ME, walled: { [GMAIL]: GMAIL_WEEK } });
-  H.BODY[ME] = body(10, RESET + 14 * HOUR, 93, ME_WEEK); // The owner's own terminals spent it
+  H.BODY[ME] = body(10, RESET + 14 * HOUR, 93, ME_WEEK); // spent outside the bridge (a terminal session)
   H.BODY[CHARLIE] = body(0, null, 5, ZH_WEEK + 7 * 24 * HOUR);
   H.BODY[DELTA] = body(0, null, 20, ZH_WEEK + 7 * 24 * HOUR);
   await freshTracker();
