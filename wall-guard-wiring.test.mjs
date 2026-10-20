@@ -133,7 +133,7 @@ const console = { log: (m, ...r) => LOGS.push([m, ...r].join(' ')), error: (m, .
 const CLAUDE_AVAILABLE = true;
 let rotationPausedUntil = 0;
 export const setPausedUntil = (v) => { rotationPausedUntil = v; };
-const OWNER_TZ = 'America/New_York';
+const OWNER_TZ = 'America/Toronto';
 const OWNER_NAME = 'Owner';
 const BRIDGE_NAME = 'B';
 const BG_CLI = '/bridge/bg.mjs';

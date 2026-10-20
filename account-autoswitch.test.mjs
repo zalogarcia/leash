@@ -56,7 +56,7 @@ const ALPHA = 'alpha@example.test';
 const BRAVO = 'bravo@example.test';
 const CHARLIE = 'charlie@example.test';
 const DELTA = 'delta@example.test';
-const TZ = 'America/New_York';
+const TZ = 'America/Toronto';
 const usage = (five, fiveReset, week, weekReset, scoped = []) => ({
   fiveHour: five === null ? null : { percent: five, resetsAt: fiveReset ? new Date(fiveReset).toISOString() : null, severity: null, locked: null },
   sevenDay: { percent: week, resetsAt: new Date(weekReset).toISOString(), severity: null, locked: null },
