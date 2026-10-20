@@ -49,6 +49,7 @@
 
 import { existsSync, readFileSync, statSync, writeFileSync, renameSync } from 'node:fs';
 import net from 'node:net';
+import { sign } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -350,7 +351,9 @@ const dispatchArgs = argv.slice();
 //
 // Explicit at dispatch, never automatic, and deliberately not a config value: a
 // cap that lifts itself under pressure is not a cap, and pressure is exactly
-// when it has to hold.
+// when it has to hold. Since 2026-10-13 it also passes the two admission gates
+// beside the count (the machine load and the usage window, bg-admission.mjs):
+// the person typing it has looked, and that is the case it is for.
 let now = false;
 const nowFlag = dispatchArgs.indexOf('--now');
 if (nowFlag !== -1) {
@@ -520,16 +523,37 @@ const queuedAt = new Date().toISOString();
 // A handoff made from INSIDE a scheduled run keeps that run's mark: the child is
 // just as unattended as its parent, and a hook can hold database writes in
 // unattended runs. The daemon's drain turns scheduleId back into
-// LEASH_TRIGGER / LEASH_SCHEDULE_ID (worker-env.mjs). The write APPROVAL never
-// travels this way: it is read from this process's env, which the run itself
-// can set (`LEASH_ALLOW_WRITE=1 node bg.mjs ...`), so a child of an approved
-// run is held like any other and its writes go in its report. Not inside tmux:
-// a pane's env can carry LEASH_TRIGGER from the tmux server (it keeps whatever
+// LEASH_TRIGGER / LEASH_SCHEDULE_ID (worker-env.mjs). Not inside tmux: a
+// pane's env can carry LEASH_TRIGGER from the tmux server (it keeps whatever
 // the process that started it had), and a handoff typed there is the user's own.
+//
+// THE WRITE APPROVAL travels too, but only as the GRANT the daemon minted for
+// this run (write-grant.mjs). An approved scheduled run that handed its ship
+// to a worker used to hand it over WITHOUT the approval, so a hook held the
+// worker's first migration. The approval itself is never taken from this env,
+// which the run can set (`LEASH_ALLOW_WRITE=1 node bg.mjs ...`): the drain
+// carries it only when the token on the item is one it minted for that same
+// entry AND the entry still carries the approval in schedules.json. A run that
+// sets the flag by hand, or names another entry's id, gets nothing.
 const scheduled =
   process.env.LEASH_TRIGGER === 'schedule' && !process.env.TMUX
-    ? { scheduleId: String(process.env.LEASH_SCHEDULE_ID || '').trim() || 'unknown' }
+    ? {
+        scheduleId: String(process.env.LEASH_SCHEDULE_ID || '').trim() || 'unknown',
+        ...(process.env.LEASH_ALLOW_WRITE === '1' && process.env.LEASH_WRITE_GRANT
+          ? { allowWrite: true }
+          : {}),
+      }
     : {};
+const queuedItem = { text, queuedAt, ...(engine ? { engine } : {}), ...(cwd ? { cwd } : {}), ...(now ? { now: true } : {}), ...scheduled };
+if (scheduled.allowWrite) {
+  try {
+    const c = JSON.parse(process.env.LEASH_WRITE_GRANT);
+    if (c.executionId) queuedItem.executionId = c.executionId;
+    const payload = JSON.stringify(Object.fromEntries(Object.keys(queuedItem).sort().map(k => [k, queuedItem[k]])));
+    queuedItem.writeGrant = { id: c.id, runId: c.runId, executionId: c.executionId,
+      signature: sign(null, Buffer.from(payload), c.privateKey).toString('base64') };
+  } catch { delete queuedItem.allowWrite; }
+}
 let pending = 0;
 let lastErr;
 
@@ -541,7 +565,7 @@ for (let attempt = 0; attempt < 5; attempt++) {
   } catch {
     /* missing or mid-rename — treat as empty and retry on failure */
   }
-  items.push({ text, queuedAt, ...(engine ? { engine } : {}), ...(cwd ? { cwd } : {}), ...(now ? { now: true } : {}), ...scheduled });
+  items.push(queuedItem);
   try {
     writeFileSync(TMP, JSON.stringify(items, null, 2));
     renameSync(TMP, FILE);
@@ -617,7 +641,7 @@ const pacing =
     : now
       ? 'starts past the cap (--now)'
       : cap
-        ? `up to ${cap} run at once, the rest start as slots free · bg.mjs ps`
-        : 'past the cap jobs queue and start as slots free · bg.mjs ps';
+        ? `up to ${cap} run at once, the rest start as slots free (and the load and usage allow) · bg.mjs ps`
+        : 'past the cap jobs queue and start as slots free (and the load and usage allow) · bg.mjs ps';
 
 console.log(`handed to ${where} (${pending} pending · ${pacing}): ${text.slice(0, 80)}`);

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createWriteGrantStore } from './write-grant.mjs';
 // Tests for `--repo` / `--cwd` on bg.mjs: the DECLARED working directory.
 //
 // A Codex job's sandbox write root is its cwd. Before this flag the daemon
@@ -53,13 +54,17 @@ const eq = (a, b, what) => {
 };
 
 /** Run bg.mjs. Returns { code, stderr, items }. Never throws on a nonzero exit. */
-function run(args) {
+function run(args, extraEnv = {}) {
   if (existsSync(QUEUE)) rmSync(QUEUE);
   let code = 0;
   let stderr = '';
+  // Hermetic: the scheduled run mark (below) must come from the test, never
+  // from whatever run happens to be executing the suite.
+  const env = { ...process.env, HOME, BRIDGE_DEFAULT_CWD: '', BRIDGE_CONFIG: path.join(TMP, 'config.json'), ...extraEnv };
+  for (const k of ['LEASH_TRIGGER', 'LEASH_SCHEDULE_ID', 'LEASH_ALLOW_WRITE', 'LEASH_WRITE_GRANT', 'TMUX']) if (!(k in extraEnv)) delete env[k];
   try {
     execFileSync(process.execPath, [BG, ...args], {
-      env: { ...process.env, HOME, BRIDGE_DEFAULT_CWD: '', BRIDGE_CONFIG: path.join(TMP, 'config.json') },
+      env,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -147,6 +152,58 @@ t('the flag works on a Claude job too, and the lane rules still prepend', () => 
   eq(r.code, 0, 'exit code');
   eq(r.items[0].cwd, REPO_DIR, 'cwd');
   if (!r.items[0].text.startsWith('LANE RULES')) throw new Error('lane rules were lost');
+});
+
+// QA 2026-09-27 round 1: a SCHEDULED worker that hands work off through bg.mjs
+// used to drop the scheduled run mark, so the child ran as an attended worker
+// and a hook holding unattended writes let its migration through.
+// bg.mjs now copies the mark from its own env onto the item; the drain turns
+// scheduleId / allowWrite back into LEASH_TRIGGER / LEASH_ALLOW_WRITE.
+t('a handoff from inside a scheduled run carries the schedule mark', () => {
+  const r = run(['do the thing'], { LEASH_TRIGGER: 'schedule', LEASH_SCHEDULE_ID: '42' });
+  eq(r.code, 0, 'exit code');
+  eq(r.items[0].scheduleId, '42', 'scheduleId');
+  eq(r.items[0].allowWrite, undefined, 'allowWrite');
+});
+t('the write approval NEVER rides along: the run could set its own env (QA 2026-09-27)', () => {
+  const r = run(['do the thing'], { LEASH_TRIGGER: 'schedule', LEASH_SCHEDULE_ID: '42', LEASH_ALLOW_WRITE: '1' });
+  eq(r.items[0].scheduleId, '42', 'scheduleId');
+  eq(r.items[0].allowWrite, undefined, 'allowWrite');
+});
+// THE GRANT (write-grant.mjs, self audit 2026-10-13 P8): an approved scheduled
+// run is given a token minted for it, and bg.mjs carries THAT, with the flag,
+// onto the child. The drain honours it only for the same entry, still approved.
+t('★ an approved run with its grant: the child carries allowWrite AND the grant', () => {
+  const capability = createWriteGrantStore({ file: path.join(TMP, 'write-grants.json') }).issue(233, 'bg-parent');
+  const r = run(['ship it'], { LEASH_TRIGGER: 'schedule', LEASH_SCHEDULE_ID: '233', LEASH_ALLOW_WRITE: '1', LEASH_WRITE_GRANT: capability });
+  eq(r.items[0].scheduleId, '233', 'scheduleId');
+  eq(r.items[0].allowWrite, true, 'allowWrite');
+  eq(typeof r.items[0].writeGrant.signature, 'string', 'signed child proof');
+  eq(JSON.stringify(r.items).includes('PRIVATE KEY'), false, 'private capability never queued');
+});
+t('a grant without the approval flag, or outside a scheduled run, carries nothing', () => {
+  const r = run(['ship it'], { LEASH_TRIGGER: 'schedule', LEASH_SCHEDULE_ID: '233', LEASH_WRITE_GRANT: 'abc123' });
+  eq(r.items[0].allowWrite, undefined, 'allowWrite without the flag');
+  eq(r.items[0].writeGrant, undefined, 'writeGrant without the flag');
+  const r2 = run(['ship it'], { LEASH_ALLOW_WRITE: '1', LEASH_WRITE_GRANT: 'abc123' });
+  eq(r2.items[0].writeGrant, undefined, 'no schedule mark, no grant');
+  const r3 = run(['ship it'], { TMUX: '/tmp/tmux-501/default,1,0', LEASH_TRIGGER: 'schedule', LEASH_SCHEDULE_ID: '233', LEASH_ALLOW_WRITE: '1', LEASH_WRITE_GRANT: 'abc123' });
+  eq(r3.items[0].writeGrant, undefined, 'typed in a tmux pane');
+});
+t('★ a handoff typed in a tmux pane carries no mark, even with a leaked LEASH_TRIGGER (QA round 3)', () => {
+  const r = run(['owner handoff'], { TMUX: '/tmp/tmux-501/default,1,0', LEASH_TRIGGER: 'schedule', LEASH_SCHEDULE_ID: '120' });
+  eq(r.items[0].scheduleId, undefined, 'scheduleId');
+});
+t('a scheduled run with no id still marks the child (unknown id)', () => {
+  const r = run(['do the thing'], { LEASH_TRIGGER: 'schedule' });
+  eq(r.items[0].scheduleId, 'unknown', 'scheduleId');
+});
+t('a handoff from the chat or an ordinary worker carries no mark', () => {
+  const r = run(['do the thing']);
+  eq(r.items[0].scheduleId, undefined, 'scheduleId');
+  eq(r.items[0].allowWrite, undefined, 'allowWrite');
+  const r2 = run(['do the thing'], { LEASH_ALLOW_WRITE: '1' });
+  eq(r2.items[0].allowWrite, undefined, 'allowWrite without a schedule');
 });
 
 // THE WORKSPACE IS THE DAEMON'S: config.json's defaultCwd is where a bare name

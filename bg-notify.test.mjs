@@ -816,7 +816,17 @@ const HARNESS = `
 import path from 'node:path';
 import { handoffNotice, completionNotice, parseRunId, briefRepo, briefTitle, stripLaneRules, workerLine, WORKER_TICK_MS, WORKER_IDLE_MS } from ${JSON.stringify(NOTIFY_URL)};
 import { describeWhen, isDailyDue } from ${JSON.stringify(SCHEDULE_DUE_URL)};
-import { hasSlot, mergeRequeue } from ${JSON.stringify(ADMISSION_URL)};
+import { hasSlot, mergeRequeue, admissionVerdict, loadGate } from ${JSON.stringify(ADMISSION_URL)};
+// THE ADMISSION GATES (2026-10-13, P2): the real verdict, with no load and no
+// usage hold, so nothing here waits on them (the cap is 99 for the same
+// reason, below). bg-concurrency-wiring.test.mjs owns the gates, the waiting
+// line and the write grant against the real stores; here they are the
+// bindings the extracted drain and schedule fire close over, by name.
+const admissionNow = () => ({ load: null, usage: null, now: Date.now(), fmtClock: (ms) => String(ms) });
+const bridgeJobsRunning = (n = 0) => Number(n) || 0;
+const noteBgWaiting = () => {};
+const takeBgWaiting = () => null;
+const writeGrants = { issue: () => null, verify: () => false };
 export const SENT = [];
 export const DISPATCHED = [];
 export const EDITS = [];
@@ -980,7 +990,9 @@ const OWNER_TZ = 'Europe/Berlin';
 // caught them being added. Fixed values rather than the real resolvers: this
 // file asserts that the drain PASSES a model through to the card, not how the
 // two engines each resolve one.
-const claudeCardSettings = () => ({ model: 'opus', effort: 'xhigh' });
+// The worker pool's pin, which the drain's worker card reads.
+const BG_MODEL = 'opus';
+const DEFAULT_EFFORT = 'xhigh';
 const codexCardSettings = () => ({ model: 'gpt-6-astra', effort: 'high' });
 // The schedule store, in memory. checkSchedules is extracted rather than
 // mirrored for the same reason the drain is: it is the SECOND card call site

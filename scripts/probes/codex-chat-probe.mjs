@@ -100,6 +100,12 @@ const codexChatBox = () => codexChatSandbox({ yolo: STATE.yolo !== false });
 const conf = (key, fallback) => fallback;
 export const RING = [];
 const recordChatTurn = (e) => { RING.push(e); };
+// THE WRITE GRANT (write-grant.mjs, 2026-10-13): runCodex clears this env key
+// on every run and mints a grant only for an approved background schedule,
+// which a chat probe never is. Without the two, the sliced runCodex died on
+// its first turn with "WRITE_GRANT_ENV is not defined" (independent review).
+const WRITE_GRANT_ENV = 'LEASH_WRITE_GRANT';
+const writeGrants = { issue: () => null };
 
 // THE EXEC LANE IS WHAT THIS PROBE EXISTS TO PROVE. runCodexChat is now a
 // dispatcher, so the app-server is switched OFF here exactly the way

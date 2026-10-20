@@ -193,7 +193,7 @@ export function runPrefix(decide, liveTracker = { peek: () => 'a', current: () =
     THINKING_WORDS: ['thinking'], tg: async () => null, CHAT_ID: 1, thinkingWord: () => 'thinking',
     attachmentFrameNote: () => '', replyQuoteFrameNote: () => '',
     redactTokens: (x) => x, clip: (x) => x, oneLine: (x) => x, WAKE_UP_PROMPT_MAX: 1000, COMPACT_MARKER: 'compact:',
-    saveState: () => {}, workerEnv: () => ({}), liveAccount: liveTracker, CLAUDE_BIN: 'fixture',
+    saveState: () => {}, workerEnv: () => ({}), WRITE_GRANT_ENV: 'LEASH_WRITE_GRANT', writeGrants: { issue: () => null }, liveAccount: liveTracker, CLAUDE_BIN: 'fixture',
     spawnWorker: (_bin, args) => {
       started++; model = args[args.indexOf('--model') + 1];
       return { child: { on: (_event, handler) => { queueMicrotask(() => handler(new Error('fixture child exit'))); } } };

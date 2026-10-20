@@ -190,6 +190,10 @@ const M = await import(
         grab('bgRunLogPath'),
         grab('isWorkerDeathText'),
         grab('fileDeadWorkerDraft'),
+        // A SCHEDULED RUN'S ONE RETRY (2026-10-13, P8), the real function: it
+        // returns null for a run the wall guard holds no schedule mark for,
+        // which is every run here (jobOf above). schedule-retry.test.mjs owns it.
+        grab('scheduledRetryFor'),
         grab('handleLimitDeath'),
         grab('reportBgOutcome'),
         `export { bgReportId, bgReportPath, writeFullReport, pruneBgReports, handBackToChat, flushParkedHandbacks, maybeAutoResumeHandbacks, bgDraftPath, fileDeadWorkerDraft, reportBgOutcome, keepHandback };`,

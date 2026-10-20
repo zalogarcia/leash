@@ -24,7 +24,8 @@
 //     spend.
 //   - CODEX jobs. Codex is billed separately and is the engine every walled
 //     Claude job falls back TO, so capping it would remove the escape hatch the
-//     cap exists to make unnecessary.
+//     cap exists to make unnecessary. (Since 2026-10-13 a Codex job still waits
+//     on the MACHINE LOAD, which it shares: see admissionVerdict below.)
 //   - subagent dispatches INSIDE one worker session (the other half of the same
 //     incident: one session made 43 dispatches and 1,265 API calls in 24
 //     minutes). That lives in the agent harness, not in this daemon.
@@ -153,6 +154,248 @@ const clip = (s, n) => {
   return v.length <= n ? v : `${v.slice(0, Math.max(0, n - 1))}…`;
 };
 
+// ---------------------------------------------------------------------------
+// ADMISSION BEYOND THE COUNT: machine load and the usage window (self audit
+// 2026-10-13, P2, approved by the owner with a cap of 6).
+//
+// WHY. The count alone paced nothing that week: 38 friction entries in 29
+// sessions named machine load (load averages of 50 to 370 on a 14 core Mac,
+// gates that never came back clean), and 14 of 80 sampled runs died on a usage
+// limit before finishing, with 11 more existing only to resume one. "About 10
+// workers burn a 5 hour window in about 2 hours." The checkpoint steer at 95%
+// and the paced resume after the wall both act once the burn has happened;
+// these two gates slow the burn itself.
+//
+//   LOAD: the 1 minute load average against `loadPerCore` times the core count
+//   (2 x 14 = 28 here). Over it, a NEW job waits. Claude and Codex alike: a
+//   Codex job does not spend a Claude window, but its gates spawn the same
+//   processes on the same cores. With no bridge job running at all the gate
+//   stands aside, so load from something else on the Mac (a render, a build)
+//   can slow the queue but never freeze it.
+//
+//   USAGE: the live account's newest reading (the same one the wall guard
+//   trusts) at or past `usagePercent` of an open window, with no other account
+//   free to move to. A new CLAUDE job waits for the reset, or for the switch to
+//   another account, instead of starting and dying on the limit minutes later.
+//   Codex is not held by it: Codex does not spend a Claude window.
+//
+// Neither gate refuses anything. A job that waits stays in the drop box, keeps
+// its place, shows its reason in `bg.mjs ps` and on its own Telegram line, and
+// starts by itself when the reason clears. `--now` still passes all of them: it
+// is typed at dispatch by a person who has looked.
+// ---------------------------------------------------------------------------
+
+/** The defaults, which are also what a missing `admission` block means. */
+export const ADMISSION_DEFAULTS = Object.freeze({
+  loadPerCore: 2,
+  usagePercent: 90,
+});
+
+// Under these a setting is a typo, not a choice: a load limit of 0.2 per core
+// would hold every job on an idle Mac, a usage gate at 9 would hold all day.
+export const LOAD_PER_CORE_MIN = 0.5;
+export const USAGE_PERCENT_MIN = 50;
+
+const numOf = (v) => (v === null || v === undefined || v === '' || typeof v === 'boolean' ? NaN : Number(v));
+
+/**
+ * The settings, normalized. `raw` is config.json's `admission` value. `false`
+ * (or the strings "false", "off", "0", "no") switches BOTH new gates off, which
+ * leaves the count alone. A gate set to 0 or false is that gate off. Anything
+ * unparseable is the default, never a value that silently removes a gate.
+ */
+export function admissionSettings(raw) {
+  const d = ADMISSION_DEFAULTS;
+  if (raw === false || (typeof raw === 'string' && /^(false|off|0|no)$/i.test(raw.trim()))) return { loadPerCore: 0, usagePercent: 0 };
+  const r = raw && typeof raw === 'object' ? raw : {};
+  const off = (v) => v === false || v === 0 || v === '0';
+  const load = numOf(r.loadPerCore);
+  const usage = numOf(r.usagePercent);
+  return {
+    loadPerCore: off(r.loadPerCore) ? 0 : Number.isFinite(load) ? Math.max(LOAD_PER_CORE_MIN, load) : d.loadPerCore,
+    usagePercent: off(r.usagePercent) ? 0 : Number.isFinite(usage) ? Math.min(100, Math.max(USAGE_PERCENT_MIN, usage)) : d.usagePercent,
+  };
+}
+
+/**
+ * Is the machine too loaded to start one more job? { high, load1, ncpu, limit }.
+ * `bridgeRunning` is every bridge job running now, Claude and Codex: with none,
+ * the load is someone else's and the gate stands aside (see the header).
+ */
+export function loadGate({ load1 = null, ncpu = null, loadPerCore = ADMISSION_DEFAULTS.loadPerCore, bridgeRunning = 0 } = {}) {
+  const l = Number(load1);
+  const n = Math.floor(Number(ncpu));
+  const per = Number(loadPerCore);
+  if (!(per > 0) || !Number.isFinite(l) || !(n >= 1)) return { high: false, load1: Number.isFinite(l) ? l : null, ncpu: n >= 1 ? n : null, limit: null };
+  const limit = Math.round(per * n * 10) / 10;
+  return { high: l > limit && Number(bridgeRunning) > 0, load1: l, ncpu: n, limit };
+}
+
+/**
+ * THE USAGE HOLD, from one reading: null, or { account, percent, label,
+ * resetsAtMs } for the fullest open window at or past the threshold.
+ *
+ * `trigger` is wall-guard.mjs checkpointTrigger's answer for this reading at
+ * the admission threshold, so "open window" and "stale reading" mean exactly
+ * what they mean to the wall guard. `othersFree` is the selector's verdict:
+ * true means another account can take the job (the automatic switch moves
+ * there, so nothing waits); false or unknown holds, because the reading itself
+ * already says this account is nearly spent.
+ */
+export function usageHold({ trigger = null, othersFree = null, account = null, usagePercent = ADMISSION_DEFAULTS.usagePercent } = {}) {
+  if (!(Number(usagePercent) > 0)) return null;
+  if (!trigger || !trigger.armed || !trigger.window) return null;
+  if (othersFree === true) return null;
+  const w = trigger.window;
+  return { account: account || null, percent: Math.round(Number(w.percent)), label: String(w.label || 'the window'), resetsAtMs: Number(w.resetsAtMs) || null };
+}
+
+const defaultClock = (ms) => new Date(Number(ms)).toISOString().slice(11, 16);
+
+/**
+ * ONE JOB, ONE VERDICT: does it start now, and if not, why? Pure.
+ *
+ * Returns { admit: true } or { admit: false, kind, text }. `kind` is one of
+ * 'retry' (a job the bridge itself re-queued, not before `notBefore`), 'cap',
+ * 'pace', 'load', 'usage'. `text` starts with "waiting:" and is what `bg.mjs ps`
+ * and the job's own Telegram line say.
+ *
+ * The order is the order of the questions a person would ask: is it even due,
+ * was it forced past everything, is there a slot, is it a resume over its pace,
+ * can the machine take it, can the account. Codex answers only the first, the
+ * second and the load question (see the header).
+ */
+export function admissionVerdict({
+  engine = 'claude',
+  bypass = false,
+  notBefore = null,
+  now = 0,
+  running = 0,
+  max = DEFAULT_MAX_CONCURRENT_WORKERS,
+  itemMax = null,
+  pacedRunning = 0,
+  load = null,
+  usage = null,
+  fmtClock = defaultClock,
+} = {}) {
+  const nb = Number(notBefore);
+  if (Number.isFinite(nb) && nb > Number(now)) {
+    return { admit: false, kind: 'retry', text: `waiting: its one retry starts at ${fmtClock(nb)}, after the limit resets` };
+  }
+  if (bypass) return { admit: true };
+  const loadWait = load?.high
+    ? { admit: false, kind: 'load', text: `waiting: machine load ${Math.round(load.load1)} is over ${load.limit} (${load.ncpu} cores)` }
+    : null;
+  if (engine === 'codex') return loadWait || { admit: true };
+  if (!(Number(running) < Number(max))) {
+    return { admit: false, kind: 'cap', text: `waiting: ${Number(running)} of ${Number(max)} Claude workers busy` };
+  }
+  const pace = paceOf(itemMax);
+  if (pace !== null && !(Number(pacedRunning) < pace)) {
+    return { admit: false, kind: 'pace', text: `waiting: ${Number(pacedRunning)} of ${pace} resumed jobs running, the resume pace` };
+  }
+  if (loadWait) return loadWait;
+  if (usage) {
+    const at = usage.resetsAtMs ? ` · resets ${fmtClock(usage.resetsAtMs)}` : '';
+    return { admit: false, kind: 'usage', text: `waiting: ${usage.account || 'the account'} is at ${usage.percent}% of ${usage.label}, no other account free${at}` };
+  }
+  return { admit: true };
+}
+
+/**
+ * The same rows queueRows makes, judged by admissionVerdict, each with its
+ * `reason` (null when it starts). `ctx` is everything the verdict takes that is
+ * not on the row: { running, max, pacedRunning, load, usage, now, fmtClock,
+ * bridgeRunning }. Every row admitted ahead counts toward the next row's pool
+ * and, for the load floor, toward the bridge's running jobs.
+ */
+export function admissionRows(items, ctx = {}) {
+  const list = Array.isArray(items) ? items : [];
+  let running = Number(ctx.running) || 0;
+  let paced = Number(ctx.pacedRunning) || 0;
+  let bridge = Number(ctx.bridgeRunning) || 0;
+  let waitSeq = 0;
+  const loadOf = () => (ctx.load ? loadGate({ ...ctx.load, bridgeRunning: bridge }) : null);
+  return list.map((it, i) => {
+    const engine = it?.engine === 'codex' ? 'codex' : 'claude';
+    const bypass = Boolean(it?.bypass);
+    const v = admissionVerdict({
+      engine,
+      bypass,
+      notBefore: it?.notBefore ?? null,
+      now: ctx.now ?? 0,
+      running,
+      max: ctx.max ?? DEFAULT_MAX_CONCURRENT_WORKERS,
+      itemMax: it?.maxRunning ?? null,
+      pacedRunning: paced,
+      load: loadOf(),
+      usage: ctx.usage || null,
+      fmtClock: ctx.fmtClock || defaultClock,
+    });
+    const waiting = !v.admit;
+    if (!waiting) {
+      bridge++;
+      if (engine === 'claude') {
+        running++;
+        if (it?.resumed) paced++;
+      }
+    }
+    if (waiting) waitSeq++;
+    return {
+      position: i + 1,
+      waitPosition: waiting ? waitSeq : 0,
+      waiting,
+      engine,
+      bypass,
+      title: String(it?.title ?? ''),
+      queuedAt: it?.queuedAt ?? null,
+      reason: waiting ? v.text : null,
+      kind: waiting ? v.kind : null,
+    };
+  });
+}
+
+/**
+ * ONE LINE for `bg.mjs ps` that says what admission sees right now, whether or
+ * not anything waits: the count, the load against its limit, and the usage
+ * gate. `load` is loadGate's answer, `usage` usageHold's.
+ *
+ *   ADMISSION · Claude workers: 6 of 6 busy · load 12 of 28 (14 cores) · usage gate clear
+ *
+ * Its THIRD whitespace field is never a number, and that is load bearing: the
+ * line sits under the worker table, and ~/.claude/scripts/worker-priority.sh
+ * reads field 3 of every line after the header as a worker PID. The first
+ * shape ("ADMISSION · 1 of 6 ...") handed it PID 1, launchd, whose descendants
+ * are every process on the Mac (independent review, 2026-10-13).
+ */
+export function admissionLine({ running = 0, max = DEFAULT_MAX_CONCURRENT_WORKERS, load = null, usage = null, fmtClock = defaultClock } = {}) {
+  const bits = [`ADMISSION · Claude workers: ${Number(running)} of ${Number(max)} busy`];
+  if (load && Number.isFinite(Number(load.load1)) && load.limit != null) {
+    bits.push(`load ${Math.round(Number(load.load1))} of ${load.limit} (${load.ncpu} cores)${load.high ? ', new jobs wait' : ''}`);
+  } else bits.push('load gate off');
+  if (usage) {
+    const at = usage.resetsAtMs ? `, resets ${fmtClock(usage.resetsAtMs)}` : '';
+    bits.push(`usage: ${usage.account || 'the account'} at ${usage.percent}% of ${usage.label}, new Claude jobs wait${at}`);
+  } else bits.push('usage gate clear');
+  return bits.join(' · ');
+}
+
+/**
+ * The reason lines under the QUEUED table: one line per distinct reason, with
+ * the positions it holds. Under the table rather than in it, so the table's
+ * columns (and every reader of them) are unchanged.
+ */
+export function reasonLines(rows, { width = 110 } = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const byText = new Map();
+  for (const r of list) {
+    if (!r?.waiting || !r.reason) continue;
+    if (!byText.has(r.reason)) byText.set(r.reason, []);
+    byText.get(r.reason).push(`#${r.position}`);
+  }
+  return [...byText.entries()].map(([text, at]) => clip(`${text} · ${at.join(' ')}`, width));
+}
+
 /**
  * The QUEUED block under the `bg.mjs ps` table.
  *
@@ -177,5 +420,8 @@ export function queuedBlock(rows, { running = 0, max = DEFAULT_MAX_CONCURRENT_WO
     .map((r) => r.map((cell, i) => (i === r.length - 1 ? cell : cell.padEnd(widths[i]))).join('  ').trimEnd())
     .join('\n  ');
   const summary = `QUEUED (${list.length} in the drop box · ${waiting} waiting for a slot · ${running} of ${max} workers busy)`;
-  return `${summary}\n  ${table}`;
+  // WHY each waiting job waits, when the rows say (admissionRows). Rows made by
+  // queueRows carry no reason and render exactly as before.
+  const why = reasonLines(list);
+  return `${summary}\n  ${table}${why.length ? `\n  ${why.join('\n  ')}` : ''}`;
 }

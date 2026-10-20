@@ -36,3 +36,8 @@ wall-guard.json
 wall-guard.json.*.tmp
 usage-stream.json
 usage-stream.json.tmp
+bg-wait.json
+bg-wait.json.*.tmp
+write-grants.json
+write-grants.json.*.tmp
+write-grants.key

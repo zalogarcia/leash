@@ -66,12 +66,14 @@ test('both spawn paths use worker context environment', () => {
   assert.match(extract('startAppServerChild'), /env: env \|\| codexWorkerContext\(process\.env\)\.env/);
 });
 test('resume rechecks schedule approval and saves id instead of old consent', () => {
-  assert.match(extract('recoverCodexAppServerJob'), /allowWrite: scheduleApprovesWrites\(rec\.scheduleId\)/);
+  assert.match(extract('recoverCodexAppServerJob'), /allowWrite: rec\.allowWrite === true && scheduleApprovesWrites\(rec\.scheduleId, rec\.executionId\)/);
   assert.match(extract('runCodexAppServerJob'), /scheduleId: schedule\?\.id \?\? null/);
 });
 test('scheduled phone and dropbox dispatches forward schedule marks', () => {
   assert.match(extract('startResolvedRun'), /schedule: item\.schedule \|\| null/);
-  assert.match(extract('drainBgHandoff'), /schedule: typeof it === 'object'[\s\S]*allowWrite: it\.allowWrite === true && scheduleApprovesWrites\(it\.scheduleId\)/);
+  const drain = extract('drainBgHandoff');
+  assert.match(drain, /codexSchedule = typeof it === 'object'[\s\S]*allowWrite: it\.allowWrite === true && scheduleApprovesWrites\(it\.scheduleId, it\.executionId\)/);
+  assert.match(drain, /startCodexJob\(text, \{[\s\S]*?schedule: codexSchedule,/);
 });
 for (const failure of failures) process.stderr.write(`${failure}\n`);
 process.stdout.write(`${passed} passed, ${failures.length} failed\n`);

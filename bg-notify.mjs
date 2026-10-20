@@ -158,6 +158,41 @@ export function completionNotice({ lane, brief, status, elapsedSec } = {}) {
   return parts.join(' · ');
 }
 
+/**
+ * THE WAITING LINE: a job that is in the drop box and not started yet, and why
+ * (self audit 2026-10-13, P2).
+ *
+ *   📥 Queued
+ *   Fix the importer
+ *   ⏳ waiting: 6 of 6 Claude workers busy
+ *   starts by itself when that clears · bg.mjs ps
+ *
+ * The ⏳ resolves on THIS message: when the job starts, the drain edits this
+ * same message into the job's worker card (startWorkerNotice `adopt`), which
+ * then runs to its own ✅/❌/🛑. A job no engine can run edits it to ❌. The
+ * message id is kept on disk by queued job (bg-wait.mjs), so a daemon restart
+ * edits the same message rather than leaving this one waiting forever. A
+ * queued job is untouched by /stop (the drop box is not a lane), so a stop
+ * never strands it either.
+ *
+ * `reason` is admissionVerdict's text and starts with "waiting:". A job a
+ * schedule queued keeps the schedule's head, so it is still identifiable as
+ * one, exactly as its worker card will be.
+ */
+export function waitingLine({ brief = '', title = null, engine = 'claude', reason = '', scheduleId = null, scheduleWhen = null } = {}) {
+  const isCodex = String(engine).toLowerCase() === 'codex';
+  const head =
+    scheduleId != null && scheduleId !== ''
+      ? `⏰ #${scheduleId}${scheduleWhen ? ` · ${scheduleWhen}` : ''} · 📥 queued`
+      : `📥 Queued${isCodex ? ' · codex' : ''}`;
+  const name = title ?? briefTitle(stripLaneRules(brief));
+  const lines = [head];
+  if (name) lines.push(name);
+  lines.push(`⏳ ${clip(oneLine(reason || 'waiting'), 110)}`);
+  lines.push('starts by itself when that clears · bg.mjs ps');
+  return lines.join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // THE LIVE WORKER LINE
 // ---------------------------------------------------------------------------

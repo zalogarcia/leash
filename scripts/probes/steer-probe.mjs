@@ -70,12 +70,14 @@ import path from 'node:path';
 import { clip, oneLine } from ${url('progress-render.mjs')};
 import { briefTitle, stripLaneRules } from ${url('bg-lane-rules.mjs')};
 import { parseEnginePrefix } from ${url('bg-codex.mjs')};
-import { maxConcurrentWorkers, queueRows, queuedBlock } from ${url('bg-admission.mjs')};
+import { maxConcurrentWorkers, queueRows, queuedBlock, admissionRows, loadGate, admissionLine } from ${url('bg-admission.mjs')};
+import { renderEntry } from ${url('progress-render.mjs')};
+import { lastActFromExecLog } from ${url('codex-appserver.mjs')};
 import {
   STEER_SOCK_NAME, decodeLine, encodeLine, parseRunId, psTable, resolveSteerTarget,
   steerFailure, steerResponse, validateRequest, REASONS as STEER_REASONS,
 } from ${url('bg-steer.mjs')};
-const { existsSync, unlinkSync, readFileSync } = fs;
+const { existsSync, unlinkSync, readFileSync, openSync, fstatSync, readSync, closeSync } = fs;
 const SCRIPT_DIR = ${JSON.stringify(SOCK_DIR)};
 // The concurrency cap, which handleSteerRequest's ps arm reads. The cap is 1
 // so the one worker below fills the pool and a job in the drop box is WAITING,
@@ -99,10 +101,24 @@ export const watchdog = { reattachedIds: new Set() };
 // A SEAM, not the subject: the wall guard's job store, which the resume pace
 // reads to count the resumed jobs running. No job here is a resume.
 const wallGuard = { jobOf: () => null };
+// SEAMS for the admission gates the ps arm prints: no machine load and no usage
+// hold, so the ADMISSION line reads on the count alone, which is the row this
+// probe checks. The line and the queue rows themselves are the real builders.
+const admissionNow = (now = Date.now()) => ({ load: null, usage: null, now, fmtClock: (ms) => new Date(ms).toISOString().slice(11, 16) });
+const HOME = ${JSON.stringify(process.env.HOME || '')};
+// SEAMS for the two ops this probe does not exercise (btw and account), so a
+// call that reached one fails with its name rather than a ReferenceError the
+// steer handler would swallow.
+const btwInto = () => ({ ok: false, reason: 'not_in_probe', detail: 'btw is not part of the steer probe' });
+const handleAccountRequest = async () => ({ ok: false, reason: 'not_in_probe', detail: 'account is not part of the steer probe' });
 `,
   grab('bgWorkerDescriptors'),
   grab('runningBgWorkers'),
   grab('runningResumedWorkers'),
+  grab('bridgeJobsRunning'),
+  grab('readTailIf'),
+  grab('TAIL_BYTES', 'const'),
+  grab('withDeadline', 'const'),
   grab('queuedBgJobRows'),
   grab('publicWorker', 'const'),
   grab('steerInto'),

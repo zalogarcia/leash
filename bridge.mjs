@@ -37,7 +37,7 @@ import {
   readSync,
 } from 'node:fs';
 import net from 'node:net';
-import { homedir, hostname, platform } from 'node:os';
+import { homedir, hostname, platform, loadavg, cpus } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import readline from 'node:readline';
@@ -118,6 +118,7 @@ import {
   handoffNotice,
   completionNotice,
   workerLine,
+  waitingLine,
   WORKER_TICK_MS,
   WORKER_IDLE_MS,
 } from './bg-notify.mjs';
@@ -209,7 +210,12 @@ import { flattenRichMessage, richPromptText } from './rich-message.mjs';
 import { inboundKind, inboundLogLine, messageKeys, unknownLogLine, unknownKindLabel, unknownFileName, unknownFilesToPrune, isSavedUnknown, UNKNOWN_KEEP } from './inbound.mjs';
 // The background concurrency cap. Pure decisions only: the wiring that makes
 // this daemon obey them is proven by bg-concurrency-wiring.test.mjs.
-import { hasSlot, maxConcurrentWorkers, mergeRequeue, queueRows, queuedBlock } from './bg-admission.mjs';
+import { maxConcurrentWorkers, mergeRequeue, queuedBlock, admissionSettings, admissionVerdict, admissionRows, admissionLine, loadGate, usageHold } from './bg-admission.mjs';
+// The waiting line's message by queued job (bg-wait.mjs), and the owner's write
+// approval carried through a handoff as a grant (write-grant.mjs). Self audit
+// 2026-10-13, P2 and P8.
+import { createBgWaitStore, waitKey } from './bg-wait.mjs';
+import { createWriteGrantStore, WRITE_GRANT_ENV } from './write-grant.mjs';
 import {
   STEER_RECORD_MAX,
   STEER_SOCK_NAME,
@@ -344,8 +350,8 @@ import { createWallWake, pickNextAccount } from './wall-wake.mjs';
 // THE USAGE WALL GUARD: the checkpoint steer before an all-accounts wall and the
 // resume of the workers that died on it, after. Both pure and shared; the
 // wiring is wallGuardTick and resumeWallDeaths below.
-import { wallGuardSettings, wallGuardStatusLine, checkpointCandidates, checkpointDecision, checkpointSteerText, checkpointNotice, nextAccountAfter, createWallGuardStore, baseRunId } from './wall-guard.mjs';
-import { resumeCandidates, resumePlan, resumeTiming, resumeNote, resumeBrief, resumeQueueItem, resumeWakeLines, resumeLiftNotice, liftNoticeDue, checkpointCommitFrom, sameJobTitle } from './wall-resume.mjs';
+import { wallGuardSettings, wallGuardStatusLine, checkpointCandidates, checkpointDecision, checkpointSteerText, checkpointNotice, nextAccountAfter, createWallGuardStore, baseRunId, checkpointTrigger } from './wall-guard.mjs';
+import { resumeCandidates, resumePlan, resumeTiming, resumeNote, resumeBrief, resumeQueueItem, resumeWakeLines, resumeLiftNotice, liftNoticeDue, checkpointCommitFrom, sameJobTitle, SKIP } from './wall-resume.mjs';
 import {
   CODEX_EFFORTS,
   canProduceHandoff,
@@ -944,6 +950,11 @@ let bgSeq = 0;
 // the default; `maxConcurrentWorkers` in config.json (or
 // BRIDGE_MAX_CONCURRENT_WORKERS) overrides it.
 const MAX_CONCURRENT_WORKERS = maxConcurrentWorkers(conf('maxConcurrentWorkers', undefined));
+// AND WHETHER THE MACHINE AND THE ACCOUNT CAN TAKE ONE MORE (self audit
+// 2026-10-13, P2): `admission: { loadPerCore, usagePercent }` in config.json,
+// ON with 2 per core and 90 percent when absent. bg-admission.mjs carries the
+// why; admissionNow below is where the daemon reads both.
+const ADMISSION = admissionSettings(conf('admission', undefined));
 function makeBgLane() {
   bgSeq++;
   const n = bgSeq;
@@ -1747,11 +1758,31 @@ const workerNotices = new Map(); // runId -> live entry
 // PARAMETER rather than an assumption baked into the body, so the day a chat
 // lane wants this line it says so and gets its steps back, instead of silently
 // inheriting a rule written for somebody else.
-async function startWorkerNotice(runId, base, read, extra = '', { laneKind = LANE_KIND.background } = {}) {
+async function startWorkerNotice(runId, base, read, extra = '', { laneKind = LANE_KIND.background, adopt = null } = {}) {
   const text = workerLine({ ...base, phase: 'dispatch' }) + extra;
-  // NOT disposable. This send IS the bubble: shed it and the job runs with
-  // nothing on screen at all, which is the complaint this change answers.
-  const m = await send(text, { markdown: false }).catch(() => null);
+  // A JOB THAT WAITED already has a line on screen (its waiting line, the
+  // admission gates, 2026-10-13): `adopt` is that message's id, or the promise
+  // of it. This card takes it over, so a queued job is ONE message from queued
+  // to done and the waiting line's ⏳ resolves here. A line that cannot be had
+  // (its send failed) means a new message, as before.
+  const adopted = adopt ? await Promise.resolve(adopt).catch(() => null) : null;
+  let m = null;
+  if (adopted) {
+    await bgWait.resolveMessage(adopted, text, async () => {
+      try {
+        await tg('editMessageText', { chat_id: CHAT_ID, message_id: adopted, text }, 0, { durable: true });
+        return true;
+      } catch (e) {
+        if (e.code === 400 && /message is not modified|message to edit not found|message can't be edited|MESSAGE_ID_INVALID/i.test(e.description || e.message || '')) return true;
+        throw e;
+      }
+    }).catch((e) => console.error('[bridge] waiting line takeover will retry:', e.message));
+    m = { message_id: adopted };
+  } else {
+    // NOT disposable. This send IS the bubble: shed it and the job runs with
+    // nothing on screen at all, which is the complaint this change answers.
+    m = await send(text, { markdown: false }).catch(() => null);
+  }
   if (!m?.message_id) return null;
   if (!BG_PROGRESS_ON) return null; // sent, but never ticked: the old static notice
   // NO RUN ID, NO TICKER. The drain hands a job to dispatchPrompt, which may
@@ -1825,6 +1856,14 @@ async function startWorkerNotice(runId, base, read, extra = '', { laneKind = LAN
 function editWorkerNotice(runId, patch, { keepAlive = false } = {}) {
   const entry = workerNotices.get(runId);
   if (!entry || entry.done) return false;
+  // THE ENDING OWNS THE MESSAGE: a waiting line this card took over with a
+  // failed edit is forgotten here, so the retry of the card's opening text
+  // (reconcileBgWaiting) cannot land after it (bg-wait.mjs release).
+  try {
+    bgWait.release(entry.msgId);
+  } catch {
+    /* decoration: it never costs the ending */
+  }
   // lastLive goes UNDER base, not over it. It is the last reading taken while
   // the run was alive (up to a tick stale), so it fills in a step count and a
   // last action the dispatch frame never had; but once a terminal patch has
@@ -2095,6 +2134,20 @@ async function runClaude(
       startedAt: isBgLane ? startedAt : null,
       schedule: isBgLane ? schedule : null,
     });
+    // THE WRITE GRANT (write-grant.mjs, self audit 2026-10-13 P8): a run the
+    // owner approved for writes gets a token minted for this one run, so a ship
+    // it hands to a worker through bg.mjs keeps the approval (bg.mjs copies the
+    // token, the drain checks it against the same entry). Never on any other
+    // run, and scrubbed from the copy first.
+    delete childEnv[WRITE_GRANT_ENV];
+    if (isBgLane && schedule?.id != null && schedule.allowWrite === true) {
+      try {
+        const grant = writeGrants.issue(schedule.id, `${lane.name || 'bg'}-${startedAt}`, schedule.executionId || null);
+        if (grant) childEnv[WRITE_GRANT_ENV] = grant;
+      } catch (e) {
+        console.error('[bridge] write grant could not be minted (its handoffs will be held):', e.message);
+      }
+    }
     // Which account this process starts on, as far as the daemon knows: the
     // live session usage readings it emits are filed by it (noteStreamUsage).
     const spawnAccount = liveAccount.peek();
@@ -2140,7 +2193,7 @@ async function runClaude(
         wallGuard.job(`${lane.name || 'bg'}-${startedAt}`, {
           account: spawnAccount || null,
           model: selectedModel,
-          ...(schedule?.id != null ? { scheduleId: schedule.id, allowWrite: schedule.allowWrite === true } : {}),
+          ...(schedule?.id != null ? { scheduleId: schedule.id, executionId: schedule.executionId || null, allowWrite: schedule.allowWrite === true } : {}),
         });
       } catch (e) {
         console.error('[bridge] wall guard dispatch record failed:', e.message);
@@ -3058,6 +3111,16 @@ const wallWake = createWallWake({ file: WALL_WAKE_FILE, log: (m) => console.erro
 // same reason: a restart must undo neither a steer nor a resume.
 const WALL_GUARD_FILE = path.join(SCRIPT_DIR, 'wall-guard.json');
 const wallGuard = createWallGuardStore({ file: WALL_GUARD_FILE, log: (m) => console.error(`[bridge] wall guard: ${m}`) });
+// THE WAITING LINE's message, by queued job (bg-wait.mjs): a job the admission
+// gates hold gets one message saying why, and it becomes the job's card when it
+// starts. On disk so a restart edits the same message. Self audit 2026-10-13, P2.
+const BG_WAIT_FILE = path.join(SCRIPT_DIR, 'bg-wait.json');
+const bgWait = createBgWaitStore({ file: BG_WAIT_FILE, log: (m) => console.error(`[bridge] waiting line: ${m}`) });
+// THE OWNER'S WRITE APPROVAL, as a grant per approved run (write-grant.mjs), so
+// it follows a scheduled ship through a bg.mjs handoff and nowhere else. Only
+// the hashes are on disk. Self audit 2026-10-13, P8.
+const WRITE_GRANTS_FILE = path.join(SCRIPT_DIR, 'write-grants.json');
+const writeGrants = createWriteGrantStore({ file: WRITE_GRANTS_FILE, log: (m) => console.error(`[bridge] write grant: ${m}`) });
 const BG_CLI = path.join(SCRIPT_DIR, 'bg.mjs');
 const BG_RESULTS_FILE = path.join(SCRIPT_DIR, 'bg-results.jsonl'); // background outcomes the chat lane can read back
 // THE CHAT RING: the last ten turns of THIS conversation, both engines, on
@@ -3676,12 +3739,18 @@ function handleSteerRequest(raw) {
     const running = runningBgWorkers();
     const queued = queuedBgJobRows({ running });
     const block = queuedBlock(queued, { running, max: MAX_CONCURRENT_WORKERS });
+    // WHAT ADMISSION SEES (2026-10-13, P2), whether or not anything waits: the
+    // count, the load against its limit, the usage gate. One line.
+    const adm = admissionNow();
+    const load = adm.load ? loadGate({ ...adm.load, bridgeRunning: bridgeJobsRunning(running) }) : null;
+    const gate = admissionLine({ running, max: MAX_CONCURRENT_WORKERS, load, usage: adm.usage, fmtClock: adm.fmtClock });
     return {
       ok: true,
       workers,
       queued,
       capacity: { running, max: MAX_CONCURRENT_WORKERS },
-      table: block ? `${psTable(workers)}\n\n${block}` : psTable(workers),
+      admission: { load, usage: adm.usage },
+      table: `${psTable(workers)}\n\n${gate}${block ? `\n\n${block}` : ''}`,
     };
   }
   if (req.op === 'btw') return btwInto(req.target, req.text);
@@ -5938,7 +6007,19 @@ function resumeWallDeaths(ep, { readyAt = null, now = Date.now(), only = null } 
   const items = [];
   const resumed = [];
   const skipped = [...plan.skip];
+  // A SCHEDULED RUN IS RETRIED ONCE (self audit 2026-10-13, P8): nobody is
+  // watching it, so a job that dies on a limit again after its one retry goes
+  // to the chat lane with the reason instead of eating a third window. Its
+  // brief says "1 of 1", so the retry knows it is the last.
+  const toResume = [];
   for (const r of plan.resume) {
+    if (r.scheduleId != null && r.count > SCHEDULED_RETRY_MAX) {
+      skipped.push({ ...r, died: true, reason: `${SKIP.chainCap(r.count - 1)}; a scheduled run is retried once` });
+      continue;
+    }
+    toResume.push(r.scheduleId != null ? { ...r, max: Math.min(Number(r.max) || SCHEDULED_RETRY_MAX, SCHEDULED_RETRY_MAX) } : r);
+  }
+  for (const r of toResume) {
     const note = resumeNote({
       runId: r.runId,
       endedClock: Number(r.at) > 0 ? fmtUntil(r.at, { timeZone: OWNER_TZ }) : null,
@@ -5959,7 +6040,15 @@ function resumeWallDeaths(ep, { readyAt = null, now = Date.now(), only = null } 
       continue;
     }
     const item = resumeQueueItem({ death: r, text: brief.text, count: r.count, now, maxRunning: settings.resumeMaxConcurrent });
-    items.push(only ? { ...item, carriedModel: only.carriedModel } : item);
+    // An approved scheduled run keeps its approval through the resume as a
+    // fresh grant (write-grant.mjs): the drain carries nothing without one.
+    if (r.executionId) item.executionId = r.executionId;
+    // `only` is ONE death resumed at once (handleLimitDeath): it may carry the
+    // model decision of that death, and a scheduled run's retry may carry the
+    // time it may not start before (its account's reset, when the swap failed).
+    const retryItem = only ? { ...item, ...(only.carriedModel ? { carriedModel: only.carriedModel } : {}), ...(Number(only.notBefore) > now ? { notBefore: Number(only.notBefore) } : {}) } : item;
+    if (retryItem.allowWrite === true && scheduleApprovesWrites(retryItem.scheduleId, retryItem.executionId)) writeGrants.seal(retryItem, r.runId, { resume: true });
+    items.push(retryItem);
     resumed.push({ runId: r.runId, title: r.title || briefTitle(r.task), newTitle: brief.title, count: r.count, max: r.max });
   }
   if (items.length && !queueResumeJobs(items)) {
@@ -6125,7 +6214,7 @@ async function rotateOffLimitedAccount(detail, { model = null, rejectedLimit = n
   // inside a few seconds; without this each corpse would burn another account.
   if (now < rotationCooldownUntil) {
     lines.push(
-      `ACCOUNT ROTATION: already rotated moments ago for this same limit wall (cooldown). The account is live; this worker just died on the old one.`,
+      `ACCOUNT ROTATION: another rotation is inside its cooldown. Its result must be checked before retrying this worker.`,
     );
     return { outcome: 'cooldown', activeName: null, nextName: null, error: null, reset, lines };
   }
@@ -6304,9 +6393,91 @@ const codexTakingChat = () => codexCanTakeChat() && !codexWalled();
 // `draft` is the worker's draft report (bg-draft.mjs) when it left one. This is
 // THE case the draft exists for: a limit most often lands inside the verifier
 // dispatch, the most expensive step, after all the work was already done.
+// A scheduled run is retried at most this many times automatically, on any
+// path (self audit 2026-10-13, P8: "retried once, never twice").
+const SCHEDULED_RETRY_MAX = 1;
+
+/**
+ * A SCHEDULED RUN THAT DIED ON A LIMIT: its one retry (self audit 2026-10-13,
+ * P8). Null for any other run, and for a scheduled run that wrote its final
+ * report (its report is the outcome; there is nothing to retry). Otherwise
+ * { queued, atLift, line }, `line` being the first rotation line the assistant reads:
+ *
+ *   • on the all-accounts wall (the death raised it, or died behind it): the
+ *     lift resumes it like every wall death, at most once for a scheduled run
+ *     (resumeWallDeaths);
+ *   • the rotation swapped (or one a moment ago already had): another account
+ *     has room now, so the retry is queued now, through the drain and every
+ *     admission gate;
+ *   • the swap failed: the account it died on is still the live one, so the
+ *     retry waits for that account's reset (`notBefore`, which `bg.mjs ps` and
+ *     the waiting line show as its reason).
+ *
+ * NEVER TWICE: the death is claimed in the wall guard's record before anything
+ * is queued (claimResume, persisted), so the lift, a restart or a second report
+ * of the same death cannot queue it again, and the assistant's handback says not to.
+ */
+function scheduledRetryFor(runId, task, rot, { wallDeath = false, draft = null, finalReportSeen = false } = {}) {
+  let job = null;
+  try {
+    job = wallGuard.jobOf?.(runId) || null;
+  } catch {
+    job = null;
+  }
+  if (job?.scheduleId == null || finalReportSeen) return null;
+  const tag = `#${job.scheduleId}`;
+  if (wallDeath) {
+    // Said only when the lift will do it: the guard's resume is on, and this
+    // run is not itself the retry (the lift's plan skips that one).
+    const settings = wallGuardNow();
+    const why = !(settings.enabled !== false && settings.resume !== false)
+      ? 'automatic resume is switched off'
+      : Number(job.resumeCount) >= SCHEDULED_RETRY_MAX
+        ? 'this run was its one retry'
+        : null;
+    if (why) {
+      console.log(`[bridge] scheduled run ${runId} (${tag}) died on the wall; not retried: ${why}`);
+      return { line: `SCHEDULED RUN ${tag}: died on the all-accounts wall and is NOT retried automatically (${why}).` };
+    }
+    console.log(`[bridge] scheduled run ${runId} (${tag}) died on the wall; its one retry runs at the lift`);
+    return { atLift: true, line: `SCHEDULED RUN ${tag}: died on the all-accounts wall; the bridge retries it ONCE at the lift. Do not dispatch it again.` };
+  }
+  if (!['swapped', 'cooldown', 'swap_failed'].includes(rot?.outcome)) return null;
+  noteWallDeath(runId, task, { draft, finalReportSeen, account: rot.activeName || null });
+  const at = Date.now();
+  let notBefore = null;
+  if (rot.outcome !== 'swapped') {
+    const reset = Number(rot.reset?.resetsAt) * 1000;
+    notBefore = Number.isFinite(reset) && reset > at ? reset : at + 60 * 60_000;
+  }
+  const res = resumeWallDeaths({ raisedAt: at, workers: [{ runId, died: true }] }, { readyAt: at, now: at, only: { runId, notBefore } });
+  const done = res.resumed.find((r) => baseRunId(r.runId) === baseRunId(runId));
+  if (!done) {
+    const why = res.skipped.find((r) => baseRunId(r.runId) === baseRunId(runId))?.reason || 'it was not resumed';
+    console.log(`[bridge] scheduled run ${runId} (${tag}) died on a limit; not retried: ${why}`);
+    return { line: `SCHEDULED RUN ${tag}: died on a session limit and was NOT retried automatically (${why}).` };
+  }
+  const when = notBefore
+    ? `at ${fmtUntil(notBefore, { timeZone: OWNER_TZ }) || new Date(notBefore).toISOString()}, after the limit resets`
+    : 'now, on the account the rotation moved to';
+  console.log(`[bridge] scheduled run ${runId} (${tag}) died on a limit (${rot.outcome}); its one retry is queued ${when}`);
+  // Started now through the same drain and gates as any job; a retry that
+  // waits for a reset is started by the poll loop's drain once it is due.
+  if (!notBefore) drainBgHandoff();
+  return { queued: true, line: `SCHEDULED RUN ${tag}: died on a session limit; the bridge queued its ONE retry ${when} ("${clip(oneLine(done.newTitle || done.title || ''), 80)}").` };
+}
+
 async function handleLimitDeath(task, outcome, runId, steers = [], draft = null, { finalReportSeen = false } = {}) {
   const detail = String(outcome.answer || '');
-  const rot = await rotateOffLimitedAccount(detail, { model: outcome.model || wallGuard.jobOf?.(runId)?.model || null, rejectedLimit: outcome.rejectedLimit, rejectedAccount: outcome.rejectedAccount });
+  let rot = await rotateOffLimitedAccount(detail, { model: outcome.model || wallGuard.jobOf?.(runId)?.model || null, rejectedLimit: outcome.rejectedLimit, rejectedAccount: outcome.rejectedAccount });
+  if (rot.outcome === 'cooldown') {
+    const behind = await rotationBehindCooldown().catch(() => null);
+    if (behind) {
+      rot = { ...behind, lines: [...(behind.lines || [])], borrowed: true };
+      if (behind.outcome === 'exhausted') rot.lines.push('The rotation behind that cooldown found EVERY account limited, so this worker died on the wall.');
+    }
+    else rot = { ...rot, lines: [...(rot.lines || []), ...(wallGuard.jobOf?.(runId)?.scheduleId != null ? ['The rotation result is unknown; the scheduled retry waits for the reset.'] : [])] };
+  }
   if (rot.outcome === 'no_claude') return;
   // REFUSED FABLE ONLY, with Opus open on the same account: nothing was walled
   // or swapped, so the worker resumes now through the wall guard's resume, and
@@ -6330,32 +6501,40 @@ async function handleLimitDeath(task, outcome, runId, steers = [], draft = null,
   // seconds, and the first corpse's rotation is still probing when the next
   // arrives). The last one used to read as "the account is live" and went to
   // a chat lane that was walled too.
-  let wallDeath = rot.outcome === 'exhausted' || rot.outcome === 'paused';
-  if (!wallDeath && rot.outcome === 'cooldown') {
-    const behind = await rotationBehindCooldown().catch(() => null);
-    if (behind?.outcome === 'exhausted') {
-      wallDeath = true;
-      lines.push('The rotation behind that cooldown found EVERY account limited, so this worker died on the wall, not on an account that was already swapped.');
-    }
-  }
+  const wallDeath = rot.outcome === 'exhausted' || rot.outcome === 'paused';
   // THE WALL GUARD'S RESUME (wall-resume.mjs): a Claude worker that died on the
   // wall is recorded with its brief, and the lift queues it again. (The
   // module's provisional rule stays inert here: the landing record answers how
   // the rotation behind a cooldown ended, so no death is provisional.)
   if (wallDeath) noteWallDeath(runId, task, { draft, finalReportSeen, account: rot.activeName || null });
+  // A SCHEDULED RUN'S ONE RETRY (self audit 2026-10-13, P8). Nobody watches a
+  // scheduled run, so one that dies on a limit used to be retried only when the
+  // death raised an all-accounts wall (the lift resumes those); one that died
+  // while the rotation swapped, or could not swap, went to the chat lane and
+  // nothing ran it again (#234 on 2026-10-08, "nothing rescheduled it").
+  const retry = scheduledRetryFor(runId, task, rot, { wallDeath, draft, finalReportSeen });
+  if (retry?.line) lines.unshift(retry.line);
   // The worker lane's own voice, unchanged: a bubble it can read later, naming
   // both halves of the swap.
-  if (rot.outcome === 'swapped') {
+  if (rot.outcome === 'swapped' && !rot.borrowed) {
     send(`🔄 Session limit on "${rot.activeName || 'the active account'}", swapped to "${rot.nextName}".`, {
       markdown: false,
     }).catch(() => {});
-  } else if (rot.outcome === 'swap_failed') {
+  } else if (rot.outcome === 'swap_failed' && !rot.borrowed) {
     send(swapFailedLine({ error: rot.error, account: rot.activeName || '' }), { markdown: false }).catch(() => {});
   }
 
   handBackToChat(
     task,
-    [detail, '', `--- ${BRIDGE_NAME.toUpperCase()} ACCOUNT ROTATION ---`, ...lines].join('\n'),
+    [
+      detail,
+      '',
+      `--- ${BRIDGE_NAME.toUpperCase()} ACCOUNT ROTATION ---`,
+      ...lines,
+      ...(retry?.queued || retry?.atLift
+        ? ['', `Do NOT relaunch this scheduled run: ${BRIDGE_NAME} ${retry.queued ? 'queued its one retry' : 'retries it once at the lift'} (see the first rotation line). Relaunch nothing for it, or it runs twice.`]
+        : []),
+    ].join('\n'),
     `died on a session limit; ${BRIDGE_NAME} handled the account rotation`,
     runId,
     steers,
@@ -7449,20 +7628,6 @@ const codexSettingsNow = () => codexSettings(engineArgs());
  * per dispatch rather than cached: it is a few KB, dispatch is not a hot path,
  * and a cache would hand back a model the CLI stopped using.
  */
-/**
- * The model and effort a CLAUDE run will actually use, for the same surface.
- *
- * There is no separate background pin here: every lane runs the chat lane's
- * /model over the config default, which is exactly what runClaude puts in argv.
- * Either can be EMPTY, meaning the daemon passes no `--model` and the `claude`
- * CLI picks; the word for that is the same "default" the Codex half prints for
- * an unset model, so one card reads the same way whichever engine drew it.
- */
-function claudeCardSettings() {
-  // A worker card: the pool runs on BG_MODEL whatever the chat lane's /model says.
-  return { model: BG_MODEL || 'default', effort: DEFAULT_EFFORT || 'default' };
-}
-
 function codexCardSettings() {
   const { model, effort } = codexSettingsNow();
   let toml = null;
@@ -8344,6 +8509,11 @@ function runCodex(rawText, { mode = 'ask', cwd = null, reviewScope = 'uncommitte
   // what you typed.
   const runCwd = cwd && existsSync(cwd) ? cwd : DEFAULT_CWD;
   const worker = codexWorkerContext(process.env, { background, cwd: runCwd, runId, startedAt, schedule, mode });
+  delete worker.env[WRITE_GRANT_ENV];
+  if (background && schedule?.allowWrite === true) {
+    const grant = writeGrants.issue(schedule.id, runId, schedule.executionId || null);
+    if (grant) worker.env[WRITE_GRANT_ENV] = grant;
+  }
   // `brief` is the task as given. `prompt` adds the Codex-only house rules and
   // draft instruction, so a Claude takeover is handed `brief`, never `prompt`.
   const brief = stripLaneRules(String(sendText ?? rawText ?? '')).trim();
@@ -8599,6 +8769,11 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
   const { log: logPath, last: lastFile, prompt: promptFile } = codexPaths(RUNS_DIR, startedAt);
   const runCwd = cwd && existsSync(cwd) ? cwd : DEFAULT_CWD;
   const worker = codexWorkerContext(process.env, { background: true, cwd: runCwd, runId, startedAt, schedule, mode });
+  delete worker.env[WRITE_GRANT_ENV];
+  if (schedule?.allowWrite === true) {
+    const grant = writeGrants.issue(schedule.id, runId, schedule.executionId || null);
+    if (grant) worker.env[WRITE_GRANT_ENV] = grant;
+  }
   // `brief` is the task as given. `prompt` adds the Codex-only house rules and
   // draft instruction, so a Claude takeover is handed `brief`, never `prompt`.
   const brief = stripLaneRules(String(sendText ?? rawText ?? '')).trim();
@@ -9059,6 +9234,8 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
         model: model || null,
         effort: codexEffort || null,
         scheduleId: schedule?.id ?? null,
+        executionId: schedule?.executionId || null,
+        allowWrite: schedule?.allowWrite === true,
         draftPath: worker.draftPath,
         network: netOn,
         carriesHandoff,
@@ -9214,7 +9391,7 @@ function recoverCodexAppServerJob(id, rec) {
     cwd: rec.cwd || null,
     announce: false, // the resume line below is this run's announcement
     resume: { threadId: rec.threadId, startedAt },
-    schedule: rec.scheduleId == null ? null : { id: rec.scheduleId, allowWrite: scheduleApprovesWrites(rec.scheduleId) },
+    schedule: rec.scheduleId == null ? null : { id: rec.scheduleId, executionId: rec.executionId || null, allowWrite: rec.allowWrite === true && scheduleApprovesWrites(rec.scheduleId, rec.executionId) },
     network: rec.network === true,
     carriesHandoff: rec.carriesHandoff === true,
   });
@@ -10683,6 +10860,197 @@ function flushParkedCodexChats({ fold = null } = {}) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// ADMISSION BEYOND THE COUNT (self audit 2026-10-13, P2): the machine load and
+// the usage window, read here, judged in bg-admission.mjs admissionVerdict.
+// ---------------------------------------------------------------------------
+
+// The selector is asked whether another account could take a job only while
+// the live reading is past the threshold, and at most this often: the same
+// pace the wall guard asks at.
+const ADMISSION_PROBE_MS = 60_000;
+// An answer older than this is no answer: the job waits on the reading alone.
+const ADMISSION_FREE_MAX_AGE_MS = 5 * ADMISSION_PROBE_MS;
+let admissionFree = { account: null, at: 0, value: null };
+let admissionInflight = null;
+// The last error the inputs threw, so the log says it once, not per drain.
+let admissionLastError = null;
+
+/** The live account's reading at the admission threshold: { account, trigger }. */
+function admissionReading(now = Date.now()) {
+  const account = liveAccount.current();
+  // The same reading the wall guard acts on (usableLiveReading: provably this
+  // account's), scoped to the model the background pool runs on.
+  const usage = usageForModel(account ? usableLiveReading(account) : null, laneModel({ isBg: true }, true));
+  const trigger = checkpointTrigger({ settings: { enabled: ADMISSION.usagePercent > 0, thresholdPercent: ADMISSION.usagePercent }, usage, account, now });
+  return { account, trigger };
+}
+
+/**
+ * Asks the selector whether another account is free, ONLY when the live
+ * reading is past the threshold, at most once a minute. Its answer is what
+ * lets a job start on a nearly spent account when the switch has somewhere to
+ * go. From the poll loop, beside the wall guard.
+ */
+async function admissionTick(now = Date.now()) {
+  if (!CLAUDE_AVAILABLE || !(ADMISSION.usagePercent > 0)) return null;
+  if (now < rotationPausedUntil) return null; // the wall itself holds every Claude job
+  const { account, trigger } = admissionReading(now);
+  if (!account || !trigger.armed) return null;
+  if (admissionFree.account === account && now - admissionFree.at < ADMISSION_PROBE_MS) return null;
+  const sel = await withDeadline(pickHealthyAccount({ activeName: account, lines: [], quiet: true, othersOnly: true, model: laneModel({ isBg: true }, true) }), WALL_LIFT_SWEEP_WAIT_MS, null);
+  admissionFree = { account, at: Date.now(), value: sel ? sel.outcome === 'selected' : null };
+  return admissionFree;
+}
+
+/** One tick at a time; the poll loop calls this every cycle. */
+function kickAdmission() {
+  if (admissionInflight) return admissionInflight;
+  const op = admissionTick().catch((e) => {
+    console.error('[bridge] admission tick failed:', e.message);
+    return null;
+  });
+  admissionInflight = op;
+  pendingOps.add(op);
+  op.finally(() => {
+    pendingOps.delete(op);
+    if (admissionInflight === op) admissionInflight = null;
+  });
+  return op;
+}
+
+/**
+ * WHAT ADMISSION KNOWS RIGHT NOW, synchronously, for the drain, the schedule
+ * fire and `bg.mjs ps`: { load, usage, now, fmtClock }. `load` is the raw
+ * reading (loadGate judges it against the bridge's own running jobs); `usage`
+ * is the hold or null. A failure to read either is logged once and read as no
+ * gate: these are additions on top of the count, which still fails closed.
+ */
+function admissionNow(now = Date.now()) {
+  let load = null;
+  let usage = null;
+  try {
+    load = ADMISSION.loadPerCore > 0 ? { load1: loadavg()[0], ncpu: cpus().length, loadPerCore: ADMISSION.loadPerCore } : null;
+    if (ADMISSION.usagePercent > 0 && CLAUDE_AVAILABLE && !(now < rotationPausedUntil)) {
+      const { account, trigger } = admissionReading(now);
+      const fresh = admissionFree.account === account && now - admissionFree.at < ADMISSION_FREE_MAX_AGE_MS;
+      usage = usageHold({ trigger, othersFree: fresh ? admissionFree.value : null, account, usagePercent: ADMISSION.usagePercent });
+    }
+    admissionLastError = null;
+  } catch (e) {
+    if (admissionLastError !== e.message) console.error('[bridge] admission inputs unreadable, admitting on the count alone:', e.message);
+    admissionLastError = e.message;
+  }
+  return { load, usage, now, fmtClock: (ms) => fmtUntil(ms, { timeZone: OWNER_TZ }) || new Date(ms).toISOString().slice(11, 16) };
+}
+
+/** Every bridge job running now, Claude and Codex: the load gate's floor. */
+function bridgeJobsRunning(claudeRunning = runningBgWorkers()) {
+  try {
+    const seen = new Set();
+    let codex = 0;
+    // Descriptors include detached survivors. Union with the live registry so
+    // a just-started job also counts before its descriptor is available.
+    for (const w of [...bgWorkerDescriptors(), ...[...codexRuns].map(([runId, run]) => ({ ...run, runId: run.runId || runId, engine: 'codex' }))]) {
+      if (w.done || w.running === false || (w.engine && w.engine !== 'codex')) continue;
+      if (!w.engine && !codexRuns.has(w.runId)) continue;
+      const keys = [w.runId && `run:${w.runId}`, (w.pid || w.child?.pid) && `pid:${w.pid || w.child.pid}`].filter(Boolean);
+      if (keys.some((key) => seen.has(key))) continue;
+      keys.forEach((key) => seen.add(key));
+      codex++;
+    }
+    return Number(claudeRunning) + codex;
+  } catch (e) {
+    console.error('[bridge] could not count all workers for load:', e.message);
+    return Math.max(1, Number(claudeRunning) + (codexRuns?.size || 0));
+  }
+}
+
+// A same-kind reason is re-said at most this often (a load figure moves every
+// minute; a phone line that edits every minute is noise).
+const BG_WAIT_EDIT_MS = 10 * 60_000;
+
+/**
+ * THE WAITING LINE for a job admission held: one message, put up the first
+ * time it waits, edited when the reason changes kind, and handed to the job's
+ * worker card when it starts (takeBgWaiting). Decoration: it never throws,
+ * and the job is already back in the drop box before this runs.
+ *
+ * `onlyIfShown` edits a line already up and never puts a new one up (a job a
+ * wall parks: the wall's own notice counts it).
+ */
+function noteBgWaiting(it, verdict, { engine = 'claude', scheduleWhen = null, onlyIfShown = false } = {}) {
+  try {
+    const key = waitKey(it);
+    if (!key || !verdict?.text) return;
+    const raw = typeof it === 'string' ? it : it?.text;
+    const scheduleId = typeof it === 'object' && it?.scheduleId != null ? it.scheduleId : null;
+    const have = bgWait.get(key);
+    const lineFor = (when) =>
+      waitingLine({ brief: stripLaneRules(parseEnginePrefix(String(raw || '')).text), engine, reason: verdict.text, scheduleId, scheduleWhen: when });
+    if (have) {
+      const since = Date.now() - Number(have.editedAt || have.at);
+      if (have.kind === verdict.kind && (have.text === verdict.text || since < BG_WAIT_EDIT_MS)) return;
+      // A new KIND of reason is said at most once a minute too: a load figure
+      // hovering at its limit must not make the line flap every drain.
+      if (since < 60_000) return;
+      const line = lineFor(have.scheduleWhen || null);
+      bgWait.update(key, { kind: verdict.kind, text: verdict.text, editedAt: Date.now() });
+      editProgress(have.msgId, escHtml(line), () => line).catch(() => {});
+      return;
+    }
+    if (onlyIfShown || bgWait.pending(key)) return;
+    const line = lineFor(scheduleWhen);
+    const sent = send(line, { markdown: false })
+      .then((m) => m?.message_id || null)
+      .catch(() => null);
+    bgWait.track(key, sent, { kind: verdict.kind, text: verdict.text, scheduleWhen: scheduleWhen || null });
+  } catch (e) {
+    console.error('[bridge] waiting line failed (the job is queued either way):', e.message);
+  }
+}
+
+/** The job is starting: its waiting line, if it had one, for its card to take over. */
+function takeBgWaiting(it) {
+  try {
+    return bgWait.claim(waitKey(it));
+  } catch {
+    return null;
+  }
+}
+
+/** Close lines for jobs removed outside the drain, only after a confirmed edit. */
+async function reconcileBgWaiting() {
+  try {
+    const readItems = (file) => {
+      try {
+        const items = JSON.parse(readFileSync(file, 'utf8'));
+        if (!Array.isArray(items)) throw new Error(`invalid queue: ${file}`);
+        return items;
+      } catch (e) {
+        if (e.code === 'ENOENT') return [];
+        throw e; // An unreadable queue is not evidence that its jobs were removed.
+      }
+    };
+    const active = [...readItems(BG_QUEUE_FILE), ...readItems(BG_HELD_FILE), ...bgStrandedJobs].map(waitKey);
+    await bgWait.reconcile(active, async (record) => {
+      const text = record.resolutionText || '🛑 Queue wait ended. This job is no longer queued or held.';
+      try {
+        // editProgress swallows failures, so use the transport acknowledgement.
+        await tg('editMessageText', { chat_id: CHAT_ID, message_id: record.msgId, text }, 0, { durable: true });
+        return true;
+      } catch (e) {
+        // A 400 that leaves nothing to do (already says it, deleted, or no longer
+        // editable) counts as resolved: retrying it every poll tick never ends.
+        if (e.code === 400 && /message is not modified|message to edit not found|message can't be edited|MESSAGE_ID_INVALID/i.test(e.description || e.message || '')) return true;
+        throw e;
+      }
+    });
+  } catch (e) {
+    console.error('[bridge] waiting line reconciliation failed:', e.message);
+  }
+}
+
 /**
  * Jobs the LAST drain deferred past the concurrency cap but could not write
  * back to the drop box (a failed rename, which is a disk-level anomaly).
@@ -10760,10 +11128,24 @@ function queuedBgJobRows({ running = runningBgWorkers() } = {}) {
         queuedAt: (typeof it === 'object' && it?.queuedAt) || null,
         maxRunning: (typeof it === 'object' && it?.maxRunning) || null, // a resumed job's own pace
         resumed: Boolean(typeof it === 'object' && it?.resumeOf),
+        notBefore: (typeof it === 'object' && it?.notBefore) || null, // a scheduled run's one retry
       };
     })
     .filter(Boolean);
-  return queueRows(rows, { running, max: MAX_CONCURRENT_WORKERS, pacedRunning: runningResumedWorkers() });
+  // JUDGED THE WAY THE DRAIN JUDGES THEM (admissionVerdict, through
+  // admissionRows), with each waiting row's reason, so ps and the daemon cannot
+  // disagree about which jobs wait or why.
+  const adm = admissionNow();
+  return admissionRows(rows, {
+    running,
+    max: MAX_CONCURRENT_WORKERS,
+    pacedRunning: runningResumedWorkers(),
+    load: adm.load,
+    usage: adm.usage,
+    now: adm.now,
+    fmtClock: adm.fmtClock,
+    bridgeRunning: bridgeJobsRunning(running),
+  });
 }
 
 // A running session hands a long job to the background lane by appending here
@@ -10798,7 +11180,29 @@ function drainBgHandoff() {
   // and bgWorkerDescriptors() reads the inflight registry off disk.
   let running = runningBgWorkers();
   let pacedRunning = runningResumedWorkers(); // the resumed jobs among them, for a resume's pace
+  // THE OTHER TWO ADMISSION INPUTS (self audit 2026-10-13, P2): the machine
+  // load and the usage window, read once per drain like the count. Every job
+  // started below counts toward the load gate's floor for the next one.
+  const adm = admissionNow();
+  let bridgeRunning = bridgeJobsRunning(running);
+  const verdictFor = (engine, it, bypass, itemMax = null) =>
+    admissionVerdict({
+      engine,
+      bypass,
+      notBefore: typeof it === 'object' && it ? it.notBefore ?? null : null,
+      now: adm.now,
+      running,
+      max: MAX_CONCURRENT_WORKERS,
+      itemMax,
+      pacedRunning,
+      load: adm.load ? loadGate({ ...adm.load, bridgeRunning }) : null,
+      usage: adm.usage,
+      fmtClock: adm.fmtClock,
+    });
   const deferred = [];
+  // The jobs that wait, with why, for their waiting lines AFTER the write back:
+  // the drop box is the durable copy, the line is decoration.
+  const waiting = [];
   for (const it of items) {
     const queuedText = typeof it === 'string' ? it : it?.text;
     if (!queuedText) continue;
@@ -10823,9 +11227,19 @@ function drainBgHandoff() {
     // row, so `bg-results.jsonl` still holds it.
     if (decision.error) {
       const why = decision.error === 'codex_missing' ? CODEX_MISSING_LINE : claudeMissingLine('That handed-off job');
-      send([`❌ Job not run · no engine available`, briefTitle(stripLaneRules(text), 200), why].join('\n'), {
-        markdown: false,
-      }).catch(() => {});
+      const refusal = [`❌ Job not run · no engine available`, briefTitle(stripLaneRules(text), 200), why].join('\n');
+      // A job that WAITED has its line on screen: the refusal is that line's
+      // ending, not a second message under a ⏳ that would never resolve.
+      const shown = takeBgWaiting(it);
+      if (shown) {
+        Promise.resolve(shown)
+          .then((id) => (id ? editProgress(id, escHtml(refusal), () => refusal, { final: true }) : send(refusal, { markdown: false })))
+          .catch(() => {});
+      } else {
+        send(refusal, {
+          markdown: false,
+        }).catch(() => {});
+      }
       recordBgResult(text, `FAILED (no engine available): ${decision.error}`, null);
       continue;
     }
@@ -10844,6 +11258,9 @@ function drainBgHandoff() {
     // path that knows how to build them, rather than from a second copy here.
     if (decision.pausedUntil && (decision.engine === 'claude' || codexWalled())) {
       if (holdBgJob(typeof it === 'object' && it ? it : { text: queuedText })) {
+        // A line already up for this job now says what it waits on; no new one
+        // (the wall's own notice counts what it holds).
+        noteBgWaiting(it, { kind: 'wall', text: 'waiting: every Claude account is at its limit, it starts after the reset' }, { onlyIfShown: true });
         logAccountDecision({
           decision: 'all_accounts_walled_until',
           until: Math.floor(Number(decision.pausedUntil) / 1000),
@@ -10894,21 +11311,39 @@ function drainBgHandoff() {
           fallbackCwd: chatState().cwd,
           exists: existsSync,
         });
+      // THE LOAD GATE, the one admission question a Codex job answers (it does
+      // not spend a Claude window, so neither the count nor the usage gate
+      // holds it; its gates load the same cores). `--now` passes it.
+      const codexVerdict = verdictFor('codex', it, Boolean(typeof it === 'object' && it?.now));
+      if (!codexVerdict.admit) {
+        deferred.push(typeof it === 'object' && it ? it : { text: queuedText });
+        waiting.push({ it, verdict: codexVerdict, engine: 'codex' });
+        continue;
+      }
       const active = bgLanes.filter((l) => l.current || l.queue.length || l.finishing).length + codexRuns.size + 1;
       const queued = bgLanes.reduce((n, l) => n + l.queue.length, 0);
+      // The waiting line this job put up, if it waited: the card takes it over.
+      const codexAdopt = takeBgWaiting(it);
       // DISPATCH FIRST, then decorate: the queue file was already claimed above,
       // so anything that throws before the spawn destroys the brief with no
-      // record of it anywhere.
+      // record of it anywhere. Same discipline as the Claude path below, same
+      // reason (a ReferenceError in the notice once ate a queued job).
+      const codexSchedule = typeof it === 'object' && it?.scheduleId != null
+        ? { id: it.scheduleId, executionId: it.executionId || null, allowWrite: it.allowWrite === true && scheduleApprovesWrites(it.scheduleId, it.executionId) && writeGrants.verify(it.writeGrant, it.scheduleId, it) }
+        : null;
       const run = startCodexJob(text, {
         mode: 'edit', // a handed-off job is work, not a question
         announce: false, // the handoff notice below IS this run's announcement
         cwd: codexCwd,
         reason: decision.reason,
         pausedUntil: decision.pausedUntil,
-        schedule: typeof it === 'object' && it?.scheduleId != null
-          ? { id: it.scheduleId, allowWrite: it.allowWrite === true && scheduleApprovesWrites(it.scheduleId) }
-          : null,
+        schedule: codexSchedule,
       });
+      bridgeRunning++; // a Codex job loads the same cores the next job would
+      // A REFUSED APPROVAL IS SAID, not silent: the guard holds the job's writes,
+      // and this line is the why (a grant is single use, so a second handoff
+      // from one approved run lands here).
+      if (codexSchedule && it.allowWrite === true && !codexSchedule.allowWrite) console.log(`[bridge] job for schedule #${it.scheduleId} runs WITHOUT write approval: the entry no longer approves it, or its write grant is missing, already used or does not match the item`);
       // CLAUDE-ONLY CONTENT IN A CODEX BRIEF (case 26). bg.mjs strips the LANE
       // RULES header for a Codex job and nothing else, so a brief written for a
       // headless Claude worker reaches Codex naming subagents, an Anthropic
@@ -10953,6 +11388,7 @@ function drainBgHandoff() {
           lint.length
             ? `\n⚠️ Codex will adapt these steps:\n${lint.map((l) => `  • ${l}`).join('\n')}`
             : '',
+          { adopt: codexAdopt },
         ).catch(() => {});
       } catch (e) {
         console.error('[bridge] codex handoff notice failed (the job was already dispatched):', e.message);
@@ -10986,8 +11422,15 @@ function drainBgHandoff() {
     // not hold back an ordinary job behind it, and ordinary jobs cannot starve
     // it either.
     const itemMax = typeof it === 'object' && it ? it.maxRunning : null;
-    if (!hasSlot({ running, max: MAX_CONCURRENT_WORKERS, engine: 'claude', bypass, itemMax, pacedRunning })) {
+    // AND THE MACHINE AND THE ACCOUNT (self audit 2026-10-13, P2): the same
+    // verdict also holds a job while the load is over its limit or the live
+    // account is past the usage gate with nowhere to switch, and a retry the
+    // bridge queued until its reset. One verdict, one reason, which `bg.mjs ps`
+    // and the job's own line both show (admissionVerdict).
+    const verdict = verdictFor('claude', it, bypass, itemMax);
+    if (!verdict.admit) {
       deferred.push(typeof it === 'object' && it ? it : { text: queuedText });
+      waiting.push({ it, verdict, engine: 'claude' });
       continue;
     }
     // The lane is resolved BEFORE the send so the notice can name the worker
@@ -11020,7 +11463,7 @@ function drainBgHandoff() {
     // the drop box is a file any worker can write.
     const schedule =
       typeof it === 'object' && it?.scheduleId != null
-        ? { id: it.scheduleId, allowWrite: it.allowWrite === true && scheduleApprovesWrites(it.scheduleId) }
+        ? { id: it.scheduleId, executionId: it.executionId || null, allowWrite: it.allowWrite === true && scheduleApprovesWrites(it.scheduleId, it.executionId) && writeGrants.verify(it.writeGrant, it.scheduleId, it) }
         : null;
     // ONLY A DECLARED directory (`--repo` / `--cwd`, which bg.mjs proved exists)
     // moves a Claude worker; otherwise it keeps the chat cwd as it always has.
@@ -11038,7 +11481,10 @@ function drainBgHandoff() {
     // A resume carries the model decision of the death it resumes (startModel).
     const carriedModel = typeof it === 'object' && it ? it.carriedModel ?? null : null;
     dispatchPrompt(pinnedClaude ? `claude: ${text}` : text, lane, { priority: true, schedule, cwd, prepend: itemPrepend, carriedModel }); // a declared job directory survives on either engine
+    // A refused approval is said, not silent (the Codex branch above says why).
+    if (schedule && it.allowWrite === true && !schedule.allowWrite) console.log(`[bridge] job for schedule #${it.scheduleId} runs WITHOUT write approval: the entry no longer approves it, or its write grant is missing, already used or does not match the item`);
     running++; // this worker is live from here on, so the next item sees a fuller pool
+    bridgeRunning++; // and a fuller machine
     if (typeof it === 'object' && it?.resumeOf) pacedRunning++; // and a resume counts toward the next resume's pace
     // THE WALL GUARD'S DISPATCH RECORD, the drop box half: the directory pin
     // and, for a job the guard itself resumed, its place in the resume chain
@@ -11049,6 +11495,9 @@ function drainBgHandoff() {
     } catch (e) {
       console.error('[bridge] wall guard dispatch record failed (the job was already dispatched):', e.message);
     }
+    // The waiting line this job put up, if it waited: its card takes it over,
+    // so a queued job is one message from queued to done.
+    const adopt = takeBgWaiting(it);
     try {
       // runClaude sets lane.current synchronously, so the id exists by now. If
       // it somehow does not, handoffNotice falls back to the lane name.
@@ -11076,7 +11525,11 @@ function drainBgHandoff() {
           queued,
           // The same two values runClaude puts in argv, so the card cannot
           // claim a model the worker is not on.
-          ...claudeCardSettings(),
+          // The pool's pin, not the chat lane's /model: the same two values
+          // runClaude puts in argv, so the card cannot claim a model the
+          // worker is not on.
+          model: BG_MODEL || 'default',
+          effort: DEFAULT_EFFORT || 'default',
         },
         // Read through the lane, not a captured `run`: /stop and a restart both
         // replace it, and a stale reference would tick a dead job forever.
@@ -11085,6 +11538,7 @@ function drainBgHandoff() {
         // dereferences null.
         () => (run && lane.current === run ? { elapsedSec: Math.round((Date.now() - run.startedAt) / 1000), steps: run.steps || 0, lastAct: run.lastAct || null } : null),
         waitNote,
+        { adopt },
       ).catch(() => {});
     } catch (e) {
       console.error('[bridge] handoff notice failed (the job was already dispatched):', e.message);
@@ -11095,6 +11549,8 @@ function drainBgHandoff() {
   // one per item. A failure here does not lose them: requeueDeferredBgJobs moves
   // them into bgStrandedJobs and the next drain tries again.
   requeueDeferredBgJobs(deferred);
+  // THEIR WAITING LINES, after the write back: the job is durable first.
+  for (const w of waiting) noteBgWaiting(w.it, w.verdict, { engine: w.engine });
 }
 
 // Does the schedules.json entry with this id carry the user's write approval
@@ -11102,10 +11558,14 @@ function drainBgHandoff() {
 // of trusting the flag on a queued job, so a forged or stale job cannot carry
 // an approval that was never given, and a revocation between queue and start
 // wins. Never throws: no entry, no approval.
-function scheduleApprovesWrites(id) {
+//
+// The drain ALSO asks whether the queued job holds a grant this daemon minted
+// for that same entry (write-grant.mjs, 2026-10-13): the entry alone answers a
+// forged approval, the grant answers a forged id.
+function scheduleApprovesWrites(id, executionId = null) {
   try {
-    const s = loadSchedules().items.find((x) => String(x.id) === String(id));
-    return !!s && s.run === true && s.allowWrite === true;
+    const store = loadSchedules();
+    return writeGrants.approves(id, executionId, store.unreadable ? null : store.items);
   } catch {
     return false;
   }
@@ -11116,7 +11576,7 @@ function loadSchedules() {
   try {
     raw = readFileSync(SCHEDULES_FILE, 'utf8');
   } catch {
-    return { nextId: 0, items: [] }; // no file yet — normal
+    return { nextId: 0, items: [], unreadable: true }; // no file yet — normal
   }
   try {
     const d = JSON.parse(raw);
@@ -11141,7 +11601,7 @@ function loadSchedules() {
       full: `${e.message}\n\nA copy of the unreadable file is at:\n${bak}`,
       hint: 'tap for the error and the backup path',
     });
-    return { nextId: 0, items: [] };
+    return { nextId: 0, items: [], unreadable: true };
   }
 }
 
@@ -11197,14 +11657,18 @@ function queueScheduledRun(s) {
     items = []; // no file, or a half-written one: this job is the queue
   }
   // `allowWrite` only when the entry has it, as the literal true: the drain
-  // re-applies both fields as the scheduled run mark (worker-env.mjs), and
-  // re-reads the approval from schedules.json before it trusts it.
-  items.push({ text: s.text, queuedAt: new Date().toISOString(), scheduleId: s.id, ...(s.allowWrite === true ? { allowWrite: true } : {}) });
+  // re-applies both fields as the scheduled run mark (worker-env.mjs), so the
+  // mark survives the wait exactly as it was when the schedule fired. With it,
+  // the GRANT the drain checks (write-grant.mjs): the drop box is a file any
+  // worker can write, so an approval on an item is worth nothing without one.
+  const item = { text: s.text, queuedAt: new Date().toISOString(), scheduleId: s.id, ...(s.executionId ? { executionId: s.executionId } : {}), ...(s.allowWrite === true ? { allowWrite: true } : {}) };
+  if (s.allowWrite === true) writeGrants.seal(item, `queued-${s.id}-${item.queuedAt}`);
+  items.push(item);
   try {
     const tmp = `${BG_QUEUE_FILE}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(items, null, 2));
     renameSync(tmp, BG_QUEUE_FILE); // atomic, so a concurrent bg.mjs read never sees half of it
-    return true;
+    return item; // truthy, and the caller's waiting line is keyed on it
   } catch (e) {
     console.error('[bridge] could not queue the scheduled job, starting it instead:', e.message);
     return false;
@@ -11234,6 +11698,7 @@ function checkSchedules() {
       due = true;
     }
     if (due) {
+      if (s.run === true && s.allowWrite === true) s.executionId = writeGrants.fire(s);
       changed = true;
       // A SCHEDULED ACCOUNT SWITCH (schedule.mjs --switch-account): through the
       // one switch path, which checks the target and sends the one message.
@@ -11274,29 +11739,30 @@ function checkSchedules() {
         } catch {
           /* the settled view is decoration; 'claude' is the capped case, so the cap holds */
         }
-        if (
-          !hasSlot({ running: runningBgWorkers(), max: MAX_CONCURRENT_WORKERS, engine: schedEngine }) &&
-          queueScheduledRun(s)
-        ) {
+        // THE SAME VERDICT the drain gives (admissionVerdict): the count, and
+        // since 2026-10-13 the machine load and the usage window too (P2). A
+        // schedule has no bypass: nobody is at the keyboard at 03:00.
+        const schedRunning = runningBgWorkers();
+        const adm = admissionNow();
+        const schedVerdict = admissionVerdict({
+          engine: schedEngine,
+          now: adm.now,
+          running: schedRunning,
+          max: MAX_CONCURRENT_WORKERS,
+          load: adm.load ? loadGate({ ...adm.load, bridgeRunning: bridgeJobsRunning(schedRunning) }) : null,
+          usage: adm.usage,
+          fmtClock: adm.fmtClock,
+        });
+        const queuedItem = !schedVerdict.admit ? queueScheduledRun(s) : null;
+        if (queuedItem) {
           // QUEUED, then the notice, the same order as a dispatch: the job is
           // already durable before anything composes a message about it.
           //
-          // A static line, not a live one. This job's start has its own worker
-          // card from the drain, so a ⏳ here would be a second bubble waiting
-          // on an event that resolves somewhere else, which is the shape the
-          // live-message rule calls a line that lies.
-          try {
-            send(
-              [
-                `⏰ #${s.id} · ${describeWhen(s)} · 📥 queued`,
-                briefTitle(stripLaneRules(s.text)),
-                `${runningBgWorkers()} of ${MAX_CONCURRENT_WORKERS} workers busy · it starts when a slot frees`,
-              ].join('\n'),
-              { markdown: false },
-            ).catch(() => {});
-          } catch (e) {
-            console.error('[bridge] scheduled-job queue notice failed (the job is already queued):', e.message);
-          }
+          // THE WAITING LINE, not a static one (2026-10-13): it says why it
+          // waits, and the drain edits THIS message into the job's worker card
+          // when it starts (noteBgWaiting / takeBgWaiting), so its ⏳ resolves
+          // on the same message, through a restart too (bg-wait.mjs).
+          noteBgWaiting(queuedItem, schedVerdict, { engine: schedEngine, scheduleWhen: describeWhen(s) });
           continue;
         }
         // scheduled work must never block chat, and must not be dropped on a
@@ -11310,7 +11776,7 @@ function checkSchedules() {
         // (LEASH_TRIGGER, LEASH_SCHEDULE_ID) and whether the user approved
         // database writes for this entry (LEASH_ALLOW_WRITE), so a hook can tell
         // an unattended run from a worker the user asked for. See worker-env.mjs.
-        dispatchPrompt(s.text, schedLane, { priority: true, schedule: { id: s.id, allowWrite: s.allowWrite === true } });
+        dispatchPrompt(s.text, schedLane, { priority: true, schedule: { id: s.id, executionId: s.executionId || null, allowWrite: s.allowWrite === true } });
         // WHETHER THIS JOB IS EVEN ON CLAUDE. dispatchPrompt re-resolves the
         // engine on every route in, so a bg lane settled to Codex (or a machine
         // with no `claude` at all) sends this job to runCodex and leaves
@@ -11336,7 +11802,7 @@ function checkSchedules() {
             running: bgLanes.filter((l) => l.current || l.queue.length || l.finishing).length,
             // A scheduled job that DID land on a bg lane runs on the pool's pin
             // like every other worker, so it carries it too.
-            ...(onClaudeLane ? claudeCardSettings() : {}),
+            ...(onClaudeLane ? { model: BG_MODEL || 'default', effort: DEFAULT_EFFORT || 'default' } : {}),
           },
           () =>
             schedRun && schedLane.current === schedRun
@@ -13667,11 +14133,15 @@ async function pollLoop() {
         flushParkedWalledJobs(); // and the handed-off jobs that had no account
       }
       drainBgHandoff();
+      await reconcileBgWaiting();
       // THE ACCOUNT SWITCH BEFORE THE LIMIT (autoSwitchTick), then THE USAGE
       // WALL GUARD (wallGuardTick): the switch runs first, so a worker is told
-      // to save a checkpoint only when no account could be switched to. The
-      // guard reads nothing while no Claude worker is running.
-      kickAutoSwitch().then(() => kickWallGuard());
+      // to save a checkpoint only when no account could be switched to. Both
+      // are cheap until the live window is past a threshold.
+      // AND THE ADMISSION GATE's question about the same window: once the live
+      // reading is past the usage gate, is another account free? Asked after
+      // the switch for the same reason, and only then.
+      kickAutoSwitch().then(() => Promise.all([kickWallGuard(), kickAdmission()]));
       // A LIVE ACCOUNT THAT IS ALREADY KNOWN DOWN. Cheap (one ledger read) and
       // on the same slow cadence as the drift check, because the expensive half
       // only runs when it has somewhere to move to.
@@ -13932,6 +14402,10 @@ if (IS_ENTRYPOINT) {
   // draft path and schedule mark to every Codex child it ever ran. First, so
   // nothing below can spawn before it. See worker-env.mjs.
   scrubWorkerEnv(process.env);
+  // And the write grant (write-grant.mjs), which is not a hook contract key and
+  // so lives outside worker-env.mjs, but must never reach a child this daemon
+  // did not mint it for.
+  delete process.env[WRITE_GRANT_ENV];
   process.on('SIGTERM', () => {
     // CHAT LANE ONLY. This used to loop over allLanes() and kill every child,
     // which is the third way a restart took background work down with it, and it

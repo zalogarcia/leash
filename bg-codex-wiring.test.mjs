@@ -108,6 +108,10 @@ const url = (f) => JSON.stringify(pathToFileURL(path.join(DIR, f)).href);
 const HARNESS = `
 const retryCodexOnClaude = () => false;
 const codexWorkerContext = (env) => ({ env, instructions: '' });
+// The per run write grant (write-grant.mjs): none of these jobs is an
+// approved schedule, so the factory is never asked; the name must exist.
+const WRITE_GRANT_ENV = 'LEASH_WRITE_GRANT';
+const writeGrants = { issue: () => null, verify: () => false };
 import { codexWritingPrompt } from ${url('codex-writing.mjs')};
 import fs from 'node:fs';
 import { spawnWorker } from ${url('detached-workers.mjs')};
@@ -2296,8 +2300,17 @@ import fs from 'node:fs';
 import { codexCwdForBrief, codexReasonText, lintCodexBrief, parseEnginePrefix, shouldRouteToCodex, CODEX_LANE } from ${url('bg-codex.mjs')};
 import { briefRepo, briefTitle, handoffNotice, stripLaneRules, workerLine, WORKER_TICK_MS, WORKER_IDLE_MS } from ${url('bg-notify.mjs')};
 import { claudeMissingLine, resolveEngine } from ${url('engine-state.mjs')};
-import { hasSlot, mergeRequeue } from ${url('bg-admission.mjs')};
+import { hasSlot, mergeRequeue, admissionVerdict, loadGate } from ${url('bg-admission.mjs')};
 const { existsSync, readFileSync, writeFileSync, renameSync } = fs;
+// THE ADMISSION GATES (2026-10-13, P2): the real verdict with no load and no
+// usage hold, so this suite's engine choice is unchanged by them.
+// bg-concurrency-wiring.test.mjs owns the gates, the waiting line and the
+// write grant; these are the bindings the extracted drain closes over.
+const admissionNow = () => ({ load: null, usage: null, now: Date.now(), fmtClock: (ms) => String(ms) });
+const bridgeJobsRunning = (n = 0) => Number(n) || 0;
+const noteBgWaiting = () => {};
+const takeBgWaiting = () => null;
+const writeGrants = { issue: () => null, verify: () => false };
 // The live worker line. Real builder, recorded transport: this file is about
 // WHICH ENGINE the drain picks, and the notice rides along so a shape change
 // cannot silently stop the drain from putting one up at all.
@@ -2370,7 +2383,9 @@ const CODEX_MISSING_LINE = 'Codex is not installed';
 // missing them makes the notice throw and eats the notification. Fixed values,
 // because this file is about WHICH ENGINE the drain picks; the card just has to
 // carry the right one's model.
-const claudeCardSettings = () => ({ model: 'opus', effort: 'xhigh' });
+// The worker pool's pin, which the drain's worker card reads.
+const BG_MODEL = 'opus';
+const DEFAULT_EFFORT = 'xhigh';
 const codexCardSettings = () => ({ model: 'gpt-6-astra', effort: 'high' });
 // The REAL resolver over this harness's state: a mirror of engineFor would keep
 // agreeing with itself after engine-state.mjs changed.
@@ -2556,6 +2571,10 @@ const C = await import(
         `
 const retryCodexOnClaude = () => false;
 const codexWorkerContext = (env) => ({ env, instructions: '' });
+// The per run write grant (write-grant.mjs): none of these jobs is an
+// approved schedule, so the factory is never asked; the name must exist.
+const WRITE_GRANT_ENV = 'LEASH_WRITE_GRANT';
+const writeGrants = { issue: () => null, verify: () => false };
 import { codexWritingPrompt } from ${url('codex-writing.mjs')};
 import fs from 'node:fs';
 import { spawnWorker } from ${url('detached-workers.mjs')};
@@ -4407,6 +4426,10 @@ const AS = await import(
         `
 const retryCodexOnClaude = () => false;
 const codexWorkerContext = (env) => ({ env, instructions: '' });
+// The per run write grant (write-grant.mjs): none of these jobs is an
+// approved schedule, so the factory is never asked; the name must exist.
+const WRITE_GRANT_ENV = 'LEASH_WRITE_GRANT';
+const writeGrants = { issue: () => null, verify: () => false };
 import { codexWritingPrompt } from ${url('codex-writing.mjs')};
 import fs from 'node:fs';
 import { spawn as spawnProcess } from 'node:child_process';
@@ -5224,6 +5247,10 @@ const conf = (_key, fallback) => fallback;
 // one of them is its fallback.
 const confBool = (_key, fallback) => Boolean(fallback);
 const codexWorkerContext = (env) => ({ env, instructions: '' });
+// The per run write grant (write-grant.mjs): none of these jobs is an
+// approved schedule, so the factory is never asked; the name must exist.
+const WRITE_GRANT_ENV = 'LEASH_WRITE_GRANT';
+const writeGrants = { issue: () => null, verify: () => false };
 import { codexWritingPrompt } from ${url('codex-writing.mjs')};
 import fs from 'node:fs';
 import { spawn as spawnProcess } from 'node:child_process';

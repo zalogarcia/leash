@@ -80,9 +80,13 @@ const url = (f) => JSON.stringify(pathToFileURL(path.join(DIR, f)).href);
 // dispatch is observable without spawning anything.
 const HARNESS = `
 import fs from 'node:fs';
-import { hasSlot, maxConcurrentWorkers, mergeRequeue, queueRows, queuedBlock } from ${url('bg-admission.mjs')};
+import { hasSlot, maxConcurrentWorkers, mergeRequeue, queueRows, queuedBlock, admissionVerdict, admissionRows, admissionLine, loadGate, usageHold } from ${url('bg-admission.mjs')};
 import { parseEnginePrefix } from ${url('bg-codex.mjs')};
-import { briefTitle, stripLaneRules } from ${url('bg-lane-rules.mjs')};
+import { briefTitle, stripLaneRules, waitingLine } from ${url('bg-notify.mjs')};
+// The admission gates' live half: the REAL waiting line store and the REAL
+// write grant store, on temp files.
+import { createBgWaitStore, waitKey } from ${url('bg-wait.mjs')};
+import { createWriteGrantStore } from ${url('write-grant.mjs')};
 // The REAL due-logic, not a mirror: checkSchedules is under test here as the
 // SECOND path into the cap, and a stub of "is it due yet" would keep agreeing
 // with itself after schedule-due.mjs changed.
@@ -124,7 +128,7 @@ export const finishFakeWorker = () => {
   if (lane) lane.current = null;
   return lane;
 };
-export const resetPool = () => { RESUMED_RUNS.clear(); bgLanes.length = 0; laneSeq = 0; DISPATCHED.length = 0; CODEX.length = 0; HELD.length = 0; SENT.length = 0; RESULTS.length = 0; DISPATCH_OPTS.length = 0; NOTICES.length = 0; SAVED.length = 0; SCHEDULES = { nextId: 1, items: [] }; FAIL_WRITE = false; };
+export const resetPool = () => { RESUMED_RUNS.clear(); bgLanes.length = 0; laneSeq = 0; DISPATCHED.length = 0; CODEX.length = 0; codexRuns.clear(); HELD.length = 0; SENT.length = 0; EDITS.length = 0; RESULTS.length = 0; DISPATCH_OPTS.length = 0; NOTICES.length = 0; SAVED.length = 0; SCHEDULES = { nextId: 1, items: [] }; FAIL_WRITE = false; ADMISSION_INPUT = { load: null, usage: null, now: null }; try { fs.unlinkSync(${JSON.stringify(path.join(TMP, 'bg-wait.json'))}); } catch {} bgWait = createBgWaitStore({ file: ${JSON.stringify(path.join(TMP, 'bg-wait.json'))} }); };
 
 // runningBgWorkers reads this, so the real counter is under test too.
 function bgWorkerDescriptors() {
@@ -147,7 +151,22 @@ const holdBgJob = (item) => { HELD.push(item); return true; };
 const logAccountDecision = () => {};
 const raiseClaudeWall = () => Promise.resolve();
 const armWallResume = () => {};
-const send = (text) => { SENT.push(text); return Promise.resolve(); };
+// A sent message has an id, as Telegram's answer does: the waiting line is
+// found again by it (bg-wait.mjs) and edited into the job's card.
+const send = (text) => { SENT.push(text); return Promise.resolve({ message_id: SENT.length }); };
+export const EDITS = [];
+const editProgress = (id, html) => { EDITS.push({ id, html }); return Promise.resolve(); };
+const escHtml = (t) => String(t);
+// THE ADMISSION INPUTS, driven by the test: the daemon reads the load average
+// and the live account's reading (admissionNow); here they are set directly,
+// and everything that JUDGES them is the real code.
+export let ADMISSION_INPUT = { load: null, usage: null, now: null };
+export const setAdmission = (v = {}) => { ADMISSION_INPUT = { load: null, usage: null, now: null, ...v }; };
+const admissionNow = () => ({ load: ADMISSION_INPUT.load, usage: ADMISSION_INPUT.usage, now: ADMISSION_INPUT.now ?? Date.now(), fmtClock: (ms) => new Date(ms).toISOString().slice(11, 16) });
+export let bgWait = createBgWaitStore({ file: ${JSON.stringify(path.join(TMP, 'bg-wait.json'))} });
+export const writeGrants = createWriteGrantStore({ file: ${JSON.stringify(path.join(TMP, 'write-grants.json'))} });
+// A daemon restart, for the waiting line: the file survives, memory does not.
+export const restartWaitStore = () => { bgWait = createBgWaitStore({ file: ${JSON.stringify(path.join(TMP, 'bg-wait.json'))} }); };
 const recordBgResult = (task, outcome) => { RESULTS.push({ task, outcome }); };
 // THE WALL GUARD'S DISPATCH RECORD: recorded; its use is
 // wall-guard-wiring.test.mjs's subject.
@@ -161,19 +180,21 @@ const noteWallGuardJob = (runId, it) => { WALL_JOBS.push({ runId, cwd: it?.cwd |
 const claudeMissingLine = () => 'no claude';
 const CODEX_MISSING_LINE = 'no codex';
 const startCodexJob = (text, opts) => { CODEX.push({ text, opts }); return { runId: 'codex-' + CODEX.length, transport: 'exec', startedAt: Date.now() }; };
-const codexRuns = new Map();
+export const codexRuns = new Map();
 const briefRepo = () => 'repo';
 const codexCwdForBrief = () => ${JSON.stringify(TMP)};
 const lintCodexBrief = () => [];
 export const NOTICES = [];
-const startWorkerNotice = (runId, head) => { NOTICES.push({ runId, head }); return Promise.resolve(); };
+const startWorkerNotice = (runId, head, read, extra, opts = {}) => { NOTICES.push({ runId, head, adopt: opts.adopt ?? null }); return Promise.resolve(); };
 const codexReasonText = () => '';
 const codexCardSettings = () => ({});
 const chatState = () => ({ cwd: ${JSON.stringify(TMP)} });
 const CODEX_LANE = 'codex';
 const DEFAULT_CWD = ${JSON.stringify(TMP)};
 const OWNER_TZ = 'UTC';
-const claudeCardSettings = () => ({ model: 'opus', effort: 'high' });
+// The worker pool's pin, which the drain's worker card reads.
+const BG_MODEL = 'opus';
+const DEFAULT_EFFORT = 'high';
 export const stranded = () => bgStrandedJobs;
 export const setStranded = (v) => { bgStrandedJobs = v; };
 
@@ -199,12 +220,16 @@ const B = await import(
         grab('runningBgWorkers'),
         grab('runningResumedWorkers'),
         grab('requeueDeferredBgJobs'),
+        grab('BG_WAIT_EDIT_MS', 'const'),
+        grab('bridgeJobsRunning'),
+        grab('noteBgWaiting'),
+        grab('takeBgWaiting'),
         grab('queuedBgJobRows'),
         grab('drainBgHandoff'),
         grab('scheduleApprovesWrites'),
         grab('queueScheduledRun'),
         grab('checkSchedules'),
-        'export { drainBgHandoff, runningBgWorkers, runningResumedWorkers, requeueDeferredBgJobs, queuedBgJobRows, queueScheduledRun, checkSchedules };',
+        'export { drainBgHandoff, runningBgWorkers, runningResumedWorkers, requeueDeferredBgJobs, queuedBgJobRows, queueScheduledRun, checkSchedules, noteBgWaiting, takeBgWaiting, scheduleApprovesWrites };',
       ].join('\n'),
     )
 );
@@ -253,7 +278,12 @@ t('★ the fourth was QUEUED, not refused and not dropped', () => {
 });
 
 t('no refusal reached the chat: the promise is "hand off as many as you like"', () => {
-  eq(B.SENT.length, 0, B.SENT.join(' | '));
+  // Since 2026-10-13 the waiting job gets ONE line saying why it waits (the
+  // admission gates, P2). It is a wait, never a refusal: no ❌, and it says the
+  // job starts by itself.
+  eq(B.SENT.length, 1, B.SENT.join(' | '));
+  ok(!B.SENT[0].includes('❌'), B.SENT[0]);
+  ok(B.SENT[0].includes('⏳ waiting: 3 of 3 Claude workers busy') && B.SENT[0].includes('starts by itself'), B.SENT[0]);
   eq(B.RESULTS.length, 0, 'a deferred job must not be recorded as a failed one');
 });
 
@@ -639,8 +669,12 @@ t('★ the owner is told it is queued, naming the schedule and the reason', () =
   eq(B.SENT.length, 1, B.SENT.join(' | '));
   const lines = B.SENT[0].split('\n');
   eq(lines[0], '⏰ #8 · daily 03:00 · 📥 queued');
-  eq(lines[2], '2 of 2 workers busy · it starts when a slot frees');
-  ok(!B.SENT[0].includes('⏳'), 'a ⏳ with no resolution path here would be a line that lies');
+  eq(lines[1], 'nightly report');
+  // THE WAITING LINE since 2026-10-13: its ⏳ resolves on this same message,
+  // which the drain edits into the job's card when it starts (asserted in the
+  // next tests but one), so it is not a line that lies.
+  eq(lines[2], '⏳ waiting: 2 of 2 Claude workers busy');
+  eq(lines[3], 'starts by itself when that clears · bg.mjs ps');
   eq(B.NOTICES.length, 0, 'no worker card: there is no worker yet');
 });
 
@@ -656,6 +690,9 @@ t('★ a freed slot starts it through the normal drain: deferred, never dropped'
   eq(B.DISPATCHED.length, 1);
   eq(B.DISPATCHED[0], 'nightly report');
   eq(readQueue().length, 0);
+  // ...and its card takes over the waiting line (the message, or the send of
+  // it still in flight), so the ⏳ above resolves on the same message.
+  ok(B.NOTICES.length === 1 && B.NOTICES[0].adopt != null, JSON.stringify(B.NOTICES));
 });
 
 t('★ it QUEUES behind the handoffs already waiting, it does not jump them', () => {
@@ -754,7 +791,7 @@ t('★ the direct path marks the dispatch with the entry id', () => {
   B.setSchedules([schedule({ id: 8 })]);
   B.checkSchedules();
   eq(B.DISPATCHED.length, 1);
-  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 8, allowWrite: false }));
+  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 8, executionId: null, allowWrite: false }));
   eq(B.DISPATCH_OPTS[0].priority, true, 'the scheduled run keeps its priority');
 });
 
@@ -764,7 +801,9 @@ t('★ the direct path carries the write approval when the entry has it', () => 
   writeQueue([]);
   B.setSchedules([schedule({ id: 9, allowWrite: true })]);
   B.checkSchedules();
-  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 9, allowWrite: true }));
+  eq(B.DISPATCH_OPTS[0].schedule.id, 9);
+  eq(B.DISPATCH_OPTS[0].schedule.allowWrite, true);
+  ok(B.DISPATCH_OPTS[0].schedule.executionId, 'approved fire has an execution receipt');
 });
 
 t('only a literal true is approval: a truthy string is not', () => {
@@ -793,7 +832,9 @@ t('★ ...and the drain that starts it later re-applies the mark', () => {
   B.finishFakeWorker();
   B.drainBgHandoff();
   eq(B.DISPATCHED.length, 1);
-  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 23, allowWrite: true }));
+  eq(B.DISPATCH_OPTS[0].schedule.id, 23);
+  eq(B.DISPATCH_OPTS[0].schedule.allowWrite, true);
+  ok(B.DISPATCH_OPTS[0].schedule.executionId, 'queued fire preserves its execution receipt');
 });
 
 t('a queued entry WITHOUT approval stores no allowWrite field at all', () => {
@@ -806,7 +847,7 @@ t('a queued entry WITHOUT approval stores no allowWrite field at all', () => {
   ok(!('allowWrite' in readQueue()[0]), JSON.stringify(readQueue()[0]));
   B.finishFakeWorker();
   B.drainBgHandoff();
-  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 24, allowWrite: false }));
+  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 24, executionId: null, allowWrite: false }));
 });
 
 // The drop box is a file any worker can write, so the approval on a queued job
@@ -817,7 +858,7 @@ t('★ a FORGED queued approval (no such schedule) starts without it', () => {
   B.setSchedules([]);
   writeQueue([{ text: 'apply it', queuedAt: 'x', scheduleId: 'forged', allowWrite: true }]);
   B.drainBgHandoff();
-  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 'forged', allowWrite: false }));
+  eq(JSON.stringify(B.DISPATCH_OPTS[0].schedule), JSON.stringify({ id: 'forged', executionId: null, allowWrite: false }));
 });
 t('★ an approval on the job for an entry that has none starts without it', () => {
   B.resetPool();
@@ -844,7 +885,10 @@ t('a string id from bg.mjs matches the numeric schedule id', () => {
   B.resetPool();
   B.setCap(3);
   B.setSchedules([schedule({ id: 42, allowWrite: true })]);
-  writeQueue([{ text: 'child', queuedAt: 'x', scheduleId: '42', allowWrite: true }]);
+  // bg.mjs carries the grant its parent run was given (write-grant.mjs).
+  const item = { text: 'child', queuedAt: 'x', scheduleId: '42', allowWrite: true };
+  B.writeGrants.seal(item, 'bg-parent');
+  writeQueue([item]);
   B.drainBgHandoff();
   eq(B.DISPATCH_OPTS[0].schedule.allowWrite, true);
 });

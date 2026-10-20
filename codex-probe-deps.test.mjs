@@ -51,4 +51,39 @@ for (const file of ['codex-chat-probe.mjs', 'codex-appserver-probe.mjs']) {
   await assert.rejects(import(`data:text/javascript,${encodeURIComponent(missing)}`), /codexWorkerContext is not defined/);
   passed += 5;
 }
+
+// THE CHAT PROBE'S REAL MODULE, called up to the spawn. Its own slice list is
+// read out of the probe, assembled over a scratch directory with the spawn
+// refused, and runCodex is called: a free identifier on that path fails here,
+// offline, instead of on the probe's first live turn (WRITE_GRANT_ENV,
+// independent review 2026-10-13). The refused spawn is the expected ending.
+{
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const source = readFileSync(path.join(root, 'scripts/probes/codex-chat-probe.mjs'), 'utf8');
+  const template = source.slice(source.indexOf('const HARNESS ='), source.indexOf('\nconst B =')).replace('const HARNESS =', 'return');
+  const tmp = mkdtempSync(path.join(tmpdir(), 'codex-probe-deps-'));
+  try {
+    const harness = new Function('url', 'TMP', 'RUNS', template)(url, tmp, path.join(tmp, 'runs'))
+      .replace(/import \{ spawnWorker \} from [^;]+;/, 'const spawnWorker = () => { throw new Error("OFFLINE SPAWN REFUSED"); };');
+    const open = source.indexOf('[\n        HARNESS,');
+    const close = source.indexOf("].join('\\n'),", open);
+    assert.ok(open > 0 && close > open, 'the probe still assembles its module from a [HARNESS, grab(...)] list');
+    const list = new Function('HARNESS', 'grab', `return ${source.slice(open, close + 1)};`)(harness, grab);
+    const B = await import(`data:text/javascript,${encodeURIComponent(list.join('\n'))}`);
+    const errors = [];
+    const realError = console.error;
+    console.error = (...args) => errors.push(args.join(' ')); // the refused launch is logged; keep the output to the count line
+    try {
+      B.runCodex('probe deps: reach the spawn', {});
+    } finally {
+      console.error = realError;
+    }
+    assert.equal(B.REPORTED.length, 1, 'runCodex reported one outcome');
+    assert.match(B.REPORTED[0].outcome.answer, /OFFLINE SPAWN REFUSED/, 'runCodex reached the spawn');
+    passed += 2;
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
 process.stdout.write(`${passed} passed, 0 failed\n`);
