@@ -122,18 +122,18 @@ billing that has nothing to do with Anthropic. While the pause is in effect:
 
 - a background job handed over with no engine preference runs on **Codex**
   instead of waiting for the reset (a Claude slash command like `/autopilot` is
-  the exception and still waits, because Codex cannot run one);
-- a message you type gets a Codex answer prefixed
-  `[Codex fallback, Claude limited until HH:MM]`, so a walled account is a
-  degraded answer rather than silence;
-- when the wall lifts, the assistant is handed those question and answer pairs as
-  context, with an explicit instruction not to answer them a second time.
+  the exception and still waits, because Codex was not asked for it);
+- a message you type, and a worker report, continue on the Codex chat thread,
+  so a follow up is a follow up;
+- when the wall lifts, the assistant is handed what Codex answered meanwhile as
+  context, with an explicit instruction not to answer it a second time.
 
-The two engines are deliberately isolated from each other: a Codex failure can
-never mark a Claude account limited, swap one, or re-fire anything on Claude.
-The Claude rotation above retries a chat message once on the next account;
-only when every account is walled does it hand that one message to Codex, and
-nothing bounces back. That is what stops a failing job bouncing between them.
+It works the other way too: with Codex missing or walled, a healthy Claude takes
+the Codex work (a `/codex` question or review stays read-only; a background job
+goes through the drop box and its cap). The engines still cannot loop: a Codex
+failure never marks a Claude account limited or swaps one, a takeover is pinned
+to the engine that took it, a write job that may already have acted is never
+replayed, and with both engines walled the work is held until either is back.
 
 `/codex off` disables the automatic half (on-demand `/codex` still works);
 `/codex on` re-enables it; `/account` shows the Codex login, its own two
@@ -141,6 +141,40 @@ rate-limit windows and what it has cost, below the Claude rows. Codex is
 entirely optional: with no binary installed, none of this exists and everything
 above is unchanged. Full grammar in the
 [README](../README.md#codex-second-engine-and-fallback).
+
+### Per model limits: a full Fable week is not a wall
+
+Plans carry per model weekly windows (a Fable week, an Opus week) beside the
+account wide five hour and weekly ones. A full scoped window used to wall the
+whole account, so an account with most of its week left sat unused because one
+model's week was spent. Now:
+
+- each account keeps `modelLimits` per model beside `limitedUntil` (which still
+  means an account wide wall), each with its own reset;
+- the selector, the automatic switch and the rotation judge an account for the
+  model the run will use, and `/account` and `/usage` draw the scoped rows;
+- a refusal scoped to one model records that model's limit, not a wall, when
+  both account wide windows are open;
+- a lane configured for Fable runs on Opus on the same account while that
+  account's Fable week is full, and returns to Fable when it frees, with one
+  line each way. The fallback changes the model, never the account; moving the
+  login stays the rotation's and the automatic switch's job;
+- the live account's model state is written to `~/.claude/state/model-limits.json`
+  (0600): `{ "updatedAt", "active", "models": { "fable": { "blocked": true,
+  "until", "percent" } } }`. An open model is absent; a reset in the past is
+  expired. No credentials.
+
+### Usage from your own sessions
+
+Anthropic's usage lookup answers 429 for up to an hour when many Claude Code
+processes poll it on the same token. Every run the daemon starts reports the
+same windows in its stream after each API response, so the newest reading per
+account is kept (`usage-stream.json`) and `/account`, `/usage` and `/status`
+draw the bars from it while the lookup is refused, marked as a session reading.
+It is filed under an account only with proof: that account's weekly reset,
+learned from its own successful lookups; for accounts that share a weekly reset,
+the five hour window; around a swap, which account the outgoing sessions are
+still on. Every doubtful case is dropped. The rotation's own reads never use it.
 
 ## The sharpest edge: refresh-token rotation
 
@@ -231,4 +265,6 @@ please file an issue with what you find either way.
 | `accounts.backup.json` | one-time pre-existing credential backup | **never** — gitignored, 0600 |
 | `accounts.unclaimed.json` | parked unidentified credentials, if any | **never** — gitignored, 0600 |
 | `accounts.example.json` | the shape, with fake values | yes |
+| `usage-stream.json` | the newest session usage reading per account (no tokens) | **never**, gitignored, 0600 |
+| `~/.claude/state/model-limits.json` | the live account's per model limits, for other tools | outside the repo, 0600 |
 | `accounts.mjs`, `account-usage.mjs`, `account-buttons.mjs`, `credential-store.mjs` | the logic (no secrets) | yes |

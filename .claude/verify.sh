@@ -10,7 +10,7 @@
 #   ./.claude/verify.sh probes-live     the two probes that spawn the real codex and SPEND MONEY
 #   ./.claude/verify.sh --list          what is available
 #
-#   VERIFY_QUICK=1   skip the 45 offline suites, keep the fast gates
+#   VERIFY_QUICK=1   skip the 69 offline suites, keep the fast gates
 #
 # One PASS / FAIL / SKIP line per check. Exit 0 only when nothing FAILed.
 # A check that cannot run where it is run SKIPs and names the real command; it

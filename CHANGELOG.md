@@ -4,6 +4,97 @@ All notable changes to Leash. Dates are release dates.
 
 ## Unreleased
 
+### Admission: the worker cap gains a load check and a usage check
+
+- **One verdict per job.** Besides the Claude worker cap (`maxConcurrentWorkers`), a new Claude job
+  waits while the machine's 1 minute load is over `loadPerCore` x cores (only while a bridge job
+  runs, so load from elsewhere never freezes the queue), and while the live account is past
+  `usagePercent` of a window with no other account free. `admission` in `config.json`:
+  `{ "loadPerCore": 2, "usagePercent": 90 }` when absent, `0` turns one check off. Codex jobs are
+  held by the load only. Queued jobs still start by themselves.
+- **A waiting job says why.** `bg.mjs ps` prints an ADMISSION line and a reason under the QUEUED
+  table, and the chat gets ONE line per waiting job (`⏳ waiting: 3 of 3 Claude workers busy`), which
+  the job's worker card takes over when it starts, through a restart too (`bg-wait.json`).
+- **An approved scheduled run keeps its write approval through a handoff.** A run started by
+  `schedule.mjs ... --run --allow-write` gets a grant minted for that one run (`write-grant.mjs`,
+  ed25519; the record `write-grants.json` is HMAC signed with `write-grants.key`, both 0600 and
+  gitignored). When it hands work to `bg.mjs`, the child carries a signed proof and the drain
+  honours it once, for the same entry and run, while the entry still approves. Setting
+  `LEASH_ALLOW_WRITE=1` by hand gets nothing, as before.
+- **A scheduled run that dies on a usage limit is retried once:** right away after a swap, at the
+  reset when the swap failed, at the lift on a wall. Never twice; its handback says not to relaunch.
+
+### Per model limits, and one owner for every run's start model
+
+- **A full model week blocks only that model.** Anthropic's plans carry per model weekly windows
+  (a Fable week, an Opus week) beside the account wide ones. One full scoped window used to wall the
+  whole account; now each account keeps `modelLimits` per model beside `limitedUntil`, and the
+  selector, the automatic switch and the rotation judge an account for the model the run will use.
+  `/account` and `/usage` draw the scoped rows.
+- **Opus when Fable is out.** A lane configured for Fable runs on Opus, on the same account, while
+  that account's Fable week is full, and comes back to Fable when it frees, with one line each way
+  (`model_fallback` and `model_restored` in the log). Every other lane runs its own model untouched.
+  The fallback changes the model, never the account.
+- **One decision.** `decideRunModel` (`model-limits.mjs`, pure) decides every run's start model and
+  `startModel` is its only caller, from held facts only: no usage request, keychain read or swap in
+  front of a run. A refusal scoped to one model records a model limit instead of an account wall.
+- **The model state is exported** to `~/.claude/state/model-limits.json` (0600, no credentials) for
+  other tools, such as a hook that wants to know a model is out.
+- **Background workers are pinned.** `bgModel` in `config.json` is what every worker runs on
+  (empty: the configured `model`). `/model` steers the chat lane only, and says so.
+
+### Live usage from your own sessions
+
+- **The usage bars survive a throttled lookup.** Every Claude stream the daemon spawns carries a
+  `rate_limit_event`, and from Claude Code 2.1.280 every Claude process polls the usage endpoint on
+  the live token, so on a busy day the lookup answers 429 for up to an hour. The newest reading per
+  account is kept in `usage-stream.json` (gitignored) and drawn by `/account`, `/usage` and `/status`
+  when the lookup is refused, with a provenance line (`stream-usage.mjs`).
+- **Filed by account, carefully.** A reading is filed under an account only with proof (its weekly
+  reset learned from that account's own lookups, the five hour mark for accounts that share a weekly
+  reset, the last swap); every doubtful case is dropped. The wall guard and the automatic switch
+  read the live account's reading only when it is provably that account's.
+
+### Codex and Claude take over for each other
+
+- **Two way takeover.** With every Claude account walled, chat messages, worker reports and jobs
+  continue on a healthy Codex (the chat continues on its Codex thread); with Codex missing or walled,
+  a healthy Claude takes the Codex work (`/codex`, reviews, background jobs). A write job that may
+  have acted is never replayed, a takeover is pinned so it cannot bounce back, and a background
+  takeover goes through the drop box and its cap. Both walled: held, with its directory, its
+  schedule mark and its worker report kept.
+- **Claude slash commands still wait for Claude.** `/autopilot`, `/goal` and friends are never
+  handed to a Codex nobody chose; they wait for the reset, and the notice says so.
+- **Codex replies render like Claude's.** One renderer for every Codex reply and relay, no token
+  count in anything you read, and reply rules sent with every Codex turn (`codex-writing.mjs`):
+  generic by default, replaced by `codexReplyRules` in `config.json`, off with an empty string.
+- **Background Codex jobs get the worker env and a draft report** in their own working directory,
+  removed once read; a failed job's draft is recovered. `codexBackgroundNetwork` (default false)
+  turns network access on for them.
+
+### Worker reports, messages and handoffs
+
+- **A worker report that dies on a session limit is read again once after the swap,** instead of a
+  red "Claude run failed" card under the line that reported the swap. Every account walled holds it
+  for the lift's wake-up; a swap that would not write parks it for the next turn. A rotation leaves a
+  landing record, and a worker the rotation cooldown turned away waits for its ending, so a death
+  behind a rotation that found every account walled is a wall death and is resumed at the lift.
+- **A long or formatted Telegram message runs as text.** Since Bot API 10.1 such a message arrives
+  as `rich_message` with no `text`; it got "Send text, photos, ..." back and nothing ran. It now takes
+  the text path (`rich-message.mjs`), a reply to one quotes its words, a kind nothing reads is saved
+  under `inbox/` and named in one notice, and every inbound message leaves one log line with its id,
+  its kind and a character count, never its content (`inbound.mjs`).
+- **`bg.mjs --repo <name|path>`** (or `--cwd`) states a job's working directory, validated at
+  enqueue: a missing directory is one line of stderr and nothing is queued. A bare name resolves
+  under the workspace (`defaultCwd`). It is what makes several Codex jobs on one repo safe.
+- **`bg.mjs ps <anything>` and a flag-shaped first argument refuse** instead of dispatching a worker
+  whose brief is the typo.
+- **A resumed worker is told which Telegram messages its dead run already sent,** and not to send
+  them again.
+- **Smaller:** `/model haiku` pins `claude-haiku-5-5` (the CLI alias still answered from Haiku 4.5);
+  a captionless photo after the assistant asked for a screenshot is read as the answer; boot drops a
+  stale chat-scoped command list that hid `/account` and `/usage` from the menu.
+
 ### The account switch before the limit
 
 - **The login moves before the limit.** When the live Claude account is at or past 90% of its 5

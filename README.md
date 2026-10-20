@@ -44,16 +44,16 @@ of Node that long-polls the Telegram Bot API and pipes messages into
 | 🔒 **No inbound network** | Long-polls Telegram. No tunnel, no open ports, no webhook, no third-party relay. |
 | 💬 **Persistent sessions** | Ask something today, follow up tomorrow — same conversation. Survives restarts and reboots. |
 | 🗂️ **Named, resumable chats** | `/rename` a conversation, `/chats` to list them, `/resume` to switch back. `/compact` summarizes a long one into a fresh chat. |
-| 🌙 **Background workers** | Long jobs (`/goal`, `/autopilot`, test suites) run in *separate* Claude sessions, in parallel. Hand off as many as you like: none is ever refused, up to 3 Claude workers run at once (`maxConcurrentWorkers`), and the rest start as slots free. |
+| 🌙 **Background workers** | Long jobs (`/goal`, `/autopilot`, test suites) run in *separate* Claude sessions, in parallel. Hand off as many as you like: none is ever refused, up to 3 Claude workers run at once (`maxConcurrentWorkers`), and the rest start as slots free and the machine's load and the usage window allow; a waiting job says why. |
 | ➡️ **Mid-task steering** | Message while a task is running and it goes *into* the running task, exactly like typing mid-turn in Claude Code. |
 | 🎯 **Steer a background worker** | `/steer latest <one more instruction>` writes into a *running* worker, so it keeps the context it has already built. Correcting a job no longer means killing it. |
 | ❓ **Ask one a side question** | `/btw did the migration apply?` puts a question to a *running* worker without changing its job. It answers in one message here, then carries on with its plan untouched. [Details.](#btw-asking-a-worker-a-question-without-changing-its-job) |
 | 🧠 **A second engine, as a peer** | OpenAI Codex, if you have it. `/engine codex` moves a whole lane to it (or `engine` in `config.json`, for an install that never had Claude), a `codex:` prefix pins one message, and switching engines carries a redacted handoff of the conversation across. While every Claude account is rate limited it keeps background work moving instead of stalling. Optional, billed separately. [Details.](#codex-second-engine-and-fallback) |
 | 📊 **Live progress** | Watch tool calls stream in as it works — including subagent activity, indented. |
 | 🎙️ **Voice notes** | Talk instead of typing. Transcribed with OpenAI speech to text (`gpt-4o-mini-transcribe` by default), run as a prompt. |
-| 📎 **Files & photos** | Send a screenshot with "why does this look broken?" — images, PDFs, code, anything ≤20MB. |
+| 📎 **Files & photos** | Send a screenshot with "why does this look broken?": images, PDFs, code, anything ≤20MB. Long or formatted messages are read as plain text. |
 | ⏰ **Reminders & cron** | "Remind me at 8" or "every morning summarize yesterday's commits" — the second one actually runs. |
-| 👤 **Multiple Claude accounts** | Hold a personal *and* a work subscription? Enroll both, see each one's live 5h/weekly headroom, swap with one tap. When the active account is rate limited, Leash swaps to the next one and retries your message, chat and background alike. [Details.](docs/multi-account.md) |
+| 👤 **Multiple Claude accounts** | Hold a personal *and* a work subscription? Enroll both, see each one's live 5h/weekly headroom, swap with one tap. When the active account is rate limited, Leash swaps to the next one and retries your message, chat and background alike; a model's own weekly limit blocks only that model. [Details.](docs/multi-account.md) |
 | 🩺 **Self-healing** | KeepAlive restarts crashes; a two-strike watchdog catches wedges and tells you it did. |
 | 🎛️ **Full CLI access** | Your custom slash commands work. Switch models mid-conversation. Check usage. |
 
@@ -129,6 +129,24 @@ job past the cap when it cannot wait. Workers are
 cleaned up when it drains, so a worker never resumes (or pays for) the context of
 an earlier job. They also get an hour-scale timeout rather than the chat lane's
 30-minute ceiling: the lane exists for work measured in hours.
+
+Two more checks sit beside the cap (`admission` in `config.json`). A new Claude
+job also waits while the machine's 1 minute load is over `loadPerCore` times the
+core count (2 by default, and only while a bridge job is running, so load from
+elsewhere never freezes the queue), and while the live Claude account is past
+`usagePercent` of a usage window with no other account free (90 by default). A
+Codex job waits on the load only. A waiting job says why: `bg.mjs ps` prints an
+`ADMISSION · Claude workers: 2 of 3 busy · load 4 of 28` line and a reason under
+the QUEUED block, and the chat gets one `⏳ waiting: ...` line per job, which the
+job's own worker card takes over when it starts. `0` turns either check off.
+
+`node bg.mjs --repo <name|path> --file ./brief.md` (or `--cwd`) states the job's
+working directory instead of letting the daemon infer it from the brief. A bare
+name resolves under the workspace (`defaultCwd`, else `~/dev`, else home), a path
+is taken as given, and a directory that does not exist is refused with one line
+of stderr before anything is queued. For a Codex job it is also the sandbox write
+root, which is what makes several Codex jobs on one repo safe: give each its own
+worktree.
 
 Jobs can also be handed off from a terminal with `node bg.mjs "<task>"`. For
 anything longer than a line, use `node bg.mjs --file ./brief.md` instead — passing
@@ -464,6 +482,25 @@ login. If an account does end up locked out (say its slot went stale while Leash
 was off for weeks), the fix is always the same and always works: log into
 that account by hand, then `/account capture <name>` it again.
 
+
+**A model's own weekly limit blocks only that model.** Plans carry per model
+weekly windows (a Fable week, an Opus week) beside the account wide five hour
+and weekly ones. A full scoped window used to wall the whole account; now the
+account keeps that model's limit on its own, and the selector, the automatic
+switch and the rotation judge an account for the model the run will use. A lane
+configured for Fable runs on Opus, on the same account, while that account's
+Fable week is full, and returns to Fable when it frees, with one line each way.
+The live account's model state is written to `~/.claude/state/model-limits.json`
+(0600, no credentials) for any tool that wants it. Background workers run on
+`bgModel` (default: the configured `model`); `/model` steers the chat lane only.
+
+**Usage from your own sessions.** Every Claude run the daemon starts reports the
+plan's windows after each API response, so when Anthropic's usage lookup is
+throttled (it answers 429 for up to an hour when many Claude processes poll it),
+`/account`, `/usage` and `/status` draw the bars from the newest session reading
+instead, marked as such. A reading is filed under an account only when it is
+provably that account's (`usage-stream.json`, gitignored).
+
 Full detail — what a swap actually writes, the MCP-token guarantee, the drift
 guard, and every failure mode: [docs/multi-account.md](docs/multi-account.md).
 
@@ -613,8 +650,25 @@ is an *account* limit, not a machine limit, and if you also have OpenAI's
 [Codex CLI](https://github.com/openai/codex) installed, there is a second engine
 sitting right there on separate billing.
 
-**Codex is optional.** Without the binary, every path below answers with one
-line saying it is not installed and nothing else changes.
+**Codex is optional.** Without the binary, a healthy Claude answers what was
+asked of Codex (below); with no Claude free either, the path says so in one
+line. Nothing else changes.
+
+**The two engines take over for each other.** With every Claude account rate
+limited, chat messages, worker reports and background jobs continue on Codex
+(the chat on its Codex thread, so a follow up is a follow up). With Codex missing
+or walled, a healthy Claude takes the Codex work instead: `/codex` questions and
+reviews stay read-only, a background job goes through the drop box and its cap,
+and a write job that may already have acted is never replayed. Both walled: the
+work is held until either is back. Claude slash commands (`/autopilot`, `/goal`,
+...) are the exception: Codex never gets one it was not asked for by name, so
+they wait for Claude's reset and the notice says so.
+
+Codex replies go through the same renderer as Claude's, with no token count in
+anything you read (the usage views keep it), and every Codex turn carries a short
+set of reply rules (lead with the answer, no pasted agent contract headings, code
+fences only for code to copy). `codexReplyRules` in `config.json` replaces them;
+an empty string turns them off.
 
 ```
 /codex <question>                    ask Codex, read-only, in the current directory
@@ -1035,6 +1089,28 @@ node account-usage.test.mjs      # live plan usage per account
 node account-buttons.test.mjs    # the one-tap swap keyboard
 node credential-store.test.mjs   # the keychain / file store behind a swap
 node tg-governor.test.mjs        # the write governor: bucket, cooldown, outbox, ledger
+node stream-usage.test.mjs       # usage readings from the live sessions, and whose they are
+node model-limits.test.mjs       # per model limits and the one start model decision
+node model-limits-wiring.test.mjs  # the model functions against the real store and reader
+node opus-limits.test.mjs        # an Opus wall never blocks the other lanes
+node model-owner.test.mjs        # one owner of the start model, every review case as a behaviour test
+node bg-model-pin.test.mjs       # workers run bgModel, whatever /model says for the chat
+node bg-repo-flag.test.mjs       # bg.mjs --repo / --cwd, the schedule mark and the write grant on a handoff
+node inbound.test.mjs            # one log line per inbound message, and the unknown kinds kept
+node rich-message.test.mjs       # a rich message read back as words
+node rich-message-wiring.test.mjs  # the real handleUpdate: rich and plain text take one path
+node codex-failover.test.mjs     # Claude takes over a Codex run that could not start
+node codex-held-jobs.test.mjs    # jobs held while both engines are walled, released per engine
+node codex-handoff-parity.test.mjs  # the handoff block reaches a Codex turn the same way
+node codex-parity-render.test.mjs   # every Codex reply through the one renderer, no token footer
+node codex-probe-deps.test.mjs   # the chat probe's slice, built and called offline
+node codex-report-recovery.test.mjs # a failed Codex job's draft is recovered, then removed
+node codex-worker-env.test.mjs   # the env and the draft a Codex job gets
+node admission-pure.test.mjs     # the admission checks' pure half: load, usage, the ps line
+node admission-gates.test.mjs    # the real drain at the cap, under load and past the usage threshold
+node admission-review.test.mjs   # retries, Codex survivors in the load, and the ps table's readers
+node security-review.test.mjs    # forged, reused and cross run write grants
+node schedule-approval-retry.test.mjs  # an approved run keeps its approval through bg.mjs; one retry
 
 # probes. One is offline. The other three spawn the REAL codex binary and
 # SPEND TOKENS on your ChatGPT account, so none of them belongs in a gate or a
