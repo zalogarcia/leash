@@ -30,7 +30,8 @@ All notable changes to Leash. Dates are release dates.
   (a Fable week, an Opus week) beside the account wide ones. One full scoped window used to wall the
   whole account; now each account keeps `modelLimits` per model beside `limitedUntil`, and the
   selector, the automatic switch and the rotation judge an account for the model the run will use.
-  `/account` and `/usage` draw the scoped rows.
+  `/account` and `/usage` draw the scoped rows. This needs `model` (and `bgModel`) to name a model:
+  with both empty, as a fresh install has them, every scoped window still counts, as before.
 - **Opus when Fable is out.** A lane configured for Fable runs on Opus, on the same account, while
   that account's Fable week is full, and comes back to Fable when it frees, with one line each way
   (`model_fallback` and `model_restored` in the log). Every other lane runs its own model untouched.

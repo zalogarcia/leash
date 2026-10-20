@@ -363,10 +363,11 @@ export function admissionRows(items, ctx = {}) {
  *   ADMISSION · Claude workers: 6 of 6 busy · load 12 of 28 (14 cores) · usage gate clear
  *
  * Its THIRD whitespace field is never a number, and that is load bearing: the
- * line sits under the worker table, and ~/.claude/scripts/worker-priority.sh
- * reads field 3 of every line after the header as a worker PID. The first
- * shape ("ADMISSION · 1 of 6 ...") handed it PID 1, launchd, whose descendants
- * are every process on the Mac (independent review, 2026-10-13).
+ * line sits under the worker table, and a script that reads field 3 of every
+ * line after the header as a worker PID (to lower its priority, say) is a shape
+ * a user's own tooling takes. The first shape ("ADMISSION · 1 of 6 ...") handed
+ * such a reader PID 1, launchd, whose descendants are every process on the
+ * machine (independent review, 2026-10-13).
  */
 export function admissionLine({ running = 0, max = DEFAULT_MAX_CONCURRENT_WORKERS, load = null, usage = null, fmtClock = defaultClock } = {}) {
   const bits = [`ADMISSION · Claude workers: ${Number(running)} of ${Number(max)} busy`];

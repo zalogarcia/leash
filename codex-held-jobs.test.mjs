@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolveEngine } from './engine-state.mjs';
 import { parseEnginePrefix } from './bg-codex.mjs';
+import { stripLaneRules } from './bg-lane-rules.mjs';
 
 const source = readFileSync(new URL('./bridge.mjs', import.meta.url), 'utf8');
 const extract = (name) => {
@@ -38,6 +39,7 @@ function harness(settings = {}, items = [], queued = []) {
     // gate reads the same two facts the daemon does, sliced from its source.
     unchosenCodex: new Function(`${source.match(/^const unchosenCodex = .*$/m)[0]}\nreturn unchosenCodex;`)(),
     BG_COMMAND_RE: new Function(`${source.match(/^const BG_COMMAND_RE = .*$/m)[0]}\nreturn BG_COMMAND_RE;`)(),
+    stripLaneRules,
   };
   const fn = new Function(...Object.keys(bindings), `${extract('canRunHeldItem')}\n${extract('flushParkedWalledJobs')}\nreturn {flushParkedWalledJobs,canRunHeldItem};`)(...Object.values(bindings));
   return { state, ...fn };

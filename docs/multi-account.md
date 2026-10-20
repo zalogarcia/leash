@@ -129,7 +129,8 @@ billing that has nothing to do with Anthropic. While the pause is in effect:
   context, with an explicit instruction not to answer it a second time.
 
 It works the other way too: with Codex missing or walled, a healthy Claude takes
-the Codex work (a `/codex` question or review stays read-only; a background job
+the Codex work (a `/codex` question or review is handed over with the instruction
+not to change files, which is an instruction and not a sandbox; a background job
 goes through the drop box and its cap). The engines still cannot loop: a Codex
 failure never marks a Claude account limited or swaps one, a takeover is pinned
 to the engine that took it, a write job that may already have acted is never
@@ -147,7 +148,9 @@ above is unchanged. Full grammar in the
 Plans carry per model weekly windows (a Fable week, an Opus week) beside the
 account wide five hour and weekly ones. A full scoped window used to wall the
 whole account, so an account with most of its week left sat unused because one
-model's week was spent. Now:
+model's week was spent. Now, when `model` (and `bgModel`) in `config.json` name a
+model (with both empty the daemon cannot tell which model a run uses, and every
+scoped window counts, as before):
 
 - each account keeps `modelLimits` per model beside `limitedUntil` (which still
   means an account wide wall), each with its own reset;

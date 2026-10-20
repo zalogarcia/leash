@@ -954,7 +954,15 @@ const MAX_CONCURRENT_WORKERS = maxConcurrentWorkers(conf('maxConcurrentWorkers',
 // 2026-10-13, P2): `admission: { loadPerCore, usagePercent }` in config.json,
 // ON with 2 per core and 90 percent when absent. bg-admission.mjs carries the
 // why; admissionNow below is where the daemon reads both.
-const ADMISSION = admissionSettings(conf('admission', undefined));
+// From config.json an object or `false`; from the environment a string, where
+// "false" switches the checks off and JSON text is read as the object (the
+// same reading wallGuardNow gives its block).
+const ADMISSION = admissionSettings(
+  (() => {
+    const v = conf('admission', undefined);
+    return typeof v === 'string' && v.trim().startsWith('{') ? confObj('admission') : v;
+  })(),
+);
 function makeBgLane() {
   bgSeq++;
   const n = bgSeq;
@@ -10676,7 +10684,9 @@ function canRunHeldItem(it) {
   if (decision.error || !decision.engine) return false;
   // A Claude slash command the fallback would hand to Codex is not runnable
   // there (see dispatchPrompt's hold): it waits for Claude.
-  if (decision.engine === 'codex' && unchosenCodex(decision) && BG_COMMAND_RE.test(String(it?.text || '').trimStart())) return false;
+  // Matched on the STRIPPED text: a drop box brief carries the LANE RULES
+  // header in front, and the anchored pattern would never see its first line.
+  if (decision.engine === 'codex' && unchosenCodex(decision) && BG_COMMAND_RE.test(stripLaneRules(String(it?.text || '')).trimStart())) return false;
   return decision.engine === 'codex' ? CODEX_AVAILABLE && !codexWalled() : !claudeWalled();
 }
 
@@ -10792,7 +10802,7 @@ function flushParkedWalledJobs() {
     const text = typeof it === 'string' ? it : it?.text;
     const pre = parseEnginePrefix(text || '');
     const forcedEngine = (typeof it === 'object' && it?.engine) || pre.engine || null;
-    const runnable = text && canRunHeldItem({ heldOnBg: true, forcedEngine });
+    const runnable = text && canRunHeldItem({ heldOnBg: true, forcedEngine, text: pre.text });
     (runnable ? ready : waiting).push(it);
   }
   if (!ready.length) return;
@@ -11386,7 +11396,7 @@ function drainBgHandoff() {
             return { elapsedSec, steps: run.steps || 0, lastAct: run.lastAct || null };
           },
           lint.length
-            ? `\n⚠️ Codex will adapt these steps:\n${lint.map((l) => `  • ${l}`).join('\n')}`
+            ? `\n⚠️ This brief names ${lint.length} thing${lint.length === 1 ? '' : 's'} Codex will handle differently:\n${lint.map((l) => `  • ${l}`).join('\n')}`
             : '',
           { adopt: codexAdopt },
         ).catch(() => {});
@@ -13524,7 +13534,9 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
   // and friends are Claude Code commands, and Codex has no idea what they are
   // unless it was asked for by name, so routing one there would produce
   // confident nonsense.
-  const unchosenSlashCommand = unchosenCodex(decision) && BG_COMMAND_RE.test(text.trimStart());
+  // On the STRIPPED text, as the drain matches it: a handed-off brief carries
+  // the LANE RULES header in front of its first real line.
+  const unchosenSlashCommand = unchosenCodex(decision) && BG_COMMAND_RE.test(stripLaneRules(text).trimStart());
   if (decision.engine === 'codex' && lane.isBg && !unchosenSlashCommand) {
     // rawText = what you typed, so the start notice, /status and the bg-results
     // row are titled by the job. `prompt` = the same thing with the quote in
@@ -13548,9 +13560,15 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
   }
   // A slash command on a machine with no Claude: it will never run, and sitting
   // silently in a lane that cannot start is worse than being told.
-  if (decision.reason === 'claude_missing' && lane.isBg && BG_COMMAND_RE.test(text.trimStart())) {
-    if (item.priority) return 'fallthrough';
-    send(claudeMissingLine(text.trimStart().split(/\s+/)[0]), { markdown: false }).catch(() => {});
+  if (decision.reason === 'claude_missing' && lane.isBg && BG_COMMAND_RE.test(stripLaneRules(text).trimStart())) {
+    // Internal traffic (a drop box job) was already told why by its own notice;
+    // it is refused without a second message rather than spawned at a missing
+    // binary.
+    if (item.priority) {
+      console.error('[bridge] a Claude command with no claude on this machine was not run');
+      return 'refused';
+    }
+    send(claudeMissingLine(stripLaneRules(text).trimStart().split(/\s+/)[0]), { markdown: false }).catch(() => {});
     return 'refused';
   }
   return 'fallthrough';
@@ -13601,7 +13619,7 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
   // makes that true. A slash command the fallback would hand to Codex waits
   // with the rest (startResolvedRun refuses it on an unchosen Codex).
   const pendingDecision = engineForItem(lane, item);
-  const codexWillNotTakeThis = unchosenCodex(pendingDecision) && BG_COMMAND_RE.test(text.trimStart());
+  const codexWillNotTakeThis = unchosenCodex(pendingDecision) && BG_COMMAND_RE.test(stripLaneRules(text).trimStart());
   const holdIt = Boolean(pendingDecision.pausedUntil) &&
     (pendingDecision.engine === 'claude' || codexWalled() || codexWillNotTakeThis);
   if (holdIt) {

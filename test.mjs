@@ -20,6 +20,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as MD from './md-format.mjs';
 import * as PR from './progress-render.mjs';
 import * as UL from './usage-limits.mjs';
+import { admissionSettings } from './bg-admission.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const HOME = homedir();
@@ -426,6 +427,38 @@ await ta('send(): a long markdown text is rendered first, so a fence at the limi
 });
 
 // ---------- report ----------
+// ---------- the admission block from the environment ----------
+// `BRIDGE_<KEY>` overrides any key, and from the environment an object can only
+// arrive as JSON text. The admission block reads that text the way the wall
+// guard's block does; it used to fall back to the defaults in silence.
+t('BRIDGE_ADMISSION as JSON reaches the admission checks, and "false" still turns them off', () => {
+  const grabDecl = (head, end) => {
+    const i = src.indexOf(head);
+    ok(i >= 0, `missing ${head}`);
+    return src.slice(i, src.indexOf(end, i) + end.length);
+  };
+  const body = [
+    grabDecl('function conf(key, fallback = undefined) {', '\n}\n'),
+    grabDecl('function confObj(key) {', '\n}\n'),
+    grabDecl('const ADMISSION = admissionSettings(', '\n);\n'),
+    'return ADMISSION;',
+  ].join('\n');
+  const read = (envValue) => {
+    const was = process.env.BRIDGE_ADMISSION;
+    process.env.BRIDGE_ADMISSION = envValue;
+    try {
+      return new Function('admissionSettings', 'fileConfig', 'console', body)(admissionSettings, {}, { error: () => {} });
+    } finally {
+      if (was === undefined) delete process.env.BRIDGE_ADMISSION;
+      else process.env.BRIDGE_ADMISSION = was;
+    }
+  };
+  const json = read('{"loadPerCore":0,"usagePercent":0}');
+  ok(json.loadPerCore === 0 && json.usagePercent === 0, JSON.stringify(json));
+  const off = read('false');
+  ok(off.loadPerCore === 0 && off.usagePercent === 0, JSON.stringify(off));
+});
+
 console.log(`\n${pass} passed, ${failures.length} failed\n`);
 if (failures.length) {
   for (const f of failures) console.error(`  ✗ ${f}\n`);

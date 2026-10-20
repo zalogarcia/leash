@@ -123,8 +123,9 @@ that some claims cannot be made from a green suite, and the following are the
 ones that have been made anyway.
 
 - **Nothing here has ever run against real Telegram.** No suite imports
-  `bridge.mjs` (verified 2026-10-19: zero `import` or `import()` of it across
-  all 69 suites; the ones that need it read it as TEXT and slice it). Only
+  `bridge.mjs` (verified 2026-10-19: no suite imports it in its own process;
+  `steer-sock.test.mjs` imports it in a child process only to prove the import
+  is inert, and the rest read it as TEXT and slice it). Only
   `bridge.mjs` itself reaches `api.telegram.org`. So no gate in this repo
   exercises the real API: not its rate limiter, not its entity parsing, not its
   message length limits, not its file size limits, not `editMessageText` on a

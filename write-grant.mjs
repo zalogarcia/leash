@@ -1,6 +1,8 @@
 // Daemon authority is authenticated on disk. Workers receive only a per-run
 // signing capability; queues hold a one-use proof bound to the entire child.
-// Deploy only with the accompanying key-access and ledger-write guard patches.
+// A hook that honours LEASH_ALLOW_WRITE can verify the grant through this store,
+// and should keep unattended runs from reading write-grants.key or writing the
+// ledger; this repo ships no such hook.
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { createHash, createHmac, randomBytes, generateKeyPairSync, sign, verify } from 'node:crypto';
 export const GRANT_KEEP_MS = 7 * 24 * 3600_000;

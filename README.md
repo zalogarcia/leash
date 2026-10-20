@@ -483,10 +483,12 @@ was off for weeks), the fix is always the same and always works: log into
 that account by hand, then `/account capture <name>` it again.
 
 
-**A model's own weekly limit blocks only that model.** Plans carry per model
-weekly windows (a Fable week, an Opus week) beside the account wide five hour
-and weekly ones. A full scoped window used to wall the whole account; now the
-account keeps that model's limit on its own, and the selector, the automatic
+**A model's own weekly limit blocks only that model** (when `model`, and
+`bgModel` for the workers, name a model: with both empty the daemon cannot know
+which model a run uses, and counts every scoped window, as before). Plans carry
+per model weekly windows (a Fable week, an Opus week) beside the account wide
+five hour and weekly ones. A full scoped window used to wall the whole account;
+now the account keeps that model's limit on its own, and the selector, the automatic
 switch and the rotation judge an account for the model the run will use. A lane
 configured for Fable runs on Opus, on the same account, while that account's
 Fable week is full, and returns to Fable when it frees, with one line each way.
@@ -657,8 +659,10 @@ line. Nothing else changes.
 **The two engines take over for each other.** With every Claude account rate
 limited, chat messages, worker reports and background jobs continue on Codex
 (the chat on its Codex thread, so a follow up is a follow up). With Codex missing
-or walled, a healthy Claude takes the Codex work instead: `/codex` questions and
-reviews stay read-only, a background job goes through the drop box and its cap,
+or walled, a healthy Claude takes the Codex work instead: a `/codex` question or
+review is handed over with the instruction not to change files (an instruction,
+not a sandbox: Claude runs with this install's own permissions), a background
+job goes through the drop box and its cap,
 and a write job that may already have acted is never replayed. Both walled: the
 work is held until either is back. Claude slash commands (`/autopilot`, `/goal`,
 ...) are the exception: Codex never gets one it was not asked for by name, so

@@ -891,7 +891,7 @@ export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wa
         grab('keepHandback'),
         'const laneModel = () => null;',
         grab('handleChatLimitFailure'),
-        'export { withoutWallWakeNote, dispatchPrompt, drainQueue, startResolvedRun, flushParkedWalledChats, bothEnginesWalledLine, raiseClaudeWall, claudeWallFacts, noEngineForChat, canRunHeldItem, trackQueueAck, resolveQueueAck, QUEUE_MAX, PARKED_WALLED_MAX, raiseWall, settleWall, wallNotices, rotateOffLimitedAccount, chatLimitRetryPlan, handleChatLimitFailure, codexCanTakeChat, codexTakingChat, chatRunFailure, resultEventErrored, handbackLimitPlan, keepHandback, rotationBehindCooldown };',
+        'export { getBgLane, withoutWallWakeNote, dispatchPrompt, drainQueue, startResolvedRun, flushParkedWalledChats, bothEnginesWalledLine, raiseClaudeWall, claudeWallFacts, noEngineForChat, canRunHeldItem, trackQueueAck, resolveQueueAck, QUEUE_MAX, PARKED_WALLED_MAX, raiseWall, settleWall, wallNotices, rotateOffLimitedAccount, chatLimitRetryPlan, handleChatLimitFailure, codexCanTakeChat, codexTakingChat, chatRunFailure, resultEventErrored, handbackLimitPlan, keepHandback, rotationBehindCooldown };',
       ].join('\n'),
     )
 );
@@ -933,6 +933,27 @@ await t('★ a Claude SLASH COMMAND is never routed to Codex, and now it really 
   // said in writing that it would "wait for the reset". It waits now.
   eq(P.CLAUDE.length, 0, 'spawning it here is a guaranteed limit death and a 90s salvage');
   eq(P.parkedWalledChats.length, 1, 'held, and re-dispatched by itself at the reset');
+});
+
+// THE DROP BOX SHAPE (QA of the port, 2026-10-19): a handed-off job reaches
+// dispatchPrompt as priority traffic with the LANE RULES header in front of the
+// command, which an anchored test on the raw text never sees. The drain sends
+// it here exactly like this, so the hold must read the stripped text too.
+const DROPBOX_SLASH = 'LANE RULES (you are a background worker: headless).\n\n--- TASK ---\n/autopilot ship the checkout fix';
+P.reset();
+P.setWall(WALL);
+P.dispatchPrompt(DROPBOX_SLASH, P.getBgLane(), { priority: true });
+
+await t('★ a drop box slash command (LANE RULES in front, priority) is held, not handed to Codex', () => {
+  eq(P.CODEX.length, 0, 'Codex was handed a Claude command with write access');
+  eq(P.CLAUDE.length, 0, 'and it was not spawned into the wall');
+  eq(P.parkedWalledChats.length, 1, 'held for the reset');
+});
+
+await t('★ ...and a held one is not released while only Codex is free, whatever shape it is in', () => {
+  eq(P.canRunHeldItem({ heldOnBg: true, text: DROPBOX_SLASH }), false);
+  eq(P.canRunHeldItem({ heldOnBg: true, text: '/goal ship it' }), false);
+  eq(P.canRunHeldItem({ heldOnBg: true, text: 'LANE RULES\n\n--- TASK ---\nrun the suite' }), true, 'an ordinary brief still runs on Codex');
 });
 
 P.reset();
@@ -2489,7 +2510,7 @@ await t('★ case 26: a Claude-shaped brief handed to Codex is RUN, and the warn
   // model, billed by the token and then improvised around.
   eq(DRAIN.CODEX.length, 1, 'an explicit engine choice must still be honoured');
   const said = DRAIN.SENT.join('\n');
-  ok(/will adapt these steps/.test(said), said);
+  ok(/Codex will handle differently/.test(said), said);
   ok(/qa-agent/.test(said), said);
   ok(/opus/.test(said), said);
 });
