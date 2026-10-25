@@ -37,6 +37,18 @@
 //      next long ban can be traced back to what was sent in the minutes before
 //      it. `/status` shows the last ten minutes.
 //
+//   5. A NETWORK HOLD (2026-10-24). The machine lost its network for three and
+//      a half hours; every send threw `fetch failed`, which is not a 429, so
+//      nothing reached the outbox and four answers were logged as RESULT NOT
+//      DELIVERED and dropped. A caller that meets a network failure on a
+//      message the owner must read hands it to enqueue() with kind 'network'.
+//      While such a hold has messages, a new message queues behind them so the
+//      chat reads in order; the flush never counts a network failure as an
+//      attempt (the message is fine, the wire is not), and a hold of two
+//      minutes or more drains behind one header line. `isNetworkError` is the
+//      one definition of "the wire failed": a numeric code means Telegram
+//      answered, so a 400 keeps its own path.
+//
 // The module owns no network code: `deliver(method, payload)` is injected and
 // so are the clock and the sleep, which is what makes every branch testable
 // in milliseconds. See tg-governor.test.mjs.
@@ -97,7 +109,26 @@ export const DEFAULTS = Object.freeze({
   dropLogEveryMs: 30_000, // one ledger line per method per this for repeated drops; the window still counts every one
   fallbackRetryAfterSec: 5, // a 429 with no retry_after
   noticeEveryMs: 15 * 60_000, // at most one "held until" notice per this, and only when they write
+  netHeaderMinMs: 2 * 60_000, // a network hold at least this old drains behind one header line
+  netLogEveryMs: 60_000, // one ledger row per this while the flush keeps meeting a dead network
 });
+
+// The system error codes of a request that never got an answer. A number in
+// `code` is Telegram's own error_code, so the request arrived: not the network.
+const NETWORK_CODE_RE = /^(?:ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ECONNABORTED|EHOSTUNREACH|ENETUNREACH|ENETDOWN|EPIPE|UND_ERR_[A-Z_]+)$/;
+const NETWORK_TEXT_RE = /fetch failed|socket hang up|getaddrinfo|\b(?:ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ENETDOWN)\b|UND_ERR_/;
+
+/** Did this request fail on the wire, before any server answered it? */
+export function isNetworkError(e) {
+  if (!e || typeof e !== 'object') return false;
+  if (typeof e.code === 'number') return false;
+  if (e.name === 'TimeoutError') return true;
+  for (let x = e, depth = 0; x && typeof x === 'object' && depth < 4; x = x.cause, depth++) {
+    if (typeof x.code === 'string' && NETWORK_CODE_RE.test(x.code)) return true;
+    if (NETWORK_TEXT_RE.test(String(x.message || ''))) return true;
+  }
+  return false;
+}
 
 const MSG_LIMIT = 4000;
 
@@ -159,6 +190,7 @@ export function createGovernor(o) {
     o.fmtTime ||
     ((ts) => new Date(ts).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: o.timeZone }));
   const { outboxFile, throttleFile, ledgerFile } = o;
+  const onDelivered = typeof o.onDelivered === 'function' ? o.onDelivered : null;
   if (!deliver || !outboxFile || !throttleFile || !ledgerFile) {
     throw new Error('createGovernor needs deliver, outboxFile, throttleFile and ledgerFile');
   }
@@ -258,12 +290,17 @@ export function createGovernor(o) {
   let throttledSince = 0; // first 429 of the current episode; cleared when the outbox drains
   let headerSent = false;
   let throttledCount = 0;
+  let netSince = 0; // first message held on a network failure; cleared when the outbox drains
+  let netHeaderSent = false;
+  let lastNetRecordAt = 0;
   function loadOutbox() {
     const j = readJson(outboxFile);
     if (!j) return;
     items = Array.isArray(j.items) ? j.items.filter((i) => i && i.method && i.payload) : [];
     throttledSince = Number(j.throttledSince) || 0;
     headerSent = Boolean(j.headerSent);
+    netSince = items.length ? Number(j.netSince) || 0 : 0;
+    netHeaderSent = Boolean(j.netHeaderSent);
     // The deadline travels with the episode. Without it a reboot mid-wall saw
     // cooldownUntil 0, judged the episode "over", and restarted its clock from
     // whatever `at` the throttle file carried (the last 429, not the first).
@@ -272,7 +309,7 @@ export function createGovernor(o) {
   }
   function persistOutbox() {
     try {
-      writeJsonAtomic(outboxFile, { version: 1, throttledSince, headerSent, cooldownUntil, items });
+      writeJsonAtomic(outboxFile, { version: 1, throttledSince, headerSent, cooldownUntil, netSince, netHeaderSent, items });
     } catch (e) {
       log(`[bridge] tg-outbox.json not written: ${e.message}`);
     }
@@ -287,13 +324,22 @@ export function createGovernor(o) {
     return dropped;
   }
   function enqueue(method, payload, meta = {}) {
+    const network = meta.kind === 'network';
     const item = { id: randomUUID().slice(0, 8), method, payload, at: now(), attempts: 0, kind: meta.kind || null };
+    if (network && !netSince) {
+      netSince = item.at;
+      netHeaderSent = false;
+    }
     items.push(item);
     prune();
     persistOutbox();
-    record({ method, outcome: 'held' });
-    log(`[bridge] telegram throttled, holding ${method} (${items.length} held, ${fmtDuration(remainingMs())} to go)`);
-    return { queued: true, id: item.id, held: items.length, until: cooldownUntil };
+    record(network ? { method, outcome: 'held', reason: 'network' } : { method, outcome: 'held' });
+    log(
+      network
+        ? `[bridge] network error, queued ${method} for the owner (${items.length} held, delivered in order once a send succeeds)`
+        : `[bridge] telegram throttled, holding ${method} (${items.length} held, ${fmtDuration(remainingMs())} to go)`,
+    );
+    return { queued: true, id: item.id, held: items.length, until: cooldownUntil, network };
   }
 
   // ---- ledger ---------------------------------------------------------------
@@ -352,6 +398,10 @@ export function createGovernor(o) {
         ? { action: 'queue', waitMs: 0, governed: true, queueable, disposable, retryAfter }
         : { action: 'drop', waitMs: 0, governed: true, queueable, disposable, retryAfter };
     }
+    // A NETWORK HOLD KEEPS ITS ORDER. Sent past the held messages, the first
+    // answer after the wire came back would land above the ones it waited
+    // behind. Chrome is not held: a typing pulse that lands is a cheap probe.
+    if (queueable && netSince && items.length) return { action: 'queue', waitMs: 0, governed: true, queueable, disposable, reason: 'network' };
     const a = acquire(disposable);
     if (!a.ok) return { action: 'drop', waitMs: a.waitMs, governed: true, queueable, disposable, retryAfter: Math.ceil(a.waitMs / 1000) };
     return { action: 'pass', waitMs: a.waitMs, governed: true, queueable, disposable };
@@ -367,6 +417,10 @@ export function createGovernor(o) {
       `${n} held message${n === 1 ? '' : 's'} follow${n === 1 ? 's' : ''}, oldest first.`
     );
   }
+  function netHeaderText() {
+    const n = items.length;
+    return `📡 ${nameOf()} is back online. ${n} message${n === 1 ? '' : 's'} held since ${fmtTime(netSince)} while the network was down follow${n === 1 ? 's' : ''}, oldest first.`;
+  }
   /** One delivery attempt with the module's own failure policy. */
   async function tryDeliver(method, payload) {
     try {
@@ -374,6 +428,17 @@ export function createGovernor(o) {
       record({ method, outcome: 'sent', via: 'flush' });
       return { ok: true, res };
     } catch (e) {
+      // THE WIRE, NOT THE MESSAGE. Checked first and never counted: during a
+      // long outage the flush meets this every few seconds, and counting it
+      // dropped a held answer after five tries. One ledger row a minute.
+      if (isNetworkError(e)) {
+        const t = now();
+        if (t - lastNetRecordAt >= cfg.netLogEveryMs) {
+          lastNetRecordAt = t;
+          record({ method, outcome: 'error', reason: 'network', via: 'flush' });
+        }
+        return { network: true, error: e?.message || String(e) };
+      }
       if (e?.code === 429) {
         throttle(e.retryAfter, method);
         record({ method, outcome: 'throttled', code: 429, retryAfter: e.retryAfter, via: 'flush' });
@@ -414,6 +479,11 @@ export function createGovernor(o) {
         headerSent = false;
         persistOutbox();
       }
+      if (netSince) {
+        netSince = 0;
+        netHeaderSent = false;
+        persistOutbox();
+      }
       return { delivered: 0, remaining: 0, stopped: 'empty' };
     }
     if (coolingDown()) return { delivered: 0, remaining: items.length, stopped: 'cooldown' };
@@ -424,8 +494,20 @@ export function createGovernor(o) {
       if (throttledSince && !headerSent) {
         const r = await tryDeliver('sendMessage', { chat_id: chatId, text: headerText() });
         if (r.throttled) return { delivered, remaining: items.length, stopped: 'throttled' };
+        if (r.network) return { delivered, remaining: items.length, stopped: 'network' };
         if (r.ok) {
           headerSent = true;
+          persistOutbox();
+          await sleep(cfg.flushGapMs);
+        }
+      } else if (netSince && !netHeaderSent && now() - netSince >= cfg.netHeaderMinMs) {
+        // A hold long enough that its first answer reads as stale without a
+        // word of why. A 429 episode has its own header, which covers both.
+        const r = await tryDeliver('sendMessage', { chat_id: chatId, text: netHeaderText() });
+        if (r.throttled) return { delivered, remaining: items.length, stopped: 'throttled' };
+        if (r.network) return { delivered, remaining: items.length, stopped: 'network' };
+        if (r.ok) {
+          netHeaderSent = true;
           persistOutbox();
           await sleep(cfg.flushGapMs);
         }
@@ -439,6 +521,11 @@ export function createGovernor(o) {
         const r = await tryDeliver(item.method, item.payload);
         if (r.throttled) {
           stopped = 'throttled';
+          break;
+        }
+        if (r.network) {
+          // Not an attempt: the item stays first, untouched, for the next flush.
+          stopped = 'network';
           break;
         }
         if (r.retry) {
@@ -455,7 +542,14 @@ export function createGovernor(o) {
           break;
         }
         items.shift();
-        if (r.ok) delivered++;
+        if (r.ok) {
+          delivered++;
+          try {
+            onDelivered?.({ ...item });
+          } catch (e) {
+            log(`[bridge] telegram outbox onDelivered failed: ${e.message}`);
+          }
+        }
         persistOutbox();
         if (items.length) await sleep(cfg.flushGapMs);
       }
@@ -463,6 +557,8 @@ export function createGovernor(o) {
         if (delivered) log(`[bridge] telegram outbox flushed: ${delivered} delivered`);
         throttledSince = 0;
         headerSent = false;
+        netSince = 0;
+        netHeaderSent = false;
         persistOutbox();
       }
     } finally {
@@ -499,6 +595,39 @@ export function createGovernor(o) {
     }
   }
 
+  // ---- the wire -------------------------------------------------------------
+  // The caller reports every request's wire outcome (the governor owns no
+  // network code). It is forwarded to `onWire`, so the caller's own outage
+  // tracker sees reads as well as writes, and a success while a network hold
+  // has messages drains the hold NOW instead of at the next flush tick.
+  const onWire = typeof o.onWire === 'function' ? o.onWire : null;
+  const onNetworkHold = typeof o.onNetworkHold === 'function' ? o.onNetworkHold : null;
+  function wireOk(method) {
+    if (netSince && items.length && !flushing) flush().catch((e) => log(`[bridge] telegram outbox flush failed: ${e.message}`));
+    try {
+      onWire?.({ ok: true, method });
+    } catch (e) {
+      log(`[bridge] onWire failed: ${e.message}`);
+    }
+  }
+  function wireFailed(error, method) {
+    try {
+      onWire?.({ ok: false, method, error });
+    } catch (e) {
+      log(`[bridge] onWire failed: ${e.message}`);
+    }
+  }
+  /** A message the owner must read, met by a network failure: held, in order. */
+  function holdForNetwork(method, payload) {
+    const r = enqueue(method, payload, { kind: 'network' });
+    try {
+      onNetworkHold?.({ id: r.id, method, payload });
+    } catch (e) {
+      log(`[bridge] onNetworkHold failed: ${e.message}`);
+    }
+    return r;
+  }
+
   let timer = null;
   function start() {
     if (timer) return;
@@ -530,6 +659,7 @@ export function createGovernor(o) {
       throttledSince,
       throttledCount,
       throttleInfo,
+      netSince,
       tokens: Math.max(0, tokens),
       windowMs: cfg.windowMs,
       counts,
@@ -542,6 +672,7 @@ export function createGovernor(o) {
     if (s.coolingDown) {
       return `📮 Telegram · throttled until ${fmtTime(s.cooldownUntil)} (${fmtDuration(s.remainingMs)} left)${held}`;
     }
+    if (s.held && s.netSince) return `📮 Telegram · ${s.held} held, waiting for the network`;
     if (s.held) return `📮 Telegram · ${s.held} held, delivering`;
     const c = s.counts;
     const sent = (c.typing || 0) + (c.edits || 0) + (c.msgs || 0);
@@ -579,6 +710,12 @@ export function createGovernor(o) {
     remainingMs,
     held: () => items.length,
     items: () => items.map((i) => ({ ...i })),
+    /** The network hold: when it started (0 when none) and how many it holds. */
+    network: () => ({ since: netSince, held: netSince ? items.length : 0 }),
+    holdForNetwork,
+    wireOk,
+    wireFailed,
+    isNetworkError,
     inlineWaitMaxMs: cfg.inlineWaitMaxMs,
     config: cfg,
   };

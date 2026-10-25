@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createGovernor, fmtDuration, stripTags, CHAT_WRITE_METHODS, QUEUEABLE_METHODS } from './tg-governor.mjs';
+import { createGovernor, fmtDuration, isNetworkError, stripTags, CHAT_WRITE_METHODS, QUEUEABLE_METHODS } from './tg-governor.mjs';
 
 let pass = 0;
 const failures = [];
@@ -253,15 +253,18 @@ t('an HTML item Telegram cannot parse is re-sent plain; a plain 400 is dropped a
   r.cleanup();
 });
 
-t('a network error keeps the item and retries on later flushes, up to maxAttempts', async () => {
+// Until 2026-10-24 this case was `fetch failed`, and the drop after five tries
+// was the bug: a three hour outage met it every five seconds. A server error
+// keeps the cap; a network failure never counts (the network section below).
+t('a server error (5xx) keeps the item and retries on later flushes, up to maxAttempts', async () => {
   const r = rig();
   r.gov.throttle(1, 'sendMessage');
   r.gov.enqueue('sendMessage', msg('flaky'));
   r.tick(3000);
-  // header ok, then the item fails with no HTTP code five times.
+  // header ok, then the item fails with a 502 five times.
   r.script.push(() => ({ message_id: 1 }));
   for (let i = 0; i < 5; i++) r.script.push(() => {
-    throw new Error('fetch failed');
+    throw r.err(502, 0, 'Bad Gateway');
   });
   for (let i = 0; i < 4; i++) {
     const res = await r.gov.flush();
@@ -270,7 +273,7 @@ t('a network error keeps the item and retries on later flushes, up to maxAttempt
   }
   const last = await r.gov.flush();
   assert.equal(last.remaining, 0);
-  assert.ok(r.logs.some((l) => /dropped after 5 attempts: fetch failed/.test(l)), r.logs.join('\n'));
+  assert.ok(r.logs.some((l) => /dropped after 5 attempts: 502 Bad Gateway/.test(l)), r.logs.join('\n'));
   r.cleanup();
 });
 
@@ -503,6 +506,173 @@ t('start() arms an unref timer that flushes; stop() disarms it', async () => {
   r.gov.stop();
   assert.equal(r.gov.held(), 0, 'the timer flushed it');
   assert.ok(r.calls.some((c) => c.payload.text === 'timed'));
+  r.cleanup();
+});
+
+// ---------------------------------------------------------------------------
+// A network outage: the wire is down, the message is fine
+// ---------------------------------------------------------------------------
+
+// What fetch actually throws when the machine is offline: a TypeError whose
+// message is "fetch failed" and whose cause carries the system error code.
+const offline = (code = 'ENOTFOUND') => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error(`getaddrinfo ${code} api.example.org`), { code }) });
+
+t('isNetworkError: transport failures yes, any answer from the server no', () => {
+  assert.equal(isNetworkError(offline()), true, 'fetch failed + ENOTFOUND');
+  assert.equal(isNetworkError(offline('EAI_AGAIN')), true);
+  for (const code of ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET']) {
+    assert.equal(isNetworkError(Object.assign(new Error('x'), { code })), true, code);
+  }
+  assert.equal(isNetworkError(new Error('socket hang up')), true);
+  assert.equal(isNetworkError(Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })), true);
+  // A number is Telegram's own error_code: the request arrived and was answered.
+  const r = rig();
+  assert.equal(isNetworkError(r.err(400, 0, 'Bad Request: can\'t parse entities')), false, '400');
+  assert.equal(isNetworkError(r.err(429, 30)), false, '429');
+  assert.equal(isNetworkError(r.err(502, 0, 'Bad Gateway')), false, '502');
+  assert.equal(isNetworkError(new Error('boom')), false);
+  assert.equal(isNetworkError(null), false);
+  r.cleanup();
+});
+
+t('★ a network failure is never an attempt: the held message survives any number of failed flushes', async () => {
+  const r = rig();
+  r.gov.enqueue('sendMessage', msg('the answer'), { kind: 'network' });
+  for (let i = 0; i < 12; i++) {
+    r.script.push(() => {
+      throw offline();
+    });
+    const res = await r.gov.flush();
+    assert.equal(res.stopped, 'network', `flush ${i}`);
+    r.tick(5_000);
+  }
+  assert.equal(r.gov.held(), 1, 'still held after 12 failed flushes (maxAttempts is 5)');
+  assert.equal(r.gov.items()[0].attempts, 0, 'no attempt was counted');
+  const done = await r.gov.flush();
+  assert.equal(done.delivered, 1);
+  assert.equal(r.gov.held(), 0);
+  assert.equal(r.calls.at(-1).payload.text, 'the answer');
+  r.cleanup();
+});
+
+t('★ order: while a network hold has messages, a new owner message queues behind them; chrome still probes', async () => {
+  const r = rig();
+  r.gov.enqueue('sendMessage', msg('first'), { kind: 'network' });
+  const g = r.gov.gate('sendMessage', msg('second'));
+  assert.equal(g.action, 'queue');
+  assert.equal(g.reason, 'network');
+  r.gov.enqueue('sendMessage', msg('second'), { kind: 'network' });
+  // Typing and edits are not held behind it: one of them landing is how the
+  // daemon learns the wire is back.
+  assert.equal(r.gov.gate('sendChatAction', { chat_id: CHAT, action: 'typing' }).action, 'pass');
+  const res = await r.gov.flush();
+  assert.equal(res.delivered, 2);
+  assert.deepEqual(
+    r.calls.map((c) => c.payload.text),
+    ['first', 'second'],
+  );
+  // The hold is over: the next message passes straight through again.
+  assert.equal(r.gov.gate('sendMessage', msg('third')).action, 'pass');
+  r.cleanup();
+});
+
+t('a 400 is not the network: a held message Telegram refuses is still dropped, as before', async () => {
+  const r = rig();
+  r.gov.enqueue('sendMessage', { chat_id: CHAT, text: 'x', reply_markup: { bogus: true } }, { kind: 'network' });
+  r.script.push(() => {
+    throw r.err(400, 0, 'Bad Request: invalid reply markup');
+  });
+  const res = await r.gov.flush();
+  assert.equal(res.delivered, 0);
+  assert.equal(r.gov.held(), 0, 'dropped');
+  assert.ok(r.logs.some((l) => /dropped, Telegram refused it/.test(l)));
+  r.cleanup();
+});
+
+t('the queue log line says it was queued, and the ledger row says why', () => {
+  const r = rig();
+  r.gov.enqueue('sendMessage', msg('a'), { kind: 'network' });
+  assert.ok(r.logs.some((l) => /network/i.test(l) && /queued/i.test(l)), r.logs.join(' | '));
+  const rows = readFileSync(r.files.ledgerFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.ok(rows.some((row) => row.outcome === 'held' && row.reason === 'network'));
+  r.cleanup();
+});
+
+t('★ a hold of 2 minutes or more drains behind ONE header line; a short one has none', async () => {
+  const long = rig();
+  long.gov.enqueue('sendMessage', msg('held a while'), { kind: 'network' });
+  long.tick(3 * 3600_000 + 35 * 60_000);
+  await long.gov.flush();
+  const texts = long.calls.map((c) => c.payload.text);
+  assert.equal(texts.length, 2);
+  assert.match(texts[0], /back online/i);
+  assert.match(texts[0], /1 message/);
+  assert.doesNotMatch(texts[0], /[\u2013\u2014]/, 'no en or em dash');
+  assert.equal(texts[1], 'held a while');
+  // A second drain later has no header: the episode closed with the outbox.
+  long.gov.enqueue('sendMessage', msg('again'), { kind: 'network' });
+  await long.gov.flush();
+  assert.equal(long.calls.at(-1).payload.text, 'again');
+  assert.equal(long.calls.length, 3, 'no header for a hold of 0s');
+  long.cleanup();
+
+  const short = rig();
+  short.gov.enqueue('sendMessage', msg('blip'), { kind: 'network' });
+  short.tick(30_000);
+  await short.gov.flush();
+  assert.deepEqual(
+    short.calls.map((c) => c.payload.text),
+    ['blip'],
+  );
+  short.cleanup();
+});
+
+t('onDelivered is told about every held message that lands, in order', async () => {
+  const seen = [];
+  const r = rig({ onDelivered: (item) => seen.push(item.payload.text) });
+  r.gov.enqueue('sendMessage', msg('one'), { kind: 'network' });
+  r.gov.enqueue('sendMessage', msg('two'), { kind: 'network' });
+  await r.gov.flush();
+  assert.deepEqual(seen, ['one', 'two']);
+  r.cleanup();
+});
+
+t('the network hold survives a restart: its start and its messages come back from the outbox', async () => {
+  const r = rig();
+  r.gov.enqueue('sendMessage', msg('kept'), { kind: 'network' });
+  const since = r.gov.network().since;
+  assert.ok(since > 0);
+  const again = r.make();
+  assert.equal(again.held(), 1);
+  assert.equal(again.network().since, since);
+  assert.equal(again.gate('sendMessage', msg('next')).action, 'queue', 'still held behind after the restart');
+  r.cleanup();
+});
+
+t('the wire hooks: every outcome reaches onWire, a hold reaches onNetworkHold, and a success drains the hold at once', async () => {
+  const wire = [];
+  const holds = [];
+  const r = rig({ onWire: (w) => wire.push(w), onNetworkHold: (h) => holds.push(h) });
+  r.gov.wireFailed(offline(), 'getUpdates');
+  const held = r.gov.holdForNetwork('sendMessage', msg('kept for later'));
+  assert.equal(held.queued, true);
+  assert.equal(held.network, true);
+  assert.deepEqual(holds.map((h) => [h.id, h.payload.text]), [[held.id, 'kept for later']]);
+  assert.equal(r.gov.network().held, 1);
+  r.gov.wireOk('getUpdates');
+  await new Promise((res) => setTimeout(res, 20));
+  assert.equal(r.gov.held(), 0, 'drained by the success, not by a timer');
+  assert.equal(r.calls.at(-1).payload.text, 'kept for later');
+  assert.deepEqual(wire.map((w) => [w.ok, w.method]), [[false, 'getUpdates'], [true, 'getUpdates']]);
+  assert.equal(r.gov.isNetworkError(offline()), true, 'the classifier rides on the instance too');
+  r.cleanup();
+});
+
+t('/status says the messages are waiting for the network', () => {
+  const r = rig();
+  r.gov.enqueue('sendMessage', msg('a'), { kind: 'network' });
+  assert.match(r.gov.statusLine(), /1 held, waiting for the network/);
+  assert.doesNotMatch(r.gov.statusLine(), /[\u2013\u2014]/);
   r.cleanup();
 });
 
