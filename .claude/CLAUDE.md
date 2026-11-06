@@ -31,7 +31,7 @@ no TypeScript, no linter, no formatter. Node is the only requirement.
 daemon against the live bot token, and two consumers of `getUpdates` fight over
 the offset. Every suite that needs it reads it as TEXT and slices the functions
 it wants, then evaluates them with a harness supplying the surrounding globals.
-Verified: zero of the 69 suites import it.
+Verified: zero of the 71 suites import it.
 
 **2. This repo is half of a deliberate pair.** A private sibling holds the
 same daemon with owner specific prose in it. 49 modules are expected to be
@@ -53,7 +53,7 @@ captured. The short version:
 
 ```bash
 node --check bridge.mjs                                   # the entry point parses
-for f in test.mjs *.test.mjs; do node "$f" || echo "FAIL $f"; done   # 69 offline suites
+for f in test.mjs *.test.mjs; do node "$f" || echo "FAIL $f"; done   # 71 offline suites
 ./scripts/check-shared.sh                                 # 49 shared modules identical
 ./install.sh --dry-run                                    # the installer, changing nothing
 ./.claude/verify.sh                                       # all of the above, with one line per check

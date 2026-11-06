@@ -11,16 +11,16 @@ Almost everything provable about it is provable OFFLINE, and the section
 "What this repo cannot prove offline" is the one that matters most: it names
 the surfaces where a green gate is not evidence.
 
-## Commands (each actually run on 2026-10-19, exit codes captured)
+## Commands (each actually run on 2026-11-06, exit codes captured)
 
 There is no package.json, no build step and no bundler. Node is the only
 runtime requirement (verified against node v22.16.0).
 
 - syntax gate (entry point): `node --check bridge.mjs` (exit 0)
-- syntax gate (everything): `for f in *.mjs scripts/probes/*.mjs; do node --check "$f" || echo "FAIL $f"; done` (121 files, 0 failures)
+- syntax gate (everything): `for f in *.mjs scripts/probes/*.mjs; do node --check "$f" || echo "FAIL $f"; done` (124 files, 0 failures)
 - shell syntax gate: `for f in *.sh scripts/*.sh; do bash -n "$f" || echo "FAIL $f"; done` (5 files, 0 failures)
 - offline suites: `for f in test.mjs *.test.mjs; do node "$f" >/dev/null 2>&1 || echo "FAIL $f"; done`
-  (69 suites: `test.mjs` plus 68 `*.test.mjs`. 3534 assertions passed, 0 failed,
+  (71 suites: `test.mjs` plus 70 `*.test.mjs`. 3639 assertions passed, 0 failed,
   summed from each suite's last pass count: most print `N passed, M failed`, and
   `lane-marker.test.mjs`, `detached-workers.test.mjs`, `watchdog.test.mjs` and
   `bg-model-pin.test.mjs` print `N/N`.)
@@ -73,6 +73,7 @@ would actually show it.
 | admission and write grants | `bg-admission.mjs` (`admissionVerdict`, `admissionLine`), `bg-wait.mjs` (the waiting line on disk), `write-grant.mjs`, wired in `bridge.mjs` (`admissionNow`, `kickAdmission`, `noteBgWaiting`, the drain, `checkSchedules`, the `ps` op) and `bg.mjs` (the signed child proof) | `node admission-gates.test.mjs` (the real drain at the cap, under load, past the usage threshold, the waiting line taken over by the card), `node admission-pure.test.mjs`, `node admission-review.test.mjs` (the ps table through a PID reader's and an ENGINE reader's awk programs at every worker count), `node security-review.test.mjs` (forged, reused and cross run grants), `node schedule-approval-retry.test.mjs` (the spawn site, the real `bg.mjs`, the real drain, the one retry). No suite spawns a worker; the live proof is `node bg.mjs ps` printing an `ADMISSION · Claude workers: N of M busy` line on a running daemon. |
 | `bg.mjs` guards: `--repo`, `ps` with arguments, a flag-shaped first argument | `bg.mjs`, the drain's declared cwd in `bridge.mjs` | `node bg-repo-flag.test.mjs` (including config.json's `defaultCwd` as the workspace), `node bg-steer.test.mjs` (the two refusals, against a cold socket). |
 | the offline test suites | `test.mjs` and `*.test.mjs` in the repo root | the command in the Commands section. Run them individually and read each exit code; a wrapper that stops at the first failure hides the rest. Under heavy machine load `bg-codex-wiring.test.mjs` can time out on one interrupt case, and `system-wiring.test.mjs` can miss its 30 ms `pendingMessage` tick case ("expected the clock to advance at least twice"), and both pass on a re-run, so a single failure in either is re-run before it is believed. |
+| schedules: every N hours, script entries, claude-only runs | `schedule.mjs`, `schedule-due.mjs` (shared), `schedule-script.mjs`, wired in `checkSchedules`, `runScheduledScript`, `claudeOnlyJobWaiting`, `tellLongClaudeOnlyHolds` and the hold in `bridge.mjs` | `node schedule-claude-only.test.mjs` drives the REAL `checkSchedules`, drain, hold and flush over temp files, and runs real scripts, with only the process starts stubbed; `node schedule-script.test.mjs`, `node schedule-due.test.mjs` and `node schedule-cli.test.mjs` for the pure halves. None of them is a running daemon: a wall that truly lifts is the live proof. |
 | the background concurrency cap | `bg-admission.mjs` (the decisions), applied in `drainBgHandoff` and `checkSchedules` in `bridge.mjs`, listed by `bg.mjs ps` | `node bg-admission.test.mjs` for the pure decisions (slots, FIFO, the QUEUED block) and `node bg-concurrency-wiring.test.mjs`, which runs the REAL drain and schedule path sliced out of `bridge.mjs` at a real cap against a real temp drop box. Neither spawns a worker, so neither proves the running daemon holds the cap; that needs a live run with more handoffs than `maxConcurrentWorkers` and `bg.mjs ps` showing the QUEUED block. |
 | the public and private split | `scripts/check-shared.sh` | `./scripts/check-shared.sh`, which exits 0 only when all 49 shared modules are byte identical. It finds the sibling repo from this repo's own directory name, or from `BRIDGE_SIBLING_REPO`. Exit 2 means the sibling was not found, which is NOT a pass. `bridge.mjs` is deliberately excluded and must never be added: the two copies diverge by design. |
 | the probes | `scripts/probes/` | see the probe table below. |

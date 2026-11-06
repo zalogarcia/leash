@@ -293,6 +293,27 @@ day it lands on (`list` prints the next one). Messages sent while a lane is busy
 steered into the running task; anything that can't be steered queues (max 5) and
 runs in order.
 
+Two more shapes live in the CLI, not in `/remind`:
+
+```bash
+node schedule.mjs add every 2h 00:05 --script ~/sweep.mjs "text"   # every N hours (1..23)
+node schedule.mjs add every 6h 00:00 --run "text"                  # a run on the same cadence
+node schedule.mjs update <id> --claude-only true|false             # a run that waits for Claude
+```
+
+An `every N hours` entry fires at its `HH:MM` and every N hours after it, the count
+restarting each local day, once per slot. It needs `--script` or `--run`. With
+`--script` the daemon runs the file (node for `.mjs`, `.cjs` and `.js`, otherwise the
+file itself) for up to 2 minutes, and only when it prints something does that output
+reach the chat lane, as a turn the daemon wrote with the entry's text on top. No output
+is one log line and no turn, so a sweep that is usually empty costs nothing.
+
+`--claude-only` marks a `--run` entry whose job needs Claude tools. While every Claude
+account is at its limit an unflagged run goes to Codex; a flagged one waits in the wall's
+hold instead, survives a restart, and fires once however many days it waited. You get one
+line if it waits past 6 hours. With no `claude` on the machine it is refused out loud,
+because no reset ends that.
+
 A `--run` entry's worker is marked as a scheduled, unattended run in its env
 (`LEASH_TRIGGER=schedule`, `LEASH_SCHEDULE_ID=<id>`), on the direct path and when
 it waited in the drop box for a free slot, so a Claude Code hook can tell it from
