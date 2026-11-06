@@ -93,6 +93,7 @@ import {
   accountLedgerBlock,
   LEDGER_NAME_MAX,
   holdFullLine,
+  claudeOnlyHeldLine,
   swapFailedLine,
   needsLoginNotice,
   chatRotatedLine,
@@ -1682,6 +1683,16 @@ t('wall: ★ the hold being full is said out loud, and not with /stop', () => {
   eq(holdFullLine({ max: 5 }), '📥 Holding 5 behind the wall\nThis one was not queued · re-send it');
   ok(!holdFullLine({ max: 5 }).includes('/stop'), 'there is nothing running to stop');
   ok(!holdFullLine({}).includes('undefined'));
+});
+
+t('claudeOnlyHeldLine: the entry and the hold on ONE line, the only builder that is one by design', () => {
+  const line = claudeOnlyHeldLine({ id: 372, hours: 6.9, title: 'Nightly review of old code, the main repo, SILENT RUN unless it finds a real bug' });
+  ok(!line.includes('\n'), line);
+  ok(line.startsWith('⏸ #372 held 6h · Nightly review'), line);
+  ok(line.endsWith('waits for a free Claude account'), line);
+  ok(line.length <= 100, `line of ${line.length}: ${line}`);
+  ok(!/[\u2013\u2014]/.test(line) && !line.includes('⏳'), line);
+  ok(!claudeOnlyHeldLine({}).includes('undefined'));
 });
 
 t('ledger: ★ every ledger and wall-row shape passes the house-style gates', () => {

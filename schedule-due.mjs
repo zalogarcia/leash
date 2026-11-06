@@ -10,6 +10,13 @@
 // the last fire, so an item that already fired today is skipped whatever its
 // cadence.
 //
+// An `every N hours` item is kind "hours" (a kind of its own, so a daemon older
+// than it reads it as a one-off whose `at` is not a number, which never comes
+// due: inert, not wrong). `every` is its whole number of hours, 1 to 23, `at`
+// its phase (HH:MM): it fires at `at` and every `every` hours after it, the
+// count restarting each local day, and `lastFiredAt` is the epoch ms of the
+// slot it last fired for.
+//
 // All date arithmetic runs on local YYYY-MM-DD strings through Date.UTC, never
 // by adding milliseconds to a local Date: on a DST boundary a local day is 23
 // or 25 hours long, and "3 days apart" must stay 3 calendar days, not 2.96.
@@ -67,9 +74,45 @@ export function isDailyDue(item, today, hhmm) {
   return Number.isNaN(gap) ? true : gap >= every;
 }
 
+/** The cadence of an hours item, 1 to 23; 0 for anything that is not one. */
+export function everyHours(item) {
+  const n = Number(item?.every);
+  return item?.kind === 'hours' && Number.isInteger(n) && n >= 1 && n <= 23 ? n : 0;
+}
+
+/** Epoch ms of the latest slot of an hours item at or before `nowMs`, or NaN.
+ *  The day's first slot is `at` minus whole steps (so 00:05 every 2h and 06:05
+ *  every 2h are the same schedule); before it, yesterday's last slot counts. */
+export function latestHoursSlot(item, nowMs = Date.now()) {
+  const every = everyHours(item);
+  const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(item?.at ?? ''));
+  if (!every || !m) return NaN;
+  const step = every * 60;
+  const first = (Number(m[1]) * 60 + Number(m[2])) % step;
+  const now = new Date(nowMs);
+  const minute = now.getHours() * 60 + now.getMinutes();
+  if (minute >= first) {
+    const slot = first + Math.floor((minute - first) / step) * step;
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, slot).getTime();
+  }
+  const last = first + Math.floor((1439 - first) / step) * step;
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 0, last).getTime();
+}
+
+/** Is this hours item due at `nowMs`? Its latest slot has come and it has not
+ *  fired for that slot. A missing or broken lastFiredAt fires once, then is
+ *  rewritten with a good one. */
+export function isHoursDue(item, nowMs = Date.now()) {
+  const slot = latestHoursSlot(item, nowMs);
+  if (Number.isNaN(slot)) return false;
+  const last = Number(item.lastFiredAt);
+  return !(Number.isFinite(last) && last >= slot);
+}
+
 /** The label both the daemon and the CLI print for an item. */
 export function describeWhen(item) {
   if (!item) return '';
+  if (item.kind === 'hours') return `every ${everyHours(item) || '?'}h from ${item.at}`;
   if (item.kind === 'daily') {
     const every = everyDays(item);
     return every > 1 ? `every ${every}d ${item.at}` : `daily ${item.at}`;

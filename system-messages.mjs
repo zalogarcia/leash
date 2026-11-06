@@ -1214,6 +1214,18 @@ export function holdFullLine({ max = 5 } = {}) {
 }
 
 /**
+ * A CLAUDE-ONLY SCHEDULE STILL HELD (schedule.mjs --claude-only), said once.
+ *
+ * ONE line by design, so it is longer than LINE_MAX, and no ⏳: nothing edits it
+ * later, and the job's own worker card is what says it started. A wall of hours
+ * is normal, so this is news only past the point where the run may be missed.
+ */
+export function claudeOnlyHeldLine({ id = '?', hours = 0, title = '' } = {}) {
+  const name = clip(oneLine(title), 44);
+  return [`⏸ #${id} held ${Math.floor(Number(hours)) || 0}h`, name, 'waits for a free Claude account'].filter(Boolean).join(' · ');
+}
+
+/**
  * The swap could not happen (ACC-02).
  *
  * Which account they are still on is the fact the old version left out, and it is

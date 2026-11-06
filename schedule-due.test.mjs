@@ -9,7 +9,7 @@
 //
 //   node schedule-due.test.mjs
 
-import { addDays, daysBetween, describeWhen, everyDays, isDailyDue, nextDaily } from './schedule-due.mjs';
+import { addDays, daysBetween, describeWhen, everyDays, everyHours, isDailyDue, isHoursDue, latestHoursSlot, nextDaily } from './schedule-due.mjs';
 
 let pass = 0;
 const failures = [];
@@ -211,6 +211,48 @@ t('anchored on 2026-09-10, every 3d 12:00, fires on the 13th and not before', ()
   const fired = { ...item, lastFired: '2026-09-13' };
   ok(!isDailyDue(fired, '2026-09-15', '12:00'));
   ok(isDailyDue(fired, '2026-09-16', '12:00'));
+});
+
+// ── every N hours (kind "hours") ────────────────────────────────────────
+const at = (y, mo, d, h, mi) => new Date(y, mo - 1, d, h, mi).getTime();
+const hours = (extra = {}) => ({ kind: 'hours', every: 2, at: '00:05', text: 'sweep', ...extra });
+
+t('everyHours reads 1..23 on an hours item and 0 on anything else', () => {
+  eq(everyHours(hours()), 2);
+  eq(everyHours(hours({ every: 1 })), 1);
+  eq(everyHours(hours({ every: 24 })), 0);
+  eq(everyHours(hours({ every: '2' })), 2);
+  eq(everyHours(daily({ every: 2 })), 0, 'a daily with every is days, not hours');
+});
+
+t('the latest slot: the phase is at, then every N hours, restarting each day', () => {
+  eq(latestHoursSlot(hours(), at(2026, 11, 4, 9, 30)), at(2026, 11, 4, 8, 5));
+  eq(latestHoursSlot(hours(), at(2026, 11, 4, 8, 5)), at(2026, 11, 4, 8, 5), 'the slot minute itself counts');
+  eq(latestHoursSlot(hours(), at(2026, 11, 4, 0, 4)), at(2026, 11, 3, 22, 5), 'before the first slot: yesterday\'s last');
+  eq(latestHoursSlot(hours({ at: '06:05' }), at(2026, 11, 4, 9, 30)), at(2026, 11, 4, 8, 5), '06:05 every 2h is the same schedule');
+  eq(latestHoursSlot(hours({ every: 5, at: '01:00' }), at(2026, 11, 4, 23, 59)), at(2026, 11, 4, 21, 0));
+  ok(Number.isNaN(latestHoursSlot(hours({ at: '25:00' }), Date.now())), 'a bad at is NaN');
+  ok(Number.isNaN(latestHoursSlot(daily(), Date.now())), 'a daily has no hours slot');
+});
+
+t('isHoursDue fires once per slot', () => {
+  const now = at(2026, 11, 4, 9, 30);
+  ok(isHoursDue(hours(), now), 'never fired: due');
+  ok(!isHoursDue(hours({ lastFiredAt: at(2026, 11, 4, 8, 5) }), now), 'fired for this slot: not due');
+  ok(isHoursDue(hours({ lastFiredAt: at(2026, 11, 4, 6, 5) }), now), 'fired for the slot before: due');
+  ok(isHoursDue(hours({ lastFiredAt: 'garbage' }), now), 'a broken lastFiredAt fires once');
+  ok(!isHoursDue(daily(), now), 'a daily is never an hours item');
+});
+
+t('describeWhen labels an hours item', () => {
+  eq(describeWhen(hours()), 'every 2h from 00:05');
+});
+
+t('an hours item is inert for a daemon that predates it (its at is not a number)', () => {
+  // The old checkSchedules: not daily, so `Date.now() >= s.at`, which is false
+  // for a string, so it never fires and is never removed.
+  const s = hours();
+  ok(!(s.kind === 'daily') && !(Date.now() >= s.at), 'an old daemon would fire it');
 });
 
 // ---------------------------------------------------------------------------

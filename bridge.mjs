@@ -195,6 +195,7 @@ import {
   enginesBackLine,
   accountLedgerBlock,
   holdFullLine,
+  claudeOnlyHeldLine,
   unreadableMessageNotice,
 } from './system-messages.mjs';
 // Read only, and shelled out to ONLY from the /status arm below. Never on a
@@ -345,7 +346,8 @@ import {
 } from './codex-appserver.mjs';
 import { codexAccountBlock, createCodexAccount, fetchCodexRateLimits, readCodexRuns } from './codex-account.mjs';
 import { normalizeDashes } from './dash-normalize.mjs';
-import { describeWhen, isDailyDue } from './schedule-due.mjs';
+import { describeWhen, isDailyDue, isHoursDue, latestHoursSlot } from './schedule-due.mjs';
+import { scheduledScriptPrompt, scriptCommand, SCRIPT_TIMEOUT_MS } from './schedule-script.mjs';
 import { createWallWake, pickNextAccount } from './wall-wake.mjs';
 // THE USAGE WALL GUARD: the checkpoint steer before an all-accounts wall and the
 // resume of the workers that died on it, after. Both pure and shared; the
@@ -4349,13 +4351,49 @@ function writeHeldBgJobs(items) {
  */
 function holdBgJob(item) {
   const held = readHeldBgJobs();
-  if (held.length >= PARKED_WALLED_JOBS_MAX) return false;
+  // A CLAUDE-ONLY JOB IS PAST THE FENCE: there is at most one per entry
+  // (claudeOnlyJobWaiting), so it cannot grow with the wall, and a job kept out
+  // of this file would wait with no line at 6 hours (tellLongClaudeOnlyHolds).
+  if (held.length >= PARKED_WALLED_JOBS_MAX && item?.claudeOnly !== true) return false;
   try {
     writeHeldBgJobs([...held, item]);
     return true;
   } catch (e) {
     console.error('[bridge] could not write the wall hold, starting the job instead of losing it:', e.message);
     return false;
+  }
+}
+
+// A Claude-only schedule (schedule.mjs --claude-only) held this long gets its one line.
+const CLAUDE_ONLY_HOLD_NOTICE_MS = 6 * 3600_000;
+
+/**
+ * THE ONE LINE FOR A LONG HOLD, from the poll loop, after the flushes: what is
+ * still in the hold file then is still behind the wall.
+ *
+ * Counted from `queuedAt`, the moment the entry came due, and marked on the held
+ * item, so a restart does not say it again (flushParkedWalledJobs takes the mark
+ * off at the release). Marked BEFORE the send: a mark that would not write stays
+ * silent and tries next poll, where the other order says the line every poll for
+ * the length of the wall.
+ *
+ * Through send, not as a chat turn: a wall is when the chat lane may have no
+ * engine to run one.
+ */
+function tellLongClaudeOnlyHolds(now = Date.now()) {
+  const held = readHeldBgJobs();
+  const due = held.filter((it) => it?.claudeOnly === true && !it.holdToldAt && now - Date.parse(it.queuedAt) >= CLAUDE_ONLY_HOLD_NOTICE_MS);
+  if (!due.length) return;
+  for (const it of due) it.holdToldAt = now;
+  try {
+    writeHeldBgJobs(held);
+  } catch (e) {
+    console.error('[bridge] could not mark the long hold, it is told next poll instead:', e.message);
+    return;
+  }
+  for (const it of due) {
+    const hours = (now - Date.parse(it.queuedAt)) / 3600_000;
+    send(claudeOnlyHeldLine({ id: it.scheduleId, hours, title: briefTitle(stripLaneRules(it.text)) }), { markdown: false }).catch(() => {});
   }
 }
 
@@ -10820,7 +10858,14 @@ function flushParkedWalledJobs() {
   } catch {
     queued = []; // no file, or a half-written one: the held items are the queue
   }
-  const merged = [...ready, ...queued];
+  // The long hold's mark stays behind: a write grant signs the whole item, so a
+  // field the hold added would void the approval at the drain.
+  const released = ready.map((it) => {
+    if (!it?.holdToldAt) return it;
+    const { holdToldAt, ...item } = it;
+    return item;
+  });
+  const merged = [...released, ...queued];
   try {
     const tmp = `${BG_QUEUE_FILE}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(merged));
@@ -11231,7 +11276,12 @@ function drainBgHandoff() {
     // config default, then the rate-limit fallback. All of it resolved in one
     // place so the notice and the handback cannot disagree about why the job is
     // where it is.
-    const decision = engineFor('bg', (typeof it === 'object' && it?.engine) || pre.engine || null);
+    const resolved = engineFor('bg', (typeof it === 'object' && it?.engine) || pre.engine || null);
+    // A CLAUDE-ONLY JOB (schedule.mjs --claude-only) never lands on Codex. Its
+    // Claude pin already beats a wall, so what is left is no `claude` on this
+    // machine. No reset ends that, so it is refused out loud rather than held.
+    const claudeOnly = typeof it === 'object' && it?.claudeOnly === true;
+    const decision = claudeOnly && resolved.engine === 'codex' ? { ...resolved, engine: null, error: 'claude_missing' } : resolved;
     // NO ENGINE CAN RUN IT. The queue file was claimed before this loop, so
     // dropping the item here would destroy the brief with no dispatch, no row
     // and no report: the exact failure the "DISPATCH FIRST, then decorate" rule
@@ -11290,6 +11340,13 @@ function drainBgHandoff() {
         // held job edits the first one's message.
         raiseClaudeWall().catch(() => {});
         armWallResume(null);
+        continue;
+      }
+      // A CLAUDE-ONLY JOB STAYS IN THE DROP BOX when the write failed: it is on
+      // disk there and tries the hold again next drain, and starting it would
+      // only park it in memory, out of sight of the once-only check.
+      if (claudeOnly) {
+        deferred.push(it);
         continue;
       }
       // THE HOLD IS FULL, OR THE WRITE FAILED: fall through and start it
@@ -11638,7 +11695,7 @@ const localHHMM = () => new Date().toTimeString().slice(0, 5);
 
 function fmtSchedule(s) {
   if (s.switchAccount) return `#${s.id} · ${describeWhen(s)} · 🔀 switch account · ${clip(oneLine(s.switchAccount), 60)}`;
-  return `#${s.id} · ${describeWhen(s)} · ${s.run ? `🤖 run${s.allowWrite === true ? ' · writes approved' : ''}` : '⏰ remind'} · ${clip(oneLine(s.text), 80)}`;
+  return `#${s.id} · ${describeWhen(s)} · ${s.run ? `🤖 run${s.allowWrite === true ? ' · writes approved' : ''}${s.claudeOnly === true ? ' · claude only' : ''}` : '⏰ remind'} · ${clip(oneLine(s.text), 80)}`;
 }
 
 /**
@@ -11680,7 +11737,9 @@ function queueScheduledRun(s) {
   // mark survives the wait exactly as it was when the schedule fired. With it,
   // the GRANT the drain checks (write-grant.mjs): the drop box is a file any
   // worker can write, so an approval on an item is worth nothing without one.
-  const item = { text: s.text, queuedAt: new Date().toISOString(), scheduleId: s.id, ...(s.executionId ? { executionId: s.executionId } : {}), ...(s.allowWrite === true ? { allowWrite: true } : {}) };
+  // A CLAUDE-ONLY entry's job is PINNED: the pin is what makes the drain hold it
+  // behind a wall, as it holds a resume, rather than send it to Codex.
+  const item = { text: s.text, queuedAt: new Date().toISOString(), scheduleId: s.id, ...(s.claudeOnly === true ? { engine: 'claude', claudeOnly: true } : {}), ...(s.executionId ? { executionId: s.executionId } : {}), ...(s.allowWrite === true ? { allowWrite: true } : {}) };
   if (s.allowWrite === true) writeGrants.seal(item, `queued-${s.id}-${item.queuedAt}`);
   items.push(item);
   try {
@@ -11694,8 +11753,48 @@ function queueScheduledRun(s) {
   }
 }
 
+/**
+ * Is a job of this Claude-only entry still waiting to start? Asked when the entry
+ * comes due, so a wall that lasts days ends in one run, not one per missed day.
+ * `claudeOnly` on the item, not the id alone: a bg.mjs handoff from inside a
+ * scheduled run carries the id of the run that made it.
+ */
+function claudeOnlyJobWaiting(id) {
+  let queued = [];
+  try {
+    const raw = JSON.parse(readFileSync(BG_QUEUE_FILE, 'utf8'));
+    if (Array.isArray(raw)) queued = raw;
+  } catch {
+    queued = []; // no file, or a half-written one
+  }
+  return [...queued, ...readHeldBgJobs(), ...bgStrandedJobs].some((it) => it?.claudeOnly === true && it.scheduleId === id);
+}
+
 // Called from the poll loop (≤~90s granularity). Sleep-tolerant: a time that
 // passed while the Mac slept fires on the next check instead of being lost.
+/** A schedule entry's script: run it, and hand any output to the chat lane as a
+ *  daemon authored turn. Never awaited by the poll loop. */
+function runScheduledScript(s) {
+  const [cmd, args] = scriptCommand(s.script);
+  try {
+    execFile(cmd, args, { timeout: SCRIPT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      const prompt = scheduledScriptPrompt({ item: s, output: stdout, ownerName: OWNER_NAME });
+      if (err && !prompt) {
+        console.error(`[bridge] schedule #${s.id} script ${path.basename(s.script)} failed: ${oneLine(String(stderr || err.message)).slice(0, 200)}`);
+        return;
+      }
+      if (!prompt) {
+        console.log(`[bridge] schedule #${s.id} script ${path.basename(s.script)}: no output, no turn`);
+        return;
+      }
+      console.log(`[bridge] schedule #${s.id} script ${path.basename(s.script)}: ${String(stdout).trim().split('\n').length} line(s) to the chat lane`);
+      dispatchPrompt(prompt, LANES.main, { priority: true });
+    });
+  } catch (e) {
+    console.error(`[bridge] schedule #${s.id} script not started: ${e.message}`);
+  }
+}
+
 function checkSchedules() {
   const store = loadSchedules(); // fresh read — the CLI may have changed it
   if (!store.items.length) return;
@@ -11712,15 +11811,34 @@ function checkSchedules() {
         s.lastFired = today;
         due = true;
       }
+    } else if (s.kind === 'hours') {
+      // EVERY N HOURS (schedule-due.mjs): once per slot. Stamped with the slot,
+      // not the clock, so a late poll does not shift the next one.
+      if (isHoursDue(s, Date.now())) {
+        s.lastFiredAt = latestHoursSlot(s, Date.now());
+        due = true;
+      }
     } else if (Date.now() >= s.at) {
       store.items = store.items.filter((x) => x.id !== s.id);
       due = true;
     }
     if (due) {
-      if (s.run === true && s.allowWrite === true) s.executionId = writeGrants.fire(s);
       changed = true;
+      // STILL WAITING FROM AN EARLIER DAY: this fire folds into that job, and the
+      // stamp above is all that remains of it.
+      if (s.run && s.claudeOnly === true && claudeOnlyJobWaiting(s.id)) {
+        console.log(`[bridge] schedule #${s.id} came due with its job still waiting; it runs once`);
+        continue;
+      }
+      if (s.run === true && s.allowWrite === true) s.executionId = writeGrants.fire(s);
       // A SCHEDULED ACCOUNT SWITCH (schedule.mjs --switch-account): through the
       // one switch path, which checks the target and sends the one message.
+      // A SCRIPT ENTRY (schedule-script.mjs): the script runs; only its output,
+      // when it has any, becomes a chat turn, framed as the daemon's.
+      if (s.script) {
+        runScheduledScript(s);
+        continue;
+      }
       if (s.switchAccount) {
         runScheduledSwitch(s).catch(() => {});
         continue;
@@ -11752,12 +11870,17 @@ function checkSchedules() {
         // in the drop box and nowhere else: the drain starts it the moment a
         // slot frees, `bg.mjs ps` lists it while it waits, and a daemon restart
         // does not lose it because the drop box is a file.
+        // A CLAUDE-ONLY entry (schedule.mjs --claude-only) answers as Claude
+        // whatever the wall or /engine bg says, because Claude is what it runs on.
+        const claudeOnly = s.claudeOnly === true;
         let schedEngine = 'claude';
         let schedReason = null;
         try {
-          const d = engineFor('bg');
-          schedEngine = d.engine || 'claude';
-          schedReason = d.reason || null;
+          if (!claudeOnly) {
+            const d = engineFor('bg');
+            schedEngine = d.engine || 'claude';
+            schedReason = d.reason || null;
+          }
         } catch {
           /* the settled view is decoration; 'claude' is the capped case, so the cap holds */
         }
@@ -11781,6 +11904,11 @@ function checkSchedules() {
           usage: adm.usage,
           fmtClock: adm.fmtClock,
         });
+        // NO ACCOUNT FREE: a Claude-only job goes to the drop box whatever the
+        // verdict, where its pin holds it behind the wall. The wall's own notice
+        // counts it, so it puts up no waiting line of its own. No `claude` at all
+        // takes the same road, to the drain's refusal.
+        if (claudeOnly && claudeWalled() && queueScheduledRun(s)) continue;
         const queuedItem = !schedVerdict.admit || schedSlashWaits ? queueScheduledRun(s) : null;
         if (queuedItem) {
           // QUEUED, then the notice, the same order as a dispatch: the job is
@@ -11810,7 +11938,7 @@ function checkSchedules() {
         // (LEASH_TRIGGER, LEASH_SCHEDULE_ID) and whether the user approved
         // database writes for this entry (LEASH_ALLOW_WRITE), so a hook can tell
         // an unattended run from a worker the user asked for. See worker-env.mjs.
-        dispatchPrompt(s.text, schedLane, { priority: true, schedule: { id: s.id, executionId: s.executionId || null, allowWrite: s.allowWrite === true } });
+        dispatchPrompt(claudeOnly ? `claude: ${s.text}` : s.text, schedLane, { priority: true, schedule: { id: s.id, executionId: s.executionId || null, allowWrite: s.allowWrite === true } });
         // WHETHER THIS JOB IS EVEN ON CLAUDE. dispatchPrompt re-resolves the
         // engine on every route in, so a bg lane settled to Codex (or a machine
         // with no `claude` at all) sends this job to runCodex and leaves
@@ -14177,6 +14305,7 @@ async function pollLoop() {
         flushParkedWalledChats(); // and run what NEITHER engine could take
         flushParkedWalledJobs(); // and the handed-off jobs that had no account
       }
+      tellLongClaudeOnlyHolds();
       drainBgHandoff();
       await reconcileBgWaiting();
       // THE ACCOUNT SWITCH BEFORE THE LIMIT (autoSwitchTick), then THE USAGE

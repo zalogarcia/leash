@@ -7,6 +7,8 @@
 //   node schedule.mjs list
 //   node schedule.mjs add daily 08:00 "text"            # every day
 //   node schedule.mjs add every 3d 12:00 "text"         # every N days, N 2..365
+//   node schedule.mjs add every 2h 00:05 --script ~/x.mjs "text"  # every N hours (1..23); the script's
+//                                                   # output, when it prints any, goes to the chat lane
 //   node schedule.mjs add once 2026-07-30 09:30 "text"  # specific date+time
 //   node schedule.mjs add in 90m "text"                 # relative: m|h|d
 //   node schedule.mjs add daily 03:00 --run --allow-write "text"  # a run approved for db writes
@@ -14,6 +16,7 @@
 //   node schedule.mjs remove <id>
 //   node schedule.mjs update <id> [--at HH:MM|YYYY-MM-DDTHH:MM] [--text "…"] [--run true|false]
 //                                 [--every N] [--anchor YYYY-MM-DD] [--allow-write true|false]
+//                                 [--claude-only true|false]
 //
 // Flags: --run  → execute the text as a Claude task instead of sending a
 //        plain reminder (same as the "run:" prefix in Telegram's /remind).
@@ -34,11 +37,17 @@
 //        is not stored, with --run, and from a background worker or a
 //        scheduled run (the owner's lanes only); refused by the daemon at fire
 //        time, with one message, when the account is walled or needs a login.
+//        --claude-only true|false  → update only, on a --run entry: this run needs
+//        Claude tools, so while every Claude account is at its limit it waits for
+//        one instead of going to Codex, and it fires once however many days it
+//        waited. Read when the entry comes due: a job already waiting keeps
+//        waiting if the flag is turned off.
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { addDays, describeWhen, everyDays, nextDaily } from './schedule-due.mjs';
+import { existsSync } from 'node:fs';
+import { addDays, describeWhen, everyDays, everyHours, latestHoursSlot, nextDaily } from './schedule-due.mjs';
 
 const FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'schedules.json');
 
@@ -68,11 +77,21 @@ const localToday = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
+const runNotes = (s) => {
+  const notes = [s.allowWrite === true ? 'writes approved' : null, s.claudeOnly === true ? 'claude only' : null].filter(Boolean);
+  return notes.length ? ` (${notes.join(', ')})` : '';
+};
 // The cadence is the one thing you cannot read off "every 3d 12:00" alone, so
 // an every-N-days item shows the date it actually lands on next.
 const fmt = (s) => {
   const next = nextDaily(s, localToday());
-  const what = s.switchAccount ? `switch account to ${s.switchAccount}` : s.run ? `run${s.allowWrite === true ? ' (writes approved)' : ''}` : 'remind';
+  const what = s.script
+    ? `script ${path.basename(String(s.script))}, its output to the chat lane`
+    : s.switchAccount
+      ? `switch account to ${s.switchAccount}`
+      : s.run
+        ? `run${runNotes(s)}`
+        : 'remind';
   return `#${s.id} · ${describeWhen(s)}${next ? ` (next ${next})` : ''} · ${what} · ${s.text}`;
 };
 // The owner's approval is a permission, so the confirmation says it in words
@@ -102,8 +121,8 @@ const hasFlag = (name) => argv.includes(`--${name}`);
 // `update` documents below. Treating every flag as value-taking made
 // `add daily 08:00 --run "text"` swallow the text and die with "missing text".
 // `--allow-write` follows the same rule, for the same reason.
-const VALUE_FLAGS = new Set(['at', 'text', 'every', 'anchor', 'switch-account']);
-const BOOL_FLAGS = new Set(['run', 'allow-write']);
+const VALUE_FLAGS = new Set(['at', 'text', 'every', 'anchor', 'switch-account', 'script']);
+const BOOL_FLAGS = new Set(['run', 'allow-write', 'claude-only']);
 
 // THE WRITE APPROVAL IS THE OWNER'S. A background worker or a scheduled run
 // (LEASH_LANE=bg, or LEASH_TRIGGER set, outside tmux) is exactly the run the
@@ -142,9 +161,20 @@ const store = load();
 if (cmd === 'list') {
   console.log(store.items.length ? store.items.map(fmt).join('\n') : 'No schedules.');
 } else if (cmd === 'add') {
+  if (hasFlag('claude-only')) die('--claude-only is set on an entry that exists: add it, then update <id> --claude-only true. Nothing was added.');
   const kind = (positional[1] || '').toLowerCase();
   let item;
-  if (kind === 'daily' || kind === 'every') {
+  if (kind === 'every' && /^\d+h$/i.test(positional[2] || '')) {
+    // EVERY N HOURS: kind "hours" (schedule-due.mjs), so a daemon older than it
+    // never fires it, instead of firing it as something else.
+    const every = Number(positional[2].slice(0, -1));
+    if (!Number.isInteger(every) || every < 1 || every > 23) die('add every <N>h <HH:MM> "text"  (N 1..23)');
+    const at = positional[3];
+    if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(at || '')) die('add every <N>h <HH:MM> "text"');
+    item = { kind: 'hours', every, at: at.padStart(5, '0'), text: positional.slice(4).join(' ') };
+    // The first fire is the NEXT slot, not the one that has already gone by.
+    item.lastFiredAt = latestHoursSlot(item, Date.now());
+  } else if (kind === 'daily' || kind === 'every') {
     // `every` is a daily with a cadence: same kind, same lastFired rules, so
     // nothing that reads the store breaks on it. A daemon older than this
     // feature does not CRASH on `every`, it ignores it and fires the item every
@@ -192,6 +222,24 @@ if (cmd === 'list') {
     item.switchAccount = hit.name;
     if (!item.text) item.text = `switch the Claude account to ${hit.name}`;
   }
+  // A SCRIPT ENTRY (--script <path>): the daemon runs the script when the entry
+  // is due, and only when it prints something does that output reach the chat
+  // lane, as a turn the daemon authored with the entry's text on top; empty
+  // output is one log line. For sweeps that are usually empty. Hours entries
+  // only: an older daemon reads any other kind carrying a script as a plain
+  // reminder and would send the text to the owner on every fire.
+  if (hasFlag('script')) {
+    const raw = String(flag('script') ?? '').trim();
+    if (!raw || raw.startsWith('--')) die('add every <N>h <HH:MM> --script <path> "text"');
+    if (item.kind !== 'hours') die('--script goes with an every <N>h schedule only');
+    if (hasFlag('run') || hasFlag('switch-account') || hasFlag('allow-write')) die('--script does not go with --run, --switch-account or --allow-write');
+    const home = process.env.HOME || '';
+    const full = path.resolve(raw.startsWith('~/') ? path.join(home, raw.slice(2)) : raw);
+    if (!existsSync(full)) die(`--script ${raw}: no such file (${full}); nothing scheduled`);
+    item.script = full;
+  } else if (item.kind === 'hours' && !hasFlag('run')) {
+    die('an every <N>h schedule needs --script <path> or --run: a reminder every few hours is not a schedule anyone wants');
+  }
   if (!item.text) die('missing text');
   if (item.kind === 'once' && item.at <= Date.now())
     die(`${new Date(item.at).toLocaleString()} is in the past — nothing scheduled; give a future date/time`);
@@ -225,7 +273,12 @@ if (cmd === 'list') {
   if (hasFlag('switch-account')) die(`--switch-account is set when an entry is added; to change the target, remove #${id} and add a new one. Nothing was changed.`);
   const at = flag('at');
   if (at) {
-    if (item.kind === 'daily') {
+    if (item.kind === 'hours') {
+      if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(at)) die('hours --at wants HH:MM');
+      item.at = at.padStart(5, '0');
+      // Re-phased: the next fire is the next slot of the new phase.
+      item.lastFiredAt = latestHoursSlot(item, Date.now());
+    } else if (item.kind === 'daily') {
       if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(at)) die('daily --at wants HH:MM');
       item.at = at.padStart(5, '0');
       // For a cadence item lastFired is the ANCHOR, not just a "fired today"
@@ -281,6 +334,7 @@ if (cmd === 'list') {
   // `--run` bare = on (matches `add`); `--run true|false` explicit; `--no-run` off.
   // Never consume the next token unless it's literally true/false, or a flag
   // following --run would be silently read as its value.
+  if (item.script && argv.includes('--run') && flag('run') !== 'false') die('a --script schedule cannot become a --run: the daemon runs the script itself');
   if (item.switchAccount && argv.includes('--run') && flag('run') !== 'false') die('a --switch-account schedule cannot become a --run: the daemon does the switch itself');
   if (argv.includes('--no-run')) delete item.run;
   else if (argv.includes('--run')) {
@@ -301,8 +355,21 @@ if (cmd === 'list') {
       item.allowWrite = true;
     } else die('update <id> --allow-write true|false');
   }
-  // A reminder cannot carry the approval, so turning --run off takes it too.
-  if (!item.run) delete item.allowWrite;
+  // `--claude-only true|false`, read AFTER --run for the same reason. Only those
+  // two values: a typo here would silently decide where a job runs.
+  if (argv.includes('--claude-only')) {
+    const v = flag('claude-only');
+    if (v === 'false') delete item.claudeOnly;
+    else if (v === 'true') {
+      if (!item.run) die('--claude-only needs a --run schedule: only a scheduled run has an engine to pick');
+      item.claudeOnly = true;
+    } else die('update <id> --claude-only true|false');
+  }
+  // A reminder cannot carry the approval or an engine, so turning --run off takes both.
+  if (!item.run) {
+    delete item.allowWrite;
+    delete item.claudeOnly;
+  }
   save(store);
   console.log(`updated ${fmt(item)}${writeNote(item, hadWrite && item.allowWrite !== true)}`);
 } else {

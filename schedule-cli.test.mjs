@@ -490,7 +490,147 @@ t('the usage text documents the flag', () => {
   ok(run('help').out.includes('--switch-account'), 'usage is missing --switch-account');
 });
 
+// ── every N hours with a script (LINEAR-WORK-1104, the work sweep) ─────
+const SCRIPT = path.join(WORK, 'sweep.mjs');
+writeFileSync(SCRIPT, '// a sweep\n');
+
+t('add every 2h --script stores an hours item that fires at the NEXT slot', () => {
+  seed([]);
+  const r = run('add', 'every', '2h', '00:05', '--script', SCRIPT, 'Work sweep: dispatch or explain each');
+  eq(r.code, 0, r.err);
+  const [item] = read().items;
+  eq(item.kind, 'hours');
+  eq(item.every, 2);
+  eq(item.at, '00:05');
+  eq(item.script, SCRIPT);
+  eq(item.text, 'Work sweep: dispatch or explain each');
+  ok(Number.isFinite(item.lastFiredAt) && item.lastFiredAt <= Date.now() && Date.now() - item.lastFiredAt < 2 * 3_600_000, 'lastFiredAt is the slot just gone by');
+  ok(!('run' in item), 'a script entry is not a run');
+});
+
+t('list shows the cadence and the script', () => {
+  const out = run('list').out;
+  ok(out.includes('every 2h from 00:05'), out);
+  ok(out.includes('script sweep.mjs, its output to the chat lane'), out);
+});
+
+t('a script that does not exist is refused, nothing saved', () => {
+  seed([]);
+  const r = run('add', 'every', '2h', '00:05', '--script', path.join(WORK, 'nope.mjs'), 'x');
+  eq(r.code, 1);
+  ok(r.err.includes('no such file'), r.err);
+  eq(read().items.length, 0);
+});
+
+t('--script only goes with an hours schedule (an old daemon would remind the owner with it)', () => {
+  seed([]);
+  const r = run('add', 'daily', '08:00', '--script', SCRIPT, 'x');
+  eq(r.code, 1);
+  ok(r.err.includes('every <N>h schedule only'), r.err);
+  eq(read().items.length, 0);
+});
+
+t('an hours schedule needs --script or --run', () => {
+  seed([]);
+  const r = run('add', 'every', '3h', '09:00', 'remind me');
+  eq(r.code, 1);
+  eq(read().items.length, 0);
+  eq(run('add', 'every', '3h', '09:00', '--run', 'check the queue').code, 0);
+  eq(read().items[0].run, true);
+});
+
+t('every 24h and every 0h are refused', () => {
+  seed([]);
+  eq(run('add', 'every', '24h', '00:05', '--script', SCRIPT, 'x').code, 1);
+  eq(run('add', 'every', '0h', '00:05', '--script', SCRIPT, 'x').code, 1);
+  eq(read().items.length, 0);
+});
+
+t('update --at re-phases an hours item and keeps it an hours item', () => {
+  seed([]);
+  run('add', 'every', '2h', '00:05', '--script', SCRIPT, 'sweep');
+  const id = read().items[0].id;
+  eq(run('update', String(id), '--at', '01:30').code, 0);
+  const item = read().items[0];
+  eq(item.kind, 'hours');
+  eq(item.at, '01:30');
+  ok(typeof item.lastFiredAt === 'number', 'still a slot stamp');
+});
+
+t('a script entry cannot be turned into a --run', () => {
+  seed([]);
+  run('add', 'every', '2h', '00:05', '--script', SCRIPT, 'sweep');
+  const id = read().items[0].id;
+  const r = run('update', String(id), '--run', 'true');
+  eq(r.code, 1);
+  ok(!read().items[0].run, 'unchanged');
+});
+
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+console.log('\nclaude only (a run that waits for Claude through a wall)');
+// ---------------------------------------------------------------------------
+
+seed([{ id: 8, kind: 'daily', at: '03:00', text: 'memory sync', lastFired: today(), run: true }]);
+
+t('update --claude-only true sets it, and the line says so', () => {
+  const r = run('update', '8', '--claude-only', 'true');
+  eq(r.code, 0, r.err);
+  eq(read().items[0].claudeOnly, true);
+  ok(/claude only/.test(r.out), r.out);
+});
+t('list shows it', () => ok(/#8 .*run \(claude only\) · memory sync/.test(run('list').out), run('list').out));
+t('it rides beside a write approval on the same line', () => {
+  eq(run('update', '8', '--allow-write', 'true').code, 0);
+  ok(/run \(writes approved, claude only\)/.test(run('list').out), run('list').out);
+  eq(run('update', '8', '--allow-write', 'false').code, 0);
+});
+t('the value is not taken for text or for another flag', () => {
+  eq(read().items[0].text, 'memory sync');
+  eq(run('update', '8', '--claude-only', 'true', '--text', 'memory sync v2').code, 0);
+  eq(read().items[0].text, 'memory sync v2');
+  eq(read().items[0].claudeOnly, true);
+});
+t('update --claude-only false takes it off, field and all', () => {
+  const r = run('update', '8', '--claude-only', 'false');
+  eq(r.code, 0, r.err);
+  ok(!('claudeOnly' in read().items[0]), 'the field is still there');
+  ok(!/claude only/.test(run('list').out), run('list').out);
+});
+t('an entry that never had it prints as it always did', () => ok(/· run · memory sync v2/.test(run('list').out), run('list').out));
+t('any other value is refused, and nothing changes', () => {
+  for (const args of [['--claude-only', 'yes'], ['--claude-only']]) {
+    const r = run('update', '8', ...args);
+    eq(r.code, 1, args.join(' '));
+    ok(/--claude-only true\|false/.test(r.err), r.err);
+  }
+  ok(!('claudeOnly' in read().items[0]), 'a refused value changed the store');
+});
+t('turning --run off takes the flag with it', () => {
+  eq(run('update', '8', '--claude-only', 'true').code, 0);
+  eq(run('update', '8', '--run', 'false').code, 0);
+  ok(!('claudeOnly' in read().items[0]), 'a reminder carries an engine flag');
+});
+t('a reminder cannot take it: nothing there picks an engine', () => {
+  const r = run('update', '8', '--claude-only', 'true');
+  eq(r.code, 1);
+  ok(/needs a --run schedule/.test(r.err), r.err);
+  ok(!('claudeOnly' in read().items[0]), 'a refused flag changed the store');
+});
+t('add refuses it and adds nothing, rather than dropping the flag in silence', () => {
+  const before = read().items.length;
+  const r = run('add', 'daily', '08:00', '--run', '--claude-only', 'true', 'a job');
+  eq(r.code, 1);
+  ok(/update <id> --claude-only true/.test(r.err), r.err);
+  eq(read().items.length, before);
+});
+t('a background worker may set it: it picks an engine, it grants nothing', () => {
+  seed([{ id: 8, kind: 'daily', at: '03:00', text: 'memory sync', lastFired: today(), run: true }]);
+  const r = runEnv({ LEASH_LANE: 'bg' }, 'update', '8', '--claude-only', 'true');
+  eq(r.code, 0, r.err);
+  eq(read().items[0].claudeOnly, true);
+});
+
 rmSync(WORK, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {
