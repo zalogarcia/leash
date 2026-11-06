@@ -13,6 +13,9 @@ All notable changes to Leash. Dates are release dates.
 - **`schedule.mjs update <id> --claude-only true`** makes a `--run` entry wait through a Claude
   usage wall rather than go to Codex. It fires once however long it waited, says one line past 6
   hours, and is refused with no `claude` on the machine. `list` and `/schedules` show it.
+- **A scheduled run no engine can take waits on disk.** It used to park in memory, and the lift
+  started every parked job at once, past the worker cap. It now waits in the hold and starts
+  through the cap.
 
 ### Admission: the worker cap gains a load check and a usage check
 

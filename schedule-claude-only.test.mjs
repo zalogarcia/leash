@@ -772,10 +772,33 @@ t('and one run at the lift', () => eq(claudeStarts().length, 1));
 await fresh({ wall: FUTURE(), entries: [hoursEntry({ run: true, text: 'Hourly repo review.' })] });
 B.setCodexInstalled(false);
 slots();
-t('no Codex on the machine: one parked run, not one per slot', () => {
-  eq(B.parkedWalledChats.length, 1);
-  eq(B.parkedWalledChats[0].schedule?.id, 9);
+t('no Codex on the machine: one job in the hold, not one per slot, and none parked in memory', () => {
+  eq(held().length, 1);
+  eq(held()[0].scheduleId, 9);
+  eq(B.parkedWalledChats.length, 0);
   eq(B.STARTS.length, 0);
+});
+B.setCodexInstalled(true);
+
+await fresh({ wall: FUTURE(), cap: 1, entries: [hoursEntry({ run: true, text: 'First review.' }), hoursEntry({ id: 10, run: true, text: 'Second review.' })] });
+B.setCodexInstalled(false);
+poll();
+t('two entries behind the wall: both held', () => eq(held().length, 2));
+B.setWall(0);
+poll();
+t('the lift goes through the cap: one starts, the other waits in the drop box', () => {
+  eq(claudeStarts().length, 1);
+  eq(queue().length, 1);
+});
+B.setCodexInstalled(true);
+
+await fresh({ wall: FUTURE(), entries: [hoursEntry({ run: true, text: 'Hourly repo review.' })] });
+writeFileSync(HELD, JSON.stringify(fullHold()));
+B.setCodexInstalled(false);
+slots();
+t('the hold full: it parks in memory, and the next slots fold into that one', () => {
+  eq(B.parkedWalledChats.filter((it) => it.schedule?.id === 9).length, 1);
+  eq(held().length, 20);
 });
 B.setCodexInstalled(true);
 
@@ -801,7 +824,7 @@ B.setCodexInstalled(false);
 poll();
 B.setClock('2026-11-07');
 poll();
-t('a daily entry without the flag is unchanged: one fire a day still stacks', () => eq(B.parkedWalledChats.length, 2));
+t('a daily entry without the flag does not fold: one fire a day still adds a job', () => eq(held().length, 2));
 B.setCodexInstalled(true);
 
 const counter = path.join(TMP, 'count.txt');

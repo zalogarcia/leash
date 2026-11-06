@@ -11908,11 +11908,14 @@ function checkSchedules() {
         const claudeOnly = s.claudeOnly === true;
         let schedEngine = 'claude';
         let schedReason = null;
+        let schedBehindWall = false;
         try {
           if (!claudeOnly) {
             const d = engineFor('bg');
             schedEngine = d.engine || 'claude';
             schedReason = d.reason || null;
+            // The drain's own hold condition: no engine can take this job now.
+            schedBehindWall = Boolean(d.pausedUntil) && (d.engine === 'claude' || codexWalled());
           }
         } catch {
           /* the settled view is decoration; 'claude' is the capped case, so the cap holds */
@@ -11938,10 +11941,13 @@ function checkSchedules() {
           fmtClock: adm.fmtClock,
         });
         // NO ACCOUNT FREE: a Claude-only job goes to the drop box whatever the
-        // verdict, where its pin holds it behind the wall. The wall's own notice
-        // counts it, so it puts up no waiting line of its own. No `claude` at all
-        // takes the same road, to the drain's refusal.
-        if (claudeOnly && claudeWalled() && queueScheduledRun(s)) continue;
+        // verdict, where its pin holds it behind the wall. A job no engine can
+        // take goes the same road: dispatched, it would park in memory, where a
+        // restart loses it and the lift starts every parked job at once, past
+        // the cap. From the hold the lift goes through the drain. The wall's own
+        // notice counts it, so it puts up no waiting line of its own. No `claude`
+        // at all takes the same road, to the drain's refusal.
+        if (((claudeOnly && claudeWalled()) || schedBehindWall) && queueScheduledRun(s)) continue;
         const queuedItem = !schedVerdict.admit || schedSlashWaits ? queueScheduledRun(s) : null;
         if (queuedItem) {
           // QUEUED, then the notice, the same order as a dispatch: the job is
