@@ -4,6 +4,16 @@ All notable changes to Leash. Dates are release dates.
 
 ## Unreleased
 
+### Schedules: every N hours, script entries and runs that wait for Claude
+
+- **`schedule.mjs add every <N>h <HH:MM>`** fires once per slot, N from 1 to 23. It takes `--run`
+  or `--script`. A slot that comes up while the entry's last job still waits folds into it.
+- **`--script <path>`** runs a file on that cadence. Only non-empty output reaches the chat lane, as
+  a turn the daemon wrote. A script that fails with no output gets one line, until it runs clean.
+- **`schedule.mjs update <id> --claude-only true`** makes a `--run` entry wait through a Claude
+  usage wall rather than go to Codex. It fires once however long it waited, says one line past 6
+  hours, and is refused with no `claude` on the machine. `list` and `/schedules` show it.
+
 ### Admission: the worker cap gains a load check and a usage check
 
 - **One verdict per job.** Besides the Claude worker cap (`maxConcurrentWorkers`), a new Claude job

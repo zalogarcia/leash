@@ -1226,6 +1226,15 @@ export function claudeOnlyHeldLine({ id = '?', hours = 0, title = '' } = {}) {
 }
 
 /**
+ * A SCHEDULED SCRIPT THAT FAILED (schedule-script.mjs), said once per failing
+ * streak. No ⏳: nothing edits it later. Without it, a script that fails on every
+ * slot looks exactly like one with nothing to say.
+ */
+export function scheduledScriptFailedLine({ id = '?', script = 'script', detail = '' } = {}) {
+  return [`❌ Schedule #${id} script failed`, clip(oneLine(script), 40), clip(oneLine(detail), 40), 'Said once until it runs clean'].filter(Boolean).join('\n');
+}
+
+/**
  * The swap could not happen (ACC-02).
  *
  * Which account they are still on is the fact the old version left out, and it is

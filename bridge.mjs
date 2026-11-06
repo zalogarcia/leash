@@ -196,6 +196,7 @@ import {
   accountLedgerBlock,
   holdFullLine,
   claudeOnlyHeldLine,
+  scheduledScriptFailedLine,
   unreadableMessageNotice,
 } from './system-messages.mjs';
 // Read only, and shelled out to ONLY from the /status arm below. Never on a
@@ -4352,7 +4353,7 @@ function writeHeldBgJobs(items) {
 function holdBgJob(item) {
   const held = readHeldBgJobs();
   // A CLAUDE-ONLY JOB IS PAST THE FENCE: there is at most one per entry
-  // (claudeOnlyJobWaiting), so it cannot grow with the wall, and a job kept out
+  // (scheduleJobWaiting), so it cannot grow with the wall, and a job kept out
   // of this file would wait with no line at 6 hours (tellLongClaudeOnlyHolds).
   if (held.length >= PARKED_WALLED_JOBS_MAX && item?.claudeOnly !== true) return false;
   try {
@@ -11695,6 +11696,7 @@ const localHHMM = () => new Date().toTimeString().slice(0, 5);
 
 function fmtSchedule(s) {
   if (s.switchAccount) return `#${s.id} · ${describeWhen(s)} · 🔀 switch account · ${clip(oneLine(s.switchAccount), 60)}`;
+  if (s.script) return `#${s.id} · ${describeWhen(s)} · 📜 script ${path.basename(String(s.script))} · ${clip(oneLine(s.text), 80)}`;
   return `#${s.id} · ${describeWhen(s)} · ${s.run ? `🤖 run${s.allowWrite === true ? ' · writes approved' : ''}${s.claudeOnly === true ? ' · claude only' : ''}` : '⏰ remind'} · ${clip(oneLine(s.text), 80)}`;
 }
 
@@ -11738,8 +11740,10 @@ function queueScheduledRun(s) {
   // the GRANT the drain checks (write-grant.mjs): the drop box is a file any
   // worker can write, so an approval on an item is worth nothing without one.
   // A CLAUDE-ONLY entry's job is PINNED: the pin is what makes the drain hold it
-  // behind a wall, as it holds a resume, rather than send it to Codex.
-  const item = { text: s.text, queuedAt: new Date().toISOString(), scheduleId: s.id, ...(s.claudeOnly === true ? { engine: 'claude', claudeOnly: true } : {}), ...(s.executionId ? { executionId: s.executionId } : {}), ...(s.allowWrite === true ? { allowWrite: true } : {}) };
+  // behind a wall, as it holds a resume, rather than send it to Codex. An HOURS
+  // entry's job is marked, so its next slot can tell it from a bg.mjs child that
+  // only carries the id (scheduleJobWaiting).
+  const item = { text: s.text, queuedAt: new Date().toISOString(), scheduleId: s.id, ...(s.claudeOnly === true ? { engine: 'claude', claudeOnly: true } : {}), ...(s.kind === 'hours' ? { hoursRun: true } : {}), ...(s.executionId ? { executionId: s.executionId } : {}), ...(s.allowWrite === true ? { allowWrite: true } : {}) };
   if (s.allowWrite === true) writeGrants.seal(item, `queued-${s.id}-${item.queuedAt}`);
   items.push(item);
   try {
@@ -11754,12 +11758,15 @@ function queueScheduledRun(s) {
 }
 
 /**
- * Is a job of this Claude-only entry still waiting to start? Asked when the entry
- * comes due, so a wall that lasts days ends in one run, not one per missed day.
- * `claudeOnly` on the item, not the id alone: a bg.mjs handoff from inside a
- * scheduled run carries the id of the run that made it.
+ * Is a job this entry fired still waiting to start? Asked when a Claude-only or
+ * an hours entry comes due, so a wall ends in one run, not one per missed fire.
+ * An hours entry needs it most: a wall of a few hours is several of its slots,
+ * where a daily entry gets one fire a day.
+ * The mark on the item, not the id alone: a bg.mjs handoff from inside a
+ * scheduled run carries the id of the run that made it. A run that met the wall
+ * on the direct dispatch is parked in memory, with its schedule on the item.
  */
-function claudeOnlyJobWaiting(id) {
+function scheduleJobWaiting(id) {
   let queued = [];
   try {
     const raw = JSON.parse(readFileSync(BG_QUEUE_FILE, 'utf8'));
@@ -11767,7 +11774,8 @@ function claudeOnlyJobWaiting(id) {
   } catch {
     queued = []; // no file, or a half-written one
   }
-  return [...queued, ...readHeldBgJobs(), ...bgStrandedJobs].some((it) => it?.claudeOnly === true && it.scheduleId === id);
+  const fired = (it) => (it?.claudeOnly === true || it?.hoursRun === true) && it.scheduleId === id;
+  return [...queued, ...readHeldBgJobs(), ...bgStrandedJobs].some(fired) || parkedWalledChats.some((it) => it.schedule?.id === id);
 }
 
 // Called from the poll loop (≤~90s granularity). Sleep-tolerant: a time that
@@ -11780,19 +11788,44 @@ function runScheduledScript(s) {
     execFile(cmd, args, { timeout: SCRIPT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
       const prompt = scheduledScriptPrompt({ item: s, output: stdout, ownerName: OWNER_NAME });
       if (err && !prompt) {
-        console.error(`[bridge] schedule #${s.id} script ${path.basename(s.script)} failed: ${oneLine(String(stderr || err.message)).slice(0, 200)}`);
+        tellScriptFailed(s, String(stderr || err.message));
         return;
       }
+      scriptFailureTold.delete(s.id);
       if (!prompt) {
         console.log(`[bridge] schedule #${s.id} script ${path.basename(s.script)}: no output, no turn`);
         return;
       }
       console.log(`[bridge] schedule #${s.id} script ${path.basename(s.script)}: ${String(stdout).trim().split('\n').length} line(s) to the chat lane`);
+      // A TURN FROM AN EARLIER SLOT IS STILL PARKED behind a wall: this output
+      // takes its place, so the lift starts one turn with the newest output
+      // rather than one stale turn per slot.
+      const head = prompt.split('\n', 2).join('\n');
+      const parked = parkedWalledChats.find((it) => String(it.text || '').startsWith(`${head}\n`));
+      if (parked) {
+        parked.text = prompt;
+        return;
+      }
       dispatchPrompt(prompt, LANES.main, { priority: true });
     });
   } catch (e) {
-    console.error(`[bridge] schedule #${s.id} script not started: ${e.message}`);
+    tellScriptFailed(s, e.message);
   }
+}
+
+// The entries whose failing script has been told, so a script that fails on
+// every slot is one line, not one per slot. A clean run clears it. In memory: a
+// restart says it once more, which is the cheap direction to be wrong in.
+const scriptFailureTold = new Set();
+
+/** A script that failed with nothing to say would look like a quiet one, so the
+ *  owner gets one line. Through send, not a turn: it needs no engine to run. */
+function tellScriptFailed(s, detail) {
+  const name = path.basename(String(s.script));
+  console.error(`[bridge] schedule #${s.id} script ${name} failed: ${oneLine(detail).slice(0, 200)}`);
+  if (scriptFailureTold.has(s.id)) return;
+  scriptFailureTold.add(s.id);
+  send(scheduledScriptFailedLine({ id: s.id, script: name, detail }), { markdown: false }).catch(() => {});
 }
 
 function checkSchedules() {
@@ -11824,9 +11857,9 @@ function checkSchedules() {
     }
     if (due) {
       changed = true;
-      // STILL WAITING FROM AN EARLIER DAY: this fire folds into that job, and the
+      // STILL WAITING FROM AN EARLIER FIRE: this fire folds into that job, and the
       // stamp above is all that remains of it.
-      if (s.run && s.claudeOnly === true && claudeOnlyJobWaiting(s.id)) {
+      if (s.run && (s.claudeOnly === true || s.kind === 'hours') && scheduleJobWaiting(s.id)) {
         console.log(`[bridge] schedule #${s.id} came due with its job still waiting; it runs once`);
         continue;
       }
@@ -11960,7 +11993,7 @@ function checkSchedules() {
             runId: schedRunId,
             brief: s.text,
             scheduleId: s.id,
-            scheduleWhen: s.kind === 'daily' ? describeWhen(s) : null,
+            scheduleWhen: s.kind === 'daily' || s.kind === 'hours' ? describeWhen(s) : null,
             running: bgLanes.filter((l) => l.current || l.queue.length || l.finishing).length,
             // A scheduled job that DID land on a bg lane runs on the pool's pin
             // like every other worker, so it carries it too.

@@ -83,6 +83,12 @@ t('runScheduledScript dispatches only a non-empty prompt to the chat lane', () =
   ok(body.includes('if (!prompt) {') && body.indexOf('if (!prompt) {') < body.indexOf('dispatchPrompt(prompt, LANES.main, { priority: true });'), 'empty is a log line');
 });
 
+t('a failure with no output is told, and only a run that did not fail clears the streak', () => {
+  const body = fn('runScheduledScript');
+  ok(body.indexOf('tellScriptFailed(s, String(stderr || err.message));') < body.indexOf('scriptFailureTold.delete(s.id);'), 'told before the clear');
+  ok(body.includes('tellScriptFailed(s, e.message);'), 'a script that never started is told too');
+});
+
 console.log(`\n${pass} passed, ${failures.length} failed`);
 for (const f of failures) console.log(`  ✗ ${f}`);
 process.exit(failures.length ? 1 : 0);

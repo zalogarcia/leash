@@ -8,8 +8,10 @@
 // The REAL functions out of bridge.mjs, through one poll cycle in the order the
 // poll loop runs them, over a real drop box, a real hold file and a real write
 // grant store on temp files. The engine is the REAL resolveEngine, and dispatch
-// is the REAL dispatchPrompt, because that is where a due entry met the wall:
-// only what starts a process is a stub, and it records the engine it was given.
+// is the REAL dispatchPrompt, because that is where a due entry met the wall.
+// Stubbed: what starts a process (it records the engine it was given),
+// startResolvedRun, Telegram, the schedule store (in memory) and the admission
+// load and usage inputs. Scripts run for real.
 //
 // CLAUDE_ONLY_DIR=<an export of the commit before> runs these same tests against
 // that code. The helpers it lacks become no-ops, so what fails there is an
@@ -100,6 +102,7 @@ import { resolveEngine } from ${engineUrl};
 import { clip, oneLine } from ${url('progress-render.mjs')};
 import * as SYSTEM_MESSAGES from ${url('system-messages.mjs')};
 const claudeOnlyHeldLine = SYSTEM_MESSAGES.claudeOnlyHeldLine || (() => '');
+const scheduledScriptFailedLine = SYSTEM_MESSAGES.scheduledScriptFailedLine || (() => '');
 const { readFileSync, renameSync, existsSync, statSync } = fs;
 export let FAIL_HOLD_WRITE = false;
 export const setFailHoldWrite = (v) => { FAIL_HOLD_WRITE = v; };
@@ -122,6 +125,7 @@ let CLAUDE_AVAILABLE = true;
 let CODEX_AVAILABLE = true;
 export const setWall = (until) => { rotationPausedUntil = until; };
 export const setClaudeInstalled = (v) => { CLAUDE_AVAILABLE = v; };
+export const setCodexInstalled = (v) => { CODEX_AVAILABLE = v; };
 let CHAT = { cwd: ${JSON.stringify(TMP)} };
 export const setBgEngine = (v) => { CHAT = { ...CHAT, engineBg: v }; };
 const chatState = () => CHAT;
@@ -242,8 +246,10 @@ const FUNCTIONS = [
   grab('fmtSchedule'),
   grabOr('CLAUDE_ONLY_HOLD_NOTICE_MS', 'const CLAUDE_ONLY_HOLD_NOTICE_MS = 0;', 'const'),
   grabOr('tellLongClaudeOnlyHolds', 'function tellLongClaudeOnlyHolds() {}'),
-  grabOr('claudeOnlyJobWaiting', 'function claudeOnlyJobWaiting() { return false; }'),
+  grabOr('scheduleJobWaiting', 'function scheduleJobWaiting() { return false; }'),
   grabOr('runScheduledScript', 'function runScheduledScript() {}'),
+  grabOr('scriptFailureTold', 'const scriptFailureTold = new Set();', 'const'),
+  grabOr('tellScriptFailed', 'function tellScriptFailed() {}'),
 ];
 const EXPORTS = 'export { drainBgHandoff, checkSchedules, flushParkedWalledJobs, tellLongClaudeOnlyHolds, readHeldBgJobs, fmtSchedule, resolveEngine };';
 
@@ -381,16 +387,33 @@ t('the next day after the lift fires as normal', () => eq(claudeStarts().length,
 
 await fresh({ wall: FUTURE() });
 poll();
-B = await load(); // a daemon restart mid wall: the hold is a file
+B = await load(); // a fresh daemon over the same files; the hold is a file
 B.setCap(3);
-B.setWall(FUTURE());
+B.setWall(FUTURE()); // by hand: a restart forgets the wall, the next test shows that
 B.setClock('2026-11-07');
 B.setSchedules([entry({ claudeOnly: true, lastFired: '2026-11-06' })]);
 poll();
-t('a restart mid wall: the once-only check reads the hold off disk', () => eq(held().length, 1));
+t('a fresh daemon with the wall up again: the once-only check reads the hold off disk', () => eq(held().length, 1));
 B.setWall(0);
 poll();
 t('and the lift runs it once', () => eq(claudeStarts().length, 1));
+
+// A REAL RESTART: nothing sets the wall, because nothing does. The wall is in
+// memory, so the first poll releases the job. The brief survives; the wait does
+// not. Pinned so the README's sentence about it stays true.
+await fresh({ wall: FUTURE() });
+poll();
+t('before the restart the job is held', () => eq(held().length, 1));
+B = await load();
+B.setCap(3);
+B.setClock('2026-11-06');
+B.setSchedules([entry({ claudeOnly: true, lastFired: '2026-11-06' })]);
+poll();
+t('a restart forgets the wall: the first poll starts the job, on Claude, not Codex', () => {
+  eq(held().length, 0);
+  eq(claudeStarts().length, 1);
+  eq(codexStarts().length, 0);
+});
 
 await fresh({ wall: 0, cap: 1 });
 B.occupy(1);
@@ -498,10 +521,10 @@ t('a new day behind the same wall: still one line', () => eq(lines().length, 1))
 const sentBefore = lines().length;
 B = await load();
 B.setCap(3);
-B.setWall(FUTURE());
+B.setWall(FUTURE()); // by hand, as above: this one is about the mark on disk
 B.setSchedules([]);
 B.tellLongClaudeOnlyHolds(firedAt + 30 * 3600_000);
-t('a daemon restart does not say it again', () => {
+t('a fresh daemon does not say it again: the mark is on the held item', () => {
   eq(sentBefore, 1);
   eq(B.SENT.filter((l) => /#8/.test(l)).length, 0);
 });
@@ -612,6 +635,11 @@ t('flagged: held on disk behind the wall, not on Codex', () => {
   eq(held().length, 1);
   eq(held()[0].claudeOnly, true);
 });
+poll();
+t('a second poll behind the wall: the flush does not release it', () => {
+  eq(B.STARTS.length, 0);
+  eq(held().length, 1);
+});
 B.setWall(0);
 poll();
 t('and it runs on Claude at the lift, as the command it is', () => {
@@ -625,6 +653,11 @@ t('no flag: the slash command hold still takes it, the same as before', () => {
   eq(codexStarts().length, 0);
   eq(held().length, 1);
   ok(!held()[0].claudeOnly, 'the hold marked an entry that never asked');
+});
+poll();
+t('and a second poll behind the wall keeps it there', () => {
+  eq(B.STARTS.length, 0);
+  eq(held().length, 1);
 });
 
 // ---------------------------------------------------------------------------
@@ -675,6 +708,121 @@ t('an hours --run entry is a scheduled run like any other', () => {
   eq(claudeStarts().length, 1);
   eq(claudeStarts()[0].text, 'Hourly repo review.');
   eq(claudeStarts()[0].schedule?.id, 9);
+});
+
+await fresh({ wall: 0, entries: [hoursEntry({ script: scriptFile('fails.mjs', "console.error('no such table');\nprocess.exit(3);\n") })] });
+const nextSlot = () => {
+  B.schedules().items[0].lastFiredAt = 0; // the next slot, without waiting two hours
+};
+const failLines = () => B.SENT.filter((l) => l.includes('script failed'));
+const quietly = async (fn) => {
+  const real = console.error;
+  console.error = () => {};
+  await fn();
+  console.error = real;
+};
+await quietly(async () => {
+  B.checkSchedules();
+  await until(() => failLines().length > 0);
+  for (let i = 0; i < 3; i++) {
+    nextSlot();
+    B.checkSchedules();
+    await new Promise((r) => setTimeout(r, 150));
+  }
+});
+t('a failing script with no output: one line, not one per slot, and no turn', () => {
+  eq(failLines().length, 1);
+  ok(failLines()[0].includes('fails.mjs') && failLines()[0].includes('no such table'), failLines()[0]);
+  eq(B.STARTS.length, 0);
+});
+writeFileSync(B.schedules().items[0].script, '// fixed\n');
+nextSlot();
+const fixedLog = [];
+console.log = (...a) => fixedLog.push(a.join(' '));
+B.checkSchedules();
+await until(() => fixedLog.some((l) => l.includes('no output, no turn')));
+console.log = realLog;
+writeFileSync(B.schedules().items[0].script, 'process.exit(3);\n');
+nextSlot();
+await quietly(async () => {
+  B.checkSchedules();
+  await until(() => failLines().length > 1);
+});
+t('a clean run ends the streak, so the next failure is said again', () => eq(failLines().length, 2));
+
+// A SLOT MUST NOT STACK A JOB. Three slots come up behind each wall; each row is
+// a road a due job can take, and each ends in one job, not three.
+const slots = (n = 3) => {
+  for (let i = 0; i < n; i++) {
+    nextSlot();
+    poll();
+  }
+};
+await fresh({ wall: FUTURE(), entries: [hoursEntry({ run: true, text: '/qa-loop the sweep' })] });
+slots();
+t('a slash command behind a wall: one held job, not one per slot', () => {
+  eq(held().length, 1);
+  eq(held()[0].hoursRun, true);
+  eq(B.STARTS.length, 0);
+});
+B.setWall(0);
+poll();
+t('and one run at the lift', () => eq(claudeStarts().length, 1));
+
+await fresh({ wall: FUTURE(), entries: [hoursEntry({ run: true, text: 'Hourly repo review.' })] });
+B.setCodexInstalled(false);
+slots();
+t('no Codex on the machine: one parked run, not one per slot', () => {
+  eq(B.parkedWalledChats.length, 1);
+  eq(B.parkedWalledChats[0].schedule?.id, 9);
+  eq(B.STARTS.length, 0);
+});
+B.setCodexInstalled(true);
+
+await fresh({ wall: 0, cap: 1, entries: [hoursEntry({ run: true, text: 'Hourly repo review.' })] });
+B.occupy(1);
+slots();
+t('the cap full and no wall: one job in the drop box, not one per slot', () => {
+  eq(queue().length, 1);
+  eq(queue()[0].hoursRun, true);
+});
+
+await fresh({ wall: 0, cap: 1, entries: [hoursEntry({ run: true, text: 'Hourly repo review.' })] });
+B.occupy(1);
+writeFileSync(QUEUE, JSON.stringify([{ text: 'a child of the last run', queuedAt: new Date().toISOString(), scheduleId: 9 }]));
+B.checkSchedules();
+t('a bg.mjs child carries the id, not the mark, so it does not count as the job waiting', () => {
+  eq(queue().length, 2);
+  eq(queue().filter((it) => it.hoursRun === true).length, 1);
+});
+
+await fresh({ wall: FUTURE(), entries: [entry({ text: 'Hourly repo review.' })] });
+B.setCodexInstalled(false);
+poll();
+B.setClock('2026-11-07');
+poll();
+t('a daily entry without the flag is unchanged: one fire a day still stacks', () => eq(B.parkedWalledChats.length, 2));
+B.setCodexInstalled(true);
+
+const counter = path.join(TMP, 'count.txt');
+writeFileSync(counter, '0');
+const countScript = scriptFile('count.mjs', `import fs from 'node:fs';\nconst n = Number(fs.readFileSync(${JSON.stringify(counter)}, 'utf8')) + 1;\nfs.writeFileSync(${JSON.stringify(counter)}, String(n));\nconsole.log('run ' + n);\n`);
+await fresh({ wall: FUTURE(), entries: [hoursEntry({ script: countScript })] });
+B.setCodexInstalled(false);
+for (let i = 1; i <= 3; i++) {
+  nextSlot();
+  B.checkSchedules();
+  await until(() => B.parkedWalledChats[0]?.text?.endsWith(`run ${i}`));
+}
+t('a script turn behind a wall: one parked turn, holding the newest output', () => {
+  eq(B.parkedWalledChats.length, 1);
+  ok(B.parkedWalledChats[0].text.endsWith('run 3'), B.parkedWalledChats[0].text);
+});
+B.setCodexInstalled(true);
+
+t('/schedules calls a script entry a script, not a reminder', () => {
+  const line = B.fmtSchedule(hoursEntry({ script: '/a/sweep.mjs' }));
+  ok(line.includes('script sweep.mjs') && !line.includes('remind'), line);
 });
 
 // ---------------------------------------------------------------------------

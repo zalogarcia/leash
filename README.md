@@ -301,18 +301,28 @@ node schedule.mjs add every 6h 00:00 --run "text"                  # a run on th
 node schedule.mjs update <id> --claude-only true|false             # a run that waits for Claude
 ```
 
-An `every N hours` entry fires at its `HH:MM` and every N hours after it, the count
-restarting each local day, once per slot. It needs `--script` or `--run`. With
-`--script` the daemon runs the file (node for `.mjs`, `.cjs` and `.js`, otherwise the
-file itself) for up to 2 minutes, and only when it prints something does that output
-reach the chat lane, as a turn the daemon wrote with the entry's text on top. No output
-is one log line and no turn, so a sweep that is usually empty costs nothing.
+An `every N hours` entry fires once per slot. `HH:MM` sets the phase, not a start: the
+slots are every N hours through the day, counted from the first one after midnight that
+lands on `HH:MM`, and the count restarts each local day. So `every 5h 09:00` fires at
+04:00, 09:00, 14:00 and 19:00. It needs `--script` or `--run`. A slot that comes up while
+the entry's last job is still waiting to start folds into that job, so a wall ends in one
+run, not one per slot.
+
+With `--script` the daemon runs the file (node for `.mjs`, `.cjs` and `.js`, otherwise the
+file itself, which must be executable) for up to 2 minutes, and only when it prints
+something does that output reach the chat lane, as a turn the daemon wrote with the entry's
+text on top. No output is one log line and no turn, so a sweep that is usually empty costs
+nothing. A script that fails with no output gets you one line, said once until it runs
+clean.
 
 `--claude-only` marks a `--run` entry whose job needs Claude tools. While every Claude
-account is at its limit an unflagged run goes to Codex; a flagged one waits in the wall's
-hold instead, survives a restart, and fires once however many days it waited. You get one
-line if it waits past 6 hours. With no `claude` on the machine it is refused out loud,
-because no reset ends that.
+account is at its limit an unflagged run goes to Codex when Codex can take it (a Claude
+slash command waits instead, and with no `codex` or with both engines walled it waits too).
+A flagged run never goes to Codex: it waits in the wall's hold and fires once however many
+days it waited. You get one line if it waits past 6 hours. The job is on disk, but the wall
+is in memory, so a daemon restart during a wall starts the job at the first poll, where it
+can hit the limit and use its one retry. With no `claude` on the machine it is refused out
+loud, because no reset ends that.
 
 A `--run` entry's worker is marked as a scheduled, unattended run in its env
 (`LEASH_TRIGGER=schedule`, `LEASH_SCHEDULE_ID=<id>`), on the direct path and when

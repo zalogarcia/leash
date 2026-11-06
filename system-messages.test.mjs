@@ -94,6 +94,7 @@ import {
   LEDGER_NAME_MAX,
   holdFullLine,
   claudeOnlyHeldLine,
+  scheduledScriptFailedLine,
   swapFailedLine,
   needsLoginNotice,
   chatRotatedLine,
@@ -1686,13 +1687,24 @@ t('wall: ★ the hold being full is said out loud, and not with /stop', () => {
 });
 
 t('claudeOnlyHeldLine: the entry and the hold on ONE line, the only builder that is one by design', () => {
-  const line = claudeOnlyHeldLine({ id: 372, hours: 6.9, title: 'Nightly review of old code, the main repo, SILENT RUN unless it finds a real bug' });
+  const line = claudeOnlyHeldLine({ id: 7, hours: 6.9, title: 'Nightly review of the repo, quiet unless a test fails, with a long title' });
   ok(!line.includes('\n'), line);
-  ok(line.startsWith('⏸ #372 held 6h · Nightly review'), line);
+  ok(line.startsWith('⏸ #7 held 6h · Nightly review'), line);
   ok(line.endsWith('waits for a free Claude account'), line);
   ok(line.length <= 100, `line of ${line.length}: ${line}`);
   ok(!/[\u2013\u2014]/.test(line) && !line.includes('⏳'), line);
   ok(!claudeOnlyHeldLine({}).includes('undefined'));
+});
+
+t('scheduledScriptFailedLine: the entry, the file and why, and that it will not repeat', () => {
+  const s = scheduledScriptFailedLine({ id: 9, script: 'sweep.mjs', detail: 'exit 3\nno such table: items and then a long tail past the line' });
+  const lines = s.split('\n');
+  eq(lines[0], '❌ Schedule #9 script failed');
+  eq(lines[1], 'sweep.mjs');
+  ok(lines[2].startsWith('exit 3 no such table'), lines[2]);
+  eq(lines[3], 'Said once until it runs clean');
+  ok(!scheduledScriptFailedLine({}).includes('undefined'));
+  eq(scheduledScriptFailedLine({ id: 9, script: 's.sh' }).split('\n').length, 3, 'no detail, no empty line');
 });
 
 t('ledger: ★ every ledger and wall-row shape passes the house-style gates', () => {
@@ -1704,6 +1716,7 @@ t('ledger: ★ every ledger and wall-row shape passes the house-style gates', ()
     [limitWallLine({ resetClock: '2:20pm', leftText: '1h 34m', heldCount: 12, accounts: [lrow(long, { walled: true, until: secsFrom(140) }), lrow('a@b.com', { walled: true, until: secsFrom(2) })], timeZone: LTZ, now: LNOW }), 'limitWallLine/rows'],
     [limitWallResolved({ clock: '2:21pm', codexAnswered: 3, resumed: 12 }), 'limitWallResolved/resumed'],
     [holdFullLine({ max: 5 }), 'holdFullLine'],
+    [scheduledScriptFailedLine({ id: 9, script: 'x'.repeat(60), detail: 'y'.repeat(60) }), 'scheduledScriptFailedLine/long'],
   ]) {
     houseStyle(s, where);
   }
