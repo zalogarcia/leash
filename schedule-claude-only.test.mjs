@@ -1189,6 +1189,53 @@ for (const first of ['sweep', 'poll']) {
   });
 }
 
+// THE WORKER CAP AT THE LIFT. The flush releases every job and the drain starts
+// what the cap allows, so the count comes from the drain: a job the cap held back
+// has its own waiting line and has not started.
+await fresh({ wall: FUTURE() + 3600_000, entries: [], realWall: true, cap: 1 });
+B.setCodexWall(FUTURE());
+drop([{ text: 'One' }, { text: 'Two' }, { text: 'Three' }]);
+await fullPoll();
+await sweep();
+B.setWall(0);
+await fullPoll();
+await sweep();
+t('three released at a cap of 1: the two-engine ending counts the one that started', () => {
+  eq(B.STARTS.length, 1);
+  eq(queue().length, 2);
+  eq(saying(/running \d+ parked/), ['▶️ Claude is back · running 1 parked']);
+});
+t('and the two the cap held back say so themselves', () => eq(saying(/waiting: 1 of 1 Claude workers busy/).length, 2));
+
+await walled({ jobs: [{ text: 'One', engine: 'claude' }, { text: 'Two', engine: 'claude' }] });
+B.setCap(1);
+await fullPoll();
+await sweep();
+B.setWall(0);
+await fullPoll();
+await sweep();
+t('two released at a cap of 1: the Claude ending counts the one that started', () => {
+  eq(B.STARTS.length, 1);
+  eq(saying(/Started \d+ held job/).length, 1);
+  ok(saying(/Started \d+ held job/)[0].includes('Started 1 held job'), said().join(' | '));
+});
+
+await walled({ jobs: [{ text: 'Pinned', engine: 'claude' }] });
+B.setCap(1);
+B.occupy(1);
+await fullPoll();
+await sweep();
+writeFileSync(QUEUE, JSON.stringify([{ text: 'A Codex job', engine: 'codex', queuedAt: new Date().toISOString() }]));
+B.setWall(0);
+B.setCodexWall(0);
+await fullPoll();
+await sweep();
+t('the cap holds the released job and a Codex job behind it starts: that is not a held job starting', () => {
+  eq(codexStarts().length, 1);
+  eq(claudeStarts().length, 0);
+  eq(saying(/Started \d+ held job/), []);
+});
+
 // A TYPED MESSAGE either engine can answer, the same ending through the chat flush.
 await fresh({ wall: FUTURE() + 3600_000, entries: [], realWall: true });
 B.setCodexWall(FUTURE());

@@ -4811,11 +4811,11 @@ function raiseClaudeWall() {
  * what runs it, and that is also what a machine with no claude needs: the Claude
  * notice there would report "Claude is back" at its first tick.
  *
- * THE ENDING BELONGS TO THE FLUSH, the one place that knows what started. It
- * leaves the engine and the count, so `lifted` stays false while anything is
- * held. The sweep sees a reset up to a poll before the flush does, and an ending
- * written there said "running 1 parked" with nothing running, for a job the reset
- * may never start. Anything else reaching `resolved` claims no job.
+ * THE ENDING BELONGS TO THE FLUSH, which leaves the engine and what actually
+ * started, so `lifted` stays false while anything is held. The sweep sees a reset
+ * up to a poll before the flush does, and an ending written there said "running 1
+ * parked" with nothing running, for a job the reset may never start. Anything
+ * else reaching `resolved` claims no job.
  */
 function raiseHoldNotice(item) {
   if (heldWaitsOn(item) === 'claude') return raiseClaudeWall();
@@ -10937,18 +10937,21 @@ function flushParkedWalledJobs() {
   } catch (e) {
     console.error('[bridge] the hold file would not clear; a held job may run twice:', e.message);
   }
+  // THE DRAIN GOES FIRST, because a release is not a start: the cap and the load
+  // hold jobs back, and those say so on their own waiting lines.
+  const started = new Set((drainBgHandoff() || []).map((it) => JSON.stringify(it)));
+  const count = released.filter((it) => started.has(JSON.stringify(it))).length;
   // THE WALL NOTICE IS THE ANNOUNCEMENT, so the count goes into its resolution
   // rather than into a message of its own: each job that starts draws its own
-  // worker card a moment later, and a line between the two saying the same
-  // thing is the duplication the live-message rules exist to remove.
+  // worker card, and a line between the two saying the same thing is the
+  // duplication the live-message rules exist to remove.
   if (!claudeRateWalled()) {
-    pendWallResolution('claude', { resumed: ready.length });
-    settleWall('claude', { resumed: ready.length });
+    pendWallResolution('claude', { resumed: count });
+    settleWall('claude', { resumed: count });
   }
   // The same for the two-engine notice, which names the engine that came back.
-  const back = { engine: claudeWalled() ? 'codex' : 'claude', count: ready.length };
+  const back = { engine: claudeWalled() ? 'codex' : 'claude', count };
   if (pendWallResolution('both', back)) settleWall('both', back);
-  drainBgHandoff();
 }
 
 // Once the wall lifts, hand the assistant what it missed. Called from the poll loop, so it
@@ -11268,6 +11271,8 @@ function queuedBgJobRows({ running = runningBgWorkers() } = {}) {
 // and again whenever a worker exits so a queued job starts within seconds
 // rather than waiting out a 50 second long poll.
 function drainBgHandoff() {
+  // What this drain started, returned for the wall endings (flushParkedWalledJobs).
+  const started = [];
   // Taken BEFORE the read: these exist only here, and a throw between the two
   // would lose them. Put back by hand on the claim-failure path below.
   const stranded = bgStrandedJobs.splice(0);
@@ -11473,6 +11478,7 @@ function drainBgHandoff() {
         pausedUntil: decision.pausedUntil,
         schedule: codexSchedule,
       });
+      started.push(it);
       bridgeRunning++; // a Codex job loads the same cores the next job would
       // A REFUSED APPROVAL IS SAID, not silent: the guard holds the job's writes,
       // and this line is the why (a grant is single use, so a second handoff
@@ -11617,6 +11623,7 @@ function drainBgHandoff() {
     dispatchPrompt(pinnedClaude ? `claude: ${text}` : text, lane, { priority: true, schedule, cwd, prepend: itemPrepend, carriedModel }); // a declared job directory survives on either engine
     // A refused approval is said, not silent (the Codex branch above says why).
     if (schedule && it.allowWrite === true && !schedule.allowWrite) console.log(`[bridge] job for schedule #${it.scheduleId} runs WITHOUT write approval: the entry no longer approves it, or its write grant is missing, already used or does not match the item`);
+    started.push(it);
     running++; // this worker is live from here on, so the next item sees a fuller pool
     bridgeRunning++; // and a fuller machine
     if (typeof it === 'object' && it?.resumeOf) pacedRunning++; // and a resume counts toward the next resume's pace
@@ -11685,6 +11692,7 @@ function drainBgHandoff() {
   requeueDeferredBgJobs(deferred);
   // THEIR WAITING LINES, after the write back: the job is durable first.
   for (const w of waiting) noteBgWaiting(w.it, w.verdict, { engine: w.engine });
+  return started;
 }
 
 // Does the schedules.json entry with this id carry the user's write approval

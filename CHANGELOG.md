@@ -24,7 +24,8 @@ All notable changes to Leash. Dates are release dates.
   so a Codex reset says nothing about it. Its waiting line reads the same way.
 - **The two-engine notice ends when the work starts.** It names the engine that came back and
   counts what started. It used to end at the reset, up to a poll before anything ran, and it could
-  say "running 1 parked" about a job that was still waiting.
+  say "running 1 parked" about a job that was still waiting. Both wall endings now leave out a job
+  the worker cap holds back, which says so on its own waiting line.
 
 ### Admission: the worker cap gains a load check and a usage check
 
