@@ -4804,21 +4804,25 @@ function raiseClaudeWall() {
 /**
  * THE NOTICE FOR WORK THAT WAITS, from both places a job can start waiting.
  *
- * WHICH NOTICE depends on which walls are real. Two walls is the one state
- * where a single clock actively misleads, so it gets the both-engines line; a
- * Claude-only wall gets the Claude notice, whose rows name each account and its
- * reset. Sending the both-engines line for a machine with no codex at all would
- * report a wall on an engine that was never there, and the Claude notice on a
- * machine with no claude would report "Claude is back" at its first tick.
+ * WHICH NOTICE is what this item waits on (heldWaitsOn). Work only Claude can run
+ * gets the Claude notice, whose rows name each account and its reset: a Codex
+ * clock would have them watching a reset that frees nothing for it. Work the next
+ * engine back runs gets the both-engines line, because whichever returns first is
+ * what runs it, and that is also what a machine with no claude needs: the Claude
+ * notice there would report "Claude is back" at its first tick.
  *
- * The count at the end is what still waits: a parked message or a held job.
+ * THE ENDING BELONGS TO THE FLUSH, the one place that knows what started. It
+ * leaves the engine and the count, so `lifted` stays false while anything is
+ * held. The sweep sees a reset up to a poll before the flush does, and an ending
+ * written there said "running 1 parked" with nothing running, for a job the reset
+ * may never start. Anything else reaching `resolved` claims no job.
  */
-function raiseHoldNotice() {
-  if (!codexWalled()) return raiseClaudeWall();
+function raiseHoldNotice(item) {
+  if (heldWaitsOn(item) === 'claude') return raiseClaudeWall();
   return raiseWall('both', {
     render: () => bothEnginesWalledLine(),
-    lifted: () => !(codexWalled() && claudeWalled()),
-    resolved: ({ engine = null, count = parkedWalledChats.length + readHeldBgJobs().length } = {}) => enginesBackLine({ engine, count }),
+    lifted: () => !(codexWalled() && claudeWalled()) && !(parkedWalledChats.length + readHeldBgJobs().length),
+    resolved: ({ engine = null, count = 0 } = {}) => enginesBackLine({ engine, count }),
   });
 }
 
@@ -7729,9 +7733,10 @@ function codexUsageWindow() {
  * live state so no call site can forget an input (a missed `codexAvailable`
  * would be a spawn of a binary that is not there; a missed
  * `rotationPausedUntil` would be a job that waits for a reset it did not need
- * to wait for).
+ * to wait for). `codexBack` asks the same question of the moment the Codex wall
+ * is gone (heldWaitsOn).
  */
-function engineFor(lane, forcedEngine = null, { ignoreWall = false } = {}) {
+function engineFor(lane, forcedEngine = null, { ignoreWall = false, codexBack = false } = {}) {
   return resolveEngine({
     lane,
     forcedEngine,
@@ -7739,7 +7744,7 @@ function engineFor(lane, forcedEngine = null, { ignoreWall = false } = {}) {
     config: ENGINE_CONFIG,
     claudeAvailable: CLAUDE_AVAILABLE,
     codexAvailable: CODEX_AVAILABLE,
-    codexPausedUntil,
+    codexPausedUntil: codexBack ? 0 : codexPausedUntil,
     // Internal reports and owner tasks both need a healthy engine. A wall
     // changes routing for both, without changing the saved lane preference.
     rotationPausedUntil,
@@ -10738,9 +10743,11 @@ function bothEnginesWalledLine() {
  * that was never walled, and dispatchPrompt parked it straight back. Every poll
  * cycle, for the length of the wall: one false bubble a cycle and a command
  * that never ran. Any term added to one of these belongs in the other.
+ *
+ * `codexBack` asks it of the moment the Codex wall is gone (heldWaitsOn).
  */
-function canRunHeldItem(it) {
-  const decision = engineFor(it?.heldOnBg ? 'bg' : 'chat', it?.forcedEngine || null);
+function canRunHeldItem(it, { codexBack = false } = {}) {
+  const decision = engineFor(it?.heldOnBg ? 'bg' : 'chat', it?.forcedEngine || null, { codexBack });
   if (decision.error || !decision.engine) return false;
   // A Claude slash command the fallback would hand to Codex is not runnable
   // there (see dispatchPrompt's hold): it waits for Claude.
@@ -10749,7 +10756,36 @@ function canRunHeldItem(it) {
   // A real Claude wall only: with no claude binary nothing comes back for it,
   // so it is released and refused with a line rather than held forever.
   if (decision.engine === 'codex' && decision.reason === 'claude_limited' && BG_COMMAND_RE.test(stripLaneRules(String(it?.text || '')).trimStart())) return false;
-  return decision.engine === 'codex' ? CODEX_AVAILABLE && !codexWalled() : !claudeWalled();
+  return decision.engine === 'codex' ? CODEX_AVAILABLE && (codexBack || !codexWalled()) : !claudeWalled();
+}
+
+/**
+ * A HELD ITEM IN THE SHAPE canRunHeldItem TAKES, however it was stored. A parked
+ * message has the fields already. A job in the hold file keeps its pin in
+ * `engine` or in a prefix on its text, and the drain reads it the same way.
+ */
+function heldItem(it) {
+  if (typeof it === 'object' && it?.heldOnBg !== undefined) return it;
+  const pre = parseEnginePrefix((typeof it === 'string' ? it : it?.text) || '');
+  return { heldOnBg: true, forcedEngine: (typeof it === 'object' && it?.engine) || pre.engine || null, text: pre.text };
+}
+
+/**
+ * WHAT A HELD ITEM WAITS ON, the one reading behind every wall notice.
+ *
+ * 'claude': only a Claude lift frees it, so a Codex reset changes nothing for it
+ * (a Claude pin, a --claude-only entry, a slash command, the fallback off).
+ * 'next': the next engine back runs it, which with no `claude` on the machine is
+ * Codex.
+ *
+ * Asked of canRunHeldItem with the Codex wall taken away, so a notice cannot
+ * disagree with the flush: this is the test the flush runs at the real lift. The
+ * walls on the machine do not answer this. Reading them instead put "running 1
+ * parked" on a job a Codex reset could not start, and "Claude is back" on a job
+ * that was waiting for Codex.
+ */
+function heldWaitsOn(it) {
+  return canRunHeldItem(heldItem(it), { codexBack: true }) ? 'next' : 'claude';
 }
 
 /** Is any engine free for an ordinary typed message? For the callers with no item in hand. */
@@ -10787,9 +10823,9 @@ function flushParkedWalledChats({ fold = null } = {}) {
   // The Claude notice is the one a Claude-only wall raised, and it resolves
   // itself off its own `lifted` check; only the both-engines notice needs the
   // facts below, which is why this block is guarded on its presence.
-  // Leave the facts, then settle. If the sweep already noticed the wall lifted
-  // it will have used them; if it has not, this settles the notice now with the
-  // same data. Either way ONE ending, naming the engine that came back.
+  // Leave the facts, then settle. The sweep leaves this ending to the flush while
+  // anything is held (raiseHoldNotice), so ONE ending, naming the engine that
+  // came back and what started.
   if (pendWallResolution('both', { engine: back, count: items.length })) {
     settleWall('both', { engine: back, count: items.length });
   } else if (wallNotices.has('both')) {
@@ -10861,10 +10897,7 @@ function flushParkedWalledJobs() {
   const ready = [];
   const waiting = [];
   for (const it of held) {
-    const text = typeof it === 'string' ? it : it?.text;
-    const pre = parseEnginePrefix(text || '');
-    const forcedEngine = (typeof it === 'object' && it?.engine) || pre.engine || null;
-    const runnable = text && canRunHeldItem({ heldOnBg: true, forcedEngine, text: pre.text });
+    const runnable = (typeof it === 'string' || it?.text) && canRunHeldItem(heldItem(it));
     (runnable ? ready : waiting).push(it);
   }
   if (!ready.length) return;
@@ -11354,7 +11387,7 @@ function drainBgHandoff() {
       if (holdBgJob(typeof it === 'object' && it ? it : { text: queuedText })) {
         // A line already up for this job now says what it waits on; no new one
         // (the wall's own notice counts what it holds).
-        noteBgWaiting(it, { kind: 'wall', text: codexWalled() ? 'waiting: no engine is free, it starts when one is back' : 'waiting: every Claude account is at its limit, it starts after the reset' }, { onlyIfShown: true });
+        noteBgWaiting(it, { kind: 'wall', text: heldWaitsOn(it) === 'claude' ? 'waiting: every Claude account is at its limit, it starts after the reset' : 'waiting: no engine is free, it starts when one is back' }, { onlyIfShown: true });
         logAccountDecision({
           decision: 'all_accounts_walled_until',
           until: Math.floor(Number(decision.pausedUntil) / 1000),
@@ -11363,7 +11396,7 @@ function drainBgHandoff() {
         // ONE notice for the whole wall, counting what is held. Not a bubble
         // per job: raiseWall keeps at most one alive per kind, so the second
         // held job edits the first one's message.
-        raiseHoldNotice().catch(() => {});
+        raiseHoldNotice(it).catch(() => {});
         armWallResume(null);
         continue;
       }
@@ -11939,8 +11972,9 @@ function checkSchedules() {
             schedEngine = d.engine || 'claude';
             schedReason = d.reason || null;
             // The drain's hold condition for a job with no pin: no engine can
-            // take it now. An entry whose text carries a `claude:` prefix is not
-            // read here, so it takes the direct dispatch and parks.
+            // take it now. A `claude:` prefix on the entry's text is not read
+            // here, so while Codex is free that entry takes the direct dispatch
+            // and parks.
             schedBehindWall = Boolean(d.pausedUntil) && (d.engine === 'claude' || codexWalled());
           }
         } catch {
@@ -13869,8 +13903,8 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
     // rather than sending again, and the flush edits THAT message into "back"
     // when the first window returns.
     //
-    // WHICH NOTICE depends on which walls are real (raiseHoldNotice).
-    raiseHoldNotice().catch(() => {});
+    // WHICH NOTICE is what this item waits on (raiseHoldNotice).
+    raiseHoldNotice({ ...item, heldOnBg: Boolean(lane.isBg) }).catch(() => {});
     armWallResume(null);
     return;
   }

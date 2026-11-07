@@ -15,10 +15,16 @@ All notable changes to Leash. Dates are release dates.
   hours, and is refused with no `claude` on the machine. `list` and `/schedules` show it.
 - **A scheduled run no engine can take waits on disk.** It used to park in memory, and the lift
   started every parked job at once, past the worker cap. It now waits in the hold and starts
-  through the cap, unless the hold is full or the entry's text carries an engine prefix: those
-  still park.
-- **A job in the hold gets the right wall notice.** With two walls, or a Codex wall and no `claude`
-  on the machine, it is the two-engine notice, not "Claude is back" while the job still waits.
+  through the cap, unless the hold is full, or the entry's text starts `claude:` while Codex is
+  free: those still park.
+- **A held job gets the notice for what it waits on.** A job the next engine back can run gets the
+  two-engine notice, with both clocks, and on a machine with no `claude` that notice no longer says
+  "Claude is back" while the job waits. A job only Claude can run (a `--claude-only` entry, a
+  `claude:` brief, a slash command, or any job with the Codex fallback off) gets the Claude notice,
+  so a Codex reset says nothing about it. Its waiting line reads the same way.
+- **The two-engine notice ends when the work starts.** It names the engine that came back and
+  counts what started. It used to end at the reset, up to a poll before anything ran, and it could
+  say "running 1 parked" about a job that was still waiting.
 
 ### Admission: the worker cap gains a load check and a usage check
 

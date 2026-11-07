@@ -41,7 +41,7 @@ function harness(settings = {}, items = [], queued = []) {
     BG_COMMAND_RE: new Function(`${source.match(/^const BG_COMMAND_RE = .*$/m)[0]}\nreturn BG_COMMAND_RE;`)(),
     stripLaneRules,
   };
-  const fn = new Function(...Object.keys(bindings), `${extract('canRunHeldItem')}\n${extract('flushParkedWalledJobs')}\nreturn {flushParkedWalledJobs,canRunHeldItem};`)(...Object.values(bindings));
+  const fn = new Function(...Object.keys(bindings), `${extract('canRunHeldItem')}\n${extract('heldItem')}\n${extract('flushParkedWalledJobs')}\nreturn {flushParkedWalledJobs,canRunHeldItem};`)(...Object.values(bindings));
   return { state, ...fn };
 }
 const future = Date.now() + 3_600_000;

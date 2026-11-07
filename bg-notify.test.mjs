@@ -1045,6 +1045,8 @@ const B = await import(
         grabFn('drainBgHandoff'),
         grabFn('flushParkedWalledJobs'),
         grabFn('canRunHeldItem'),
+        grabFn('heldItem'),
+        grabFn('heldWaitsOn'),
         grabFn('notifyOwnerBgFinished'),
         // checkSchedules calls this when the pool is full. The cap is 99 here
         // so the && short-circuits and it is never reached, but a harness that

@@ -669,7 +669,7 @@ export const setEngines = (o) => {
   if (o.claudeAvailable !== undefined) CLAUDE_AVAILABLE = o.claudeAvailable;
   if (o.codexAvailable !== undefined) CODEX_AVAILABLE = o.codexAvailable;
 };
-const engineFor = (lane, forcedEngine = null, { ignoreWall = false } = {}) =>
+const engineFor = (lane, forcedEngine = null, { ignoreWall = false, codexBack = false } = {}) =>
   resolveEngine({
     lane,
     forcedEngine,
@@ -677,7 +677,7 @@ const engineFor = (lane, forcedEngine = null, { ignoreWall = false } = {}) =>
     config: ENGINE_CFG,
     claudeAvailable: CLAUDE_AVAILABLE,
     codexAvailable: CODEX_AVAILABLE,
-    codexPausedUntil,
+    codexPausedUntil: codexBack ? 0 : codexPausedUntil,
     rotationPausedUntil,
     now: Date.now(),
     codexFallback: codexFallbackValue,
@@ -859,6 +859,8 @@ export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wa
         grab('raiseHoldNotice'),
         grab('armWallResume'),
         grab('canRunHeldItem'),
+        grab('heldItem'),
+        grab('heldWaitsOn'),
         grab('noEngineForChat', 'const'),
         grab('flushParkedWalledChats'),
         grab('queueItem'),
@@ -2339,6 +2341,7 @@ export const HELD = [];
 const holdBgJob = (it) => { HELD.push(it); return true; };
 const raiseClaudeWall = () => Promise.resolve();
 const raiseHoldNotice = () => raiseClaudeWall();
+const heldWaitsOn = () => 'claude';
 const armWallResume = () => {};
 const logAccountDecision = () => {};
 // The live worker line. Real builder, recorded transport: this file is about

@@ -10,8 +10,10 @@
 // grant store on temp files. The engine is the REAL resolveEngine, and dispatch
 // is the REAL dispatchPrompt, because that is where a due entry met the wall.
 // Stubbed: what starts a process (it records the engine it was given),
-// startResolvedRun, Telegram, the wall notice machinery, the schedule store (in
-// memory) and the admission load and usage inputs. Scripts run for real.
+// startResolvedRun, Telegram, the schedule store (in memory) and the admission
+// load and usage inputs. Scripts run for real. The wall notice machinery is
+// stubbed in sections 1 to 7, which read what raiseHoldNotice hands it, and REAL
+// in section 8, which is about the words on screen.
 //
 // CLAUDE_ONLY_DIR=<an export of the commit before> runs these same tests against
 // that code. The helpers it lacks become no-ops, so what fails there is an
@@ -84,15 +86,38 @@ const grabOr = (name, fallback, kind = 'function') => {
 const url = (f) => JSON.stringify(pathToFileURL(path.join(DIR, f)).href);
 const engineUrl = url('engine-state.mjs');
 
+// The wall notice machinery, both ways. The stubs record what raiseHoldNotice
+// hands them. The real pieces need only what the notice reads around them.
+const WALL_STUBS = `
+export const WALLS = [];
+export const wallOpts = {};
+const raiseWall = (kind, opts) => { WALLS.push(kind); wallOpts[kind] = opts; return Promise.resolve(); };
+export const WALL_NOTICES = [];
+const raiseClaudeWall = () => { WALL_NOTICES.push(Date.now()); return Promise.resolve(); };
+export const SETTLED = [];
+const pendWallResolution = (kind) => kind in wallOpts;
+const settleWall = (kind, extra = {}) => { SETTLED.push({ kind, ...extra }); };
+const bothEnginesWalledLine = () => '';
+`;
+const WALL_REAL = `
+const { WALL_TICK_MS, limitWallLine, limitWallResolved, bothWalledLine } = SYSTEM_MESSAGES;
+const editCooldownUntil = 0;
+const accounts = { describe: () => (rotationPausedUntil > Date.now() ? [{ name: 'one', limited: true, limitedUntil: Math.floor(rotationPausedUntil / 1000), captured: true }] : []) };
+const wallWake = { pending: () => false, current: () => null };
+const pickNextAccount = () => null;
+const parkedCodexChats = [];
+`;
+
 // `boot` makes every evaluation a fresh module: a daemon restart is a new one
 // over the same files.
-const HARNESS = (boot) => `
+const HARNESS = (boot, realWall) => `
 // boot ${boot}
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { mergeRequeue, admissionVerdict, loadGate, queueRows, queuedBlock, admissionRows, admissionLine, usageHold } from ${url('bg-admission.mjs')};
-import { parseEnginePrefix } from ${url('bg-codex.mjs')};
+import { parseEnginePrefix, fmtUntil } from ${url('bg-codex.mjs')};
+import { fmtLeft } from ${url('usage-limits.mjs')};
 import { briefTitle, stripLaneRules, waitingLine } from ${url('bg-notify.mjs')};
 import { createBgWaitStore, waitKey } from ${url('bg-wait.mjs')};
 import { createWriteGrantStore } from ${url('write-grant.mjs')};
@@ -132,7 +157,9 @@ export const setBgEngine = (v) => { CHAT = { ...CHAT, engineBg: v }; };
 const chatState = () => CHAT;
 const fileConfig = {};
 const ENGINE_CONFIG = fileConfig;
-const codexFallbackOn = () => true;
+let FALLBACK = true;
+export const setFallback = (v) => { FALLBACK = v; };
+const codexFallbackOn = () => FALLBACK;
 const codexWalled = (now = Date.now()) => codexPausedUntil > now;
 const claudeWalled = (now = Date.now()) => !CLAUDE_AVAILABLE || rotationPausedUntil > now;
 const claudeRateWalled = (now = Date.now()) => CLAUDE_AVAILABLE && rotationPausedUntil > now;
@@ -165,24 +192,17 @@ const deliverWithoutClaude = () => {};
 const takeHandoffPrefix = () => '';
 const startCodexJob = (text, opts) => { STARTS.push({ engine: 'codex', text, schedule: opts.schedule, reason: opts.reason }); return { runId: 'codex-' + STARTS.length, transport: 'exec', startedAt: Date.now() }; };
 
-const LANES = { main: { name: 'main', queue: [], current: null } };
+export const LANES = { main: { name: 'main', queue: [], current: null } };
 const pickLane = () => LANES.main;
 const send = (text) => { SENT.push(text); return Promise.resolve({ message_id: SENT.length }); };
-const editProgress = () => Promise.resolve();
+export const EDITS = [];
+const editProgress = (id, html, plain) => { EDITS.push({ id, text: typeof plain === 'function' ? plain() : html }); return Promise.resolve(); };
 const escHtml = (s) => String(s);
 const keepHandback = () => {};
-export const WALLS = [];
-export const wallOpts = {};
-const raiseWall = (kind, opts) => { WALLS.push(kind); wallOpts[kind] = opts; return Promise.resolve(); };
-export const WALL_NOTICES = [];
-const raiseClaudeWall = () => { WALL_NOTICES.push(Date.now()); return Promise.resolve(); };
+${realWall ? WALL_REAL : WALL_STUBS}
 const armWallResume = () => {};
 const logAccountDecision = () => {};
-export const SETTLED = [];
-const pendWallResolution = (kind) => kind in wallOpts;
-const settleWall = (kind, extra = {}) => { SETTLED.push({ kind, ...extra }); };
 const holdFullLine = () => 'hold full';
-const bothEnginesWalledLine = () => '';
 const enginesBackLine = SYSTEM_MESSAGES.enginesBackLine;
 const QUEUE_MAX = 5;
 const PARKED_WALLED_MAX = 5;
@@ -237,6 +257,8 @@ const FUNCTIONS = [
   grab('writeHeldBgJobs'),
   grab('holdBgJob'),
   grab('canRunHeldItem'),
+  grabOr('heldItem', 'function heldItem(it) { return it; }'),
+  grabOr('heldWaitsOn', "function heldWaitsOn() { return 'claude'; }"),
   grab('flushParkedWalledJobs'),
   grab('engineFor'),
   grab('unchosenCodex', 'const'),
@@ -256,10 +278,26 @@ const FUNCTIONS = [
   grabOr('scriptFailureTold', 'const scriptFailureTold = new Set();', 'const'),
   grabOr('tellScriptFailed', 'function tellScriptFailed() {}'),
 ];
-const EXPORTS = 'export { drainBgHandoff, checkSchedules, flushParkedWalledJobs, tellLongClaudeOnlyHolds, readHeldBgJobs, fmtSchedule, resolveEngine };';
+const EXPORTS = 'export { drainBgHandoff, checkSchedules, flushParkedWalledJobs, tellLongClaudeOnlyHolds, readHeldBgJobs, fmtSchedule, resolveEngine, fmtUntil, dispatchPrompt };';
+// Section 8's real notice functions, and the sweep that ticks them.
+const WALL_FUNCTIONS = [
+  grab('liveMessages', 'const'),
+  grab('wallNotices', 'const'),
+  grab('registerLive'),
+  grab('tickLiveMessages'),
+  grab('raiseWall'),
+  grab('pendWallResolution'),
+  grab('settleWall'),
+  grab('claudeWallFacts'),
+  grab('raiseClaudeWall'),
+  grab('bothEnginesWalledLine'),
+  grab('flushParkedWalledChats'),
+];
+const WALL_EXPORTS = 'export { liveMessages, tickLiveMessages, raiseClaudeWall, flushParkedWalledChats };';
 
 let bootCount = 0;
-const load = () => import('data:text/javascript,' + encodeURIComponent([HARNESS(++bootCount), ...FUNCTIONS, EXPORTS].join('\n')));
+const load = ({ realWall = false } = {}) =>
+  import('data:text/javascript,' + encodeURIComponent([HARNESS(++bootCount, realWall), ...FUNCTIONS, ...(realWall ? [...WALL_FUNCTIONS, WALL_EXPORTS] : []), EXPORTS].join('\n')));
 let B = await load();
 
 // One poll cycle, in the poll loop's order. Section 7 reads that order off the
@@ -280,10 +318,10 @@ const SIX_HOURS = 6 * 3600_000;
 
 const entry = (extra = {}) => ({ id: 8, kind: 'daily', at: '03:00', run: true, text: 'Nightly repo review.', lastFired: '2026-11-05', ...extra });
 
-const fresh = async ({ wall = 0, entries = [entry({ claudeOnly: true })], cap = 3 } = {}) => {
+const fresh = async ({ wall = 0, entries = [entry({ claudeOnly: true })], cap = 3, realWall = false } = {}) => {
   rmSync(QUEUE, { force: true });
   rmSync(HELD, { force: true });
-  B = await load();
+  B = await load({ realWall });
   B.setCap(cap);
   B.setWall(wall);
   B.setClock('2026-11-06');
@@ -875,21 +913,48 @@ t('no claude and a Codex wall: held, under the two-engine notice, not the Claude
   eq(B.WALL_NOTICES.length, 0, 'the Claude notice would say Claude is back at its first tick');
 });
 t('that notice stays up while Codex is walled', () => ok(!B.wallOpts.both.lifted(), 'it says an engine is back with none back'));
-t('and its ending counts the held job', () => eq(B.wallOpts.both.resolved({}), '▶️ An engine is back · running 1 parked'));
+t('and the ending it writes for itself claims no job: only the flush knows what started', () =>
+  eq(B.wallOpts.both.resolved({}), '▶️ An engine is back · running 0 parked'));
 B.setCodexWall(0);
+t('a lift with the job still in the hold does not end it: the flush has not started the job', () =>
+  ok(!B.wallOpts.both.lifted(), 'the sweep would write the ending before the job runs'));
 poll();
 t('the Codex lift runs it, and the ending names Codex and the count', () => {
   eq(codexStarts().length, 1);
   eq(B.SETTLED.filter((x) => x.kind === 'both'), [{ kind: 'both', engine: 'codex', count: 1 }]);
 });
+t('with the hold empty, lifted() is true after that lift', () => ok(B.wallOpts.both.lifted(), 'a notice with nothing behind it never ends'));
 
 await fresh({ wall: FUTURE(), entries: [entry({ text: 'Hourly repo review.' })] });
 B.setCodexWall(FUTURE());
 poll();
-t('both engines walled: the two-engine notice, which names both clocks', () => {
+t('both engines walled, a job either can run: the two-engine notice', () => {
   eq(held().length, 1);
   ok(B.WALLS.includes('both'), `notices: ${B.WALLS}`);
   eq(B.WALL_NOTICES.length, 0);
+});
+t('lifted() is false while both are out', () => ok(!B.wallOpts.both.lifted(), 'it ends with no engine back'));
+B.setCodexWall(0);
+poll();
+t('Codex lifts first, Claude still walled: lifted() is true once the job has gone', () => {
+  eq(codexStarts().length, 1);
+  ok(B.wallOpts.both.lifted(), 'only a Claude lift ends this notice');
+});
+
+await fresh({ wall: FUTURE(), entries: [entry({ text: 'Hourly repo review.' })] });
+B.setCodexWall(FUTURE());
+poll();
+writeFileSync(HELD, '[]');
+t('an empty hold with both still out: lifted() is false, no engine is back', () => ok(!B.wallOpts.both.lifted(), 'it ends with no engine back'));
+
+await fresh({ wall: FUTURE(), entries: [entry({ text: 'Hourly repo review.' })] });
+B.setCodexWall(FUTURE());
+poll();
+B.setWall(0);
+poll();
+t('Claude lifts first, Codex still walled: lifted() is true once the job has gone', () => {
+  eq(claudeStarts().length, 1);
+  ok(B.wallOpts.both.lifted(), 'only a Codex lift ends this notice');
 });
 
 await fresh({ wall: FUTURE(), entries: [entry({ text: 'Hourly repo review.' })] });
@@ -920,6 +985,263 @@ t('the poll loop runs this order: schedules, flushes, the long hold line, the dr
   ok(order.every((n) => n >= 0), `a call is missing from pollLoop: ${order}`);
   eq(order, [...order].sort((a, b) => a - b));
 });
+
+// ---------------------------------------------------------------------------
+console.log('\n8. the wall notice says what the job waits on (the REAL notice functions)');
+// ---------------------------------------------------------------------------
+//
+// The real raiseWall, settleWall, tickLiveMessages, raiseClaudeWall, line
+// builders and both flushes, so these read the words on screen. Two rules: no
+// line says a job is running unless it started, and no line says an engine is
+// back for a job that still waits on the other engine.
+
+const breath = () => new Promise((r) => setTimeout(r, 0));
+const fullPoll = async () => {
+  B.checkSchedules();
+  B.flushParkedWalledChats();
+  B.flushParkedWalledJobs();
+  B.tellLongClaudeOnlyHolds(Date.now());
+  B.drainBgHandoff();
+  await breath();
+};
+const sweep = async () => {
+  B.tickLiveMessages();
+  await breath();
+};
+const rerender = async () => {
+  for (const e of B.liveMessages) e.nextAt = 0;
+  await sweep();
+};
+const said = () => [...B.SENT, ...B.EDITS.map((e) => e.text)];
+const saying = (re) => said().filter((l) => re.test(l));
+const backLines = () => saying(/is back/);
+const runningLines = () => saying(/running \d+ parked|Started \d+ held/);
+const liveNotices = () => [...B.liveMessages].filter((e) => !e.done).map((e) => e.last);
+const bothNotices = () => liveNotices().filter((l) => /Both engines are out/.test(l));
+const heldOnClaudeNotice = () => liveNotices().some((l) => /1 held · it runs at the reset/.test(l));
+const drop = (jobs) => writeFileSync(QUEUE, JSON.stringify(jobs.map((j) => ({ queuedAt: new Date().toISOString(), ...j }))));
+
+// A real wall raises its own notice the moment rotation runs out of accounts, so
+// a job that comes due later finds it up.
+const walled = async ({ entries = [], jobs = [], fallback = true } = {}) => {
+  await fresh({ wall: FUTURE() + 3600_000, entries, realWall: true });
+  B.setFallback(fallback);
+  B.setCodexWall(FUTURE());
+  if (jobs.length) drop(jobs);
+  await B.raiseClaudeWall();
+  await breath();
+};
+
+// A JOB ONLY CLAUDE CAN RUN, both engines walled, Codex resetting first.
+for (const [name, setup] of [
+  ['a --claude-only entry', { entries: [entry({ claudeOnly: true })] }],
+  ['an --engine claude handoff', { jobs: [{ text: 'Pinned work', engine: 'claude' }] }],
+  ['a claude: brief', { jobs: [{ text: 'claude: Pinned work' }] }],
+  ['a slash command handoff', { jobs: [{ text: '/qa-loop the repo' }] }],
+  ['a plain job with the fallback off', { entries: [entry()], fallback: false }],
+]) {
+  await walled(setup);
+  await fullPoll();
+  await sweep();
+  t(`${name}: held under the Claude notice alone, a Codex reset frees nothing for it`, () => {
+    eq(held().length, 1);
+    eq(bothNotices(), []);
+  });
+  B.setCodexWall(0);
+  await sweep();
+  await fullPoll();
+  await sweep();
+  await rerender();
+  t(`${name}: the Codex reset says nothing about it`, () => {
+    eq(B.STARTS.length, 0);
+    eq(held().length, 1);
+    eq(backLines(), []);
+    eq(runningLines(), []);
+  });
+  t(`${name}: the Claude notice still counts it`, () => ok(heldOnClaudeNotice(), `live: ${liveNotices()}`));
+  B.setWall(0);
+  await fullPoll();
+  await sweep();
+  t(`${name}: the Claude lift runs it, and one ending says so`, () => {
+    eq(claudeStarts().length, 1);
+    eq(held().length, 0);
+    eq(saying(/Started 1 held job/).length, 1);
+    eq(saying(/running \d+ parked/), []);
+  });
+}
+
+// A TYPED SLASH COMMAND takes the chat road to the same notice.
+await walled();
+B.dispatchPrompt('/qa-loop the repo', B.LANES.main, { allowCodexFallback: true });
+await breath();
+await sweep();
+t('a typed slash command: parked under the Claude notice alone', () => {
+  eq(B.parkedWalledChats.length, 1);
+  eq(bothNotices(), []);
+});
+B.setCodexWall(0);
+await sweep();
+await fullPoll();
+await sweep();
+t('a typed slash command: the Codex reset says nothing about it', () => {
+  eq(B.STARTS.length, 0);
+  eq(B.parkedWalledChats.length, 1);
+  eq(backLines(), []);
+  eq(runningLines(), []);
+});
+
+// NO `claude` ON THE MACHINE, Codex walled: what it waits on is Codex, and the
+// Claude notice would say "Claude is back" at its first tick.
+await fresh({ wall: 0, entries: [entry()], realWall: true });
+B.setClaudeInstalled(false);
+B.setCodexWall(FUTURE());
+await fullPoll();
+await sweep();
+await sweep();
+await fullPoll();
+await sweep();
+t('no claude, Codex walled: it waits and no line says Claude is back', () => {
+  eq(held().length, 1);
+  eq(saying(/Claude is back/), []);
+  eq(backLines(), []);
+  ok(bothNotices().some((l) => l.includes('No claude on this machine')), `live: ${liveNotices()}`);
+});
+B.setCodexWall(0);
+await sweep();
+t('no claude, the sweep sees the lift first: no job started, so no line says running', () => {
+  eq(B.STARTS.length, 0);
+  eq(runningLines(), []);
+});
+await fullPoll();
+await sweep();
+t('no claude: the poll starts it, and the ending names Codex and what started', () => {
+  eq(codexStarts().length, 1);
+  eq(backLines(), ['▶️ Codex is back · running 1 parked']);
+});
+
+// A JOB EITHER ENGINE CAN RUN, both walled: both clocks, because whichever comes
+// back first is the one that matters.
+for (const [lift, engine] of [['Codex', 'codex'], ['Claude', 'claude']]) {
+  const claudeAt = FUTURE();
+  const codexAt = FUTURE() + 3600_000;
+  await fresh({ wall: claudeAt, entries: [entry()], realWall: true });
+  B.setCodexWall(codexAt);
+  await fullPoll();
+  await sweep();
+  t(`both walled, ${lift} back first: the notice names both clocks`, () => {
+    const [line] = bothNotices();
+    ok(line, `live: ${liveNotices()}`);
+    ok(line.includes(`Claude resets ${B.fmtUntil(claudeAt, { timeZone: 'America/Toronto' })}`), line);
+    ok(line.includes(`Codex ${B.fmtUntil(codexAt, { timeZone: 'America/Toronto' })}`), line);
+  });
+  if (engine === 'codex') B.setCodexWall(0);
+  else B.setWall(0);
+  await sweep();
+  t(`both walled, ${lift} back first: the sweep says nothing before a job starts`, () => {
+    eq(B.STARTS.length, 0);
+    eq(runningLines(), []);
+  });
+  await fullPoll();
+  await sweep();
+  t(`both walled, ${lift} back first: the ending names ${lift} and what started`, () => {
+    eq(B.STARTS.map((s) => s.engine), [engine]);
+    eq(saying(/running \d+ parked/), [`▶️ ${lift} is back · running 1 parked`]);
+  });
+}
+
+// A reset that does not last: the sweep saw the lift, then Codex walled again
+// before any poll. Nothing started, so nothing may say so.
+await fresh({ wall: FUTURE() + 3600_000, entries: [entry()], realWall: true });
+B.setCodexWall(FUTURE());
+await fullPoll();
+await sweep();
+B.setCodexWall(0);
+await sweep();
+B.setCodexWall(FUTURE());
+await fullPoll();
+await sweep();
+t('Codex lifts and walls again before the poll: no line claims a start, and the notice stays', () => {
+  eq(B.STARTS.length, 0);
+  eq(held().length, 1);
+  eq(backLines(), []);
+  eq(runningLines(), []);
+  eq(bothNotices().length, 1);
+});
+
+// A MIX: the plain job goes when Codex does, the Claude job stays, and the
+// ending counts what started, whichever of the sweep and the poll sees it first.
+for (const first of ['sweep', 'poll']) {
+  await walled({ entries: [entry({ claudeOnly: true })], jobs: [{ text: 'Plain work' }] });
+  await fullPoll();
+  await sweep();
+  B.setCodexWall(0);
+  if (first === 'sweep') await sweep();
+  await fullPoll();
+  await sweep();
+  await rerender();
+  t(`a mix, the ${first} sees the Codex lift first: the ending counts the one job that started`, () => {
+    eq(codexStarts().length, 1);
+    eq(saying(/running \d+ parked/), ['▶️ Codex is back · running 1 parked']);
+  });
+  t(`a mix, the ${first} first: the Claude job stays held and the Claude notice counts it`, () => {
+    eq(held().map((j) => j.scheduleId), [8]);
+    ok(heldOnClaudeNotice(), `live: ${liveNotices()}`);
+  });
+}
+
+// A TYPED MESSAGE either engine can answer, the same ending through the chat flush.
+await fresh({ wall: FUTURE() + 3600_000, entries: [], realWall: true });
+B.setCodexWall(FUTURE());
+B.dispatchPrompt('is the deploy green', B.LANES.main, { allowCodexFallback: true });
+await breath();
+await sweep();
+B.setCodexWall(0);
+await sweep();
+t('a typed message: the sweep says nothing before it runs', () => eq(runningLines(), []));
+await fullPoll();
+await sweep();
+t('a typed message: the ending names Codex and what started', () => {
+  eq(codexStarts().length, 1);
+  eq(saying(/running \d+ parked/), ['▶️ Codex is back · running 1 parked']);
+});
+
+// THE WAITING LINE on a job that already has one up: the same reading.
+const realNow = Date.now;
+const waitingAtTheWall = async (setup) => {
+  B.occupy(3);
+  await fullPoll();
+  B.finishWorkers();
+  setup();
+  Date.now = () => realNow() + 120_000;
+  try {
+    await fullPoll();
+  } finally {
+    Date.now = realNow;
+  }
+  return B.EDITS.map((e) => e.text).join('\n');
+};
+await fresh({ wall: 0, entries: [entry({ claudeOnly: true })], realWall: true });
+{
+  const lines = await waitingAtTheWall(() => {
+    B.setWall(FUTURE() + 3600_000);
+    B.setCodexWall(FUTURE());
+  });
+  t('a job only Claude can run: its waiting line names Claude, not any engine', () => {
+    ok(lines.includes('every Claude account is at its limit, it starts after the reset'), lines);
+    ok(!lines.includes('no engine is free'), lines);
+  });
+}
+await fresh({ wall: 0, entries: [entry()], realWall: true });
+{
+  const lines = await waitingAtTheWall(() => {
+    B.setClaudeInstalled(false);
+    B.setCodexWall(FUTURE());
+  });
+  t('no claude, Codex walled: its waiting line says any engine, not Claude', () => {
+    ok(lines.includes('no engine is free, it starts when one is back'), lines);
+    ok(!lines.includes('every Claude account'), lines);
+  });
+}
 
 rmSync(TMP, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${failures.length} failed`);

@@ -153,6 +153,7 @@ const holdBgJob = () => true;
 const logAccountDecision = () => {};
 const raiseClaudeWall = () => Promise.resolve();
 const raiseHoldNotice = () => raiseClaudeWall();
+const heldWaitsOn = () => 'claude';
 const armWallResume = () => {};
 const send = (text) => { SENT.push(text); return Promise.resolve({ message_id: 100 + SENT.length }); };
 const editProgress = (id, html) => { EDITS.push({ id, html }); return Promise.resolve(); };

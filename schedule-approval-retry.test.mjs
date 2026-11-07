@@ -138,6 +138,7 @@ const holdBgJob = () => true;
 const logAccountDecision = (d) => LOGS.push('decision ' + JSON.stringify(d));
 const raiseClaudeWall = () => Promise.resolve();
 const raiseHoldNotice = () => raiseClaudeWall();
+const heldWaitsOn = () => 'claude';
 const armWallResume = () => {};
 export const SENT = [];
 const send = (text) => { SENT.push(text); return Promise.resolve({ message_id: SENT.length }); };
