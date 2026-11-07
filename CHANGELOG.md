@@ -15,17 +15,23 @@ All notable changes to Leash. Dates are release dates.
   hours, and is refused with no `claude` on the machine. `list` and `/schedules` show it.
 - **A scheduled run no engine can take waits on disk.** It used to park in memory, and the lift
   started every parked job at once, past the worker cap. It now waits in the hold and starts
-  through the cap, unless the hold is full, or the entry's text starts `claude:` while Codex is
-  free: those still park.
+  through the cap, unless the hold is full, or the entry's text starts `claude:` while Codex can
+  take it: those still park.
 - **A held job gets the notice for what it waits on.** A job the next engine back can run gets the
   two-engine notice, with both clocks, and on a machine with no `claude` that notice no longer says
-  "Claude is back" while the job waits. A job only Claude can run (a `--claude-only` entry, a
-  `claude:` brief, a slash command, or any job with the Codex fallback off) gets the Claude notice,
-  so a Codex reset says nothing about it. Its waiting line reads the same way.
+  "Claude is back" while the job waits. With `claude` installed, a job only Claude can run (a
+  `--claude-only` entry, a `claude:` brief, a slash command nobody pinned to Codex, or a job on a
+  Claude lane with the Codex fallback off) gets the Claude notice, so a Codex reset says nothing
+  about it. Its waiting line reads the same way.
+- **A Claude slash command with no `claude` on the machine is refused at once.** Nothing can ever
+  run it, so it no longer waits out a Codex wall: it is refused where it arrives, with a line that
+  says why, and no notice counts it. One pinned to Codex by name still waits for Codex.
 - **The two-engine notice ends when the work starts.** It names the engine that came back and
-  counts what started. It used to end at the reset, up to a poll before anything ran, and it could
-  say "running 1 parked" about a job that was still waiting. Both wall endings now leave out a job
-  the worker cap holds back, which says so on its own waiting line.
+  counts what it released: a held job once the drain has started it, a parked message as it goes
+  back to its lane. With both waiting the messages' flush writes the ending, so the count can run
+  low. It used to end at the reset, up to a poll before anything ran, and it could say "running 1
+  parked" about a job that was still waiting. Both wall endings now leave out a job the worker cap
+  or the load check holds back, which says so on its own waiting line, and a job the drain refuses.
 
 ### Admission: the worker cap gains a load check and a usage check
 

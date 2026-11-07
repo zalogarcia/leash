@@ -3150,9 +3150,10 @@ await t('★ a Claude slash command is refused on a Codex-first machine, not run
   ok(P.SENT.join('\n').includes('needs Claude'), P.SENT.join('\n'));
 });
 
-// THE SAME MACHINE, internal traffic (QA round 2 of the port): a scheduled run's
-// slash command has no card of its own, so it is told; a drop box one was told
-// by its card, so it is refused quietly. Neither reaches Codex.
+// THE SAME MACHINE, internal traffic (QA round 2 of the port): a refused job says
+// why, whichever road it took. The drain refuses a drop box job before it gets
+// here, so a priority job at this line has had no card to say it. Neither
+// reaches Codex.
 P.reset();
 P.setEngines({ claudeAvailable: false });
 P.dispatchPrompt('/goal nightly cleanup of the repo', P.getBgLane(), { priority: true, schedule: { id: 3 } });
@@ -3163,10 +3164,10 @@ await t('★ no claude: a SCHEDULED slash command is refused with the line, not 
 P.reset();
 P.setEngines({ claudeAvailable: false });
 P.dispatchPrompt('LANE RULES (headless).\n\n--- TASK ---\n/autopilot ship it', P.getBgLane(), { priority: true });
-await t('no claude: a drop box slash command is refused quietly (its card already said so), not run on Codex', () => {
+await t('no claude: a priority slash command with its LANE RULES header says why, and is not run on Codex', () => {
   eq(P.CODEX.length, 0);
   eq(P.CLAUDE.length, 0);
-  ok(!P.SENT.join('\n').includes('needs Claude'), P.SENT.join('\n'));
+  ok(P.SENT.join('\n').includes('needs Claude'), P.SENT.join('\n'));
 });
 
 P.reset();

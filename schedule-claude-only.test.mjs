@@ -8,12 +8,13 @@
 // The REAL functions out of bridge.mjs, through one poll cycle in the order the
 // poll loop runs them, over a real drop box, a real hold file and a real write
 // grant store on temp files. The engine is the REAL resolveEngine, and dispatch
-// is the REAL dispatchPrompt, because that is where a due entry met the wall.
-// Stubbed: what starts a process (it records the engine it was given),
-// startResolvedRun, Telegram, the schedule store (in memory) and the admission
-// load and usage inputs. Scripts run for real. The wall notice machinery is
-// stubbed in sections 1 to 7, which read what raiseHoldNotice hands it, and REAL
-// in section 8, which is about the words on screen.
+// is the REAL dispatchPrompt, startResolvedRun and pickLane, because that is
+// where a due entry met the wall and where a job is refused. Stubbed: what starts
+// a process (it records the engine it was given), Telegram, the schedule store
+// (in memory) and the admission load and usage inputs. Scripts run for real. The
+// wall notice machinery is stubbed in sections 1 to 7, which read what
+// raiseHoldNotice hands it, and REAL in sections 8 and 9, which are about the
+// words on screen.
 //
 // CLAUDE_ONLY_DIR=<an export of the commit before> runs these same tests against
 // that code. The helpers it lacks become no-ops, so what fails there is an
@@ -123,7 +124,7 @@ import { createBgWaitStore, waitKey } from ${url('bg-wait.mjs')};
 import { createWriteGrantStore } from ${url('write-grant.mjs')};
 import { describeWhen, isDailyDue, isHoursDue, latestHoursSlot } from ${url('schedule-due.mjs')};
 import { scheduledScriptPrompt, scriptCommand, SCRIPT_TIMEOUT_MS } from ${url('schedule-script.mjs')};
-import { resolveEngine } from ${engineUrl};
+import { resolveEngine, claudeMissingLine } from ${engineUrl};
 import { clip, oneLine } from ${url('progress-render.mjs')};
 import * as SYSTEM_MESSAGES from ${url('system-messages.mjs')};
 const claudeOnlyHeldLine = SYSTEM_MESSAGES.claudeOnlyHeldLine || (() => '');
@@ -178,11 +179,9 @@ export const occupy = (n) => { for (let i = 0; i < n; i++) newLane().current = {
 function bgWorkerDescriptors() {
   return bgLanes.filter((l) => l.isBg && l.current).map((l) => ({ runId: l.name + '-' + l.current.startedAt, lane: l.name, engine: 'claude' }));
 }
-const startResolvedRun = (decision, lane, item) => {
-  if (decision.engine !== 'codex') return 'fallthrough';
-  STARTS.push({ engine: 'codex', text: item.text, schedule: item.schedule, reason: decision.reason });
-  return 'started';
-};
+const automaticChatHandoff = () => '';
+const composeWithQuote = (quote, text) => text;
+const runCodexChat = (text) => { STARTS.push({ engine: 'codex', text, chat: true }); };
 const runClaude = (text, lane, opts = {}) => {
   STARTS.push({ engine: 'claude', text, schedule: opts.schedule });
   lane.current = { startedAt: Date.now(), steps: 0 };
@@ -193,7 +192,6 @@ const takeHandoffPrefix = () => '';
 const startCodexJob = (text, opts) => { STARTS.push({ engine: 'codex', text, schedule: opts.schedule, reason: opts.reason }); return { runId: 'codex-' + STARTS.length, transport: 'exec', startedAt: Date.now() }; };
 
 export const LANES = { main: { name: 'main', queue: [], current: null } };
-const pickLane = () => LANES.main;
 const send = (text) => { SENT.push(text); return Promise.resolve({ message_id: SENT.length }); };
 export const EDITS = [];
 const editProgress = (id, html, plain) => { EDITS.push({ id, text: typeof plain === 'function' ? plain() : html }); return Promise.resolve(); };
@@ -214,7 +212,6 @@ export const writeGrants = createWriteGrantStore({ file: ${JSON.stringify(path.j
 const recordBgResult = (task, outcome) => { RESULTS.push({ task, outcome }); };
 const wallGuard = { jobOf: () => null };
 const noteWallGuardJob = () => {};
-const claudeMissingLine = () => 'no claude on this machine';
 const CODEX_MISSING_LINE = 'no codex';
 export const codexRuns = new Map();
 const briefRepo = () => 'repo';
@@ -260,6 +257,9 @@ const FUNCTIONS = [
   grabOr('heldItem', 'function heldItem(it) { return it; }'),
   grabOr('heldWaitsOn', "function heldWaitsOn() { return 'claude'; }"),
   grab('flushParkedWalledJobs'),
+  grab('claudeTakeoverToldFor', 'const'),
+  grab('startResolvedRun'),
+  grab('pickLane'),
   grab('engineFor'),
   grab('unchosenCodex', 'const'),
   grab('engineForItem'),
@@ -1289,6 +1289,201 @@ await fresh({ wall: 0, entries: [entry()], realWall: true });
     ok(!lines.includes('every Claude account'), lines);
   });
 }
+
+// ---------------------------------------------------------------------------
+console.log('\n9. a job nothing can run is refused at once, and no line says it runs');
+// ---------------------------------------------------------------------------
+//
+// No `claude` on the machine and a Claude slash command nobody asked Codex for:
+// no reset ever runs it. Refused at the reset, it read as a job that started, so
+// it is refused where it arrives. The real dispatchPrompt, startResolvedRun and
+// notice functions: a stub that could not refuse hid this.
+
+const SLASH = '/qa-loop the repo';
+const noClaude = async ({ entries = [], cap = 3 } = {}) => {
+  await fresh({ wall: 0, entries, cap, realWall: true });
+  B.setClaudeInstalled(false);
+  B.setCodexWall(FUTURE());
+};
+const codexResets = async () => {
+  B.setCodexWall(0);
+  await sweep();
+  await fullPoll();
+  await sweep();
+  await rerender();
+};
+const needsClaude = () => saying(/needs Claude/);
+
+for (const [name, setup, arrive, told] of [
+  ['a slash handoff', {}, () => drop([{ text: SLASH }]), 'That handed-off job needs Claude'],
+  ['a slash handoff with its LANE RULES header', {}, () => drop([{ text: `LANE RULES (headless).\n\n--- TASK ---\n${SLASH}` }]), 'That handed-off job needs Claude'],
+  ['a typed slash command', {}, () => B.dispatchPrompt(SLASH, undefined, { allowCodexFallback: true }), '/qa-loop needs Claude'],
+  ['a typed bg: slash command', {}, () => B.dispatchPrompt(`bg: ${SLASH}`, undefined, { allowCodexFallback: true }), '/qa-loop needs Claude'],
+  ['a scheduled slash entry', { entries: [entry({ text: SLASH })] }, () => {}, 'That handed-off job needs Claude'],
+]) {
+  await noClaude(setup);
+  arrive();
+  await fullPoll();
+  await sweep();
+  t(`no claude, ${name}: refused now, nothing waits and nothing starts`, () => {
+    eq(held().length, 0);
+    eq(B.parkedWalledChats.length, 0);
+    eq(queue().length, 0);
+    eq(B.STARTS.length, 0);
+  });
+  t(`no claude, ${name}: the refusal says why, once`, () => {
+    eq(needsClaude().length, 1, said().join(' | '));
+    ok(needsClaude()[0].includes(told), needsClaude()[0]);
+  });
+  t(`no claude, ${name}: no wall notice goes up for it`, () => eq(liveNotices(), []));
+  await codexResets();
+  t(`no claude, ${name}: the Codex reset claims nothing for it`, () => {
+    eq(B.STARTS.length, 0);
+    eq(backLines(), []);
+    eq(runningLines(), []);
+  });
+}
+
+await noClaude({ entries: [entry({ text: SLASH })] });
+await fullPoll();
+t('no claude, a refused scheduled entry: stamped, so one fire is one refusal', () => {
+  eq(B.schedules().items[0].lastFired, '2026-11-06');
+  eq(B.RESULTS.length, 1);
+  ok(B.RESULTS[0].outcome.startsWith('FAILED'), B.RESULTS[0].outcome);
+});
+
+// BESIDE WORK THAT DOES RUN: the ending counts the one that started.
+await noClaude();
+drop([{ text: SLASH }, { text: 'Plain work' }]);
+await fullPoll();
+await sweep();
+t('no claude, a slash job beside a plain job: only the plain job waits', () => {
+  eq(held().map((j) => j.text), ['Plain work']);
+  eq(needsClaude().length, 1, said().join(' | '));
+  eq(bothNotices().length, 1, `live: ${liveNotices()}`);
+});
+await codexResets();
+t('no claude, a slash job beside a plain job: the ending counts the one start', () => {
+  eq(codexStarts().map((s) => s.text), ['Plain work']);
+  eq(runningLines().length, 1, said().join(' | '));
+  ok(runningLines()[0].includes('Codex is back · running 1 parked'), runningLines()[0]);
+});
+
+// A HOLD FROM BEFORE THIS: released with the rest, refused, and not counted.
+await noClaude();
+writeFileSync(HELD, JSON.stringify([{ text: SLASH }]));
+drop([{ text: 'Plain work' }]);
+await fullPoll();
+await sweep();
+await codexResets();
+t('no claude, a slash job already in the hold: refused at the reset and left out of the count', () => {
+  eq(held().length, 0);
+  eq(codexStarts().map((s) => s.text), ['Plain work']);
+  eq(needsClaude().length, 1, said().join(' | '));
+  eq(runningLines().length, 1, said().join(' | '));
+  ok(runningLines()[0].includes('running 1 parked'), runningLines()[0]);
+});
+
+// AT ONCE MEANS AT ONCE: a free Codex, or a full pool, is no reason to wait.
+await fresh({ wall: 0, entries: [], realWall: true });
+B.setClaudeInstalled(false);
+drop([{ text: SLASH }]);
+await fullPoll();
+t('no claude, Codex free: a slash handoff is refused the same way, not handed to Codex', () => {
+  eq(B.STARTS.length, 0);
+  eq(needsClaude().length, 1, said().join(' | '));
+  eq(saying(/Job not run/).length, 1, said().join(' | '));
+});
+await noClaude({ cap: 1 });
+B.occupy(1);
+drop([{ text: SLASH }]);
+await fullPoll();
+t('no claude, a full worker pool: the refusal does not wait for a slot', () => {
+  eq(queue().length, 0);
+  eq(needsClaude().length, 1, said().join(' | '));
+});
+
+// THE REAL startResolvedRun on the road that needs no drain: a due entry with
+// Codex free is dispatched directly, and its refusal is that function's own.
+await fresh({ wall: 0, entries: [entry({ text: SLASH })], realWall: true });
+B.setClaudeInstalled(false);
+await fullPoll();
+t('no claude, a scheduled slash entry with Codex free: startResolvedRun refuses it and says why', () => {
+  eq(B.STARTS.length, 0);
+  eq(needsClaude().length, 1, said().join(' | '));
+  ok(needsClaude()[0].includes('/qa-loop needs Claude'), needsClaude()[0]);
+});
+
+// THE LANE THAT DOES NOT REFUSE: startResolvedRun refuses on a bg lane, so a slash
+// command forced onto the chat lane keeps its hold, rather than start into the wall.
+await noClaude();
+B.dispatchPrompt(SLASH, B.LANES.main, { allowCodexFallback: true });
+await breath();
+t('no claude, a slash command forced onto the chat lane: held, not run into the Codex wall', () => {
+  eq(B.STARTS.length, 0);
+  eq(B.parkedWalledChats.length, 1);
+});
+
+// NOT A SLASH COMMAND: Codex can run it, so a typed job still waits out the wall.
+await noClaude();
+B.dispatchPrompt('bg: Plain work', undefined, { allowCodexFallback: true });
+await breath();
+t('no claude, a typed bg: job with no slash command: it waits for Codex, not refused', () => {
+  eq(B.STARTS.length, 0);
+  eq(B.parkedWalledChats.length, 1);
+  eq(needsClaude(), []);
+});
+await codexResets();
+t('no claude, a typed bg: job with no slash command: the reset starts it', () => {
+  eq(codexStarts().map((s) => s.text), ['Plain work']);
+  eq(runningLines().length, 1, said().join(' | '));
+  ok(runningLines()[0].includes('running 1 parked'), runningLines()[0]);
+});
+
+// ASKED FOR BY NAME: Codex takes it, so it is real work behind a real wall, and
+// neither refusal may catch it.
+for (const [name, arrive, pinned] of [
+  ['an --engine codex handoff', () => drop([{ text: SLASH, engine: 'codex' }]), () => held().length],
+  ['a codex: handoff', () => drop([{ text: `codex: ${SLASH}` }]), () => held().length],
+  ['a typed codex: command', () => B.dispatchPrompt(`codex: ${SLASH}`, undefined, { allowCodexFallback: true }), () => B.parkedWalledChats.length],
+]) {
+  await noClaude();
+  arrive();
+  await fullPoll();
+  await sweep();
+  t(`no claude, ${name}: it waits for Codex, under the two-engine notice`, () => {
+    eq(pinned(), 1);
+    eq(needsClaude(), []);
+    eq(bothNotices().length, 1, `live: ${liveNotices()}`);
+  });
+  await codexResets();
+  t(`no claude, ${name}: the reset starts it, and the ending counts it`, () => {
+    eq(codexStarts().map((s) => s.text), [SLASH]);
+    eq(runningLines().length, 1, said().join(' | '));
+    ok(runningLines()[0].includes('running 1 parked'), runningLines()[0]);
+  });
+}
+await noClaude();
+B.setBgEngine('codex');
+drop([{ text: SLASH }]);
+await fullPoll();
+await sweep();
+t('no claude, /engine bg codex: a slash job waits for Codex', () => {
+  eq(held().length, 1);
+  eq(needsClaude(), []);
+});
+
+// WITH `claude` INSTALLED nothing changes: a reset does run it, so it waits.
+await fresh({ wall: FUTURE(), entries: [], realWall: true });
+B.dispatchPrompt(SLASH, undefined, { allowCodexFallback: true });
+drop([{ text: SLASH }]);
+await fullPoll();
+await sweep();
+t('claude installed and walled: a slash job waits for Claude, on both roads, and no refusal goes out', () => {
+  eq(held().length, 1);
+  eq(B.parkedWalledChats.length, 1);
+  eq(needsClaude(), []);
+});
 
 rmSync(TMP, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${failures.length} failed`);

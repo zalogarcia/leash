@@ -10753,8 +10753,9 @@ function canRunHeldItem(it, { codexBack = false } = {}) {
   // there (see dispatchPrompt's hold): it waits for Claude.
   // Matched on the STRIPPED text: a drop box brief carries the LANE RULES
   // header in front, and the anchored pattern would never see its first line.
-  // A real Claude wall only: with no claude binary nothing comes back for it,
-  // so it is released and refused with a line rather than held forever.
+  // A real Claude wall only: with no claude binary nothing comes back for it, so
+  // the drain and dispatchPrompt refuse it before it is held. One already in the
+  // hold, from a daemon before that, is released here and refused by the drain.
   if (decision.engine === 'codex' && decision.reason === 'claude_limited' && BG_COMMAND_RE.test(stripLaneRules(String(it?.text || '')).trimStart())) return false;
   return decision.engine === 'codex' ? CODEX_AVAILABLE && (codexBack || !codexWalled()) : !claudeWalled();
 }
@@ -10777,6 +10778,8 @@ function heldItem(it) {
  * (a Claude pin, a --claude-only entry, a slash command, the fallback off).
  * 'next': the next engine back runs it, which with no `claude` on the machine is
  * Codex.
+ * A job nothing can run has no answer, and is never asked about: it is refused
+ * where it arrives (the drain, dispatchPrompt), so no notice counts it.
  *
  * Asked of canRunHeldItem with the Codex wall taken away, so a notice cannot
  * disagree with the flush: this is the test the flush runs at the real lift. The
@@ -11343,8 +11346,11 @@ function drainBgHandoff() {
     // A CLAUDE-ONLY JOB (schedule.mjs --claude-only) never lands on Codex. Its
     // Claude pin already beats a wall, so what is left is no `claude` on this
     // machine. No reset ends that, so it is refused out loud rather than held.
+    // A Claude slash command nobody asked Codex for is the same case: nothing here
+    // will ever run it, so a Codex wall is not something it can wait out.
     const claudeOnly = typeof it === 'object' && it?.claudeOnly === true;
-    const decision = claudeOnly && resolved.engine === 'codex' ? { ...resolved, engine: null, error: 'claude_missing' } : resolved;
+    const slashNoClaude = resolved.reason === 'claude_missing' && BG_COMMAND_RE.test(stripLaneRules(text).trimStart());
+    const decision = (claudeOnly && resolved.engine === 'codex') || slashNoClaude ? { ...resolved, engine: null, error: 'claude_missing' } : resolved;
     // NO ENGINE CAN RUN IT. The queue file was claimed before this loop, so
     // dropping the item here would destroy the brief with no dispatch, no row
     // and no report: the exact failure the "DISPATCH FIRST, then decorate" rule
@@ -11645,11 +11651,7 @@ function drainBgHandoff() {
       const runId = lane.current?.startedAt ? `${lane.name}-${lane.current.startedAt}` : null;
       // A job that lands on a walled lane sits still for hours, which is
       // indistinguishable from a job that was dropped unless the notice says so.
-      const waitNote = !fallbackSlashCommand
-        ? ''
-        : decision.reason === 'claude_missing'
-          ? '\n⛔ It is a Claude command and there is no `claude` on this machine, so it will not run.'
-          : '\n⏸ It is a Claude command, so it waits for the reset rather than running on Codex.';
+      const waitNote = fallbackSlashCommand ? '\n⏸ It is a Claude command, so it waits for the reset rather than running on Codex.' : '';
       // ONE message for the whole job now, kept alive off the live run record.
       // `markdown: false` inside startWorkerNotice for the same reason it was
       // here: titles and repo names carry _ and *, and one bad entity costs the
@@ -11981,8 +11983,8 @@ function checkSchedules() {
             schedReason = d.reason || null;
             // The drain's hold condition for a job with no pin: no engine can
             // take it now. A `claude:` prefix on the entry's text is not read
-            // here, so while Codex is free that entry takes the direct dispatch
-            // and parks.
+            // here, so while Codex can take it that entry takes the direct
+            // dispatch and parks.
             schedBehindWall = Boolean(d.pausedUntil) && (d.engine === 'claude' || codexWalled());
           }
         } catch {
@@ -13820,13 +13822,6 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
   // A slash command on a machine with no Claude: it will never run, and sitting
   // silently in a lane that cannot start is worse than being told.
   if (decision.reason === 'claude_missing' && lane.isBg && BG_COMMAND_RE.test(stripLaneRules(text).trimStart())) {
-    // A drop box job was already told why by its own card; it is refused
-    // without a second message rather than spawned at a missing binary. A
-    // scheduled run's ⏰ card does not say why, so it gets the line as well.
-    if (item.priority && !item.schedule) {
-      console.error('[bridge] a Claude command with no claude on this machine was not run');
-      return 'refused';
-    }
     send(claudeMissingLine(stripLaneRules(text).trimStart().split(/\s+/)[0]), { markdown: false }).catch(() => {});
     return 'refused';
   }
@@ -13881,7 +13876,11 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
   // A real Claude wall only: with no claude binary there is no reset to wait
   // for, and startResolvedRun refuses the command with a line instead.
   const codexWillNotTakeThis = pendingDecision.reason === 'claude_limited' && BG_COMMAND_RE.test(stripLaneRules(text).trimStart());
-  const holdIt = Boolean(pendingDecision.pausedUntil) &&
+  // That refusal comes NOW, with a Codex wall up too: nothing will ever run this,
+  // and held through the wall it reads as work the reset started. Its lane test
+  // is startResolvedRun's, so nothing skips the hold that it would not refuse.
+  const slashNoClaude = lane.isBg && pendingDecision.reason === 'claude_missing' && BG_COMMAND_RE.test(stripLaneRules(text).trimStart());
+  const holdIt = Boolean(pendingDecision.pausedUntil) && !slashNoClaude &&
     (pendingDecision.engine === 'claude' || codexWalled() || codexWillNotTakeThis);
   if (holdIt) {
     // A WORKER REPORT IS KEPT, not parked with the chat messages: held for
