@@ -490,7 +490,7 @@ t('the usage text documents the flag', () => {
   ok(run('help').out.includes('--switch-account'), 'usage is missing --switch-account');
 });
 
-// ── every N hours with a script (LINEAR-WORK-1104, the work sweep) ─────
+// ── every N hours with a script (the work sweep) ─────
 const SCRIPT = path.join(WORK, 'sweep.mjs');
 writeFileSync(SCRIPT, '// a sweep\n');
 
