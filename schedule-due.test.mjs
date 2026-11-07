@@ -255,6 +255,154 @@ t('an hours item is inert for a daemon that predates it (its at is not a number)
   ok(!(s.kind === 'daily') && !(Date.now() >= s.at), 'an old daemon would fire it');
 });
 
+// ── every N hours across a clock change ─────────────────────────────────
+// A slot is a local wall time. On the spring night one local hour never
+// happens, and on the fall back night one happens twice. The rule: a slot in
+// the skipped hour fires at the first real minute after it, where the clock
+// lands when it jumps (as a daily item at 02:30 fires at 03:00 that night), and
+// when that minute is itself a slot the two are one fire. A slot in the
+// repeated hour fires once, the first time round. So, polled once a minute as
+// the daemon polls, an entry fires exactly where the wall clock first reaches
+// one of its slots, and stamps the minute it fired: never a later minute (an
+// early fire), never an earlier one (a late fire). The expected fires come from
+// the zone's own clock read through Intl, never from a Date built out of a
+// local time, which is the step that went wrong.
+const CLOCK_CHANGES = [
+  // zone, the night an hour is skipped, the night an hour repeats
+  ['America/Chicago', [2027, 3, 14], [2026, 11, 1]],
+  ['Australia/Sydney', [2026, 10, 4], [2027, 4, 4]],
+];
+
+// Minutes since 1970-01-01 on the wall clock of `zone` at epoch ms `ms`.
+const wallClock = (zone) => {
+  const f = new Intl.DateTimeFormat('en-US', { timeZone: zone, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric' });
+  return (ms) => {
+    const p = Object.fromEntries(f.formatToParts(ms).map((x) => [x.type, x.value]));
+    return Date.UTC(+p.year, +p.month - 1, +p.day) / 60_000 + +p.hour * 60 + +p.minute;
+  };
+};
+
+const minutePolls = (from, to) => {
+  const out = [];
+  for (let ms = from; ms < to; ms += 60_000) out.push(ms);
+  return out;
+};
+
+// The polls a correct entry fires on: those where the wall clock first passes
+// one of its slots (minute `first` of each day, then every `step` minutes).
+const clockFires = (polls, wall, first, step) => {
+  const nextSlot = (v) => {
+    const day = Math.floor(v / 1440) * 1440;
+    const m = v - day;
+    const s = m < first ? first : first + (Math.floor((m - first) / step) + 1) * step;
+    return s < 1440 ? day + s : day + 1440 + first;
+  };
+  const out = [];
+  let reached = wall(polls[0] - 60_000);
+  for (const ms of polls) {
+    const w = wall(ms);
+    if (w <= reached) continue; // the repeated hour: nothing new on the clock
+    if (nextSlot(reached) <= w) out.push(ms);
+    reached = w;
+  }
+  return out;
+};
+
+// The daemon's loop (bridge.mjs checkSchedules): poll, fire when due, stamp the
+// slot. Counts a slot later than the poll, and a stamp that is not the poll.
+const daemonFires = (item, polls, seen) => {
+  item.lastFiredAt = latestHoursSlot(item, polls[0] - 60_000);
+  const fires = [];
+  for (const ms of polls) {
+    if (latestHoursSlot(item, ms) > ms) seen.future++;
+    if (!isHoursDue(item, ms)) continue;
+    item.lastFiredAt = latestHoursSlot(item, ms);
+    if (item.lastFiredAt !== ms) seen.offMinute++;
+    fires.push(ms);
+  }
+  return fires;
+};
+
+const hhmm = (min) => `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
+const utc = (iso) => Date.parse(`${iso}Z`);
+
+console.log('\n7. every N hours across a clock change');
+const homeTZ = process.env.TZ;
+try {
+  for (const [zone, ...nights] of CLOCK_CHANGES) {
+    process.env.TZ = zone;
+    const wall = wallClock(zone);
+    for (const [y, mo, d] of nights) {
+      const name = `${zone} ${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      t(`${name}: every 1 to 23 hours, polled once a minute, fires where the clock reaches a slot`, () => {
+        const start = new Date(y, mo - 1, d).getTime();
+        ok(wall(start) % 1440 === 0 && wall(new Date(y, mo - 1, d, 12).getTime()) % 1440 === 720, `the process clock is not ${zone}`);
+        // Every cadence, with `at` on a 15 minute grid over 01:00 to 03:45,
+        // where both zones change their clocks, one entry per distinct
+        // schedule. Polls run to noon; a cadence of 21 hours or more runs on to
+        // 03:00 the next day, because its last slot of the day can be the
+        // skipped one, and it comes back the next morning as yesterday's slot.
+        const toNoon = minutePolls(start, new Date(y, mo - 1, d, 12).getTime());
+        const toNextNight = minutePolls(start, new Date(y, mo - 1, d + 1, 3).getTime());
+        const seen = { future: 0, offMinute: 0 };
+        const wrong = [];
+        let entries = 0;
+        let polls = 0;
+        let fires = 0;
+        for (let every = 1; every <= 23; every++) {
+          const firsts = new Set();
+          for (let a = 60; a < 240; a += 15) {
+            const step = every * 60;
+            if (firsts.has(a % step)) continue;
+            firsts.add(a % step);
+            const run = every >= 21 ? toNextNight : toNoon;
+            const item = { kind: 'hours', every, at: hhmm(a), text: 'sweep' };
+            const got = daemonFires(item, run, seen);
+            const want = clockFires(run, wall, a % step, step);
+            if (got.join() !== want.join()) wrong.push(`every ${every}h from ${hhmm(a)}`);
+            entries++;
+            polls += run.length;
+            fires += got.length;
+          }
+        }
+        console.log(`   ${name}: ${entries} entries, ${polls} polls, ${fires} fires`);
+        ok(entries > 250 && fires > entries, `the grid ran: ${entries} entries, ${fires} fires`);
+        // future: polls where latestHoursSlot is later than now. off minute:
+        // fires stamped with another minute than their own, early or late.
+        // wrong: entries that fire where the clock reaches no slot, or miss one.
+        eq(`future ${seen.future}, off minute ${seen.offMinute}, wrong ${wrong.length}`, 'future 0, off minute 0, wrong 0', wrong.slice(0, 3).join('; '));
+      });
+    }
+  }
+
+  process.env.TZ = 'America/Chicago';
+  const fired = (every, at, from, to) => daemonFires({ kind: 'hours', every, at, text: 'sweep' }, minutePolls(utc(from), utc(to)), { future: 0, offMinute: 0 }).map((ms) => new Date(ms).toISOString().slice(0, 16));
+
+  t('spring night: the skipped 02:30 fires at 03:00, and 03:30 still fires', () => {
+    // CST is UTC-6 and CDT UTC-5; 02:00 CST jumps to 03:00 CDT, 08:00Z.
+    eq(fired(1, '00:30', '2027-03-14T06:00', '2027-03-14T10:00').join(' '), '2027-03-14T06:30 2027-03-14T07:30 2027-03-14T08:00 2027-03-14T08:30 2027-03-14T09:30');
+    eq(latestHoursSlot({ kind: 'hours', every: 1, at: '00:30' }, utc('2027-03-14T08:10')), utc('2027-03-14T08:00'), 'at 03:10 CDT the slot is 03:00, not 03:30');
+  });
+
+  t('spring night: a skipped 02:00 and the 03:00 it lands on are one fire', () => {
+    eq(fired(1, '00:00', '2027-03-14T06:00', '2027-03-14T10:00').join(' '), '2027-03-14T06:00 2027-03-14T07:00 2027-03-14T08:00 2027-03-14T09:00');
+  });
+
+  t('spring night: a skipped last slot is not fired again as yesterday\'s the next morning', () => {
+    // every 22h from 02:30 has one slot a day. It fires at 03:00 CDT on the
+    // 14th, and next at 02:30 CDT on the 15th, 07:30Z, with nothing between.
+    eq(fired(22, '02:30', '2027-03-14T06:00', '2027-03-15T09:00').join(' '), '2027-03-14T08:00 2027-03-15T07:30');
+  });
+
+  t('fall back night: the repeated 01:30 fires once, the first time round', () => {
+    // CDT until 02:00 CDT, 07:00Z, then CST: 01:30 CDT is 06:30Z, 01:30 CST 07:30Z.
+    eq(fired(1, '00:30', '2026-11-01T05:00', '2026-11-01T10:00').join(' '), '2026-11-01T05:30 2026-11-01T06:30 2026-11-01T08:30 2026-11-01T09:30');
+  });
+} finally {
+  if (homeTZ === undefined) delete process.env.TZ;
+  else process.env.TZ = homeTZ;
+}
+
 // ---------------------------------------------------------------------------
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

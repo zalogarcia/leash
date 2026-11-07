@@ -7,7 +7,9 @@ All notable changes to Leash. Dates are release dates.
 ### Schedules: every N hours, script entries and runs that wait for Claude
 
 - **`schedule.mjs add every <N>h <HH:MM>`** fires once per slot, N from 1 to 23. It takes `--run`
-  or `--script`. A slot that comes up while the entry's last job still waits folds into it.
+  or `--script`. A slot that comes up while the entry's last job still waits folds into it. A slot
+  in the hour a spring clock change skips fires at the first minute after it, and a slot in the
+  repeated autumn hour fires once.
 - **`--script <path>`** runs a file on that cadence. Only non-empty output reaches the chat lane, as
   a turn the daemon wrote. A script that fails with no output gets one line, until it runs clean.
 - **`schedule.mjs update <id> --claude-only true`** makes a `--run` entry wait through a Claude

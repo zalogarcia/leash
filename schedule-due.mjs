@@ -80,9 +80,25 @@ export function everyHours(item) {
   return item?.kind === 'hours' && Number.isInteger(n) && n >= 1 && n <= 23 ? n : 0;
 }
 
+// Epoch ms of local minute `minute` (0 to 1439) of the local day `day` falls
+// on. A minute the clock skips (the spring hour) is no time at all, so it maps
+// to the first real minute after it, where the clock lands when it jumps:
+// `new Date(y, mo, d, 0, minute)` alone would push it a whole hour further, past
+// now. A minute that happens twice (the fall back hour) is its first pass.
+const slotMs = (day, minute) => {
+  const y = day.getFullYear(), mo = day.getMonth(), d = day.getDate();
+  for (let k = minute; k < 1440; k++) {
+    const t = new Date(y, mo, d, 0, k);
+    if (t.getDate() === d && t.getHours() * 60 + t.getMinutes() === k) return t.getTime();
+  }
+  return new Date(y, mo, d + 1).getTime(); // the skipped stretch ran to midnight
+};
+
 /** Epoch ms of the latest slot of an hours item at or before `nowMs`, or NaN.
  *  The day's first slot is `at` minus whole steps (so 00:05 every 2h and 06:05
- *  every 2h are the same schedule); before it, yesterday's last slot counts. */
+ *  every 2h are the same schedule); before it, yesterday's last slot counts. A
+ *  slot in the hour the clock skips fires at the first real minute after it,
+ *  so the value is never later than `nowMs`. */
 export function latestHoursSlot(item, nowMs = Date.now()) {
   const every = everyHours(item);
   const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(item?.at ?? ''));
@@ -91,12 +107,9 @@ export function latestHoursSlot(item, nowMs = Date.now()) {
   const first = (Number(m[1]) * 60 + Number(m[2])) % step;
   const now = new Date(nowMs);
   const minute = now.getHours() * 60 + now.getMinutes();
-  if (minute >= first) {
-    const slot = first + Math.floor((minute - first) / step) * step;
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, slot).getTime();
-  }
+  if (minute >= first) return slotMs(now, first + Math.floor((minute - first) / step) * step);
   const last = first + Math.floor((1439 - first) / step) * step;
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 0, last).getTime();
+  return slotMs(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12), last);
 }
 
 /** Is this hours item due at `nowMs`? Its latest slot has come and it has not
