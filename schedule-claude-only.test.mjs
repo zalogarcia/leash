@@ -10,8 +10,8 @@
 // grant store on temp files. The engine is the REAL resolveEngine, and dispatch
 // is the REAL dispatchPrompt, because that is where a due entry met the wall.
 // Stubbed: what starts a process (it records the engine it was given),
-// startResolvedRun, Telegram, the schedule store (in memory) and the admission
-// load and usage inputs. Scripts run for real.
+// startResolvedRun, Telegram, the wall notice machinery, the schedule store (in
+// memory) and the admission load and usage inputs. Scripts run for real.
 //
 // CLAUDE_ONLY_DIR=<an export of the commit before> runs these same tests against
 // that code. The helpers it lacks become no-ops, so what fails there is an
@@ -126,6 +126,7 @@ let CODEX_AVAILABLE = true;
 export const setWall = (until) => { rotationPausedUntil = until; };
 export const setClaudeInstalled = (v) => { CLAUDE_AVAILABLE = v; };
 export const setCodexInstalled = (v) => { CODEX_AVAILABLE = v; };
+export const setCodexWall = (until) => { codexPausedUntil = until; };
 let CHAT = { cwd: ${JSON.stringify(TMP)} };
 export const setBgEngine = (v) => { CHAT = { ...CHAT, engineBg: v }; };
 const chatState = () => CHAT;
@@ -170,16 +171,19 @@ const send = (text) => { SENT.push(text); return Promise.resolve({ message_id: S
 const editProgress = () => Promise.resolve();
 const escHtml = (s) => String(s);
 const keepHandback = () => {};
-const raiseWall = () => Promise.resolve();
+export const WALLS = [];
+export const wallOpts = {};
+const raiseWall = (kind, opts) => { WALLS.push(kind); wallOpts[kind] = opts; return Promise.resolve(); };
 export const WALL_NOTICES = [];
 const raiseClaudeWall = () => { WALL_NOTICES.push(Date.now()); return Promise.resolve(); };
 const armWallResume = () => {};
 const logAccountDecision = () => {};
-const pendWallResolution = () => {};
-const settleWall = () => {};
+export const SETTLED = [];
+const pendWallResolution = (kind) => kind in wallOpts;
+const settleWall = (kind, extra = {}) => { SETTLED.push({ kind, ...extra }); };
 const holdFullLine = () => 'hold full';
 const bothEnginesWalledLine = () => '';
-const enginesBackLine = () => '';
+const enginesBackLine = SYSTEM_MESSAGES.enginesBackLine;
 const QUEUE_MAX = 5;
 const PARKED_WALLED_MAX = 5;
 export const parkedWalledChats = [];
@@ -246,6 +250,7 @@ const FUNCTIONS = [
   grab('fmtSchedule'),
   grabOr('CLAUDE_ONLY_HOLD_NOTICE_MS', 'const CLAUDE_ONLY_HOLD_NOTICE_MS = 0;', 'const'),
   grabOr('tellLongClaudeOnlyHolds', 'function tellLongClaudeOnlyHolds() {}'),
+  grabOr('raiseHoldNotice', 'function raiseHoldNotice() { return raiseClaudeWall(); }'),
   grabOr('scheduleJobWaiting', 'function scheduleJobWaiting() { return false; }'),
   grabOr('runScheduledScript', 'function runScheduledScript() {}'),
   grabOr('scriptFailureTold', 'const scriptFailureTold = new Set();', 'const'),
@@ -750,6 +755,20 @@ await quietly(async () => {
 });
 t('a clean run ends the streak, so the next failure is said again', () => eq(failLines().length, 2));
 
+writeFileSync(B.schedules().items[0].script, "console.log('half done');\nprocess.exit(4);\n");
+await quietly(async () => {
+  nextSlot();
+  B.checkSchedules();
+  await until(() => B.STARTS.length > 0);
+});
+writeFileSync(B.schedules().items[0].script, 'process.exit(3);\n');
+await quietly(async () => {
+  nextSlot();
+  B.checkSchedules();
+  await new Promise((r) => setTimeout(r, 200));
+});
+t('a failed run with output is not a clean run: the streak stays, so the next failure is not said twice', () => eq(failLines().length, 2));
+
 // A SLOT MUST NOT STACK A JOB. Three slots come up behind each wall; each row is
 // a road a due job can take, and each ends in one job, not three.
 const slots = (n = 3) => {
@@ -840,6 +859,45 @@ for (let i = 1; i <= 3; i++) {
 t('a script turn behind a wall: one parked turn, holding the newest output', () => {
   eq(B.parkedWalledChats.length, 1);
   ok(B.parkedWalledChats[0].text.endsWith('run 3'), B.parkedWalledChats[0].text);
+});
+B.setCodexInstalled(true);
+
+// THE NOTICE names the walls that are real. The Claude notice lifts when the
+// Claude clock runs out, which on a machine with no claude is at once.
+await fresh({ wall: 0, entries: [entry({ text: 'Hourly repo review.' })] });
+B.setClaudeInstalled(false);
+B.setCodexWall(FUTURE());
+poll();
+t('no claude and a Codex wall: held, under the two-engine notice, not the Claude one', () => {
+  eq(held().length, 1);
+  eq(B.STARTS.length, 0);
+  ok(B.WALLS.includes('both'), `notices: ${B.WALLS}`);
+  eq(B.WALL_NOTICES.length, 0, 'the Claude notice would say Claude is back at its first tick');
+});
+t('that notice stays up while Codex is walled', () => ok(!B.wallOpts.both.lifted(), 'it says an engine is back with none back'));
+t('and its ending counts the held job', () => eq(B.wallOpts.both.resolved({}), '▶️ An engine is back · running 1 parked'));
+B.setCodexWall(0);
+poll();
+t('the Codex lift runs it, and the ending names Codex and the count', () => {
+  eq(codexStarts().length, 1);
+  eq(B.SETTLED.filter((x) => x.kind === 'both'), [{ kind: 'both', engine: 'codex', count: 1 }]);
+});
+
+await fresh({ wall: FUTURE(), entries: [entry({ text: 'Hourly repo review.' })] });
+B.setCodexWall(FUTURE());
+poll();
+t('both engines walled: the two-engine notice, which names both clocks', () => {
+  eq(held().length, 1);
+  ok(B.WALLS.includes('both'), `notices: ${B.WALLS}`);
+  eq(B.WALL_NOTICES.length, 0);
+});
+
+await fresh({ wall: FUTURE(), entries: [entry({ text: 'Hourly repo review.' })] });
+B.setCodexInstalled(false);
+poll();
+t('a Claude wall alone keeps the Claude notice: no wall on an engine that is not there', () => {
+  eq(B.WALLS.length, 0);
+  ok(B.WALL_NOTICES.length >= 1, 'no Claude notice');
 });
 B.setCodexInstalled(true);
 

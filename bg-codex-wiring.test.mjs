@@ -856,6 +856,7 @@ export const reset = () => { SENT.length = 0; EDITS.length = 0; LIVE.clear(); wa
         // left out.
         grab('claudeWallFacts'),
         grab('raiseClaudeWall'),
+        grab('raiseHoldNotice'),
         grab('armWallResume'),
         grab('canRunHeldItem'),
         grab('noEngineForChat', 'const'),
@@ -2337,6 +2338,7 @@ const writeGrants = { issue: () => null, verify: () => false };
 export const HELD = [];
 const holdBgJob = (it) => { HELD.push(it); return true; };
 const raiseClaudeWall = () => Promise.resolve();
+const raiseHoldNotice = () => raiseClaudeWall();
 const armWallResume = () => {};
 const logAccountDecision = () => {};
 // The live worker line. Real builder, recorded transport: this file is about

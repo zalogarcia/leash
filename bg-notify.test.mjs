@@ -927,6 +927,7 @@ const runningResumedWorkers = () => 0;
 const CLAUDE_AVAILABLE = true;
 export const WALLS_RAISED = [];
 const raiseClaudeWall = async () => { WALLS_RAISED.push(Date.now()); return null; };
+const raiseHoldNotice = () => raiseClaudeWall();
 export const RESUMES = [];
 const armWallResume = (at) => { RESUMES.push(at); return null; };
 export const DECISIONS = [];

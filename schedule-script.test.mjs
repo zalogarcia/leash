@@ -85,7 +85,7 @@ t('runScheduledScript dispatches only a non-empty prompt to the chat lane', () =
 
 t('a failure with no output is told, and only a run that did not fail clears the streak', () => {
   const body = fn('runScheduledScript');
-  ok(body.indexOf('tellScriptFailed(s, String(stderr || err.message));') < body.indexOf('scriptFailureTold.delete(s.id);'), 'told before the clear');
+  ok(body.indexOf('tellScriptFailed(s, String(stderr || err.message));') < body.indexOf('if (!err) scriptFailureTold.delete(s.id);'), 'told before the clear');
   ok(body.includes('tellScriptFailed(s, e.message);'), 'a script that never started is told too');
 });
 

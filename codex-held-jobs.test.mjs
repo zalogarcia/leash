@@ -31,7 +31,7 @@ function harness(settings = {}, items = [], queued = []) {
     writeFileSync: (file, content) => { if (settings.failWrite) throw new Error('test write failure'); state.pending = JSON.parse(content); state.writes++; },
     renameSync: () => { state.queued = state.pending; },
     writeHeldBgJobs: (items) => { state.held = items; },
-    pendWallResolution: () => { state.notices++; },
+    pendWallResolution: (kind) => { if (kind === 'claude') state.notices++; },
     settleWall: () => {},
     drainBgHandoff: () => { state.drains++; },
     console: { error: () => {} },

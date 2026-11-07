@@ -150,6 +150,7 @@ const BG_COMMAND_RE = /^\\/(goal|autopilot|qa-loop|bug|go-live|autopilot-merge)\
 const holdBgJob = (item) => { HELD.push(item); return true; };
 const logAccountDecision = () => {};
 const raiseClaudeWall = () => Promise.resolve();
+const raiseHoldNotice = () => raiseClaudeWall();
 const armWallResume = () => {};
 // A sent message has an id, as Telegram's answer does: the waiting line is
 // found again by it (bg-wait.mjs) and edited into the job's card.

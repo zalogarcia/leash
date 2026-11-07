@@ -4802,6 +4802,27 @@ function raiseClaudeWall() {
 }
 
 /**
+ * THE NOTICE FOR WORK THAT WAITS, from both places a job can start waiting.
+ *
+ * WHICH NOTICE depends on which walls are real. Two walls is the one state
+ * where a single clock actively misleads, so it gets the both-engines line; a
+ * Claude-only wall gets the Claude notice, whose rows name each account and its
+ * reset. Sending the both-engines line for a machine with no codex at all would
+ * report a wall on an engine that was never there, and the Claude notice on a
+ * machine with no claude would report "Claude is back" at its first tick.
+ *
+ * The count at the end is what still waits: a parked message or a held job.
+ */
+function raiseHoldNotice() {
+  if (!codexWalled()) return raiseClaudeWall();
+  return raiseWall('both', {
+    render: () => bothEnginesWalledLine(),
+    lifted: () => !(codexWalled() && claudeWalled()),
+    resolved: ({ engine = null, count = parkedWalledChats.length + readHeldBgJobs().length } = {}) => enginesBackLine({ engine, count }),
+  });
+}
+
+/**
  * HOW OFTEN THE LIVE ACCOUNT IS CHECKED AGAINST THE LEDGER.
  *
  * The same slow cadence as the drift check, and for the same reason: this is a
@@ -10891,6 +10912,9 @@ function flushParkedWalledJobs() {
     pendWallResolution('claude', { resumed: ready.length });
     settleWall('claude', { resumed: ready.length });
   }
+  // The same for the two-engine notice, which names the engine that came back.
+  const back = { engine: claudeWalled() ? 'codex' : 'claude', count: ready.length };
+  if (pendWallResolution('both', back)) settleWall('both', back);
   drainBgHandoff();
 }
 
@@ -11330,7 +11354,7 @@ function drainBgHandoff() {
       if (holdBgJob(typeof it === 'object' && it ? it : { text: queuedText })) {
         // A line already up for this job now says what it waits on; no new one
         // (the wall's own notice counts what it holds).
-        noteBgWaiting(it, { kind: 'wall', text: 'waiting: every Claude account is at its limit, it starts after the reset' }, { onlyIfShown: true });
+        noteBgWaiting(it, { kind: 'wall', text: codexWalled() ? 'waiting: no engine is free, it starts when one is back' : 'waiting: every Claude account is at its limit, it starts after the reset' }, { onlyIfShown: true });
         logAccountDecision({
           decision: 'all_accounts_walled_until',
           until: Math.floor(Number(decision.pausedUntil) / 1000),
@@ -11339,7 +11363,7 @@ function drainBgHandoff() {
         // ONE notice for the whole wall, counting what is held. Not a bubble
         // per job: raiseWall keeps at most one alive per kind, so the second
         // held job edits the first one's message.
-        raiseClaudeWall().catch(() => {});
+        raiseHoldNotice().catch(() => {});
         armWallResume(null);
         continue;
       }
@@ -11791,7 +11815,7 @@ function runScheduledScript(s) {
         tellScriptFailed(s, String(stderr || err.message));
         return;
       }
-      scriptFailureTold.delete(s.id);
+      if (!err) scriptFailureTold.delete(s.id);
       if (!prompt) {
         console.log(`[bridge] schedule #${s.id} script ${path.basename(s.script)}: no output, no turn`);
         return;
@@ -11914,7 +11938,9 @@ function checkSchedules() {
             const d = engineFor('bg');
             schedEngine = d.engine || 'claude';
             schedReason = d.reason || null;
-            // The drain's own hold condition: no engine can take this job now.
+            // The drain's hold condition for a job with no pin: no engine can
+            // take it now. An entry whose text carries a `claude:` prefix is not
+            // read here, so it takes the direct dispatch and parks.
             schedBehindWall = Boolean(d.pausedUntil) && (d.engine === 'claude' || codexWalled());
           }
         } catch {
@@ -13843,20 +13869,8 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
     // rather than sending again, and the flush edits THAT message into "back"
     // when the first window returns.
     //
-    // WHICH NOTICE depends on which walls are real. Two walls is the one state
-    // where a single clock actively misleads, so it gets the both-engines line;
-    // a Claude-only wall gets the Claude notice, whose rows name each account
-    // and its reset. Sending the both-engines line for a machine with no codex
-    // at all would report a wall on an engine that was never there.
-    if (codexWalled()) {
-      raiseWall('both', {
-        render: () => bothEnginesWalledLine(),
-        lifted: () => !(codexWalled() && claudeWalled()),
-        resolved: ({ engine = null, count = parkedWalledChats.length } = {}) => enginesBackLine({ engine, count }),
-      }).catch(() => {});
-    } else {
-      raiseClaudeWall().catch(() => {});
-    }
+    // WHICH NOTICE depends on which walls are real (raiseHoldNotice).
+    raiseHoldNotice().catch(() => {});
     armWallResume(null);
     return;
   }
