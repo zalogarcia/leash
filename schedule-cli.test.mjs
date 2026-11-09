@@ -631,6 +631,87 @@ t('a background worker may set it: it picks an engine, it grants nothing', () =>
   eq(read().items[0].claudeOnly, true);
 });
 
+// ---- update on an every-N-hours script entry (SWEEP-COST-1108) --------------
+const SCRIPT_A = path.join(WORK, 'a.mjs');
+const SCRIPT_B = path.join(WORK, 'b.mjs');
+writeFileSync(SCRIPT_A, '');
+writeFileSync(SCRIPT_B, '');
+const HOURS = () => ({ id: 1, kind: 'hours', every: 2, at: '00:05', text: 'the sweep', script: SCRIPT_A, lastFiredAt: Date.now() - 86_400_000 });
+
+t('--every on an hours entry sets the hours, and the next fire is the next slot, not now', () => {
+  seed([HOURS()]);
+  const before = Date.now();
+  const r = run('update', '1', '--every', '1');
+  eq(r.code, 0, r.err);
+  const item = read().items[0];
+  eq(item.every, 1);
+  ok(item.lastFiredAt > before - 3_700_000 && item.lastFiredAt <= Date.now(), `lastFiredAt ${item.lastFiredAt} is not the latest slot`);
+  ok(r.out.includes('every 1h from 00:05'), r.out);
+});
+t('--every 1 on an hours entry keeps the 1: it is every hour, not back to daily', () => {
+  seed([HOURS()]);
+  run('update', '1', '--every', '1');
+  eq(read().items[0].every, 1);
+  eq(read().items[0].kind, 'hours');
+});
+t('--every keeps a lastFiredAt in the future: that is a pause set by hand, and a cadence change must not lift it', () => {
+  const pausedUntil = Date.now() + 86_400_000;
+  seed([{ ...HOURS(), lastFiredAt: pausedUntil }]);
+  const r = run('update', '1', '--every', '1', '--script', SCRIPT_B, '--text', 'new words');
+  eq(r.code, 0, r.err);
+  const item = read().items[0];
+  eq(item.lastFiredAt, pausedUntil);
+  eq(item.every, 1);
+  eq(item.script, SCRIPT_B);
+});
+t('--at lifts that pause: it is the way to resume an hours entry', () => {
+  const pausedUntil = Date.now() + 86_400_000;
+  seed([{ ...HOURS(), every: 1, lastFiredAt: pausedUntil }]);
+  eq(run('update', '1', '--at', '00:05').code, 0);
+  const item = read().items[0];
+  ok(item.lastFiredAt <= Date.now() && item.lastFiredAt > Date.now() - 3_700_000, `lastFiredAt ${item.lastFiredAt} is not the latest slot`);
+});
+t('--every outside 1 to 23 on an hours entry is refused, and the store is untouched', () => {
+  for (const n of ['0', '24', '1.5', 'x', '-1']) {
+    const item = HOURS();
+    seed([item]);
+    ok(run('update', '1', '--every', n).code !== 0, `--every ${n} was accepted`);
+    eq(JSON.stringify(read().items[0]), JSON.stringify(item), `--every ${n} wrote to the store`);
+  }
+});
+t('--script points a script entry at another script, and keeps its text and id', () => {
+  seed([HOURS()]);
+  const r = run('update', '1', '--script', SCRIPT_B);
+  eq(r.code, 0, r.err);
+  const item = read().items[0];
+  eq(item.script, SCRIPT_B);
+  eq(item.text, 'the sweep');
+  eq(item.id, 1);
+  ok(r.out.includes('script b.mjs'), r.out);
+});
+t('--script and --every and --text in one call: the switch a sweep needs', () => {
+  seed([HOURS()]);
+  const r = run('update', '1', '--script', SCRIPT_B, '--every', '1', '--text', 'new words');
+  eq(r.code, 0, r.err);
+  const item = read().items[0];
+  eq(item.script, SCRIPT_B);
+  eq(item.every, 1);
+  eq(item.text, 'new words');
+});
+t('--script to a file that does not exist is refused, and the store is untouched', () => {
+  const item = HOURS();
+  seed([item]);
+  ok(run('update', '1', '--script', path.join(WORK, 'nope.mjs')).code !== 0);
+  ok(run('update', '1', '--script').code !== 0, '--script with nothing after it reported success');
+  eq(JSON.stringify(read().items[0]), JSON.stringify(item));
+});
+t('--script is refused on an entry that has no script: an older daemon would read it as a reminder', () => {
+  const item = { id: 1, kind: 'daily', at: '08:00', text: 'x' };
+  seed([{ ...item }]);
+  ok(run('update', '1', '--script', SCRIPT_B).code !== 0);
+  eq(JSON.stringify(read().items[0]), JSON.stringify(item));
+});
+
 rmSync(WORK, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

@@ -16,12 +16,17 @@
 //   node schedule.mjs remove <id>
 //   node schedule.mjs update <id> [--at HH:MM|YYYY-MM-DDTHH:MM] [--text "…"] [--run true|false]
 //                                 [--every N] [--anchor YYYY-MM-DD] [--allow-write true|false]
-//                                 [--claude-only true|false]
+//                                 [--claude-only true|false] [--script <path>]
 //
 // Flags: --run  → execute the text as a Claude task instead of sending a
 //        plain reminder (same as the "run:" prefix in Telegram's /remind).
 //        --every N  → turn a daily into an every-N-days item (N 2..365);
 //        --every 1 removes the cadence and it goes back to every day.
+//        On an every-N-hours item it is the hours (1..23), and the next fire is
+//        the next slot of the new cadence, unless a lastFiredAt in the future
+//        holds it (a pause set by hand), which --every keeps and --at lifts.
+//        --script <path> on an every-N-hours item that already has a script
+//        points it at another one.
 //        --anchor YYYY-MM-DD  → record that date as the last fire, so the next
 //        one lands on anchor + N days. `list` prints that date, so the way to
 //        make an every-3d item fire on the 13th is --anchor 2026-09-10.
@@ -309,8 +314,17 @@ if (cmd === 'list') {
   // creating one that means nothing.
   if (argv.includes('--every')) {
     const every = flag('every');
-    if (item.kind !== 'daily') die('--every only applies to a daily schedule');
-    if (String(every) === '1') delete item.every;
+    if (item.kind === 'hours') {
+      const n = Number(every);
+      if (!/^\d+$/.test(String(every ?? '')) || n < 1 || n > 23) die('update <id> --every <N>  (an every-N-hours schedule: N 1..23)');
+      item.every = n;
+      // Re-phased, like --at above: the next fire is the next slot of the new
+      // cadence. Unless lastFiredAt is still in the future: that is a pause set by
+      // hand (there is no pause switch), and changing a cadence must not lift it
+      // (SWEEP-COST-1108 did, for about 5 minutes). --at lifts it, on purpose.
+      if (!(Number(item.lastFiredAt) > Date.now())) item.lastFiredAt = latestHoursSlot(item, Date.now());
+    } else if (item.kind !== 'daily') die('--every only applies to a daily or an every-N-hours schedule');
+    else if (String(every) === '1') delete item.every;
     else item.every = parseEvery(every, 'update <id> --every <N>  (N 2..365, or 1 to go back to daily)');
   }
   // The anchor is the last fire, so the next one is anchor + N days. Read after
@@ -328,6 +342,18 @@ if (cmd === 'list') {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(String(anchor ?? '')) || addDays(anchor, 0) !== anchor)
       die('update <id> --anchor YYYY-MM-DD  (a real date to count from; the next fire is that date plus N days)');
     item.lastFired = anchor;
+  }
+  // Another script for a script entry. Same checks as `add`: only an entry that
+  // already has one (an older daemon reads any other kind carrying a script as a
+  // plain reminder), and a file that exists.
+  if (argv.includes('--script')) {
+    const raw = String(flag('script') ?? '').trim();
+    if (!raw || raw.startsWith('--')) die('update <id> --script <path>');
+    if (!item.script) die('--script changes the script of a script entry; this one has none');
+    const home = process.env.HOME || '';
+    const full = path.resolve(raw.startsWith('~/') ? path.join(home, raw.slice(2)) : raw);
+    if (!existsSync(full)) die(`--script ${raw}: no such file (${full}); nothing changed`);
+    item.script = full;
   }
   const text = flag('text');
   if (text) item.text = text;
