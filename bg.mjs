@@ -125,7 +125,7 @@ function workOutboxLine(work) {
     failed = 0;
   }
   const setUp = existsSync(work.ids);
-  return `WORK TRACKER · outbox ${names.length} waiting for Linear · ${failed} set aside${setUp ? '' : ' · not set up yet (node scripts/work.mjs setup)'}${names.length ? ' · node scripts/work.mjs drain sends them' : ''}${failed ? ' · node scripts/work.mjs retry puts the set aside ones back' : ''}`;
+  return `WORK TRACKER · outbox ${names.length} waiting for Linear · ${failed} set aside${setUp ? '' : ` · not set up yet (node ${work.cli} setup)`}${names.length ? ` · node ${work.cli} drain sends them` : ''}${failed ? ` · node ${work.cli} retry puts the set aside ones back` : ''}`;
 }
 
 // --file <path> reads the brief from disk instead of argv. Use it for anything

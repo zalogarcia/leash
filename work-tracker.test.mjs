@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { baseRunId, createWorkTracker, jobTitleOf, workKeyLine, workKeyOf, workTrackerSettings } from './work-track.mjs';
 import { helpMessage } from './system-messages.mjs';
 import { commentsBatchPrompt, commentsCommandResult, isCommentsBatch } from './linear-comments.mjs';
-import { MARK, Q, Transient, cardTitleProblems, createTracker, enqueue, isTracked, linearTransport, main, outboxStatus, parseCardLine, parsePlan, parseRemaining, readMeta, statePaths, sweepText, takeLock, withMeta, withStands } from './scripts/work.mjs';
+import { CLI, MARK, Q, Transient, cardTitleProblems, commentsBatch, createTracker, enqueue, isTracked, linearTransport, main, outboxStatus, parseCardLine, parsePlan, parseRemaining, readMeta, statePaths, sweepText, takeLock, withMeta, withStands } from './scripts/work.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const TMP = mkdtempSync(path.join(tmpdir(), 'work-tracker-'));
@@ -53,6 +53,10 @@ function fakeLinear({ states = ['Backlog', 'Todo', 'Done', 'Canceled'] } = {}) {
     const op = /^(?:query|mutation) (\w+)/.exec(query)[1];
     db.calls.push(op);
     if (db.before) db.before(op);
+    if (db.failOp?.[op] > 0) {
+      db.failOp[op]--;
+      throw new Transient('Linear 503: unavailable');
+    }
     if (failNext > 0) {
       failNext--;
       throw new Transient('Linear 503: unavailable');
@@ -483,6 +487,98 @@ t('comments: a comment on an issue the tracker did not make is not an answer', a
   f.out.length = 0;
   await f.run(['comments']);
   eq(f.out.join(''), '');
+});
+
+t('a job linked to a hand made issue: its comments are answers and the sweep still watches it', async () => {
+  const f = fresh('linked-human');
+  await f.run(['setup']);
+  const h = f.L.human('Area: made by hand');
+  await f.run(['job', '--key', 'job-lh1', '--title', 'x', '--link', h.identifier]);
+  ok(isTracked(h), 'linked means tracked');
+  await f.run(['link-run', '--key', 'job-lh1', '--run', 'bg5-1790000000000-3']);
+  clock += 60_000;
+  f.L.db.comments.push({ id: 'lh-c', body: 'go ahead', issueId: h.id, createdAt: new Date(clock).toISOString(), user: { id: 'user-me' } });
+  f.out.length = 0;
+  await f.run(['comments']);
+  ok(f.out.join('\n').includes('> go ahead'), f.out.join('\n'));
+  ok(sweepText(await f.tr.openIssues(), { names: f.tr.names, psText: '', now: NOW }).includes('Area: made by hand'), 'its dead worker is listed');
+});
+
+t('comments: the ack names the CLI by its absolute path, waits for the lock, and a re-shown comment says so', async () => {
+  const f = fresh('ack');
+  await f.run(['setup']);
+  await f.run(['job', '--key', 'job-ack1', '--title', 'Area: ack']);
+  const card = f.L.byTitle('Area: ack');
+  clock += 60_000;
+  f.L.db.comments.push({ id: 'a1', body: 'yes', issueId: card.id, createdAt: new Date(clock).toISOString(), user: { id: 'user-me' } });
+  f.out.length = 0;
+  await f.run(['comments']);
+  const first = f.out.join('\n');
+  ok(first.includes(`node ${CLI} comments --done `) && path.isAbsolute(CLI), first);
+  f.out.length = 0;
+  await f.run(['comments']);
+  ok(f.out.join('\n').includes('were shown before') && f.out.join('\n').includes('its state may have changed'));
+  const lock = path.join(f.dir, 'comments.lock');
+  writeFileSync(lock, JSON.stringify({ pid: process.pid, at: Date.now(), nonce: 'reader' }));
+  eq(await f.run(['comments', '--done', '2099-01-01T00:00:00.000Z']), 3, 'an ack waits for a running read');
+  rmSync(lock);
+  eq(await f.run(['comments', '--done', '2099-01-01T00:00:00.000Z']), 0);
+  f.out.length = 0;
+  await f.run(['comments']);
+  eq(f.out.join(''), '');
+});
+
+t('comments: a batch over the length limit acks only what it shows', () => {
+  const pending = Array.from({ length: 30 }, (_, i) => ({ id: `p${i}`, body: 'x'.repeat(400), createdAt: new Date(NOW + i * 1000).toISOString(), card: 'ENG-1', title: 'Area: long', state: 'Answered', shown: 0 }));
+  const text = commentsBatch(pending, { maxChars: 5000 });
+  const upTo = /comments --done (\S+)/.exec(text)[1];
+  const shown = (text.match(/^> /gm) || []).length;
+  ok(shown > 0 && shown < 30, `${shown} shown`);
+  eq(upTo, pending[shown - 1].createdAt, 'the ack stops at the last comment shown');
+  ok(text.includes(`${30 - shown} more wait for the next read`));
+});
+
+t('a late start (a retried op) never reopens a card its run already reported on', async () => {
+  const f = fresh('late-start');
+  await f.run(['setup']);
+  await f.run(['job', '--key', 'job-ls1', '--title', 'Area: late']);
+  await f.run(['report', '--key', 'job-ls1', '--run', 'bg6-1790000000000', '--status', 'finished', '--stdin'], { stdin: '## Remaining\n- none' });
+  await f.run(['link-run', '--key', 'job-ls1', '--run', 'bg6-1790000000000-77']);
+  eq(f.L.stateOf(f.L.byTitle('Area: late').stateId).name, 'Done');
+});
+
+t('a report whose comment fails once is applied once, with its comment', async () => {
+  const f = fresh('comment-blip');
+  await f.run(['setup']);
+  await f.run(['job', '--key', 'job-cb1', '--title', 'Area: blip']);
+  f.L.db.failOp = { WorkComment: 1 };
+  await f.run(['report', '--key', 'job-cb1', '--run', 'bg7-1790000000000', '--status', 'failed', '--stdin'], { stdin: 'no block' });
+  eq(outboxStatus(f.p).waiting, 1, 'it waits');
+  await f.run(['drain']);
+  const card = f.L.byTitle('Area: blip');
+  eq(f.L.db.comments.filter((c) => c.issueId === card.id).length, 1);
+  await f.run(['report', '--key', 'job-cb1', '--run', 'bg7-1790000000000', '--status', 'failed', '--stdin'], { stdin: 'no block' });
+  eq(f.L.db.comments.filter((c) => c.issueId === card.id).length, 1, 'and only once');
+});
+
+t('transport: a body that stalls is cut at the timeout; a rate limit is transient', async () => {
+  const stall = linearTransport({ key: 'lin_api_x', timeoutMs: 50, fetchImpl: async (url, init) => ({ ok: true, status: 200, json: () => new Promise((_, rej) => init.signal.addEventListener('abort', () => rej(Object.assign(new Error('aborted'), { name: 'AbortError' })))) }) });
+  const t0 = Date.now();
+  let e1;
+  try {
+    await stall(Q.viewer);
+  } catch (e) {
+    e1 = e;
+  }
+  ok(e1 instanceof Transient && /did not answer/.test(e1.message) && Date.now() - t0 < 2000, String(e1?.message));
+  const limited = linearTransport({ key: 'lin_api_x', fetchImpl: async () => ({ ok: false, status: 400, statusText: 'Bad Request', json: async () => ({ errors: [{ message: 'Rate limit exceeded', extensions: { code: 'RATELIMITED' } }] }) }) });
+  let e2;
+  try {
+    await limited(Q.viewer);
+  } catch (e) {
+    e2 = e;
+  }
+  ok(e2 instanceof Transient, String(e2?.message));
 });
 
 t('sweep: only what needs the chat session, and nothing when nothing does', async () => {

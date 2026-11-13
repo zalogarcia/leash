@@ -1062,8 +1062,10 @@ How it works:
    hands them to the chat session as one turn; a card in **Waiting on you** that you
    commented on moves to **Answered**. A comment stays in every batch until the chat
    session runs the `comments --done` line the batch ends with, so an answer that never
-   reached a turn is shown again rather than lost. Only cards the tracker made count:
-   your comments on a teammate's issue in the same team are not read.
+   reached a turn is shown again rather than lost (marked as shown before, so the chat
+   session checks the card before acting twice). Only the tracker's cards count, the ones
+   it made and the ones a job was linked to: your comments on a teammate's issue in the
+   same team are not read.
 
 Only the job title (or its `--card` text), the engine, the working folder's name, run ids
 and the `## Remaining` lines reach Linear. The brief and the rest of the report stay on
@@ -1127,7 +1129,7 @@ node schedule.mjs add every 2h 09:10 --script scripts/work-comments.mjs "Linear 
 
 **Nothing is lost when Linear is down.** `bg.mjs` and the daemon write each change to a
 local outbox first and send it in order. While Linear cannot be reached (no network, a
-timeout, an outage, a key it refuses), every change waits with no try spent, and a job's
+timeout, an outage, a rate limit, a key it refuses), every change waits with no try spent, and a job's
 start or report opens its card if the dispatch never got through. A change Linear itself
 refuses three times is set aside in `work-tracker/outbox/failed/`, and
 `node scripts/work.mjs retry` puts it back. `bg.mjs ps` shows what waits.
