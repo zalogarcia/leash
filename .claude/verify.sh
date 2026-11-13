@@ -10,7 +10,7 @@
 #   ./.claude/verify.sh probes-live     the two probes that spawn the real codex and SPEND MONEY
 #   ./.claude/verify.sh --list          what is available
 #
-#   VERIFY_QUICK=1   skip the 71 offline suites, keep the fast gates
+#   VERIFY_QUICK=1   skip the 72 offline suites, keep the fast gates
 #
 # One PASS / FAIL / SKIP line per check. Exit 0 only when nothing FAILed.
 # A check that cannot run where it is run SKIPs and names the real command; it
@@ -46,7 +46,7 @@ local_gate() {
   fi
 
   local bad=0 n=0 f
-  for f in ./*.mjs scripts/probes/*.mjs; do
+  for f in ./*.mjs scripts/*.mjs scripts/probes/*.mjs; do
     n=$((n + 1))
     node --check "$f" >/dev/null 2>&1 || { bad=$((bad + 1)); echo "     bad syntax: $f"; }
   done

@@ -83,6 +83,8 @@ const tg = (method) => (method === 'sendMessage' ? Promise.resolve({ message_id:
 const editProgress = () => Promise.resolve();
 export const codexRuns = new Map();
 export const registry = new Map();
+const workTracker = { started: () => null, reported: () => null }; // work-track.mjs
+const WORK_SETTINGS = null; // BOT_COMMANDS reads it
 const inflight = { add: (id, rec) => registry.set(id, rec), clear: (id) => registry.delete(id), read: () => Object.fromEntries(registry) };
 const closeStdin = (c) => { try { c?.stdin?.destroy(); } catch {} };
 export const REPORTED = [];

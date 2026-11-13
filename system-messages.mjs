@@ -372,7 +372,7 @@ export const HELP_GROUPS = [
   { icon: '🌙', commands: ['/status', '/steer', '/btw', '/stop'] },
   { icon: '🧠', commands: ['/engine', '/codex', '/model', '/yolo'] },
   { icon: '📊', commands: ['/usage', '/account', '/context'] },
-  { icon: '⏰', commands: ['/remind', '/schedules', '/unschedule'] },
+  { icon: '⏰', commands: ['/remind', '/schedules', '/unschedule', '/comments'] },
   { icon: '📁', commands: ['/cd', '/logs', '/restart', '/help'] },
 ];
 

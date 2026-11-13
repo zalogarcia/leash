@@ -47,15 +47,86 @@
 // only thing watching the worker's stream. Availability is IDENTICAL to steer,
 // so the STEER column of `bg.mjs ps` answers both questions.
 
-import { existsSync, readFileSync, statSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync, renameSync } from 'node:fs';
 import net from 'node:net';
-import { sign } from 'node:crypto';
+import { createHash, sign } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const FILE = path.join(SCRIPT_DIR, 'bg-queue.json');
 const SOCK = path.join(SCRIPT_DIR, 'steer.sock');
+
+// THE OPTIONAL LINEAR WORK TRACKER (README, "Track jobs in Linear"). Off unless
+// the config names a team and a Linear key exists; then every dispatch gets an
+// issue: the brief gains a last line naming its work key (the daemon reads it
+// back to move the issue to Running and, when the report lands, to file its
+// ## Remaining lines), and `scripts/work.mjs job` opens the issue, or links the
+// one the brief names on a line `Linear: ABC-12`. A Linear failure never blocks
+// a dispatch: the CLI writes the op to its local outbox first.
+//
+// KEEP IN SYNC with workTrackerSettings in work-track.mjs: the same layers
+// (BRIDGE_WORK_TRACKER as JSON, then config.json `workTracker`) and the same
+// three conditions (not disabled, a team, a key in LINEAR_API_KEY or a non
+// empty key file). It is inlined because this CLI imports nothing local (its
+// tests copy it into a temp dir); work-tracker.test.mjs holds the two equal.
+function workTrackerSettings() {
+  const home = process.env.HOME || '';
+  const expand = (p) => (String(p).startsWith('~/') ? path.join(home, String(p).slice(2)) : String(p));
+  let c = null;
+  const raw = process.env.BRIDGE_WORK_TRACKER;
+  if (typeof raw === 'string' && raw.trim().startsWith('{')) {
+    try {
+      c = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  } else {
+    try {
+      c = JSON.parse(readFileSync(process.env.BRIDGE_CONFIG || path.join(SCRIPT_DIR, 'config.json'), 'utf8'))?.workTracker;
+    } catch {
+      c = null;
+    }
+  }
+  if (!c || typeof c !== 'object' || c.enabled === false) return null;
+  if (typeof c.team !== 'string' || !c.team.trim()) return null;
+  const keyFile = expand(c.keyFile || '~/.config/leash/linear-api-key');
+  let keyed = Boolean(String(process.env.LINEAR_API_KEY || '').trim());
+  if (!keyed) {
+    try {
+      keyed = statSync(keyFile).size > 0;
+    } catch {
+      keyed = false;
+    }
+  }
+  if (!keyed) return null;
+  const drain = Number(c.dispatchDrainMs);
+  const stateDir = expand(c.stateDir || path.join(SCRIPT_DIR, 'work-tracker'));
+  return {
+    cli: path.join(SCRIPT_DIR, 'scripts', 'work.mjs'),
+    outbox: path.join(stateDir, 'outbox'),
+    ids: path.join(stateDir, 'ids.json'),
+    drainMs: Number.isFinite(drain) && drain >= 0 ? Math.min(drain, 20_000) : 6000,
+  };
+}
+function workOutboxLine(work) {
+  if (!work) return null;
+  let names = [];
+  let failed = 0;
+  try {
+    names = readdirSync(work.outbox).filter((f) => /^\d{14}-.*\.json$/.test(f)).sort();
+  } catch {
+    names = [];
+  }
+  try {
+    failed = readdirSync(path.join(work.outbox, 'failed')).filter((f) => f.endsWith('.json')).length;
+  } catch {
+    failed = 0;
+  }
+  const setUp = existsSync(work.ids);
+  return `WORK TRACKER · outbox ${names.length} waiting for Linear · ${failed} set aside${setUp ? '' : ' · not set up yet (node scripts/work.mjs setup)'}${names.length ? ' · node scripts/work.mjs drain sends them' : ''}`;
+}
 
 // --file <path> reads the brief from disk instead of argv. Use it for anything
 // longer than a line.
@@ -148,6 +219,8 @@ if (argv[0] === 'ps' && argv.length === 1) {
     process.exit(2);
   }
   console.log(res.table || (res.workers || []).map((w) => `${w.runId} ${w.lane} ${w.pid}`).join('\n') || 'no background workers running');
+  const workLine = workOutboxLine(workTrackerSettings());
+  if (workLine) console.log(`\n${workLine}`);
   process.exit(0);
 }
 // AND THE HALF THAT KEEPS A TYPO FROM BECOMING A WORKER. `ps` takes no
@@ -251,7 +324,7 @@ if (argv[0] === 'btw') {
 // typing a flag means "go do this"; the flags this command really takes are
 // handled below and never arrive first except with a value. Print the usage
 // the typist was asking for instead of burning a worker on it.
-const KNOWN_FLAGS = new Set(['--file', '--engine', '--repo', '--cwd', '--now']);
+const KNOWN_FLAGS = new Set(['--file', '--engine', '--repo', '--cwd', '--now', '--card', '--no-track']);
 if (typeof argv[0] === 'string' && argv[0].startsWith('-') && !KNOWN_FLAGS.has(argv[0])) {
   const usage = [
     'usage:',
@@ -260,6 +333,8 @@ if (typeof argv[0] === 'string' && argv[0].startsWith('-') && !KNOWN_FLAGS.has(a
     '  node bg.mjs --engine codex --file <path>                run it on OpenAI Codex (Claude if Codex is out)',
     '  node bg.mjs --repo <name|path> --file <path>            pin the working dir (Codex sandbox root)',
     '  node bg.mjs --now --file <path>                         start it past the concurrency cap',
+    '  node bg.mjs --card "Area: title | sentence" --file <path>   its Linear card text (work tracker on)',
+    '  node bg.mjs --no-track --file <path>                    no Linear issue for this job',
     '  node bg.mjs steer <lane|runId|pid|latest> "<text>"      one more instruction, mid run',
     '  node bg.mjs steer <target> --file <path>',
     '  node bg.mjs btw <lane|runId|pid|latest> "<question>"    a side question, answered in one message',
@@ -359,6 +434,33 @@ const nowFlag = dispatchArgs.indexOf('--now');
 if (nowFlag !== -1) {
   now = true;
   dispatchArgs.splice(nowFlag, 1);
+}
+
+// --no-track: NO LINEAR ISSUE FOR THIS JOB. For a periodic job whose next run
+// finds the same list by itself (a sweep): tracked, each of its leftover lines
+// would become an issue the next sweep lists again. Harmless when the tracker
+// is off.
+let noTrack = false;
+const noTrackFlag = dispatchArgs.indexOf('--no-track');
+if (noTrackFlag !== -1) {
+  noTrack = true;
+  dispatchArgs.splice(noTrackFlag, 1);
+}
+
+// --card: WHAT THIS JOB'S LINEAR CARD SAYS, "Area: plain title | one plain
+// sentence" (the title 45 characters at most). Only the card reads it. A text
+// the tracker finds not plain costs nothing: the card keeps the job's title and
+// the sweep lists it for a rewrite. Ignored when the tracker is off.
+let cardLine = null;
+const cardFlag = dispatchArgs.indexOf('--card');
+if (cardFlag !== -1) {
+  const raw = String(dispatchArgs[cardFlag + 1] ?? '').trim();
+  if (!raw || raw.startsWith('-')) {
+    console.error(`bg.mjs: --card takes the card's text, "Area: plain title | one plain sentence" (got ${JSON.stringify(dispatchArgs[cardFlag + 1] ?? '')}). Nothing was queued.`);
+    process.exit(1);
+  }
+  cardLine = raw;
+  dispatchArgs.splice(cardFlag, 2);
 }
 const engineFlag = dispatchArgs.indexOf('--engine');
 if (engineFlag !== -1) {
@@ -509,6 +611,35 @@ const LANE_RULES = [
 // to Codex on the limit fallback.
 if (engine !== 'codex' && !text.startsWith('LANE RULES')) text = `${LANE_RULES}${text}`;
 
+// THE WORK ITEM (see workTrackerSettings above). Decided before the drop box
+// write, because the key travels IN the brief: the daemon reads it back from
+// the text at start and at report time, on every engine and every route. A
+// re-dispatch of a brief that already names its key keeps that key. The words
+// are workKeyLine's in work-track.mjs, kept equal by work-tracker.test.mjs.
+const work = noTrack ? null : workTrackerSettings();
+if (work) {
+  const named = [...text.matchAll(/^Work item: ([a-z0-9][a-z0-9-]{1,120})\b/gm)].pop();
+  work.key = named ? named[1] : `job-${Date.now().toString(36)}-${createHash('sha256').update(text).digest('hex').slice(0, 6)}`;
+  work.link = (text.match(/^\s*Linear:\s*([A-Z][A-Z0-9]{0,6}-\d+)\s*$/m) || [])[1] || null;
+  if (!named) {
+    text = `${text}\n\n---\nWork item: ${work.key}. The bridge tracks this job in Linear. End your final report with a "## Remaining" section, one line per item: "- owed: <text>", "- waiting-owner: <text>", "- follow-up: <text>", or the single line "- none". Write each line as "Area: plain title | one plain sentence on what and why", so the owner can read the card on a phone; one "waiting-owner" line per decision the owner actually makes.`;
+  }
+  // The job's own title: its first `# ` heading after the lane rules, else its first line.
+  const body = text.includes('\n--- TASK ---\n') ? text.slice(text.indexOf('\n--- TASK ---\n') + 14) : text;
+  const heading = body.split('\n').find((l) => /^#\s+\S/.test(l));
+  const first = body.split('\n').find((l) => l.trim());
+  work.title = String(heading ? heading.replace(/^#\s+/, '') : first || work.key).replace(/\s+/g, ' ').trim().slice(0, 90);
+}
+function runTracker(args, timeout) {
+  try {
+    const r = spawnSync(process.execPath, [work.cli, ...args], { encoding: 'utf8', timeout });
+    const last = String(r.stdout || '').trim().split('\n').pop();
+    return r.status === 0 && last ? { ok: true, line: last } : { ok: false, line: r.error?.code || r.signal || `exit ${r.status}: ${String(r.stderr || '').trim().split('\n').pop()}` };
+  } catch (e) {
+    return { ok: false, line: e.message };
+  }
+}
+
 // The daemon drains this file concurrently. A pid-unique temp keeps our write
 // from clobbering (or being clobbered by) its claim, and re-reading inside the
 // retry loop means an item can't be lost to a drain that landed mid-flight.
@@ -554,6 +685,20 @@ if (scheduled.allowWrite) {
       signature: sign(null, Buffer.from(payload), c.privateKey).toString('base64') };
   } catch { delete queuedItem.allowWrite; }
 }
+// THE JOB OP GOES TO THE TRACKER'S OUTBOX BEFORE THE JOB GOES TO THE DROP BOX:
+// the daemon can start the worker within a second of the rename below, and its
+// `link-run` op must find the `job` op ahead of it in the outbox. Queue only
+// (`--drain-ms 0`, a local file write); the send runs after the dispatch. A
+// failure here is one line, and the job is dispatched anyway.
+if (work) {
+  const args = ['job', '--key', work.key, '--title', work.title, '--drain-ms', '0'];
+  if (cwd) args.push('--repo', cwd);
+  if (engine) args.push('--engine', engine);
+  if (work.link) args.push('--link', work.link);
+  if (cardLine) args.push('--card', cardLine);
+  work.recorded = runTracker(args, 5000);
+}
+
 let pending = 0;
 let lastErr;
 
@@ -578,8 +723,23 @@ for (let attempt = 0; attempt < 5; attempt++) {
 }
 
 if (lastErr) {
+  // The job never reached the drop box, so its queued Linear op goes too.
+  if (work?.recorded?.ok) runTracker(['unqueue', '--key', work.key], 5000);
   console.error(`could not hand off after 5 attempts: ${lastErr.message}`);
   process.exit(1);
+}
+
+// The send to Linear, now that the job is safely queued. Bounded, and its
+// failure is one line on stdout, never an exit code: the job is in the drop box
+// and its op in the outbox, which the next drain, report or sweep sends.
+if (work) {
+  let said;
+  if (!work.recorded.ok) said = `not recorded (the tracker did not answer: ${work.recorded.line}); the job is queued anyway`;
+  else {
+    const sent = work.drainMs > 0 ? runTracker(['drain', '--budget-ms', String(work.drainMs)], work.drainMs + 6000) : { ok: true, line: 'queued for Linear, not sent yet' };
+    said = sent.ok ? sent.line : `recorded; the send to Linear did not answer (${sent.line}); the next drain sends it`;
+  }
+  console.log(`work: ${work.key}${work.link ? ` (linked to ${work.link})` : ''} · ${said}`);
 }
 
 const where =

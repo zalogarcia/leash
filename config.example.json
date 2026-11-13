@@ -44,6 +44,7 @@
   "reattachPollMs": 5000,
   "runLogMaxAgeDays": 7,
   "inflightFile": "",
+  "workTracker": { "enabled": false, "team": "", "keyFile": "~/.config/leash/linear-api-key" },
 
   "_comments": {
     "name": "What the daemon calls itself in /help, /status and the boot announce. Default 'Leash'.",
@@ -80,6 +81,7 @@
     "bgTailMs": "How often the daemon polls a detached worker's log file, in ms. This replaces the stdout pipe. Default 300.",
     "reattachPollMs": "How often to check whether a worker that outlived a daemon restart has exited, in ms. Default 5000.",
     "runLogMaxAgeDays": "Delete background run logs older than this at startup. Logs still named by a live worker are kept. Default 7.",
+    "workTracker": "Optional Linear work tracker, off by default. Set team to a Linear team key or name and save a personal API key in keyFile (or set $LINEAR_API_KEY), then run node scripts/work.mjs setup. README, Track jobs in Linear.",
     "inflightFile": "Path to the live-worker registry. Empty = bg-inflight.json next to bridge.mjs. Only change it if the Leash directory is read-only.",
     "openaiApiKey": "Optional. For voice-note transcription. Usually better set as $OPENAI_API_KEY.",
     "transcribeModel": "The OpenAI speech to text model for voice notes. Empty = gpt-4o-mini-transcribe. whisper-1 still works.",

@@ -349,6 +349,8 @@ import { codexAccountBlock, createCodexAccount, fetchCodexRateLimits, readCodexR
 import { normalizeDashes } from './dash-normalize.mjs';
 import { describeWhen, isDailyDue, isHoursDue, latestHoursSlot } from './schedule-due.mjs';
 import { scheduledScriptPrompt, scriptCommand, SCRIPT_TIMEOUT_MS } from './schedule-script.mjs';
+import { createWorkTracker, workTrackerSettings } from './work-track.mjs';
+import { commentsCommandResult } from './linear-comments.mjs';
 import { createWallWake, pickNextAccount } from './wall-wake.mjs';
 // THE USAGE WALL GUARD: the checkpoint steer before an all-accounts wall and the
 // resume of the workers that died on it, after. Both pure and shared; the
@@ -554,6 +556,12 @@ const DEFAULT_EFFORT = conf('effort', '');
 const DEFAULT_YOLO = String(conf('yolo', 'true')) !== 'false';
 // What the assistant calls you in background-worker reports.
 const OWNER_NAME = conf('ownerName', 'the owner');
+// THE OPTIONAL LINEAR WORK TRACKER (work-track.mjs, README "Track jobs in
+// Linear"): a dispatched job's issue moves to Running when its worker starts
+// and takes its report's ## Remaining block when the report lands. Off unless
+// the config names a team and a Linear key exists; off, both calls are no-ops.
+const WORK_SETTINGS = workTrackerSettings({ config: fileConfig });
+const workTracker = createWorkTracker({ cli: WORK_SETTINGS?.cli || null });
 // The IANA timezone /account, /usage and /status render reset clocks in
 // (e.g. "Europe/Lisbon"). Empty = this machine's local zone. Set it when
 // you read Leash from a different timezone than the machine runs in.
@@ -2170,6 +2178,7 @@ async function runClaude(
     // discoverable. The chat lane is excluded — the user watches that one live.
     if (isBgLane) {
       run.watchdogId = `${lane.name || 'bg'}-${startedAt}-${child.pid}`;
+      workTracker.started(rawText, run.watchdogId);
       inflight.add(run.watchdogId, {
         pid: child.pid,
         task: rawText,
@@ -3097,6 +3106,7 @@ const RESERVED_COMMANDS = new Set([
   '/resume',
   '/chats',
   '/compact',
+  '/comments',
 ]);
 
 // ---------- schedules ----------
@@ -7282,6 +7292,11 @@ function isWorkerDeathText(text) {
 function writeFullReport(id, task, output, status) {
   const text = String(output ?? '');
   const file = bgReportPath(id);
+  // THE WORK TRACKER (work-track.mjs): the job's Linear issue takes this
+  // report's ## Remaining block. Here, in the one function every report goes
+  // through, not in one of its callers. Fire and forget; a brief with no
+  // `Work item:` line is not tracked, and with the tracker off it is a no-op.
+  workTracker.reported(task, id, { output: text, status });
   try {
     mkdirSync(BG_REPORTS_DIR, { recursive: true });
     writeFileSync(
@@ -8670,6 +8685,7 @@ function runCodex(rawText, { mode = 'ask', cwd = null, reviewScope = 'uncommitte
   // a pid-less corpse for the reaper to announce as a dead worker; the error
   // handler below reports it properly instead.
   if (child.pid) {
+    workTracker.started(rawText, run.watchdogId);
     inflight.add(run.watchdogId, {
       pid: child.pid,
       task: rawText,
@@ -9293,6 +9309,7 @@ function runCodexAppServerJob(rawText, { mode = 'edit', cwd = null, reason = nul
     if (run.watchdogId) inflight.clear(run.watchdogId);
     if (c.child?.pid) {
       run.watchdogId = `${runId}-${c.child.pid}`;
+      workTracker.started(rawText, run.watchdogId);
       inflight.add(run.watchdogId, {
         pid: c.child.pid,
         task: rawText,
@@ -12330,6 +12347,8 @@ const BOT_COMMANDS = [
   { command: 'brainstorm', description: 'CC: deep thinking, challenge assumptions' },
   { command: 'goal', description: 'CC: goal-driven convergence loop' },
   { command: 'go_live', description: 'CC: activation + live-verification (/go-live)' },
+  // Only in the menu when the optional Linear work tracker is on.
+  ...(WORK_SETTINGS ? [{ command: 'comments', description: 'Read your new Linear card comments now' }] : []),
   { command: 'help', description: 'All commands' },
 ];
 // THE COMMAND TABLE AS THE PATH FILTER SEES IT. `/usage` in a shell command or
@@ -12360,8 +12379,8 @@ Commands:
 /stop [bg|all] · kill the running task (chat lane by default)
 /restart · restart the daemon (if something feels stuck)
 /logs · last lines of the daemon log
-/remind daily HH:MM <text> · every 3d HH:MM <text> · once [date] HH:MM · in 2h · prefix "run:" to run it as a Claude task
-/schedules · list them · /unschedule <id> removes one
+/remind daily HH:MM <text> · every 3d HH:MM <text> · once [date] HH:MM · in 2h · prefix "run:" to run it as a task
+/schedules lists them · /unschedule <id> removes one
 /yolo on|off · permission bypass (default: ON, as you run CC)
 /help · this message
 
@@ -13372,6 +13391,24 @@ async function handleCommand(text, msg = null) {
       store.items.push(sched);
       saveSchedules(store);
       await send(`✅ Scheduled: ${fmtSchedule(sched)}`, { markdown: false });
+      return;
+    }
+    case '/comments': {
+      // The owner's new comments on Linear cards (scripts/work.mjs comments):
+      // ONE chat turn for the batch, or one line from the daemon and no turn.
+      // Off the poll loop, so a slow Linear never holds /stop.
+      if (!WORK_SETTINGS) {
+        await send(commentsCommandResult({ enabled: false }).line, { markdown: false });
+        return;
+      }
+      execFile(process.execPath, [WORK_SETTINGS.cli, 'comments'], { timeout: SCRIPT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+        const r = commentsCommandResult({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout, stderr, ownerName: OWNER_NAME });
+        if (r.prompt) dispatchPrompt(r.prompt, LANES.main, { priority: true });
+        else {
+          console.log(`[bridge] ${r.log} (/comments)`);
+          send(r.line, { markdown: false }).catch(() => {});
+        }
+      });
       return;
     }
     case '/schedules': {

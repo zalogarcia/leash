@@ -282,6 +282,7 @@ left to be guessed. The ack and the run bubble both say a quote went with the me
 | `/logs` | Tail the daemon log |
 | `/remind …` | `daily HH:MM <text>` · `every <N>d HH:MM <text>` (every N days, N 2 to 365) · `once [YYYY-MM-DD] HH:MM <text>` · `in 90m <text>` |
 | `/schedules` · `/unschedule <id>` | List / remove scheduled entries |
+| `/comments` | Your new comments on Linear cards, read now as one turn (only with the optional work tracker on) |
 | `/yolo on\|off` | Permission bypass (see [Security](#security)) |
 | `/help` | All of the above, in Telegram |
 
@@ -1032,6 +1033,99 @@ exists.
 
 **One residual worth knowing:** Codex writes em dashes. That violates the owner's standing rule for
 their own copy, so anything a Codex turn drafts for publication needs a pass before it ships.
+
+
+## Track jobs in Linear (optional)
+
+Off by default. Turn it on and every background job becomes a Linear issue, and every
+leftover line in a worker's report becomes an issue too, so work a worker did not finish
+is never left as one sentence in a chat.
+
+How it works:
+
+1. `bg.mjs` gives each brief a last line `Work item: <key>` and opens the job's issue in
+   **Queued**. A brief line `Linear: ENG-12` links that issue instead of opening a new one.
+2. When a worker starts, the daemon moves the issue to **Running** and records the run id.
+3. The `Work item:` line asks the worker to end its report with a `## Remaining` block:
+
+   ```
+   ## Remaining
+   - owed: Billing: finish the import | the export side is done, the import is not
+   - waiting-owner: Billing: ship to all users? | it changes the file format
+   - follow-up: Docs: explain the export | users keep asking how
+   ```
+
+   or the single line `- none`. When the report lands, each `owed` and `follow-up` line
+   becomes a sub-issue in **Queued**, and all the `waiting-owner` lines become ONE card in
+   **Waiting on you**, assigned to you. A clean finish closes the job's issue.
+4. A comment you write on a card is an answer. `/comments` reads your new comments now and
+   hands them to the chat session as one turn; a card in **Waiting on you** that you
+   commented on moves to **Answered**.
+
+Only the job title (or its `--card` text), the engine, the working folder's name, run ids
+and the `## Remaining` lines reach Linear. The brief and the rest of the report stay on
+your machine.
+
+### Turn it on
+
+1. In Linear, Settings, Account, Security and access: create a personal API key. Save it
+   without echoing it, readable only by you:
+
+   ```bash
+   mkdir -p ~/.config/leash && umask 077 && pbpaste | tr -d '\n' > ~/.config/leash/linear-api-key
+   ```
+
+   Or set `LINEAR_API_KEY` in the daemon's environment instead.
+2. Add the team to `config.json` (its key, like `ENG`, or its name):
+
+   ```json
+   "workTracker": { "team": "ENG" }
+   ```
+
+3. Create the states and save the ids: `node scripts/work.mjs setup`. It adds any of
+   Queued, Running, Waiting on you, Answered, Blocked, Done and Canceled the team lacks.
+   To reuse a team's own states, map them first, for example
+   `"states": { "queued": "Todo", "running": "In Progress" }`.
+4. Optional, a live check that writes nothing: `node scripts/probes/linear-probe.mjs`.
+5. Restart the daemon (`./safe-restart.sh`).
+
+Other keys of `workTracker`: `keyFile` (default `~/.config/leash/linear-api-key`),
+`stateDir` (default `work-tracker/` in the repo, gitignored), `dispatchDrainMs` (how
+long `bg.mjs` waits to send to Linear, default 6000, 0 queues only), `enabled: false`.
+
+### Day to day
+
+```bash
+node bg.mjs --card "Billing: rework the export | the CSV drops rows" --file brief.md   # the card's text
+node bg.mjs --no-track --file sweep.md        # no issue for this job
+node scripts/work.mjs open                    # open issues: id, state, age, title
+node scripts/work.mjs status ENG-12 Done --comment "shipped"
+node scripts/work.mjs status ENG-12 Blocked --comment "waits for the vendor fix"   # Blocked needs a reason
+node scripts/work.mjs comment ENG-12 "text"
+node scripts/work.mjs lint                    # which titles do not read plainly on a phone
+node scripts/work.mjs plan PLAN.md --section "Steps"   # one Queued issue per row of a step table
+node scripts/work.mjs outbox                  # what waits to be sent; `drain` sends it now
+```
+
+Two rules the CLI enforces: owed work is never moved to Backlog (it goes back to Queued,
+to a question for you, to Blocked with the blocker named, or it is closed), and a card
+title reads plainly on a phone: `Area: plain words`, 45 characters at most, no ids,
+paths or code. `lint` and the sweep list the ones that do not.
+
+**The sweep.** `scripts/work-sweep.mjs` prints what needs the chat session: cards you
+answered, owed leftovers nobody picked up for 2 hours, Running cards whose worker is
+gone, owed work parked in a backlog state, and titles that do not read plainly. It prints
+nothing when nothing does, so as a schedule script it costs no turn on a quiet board:
+
+```bash
+node schedule.mjs add every 3h 09:05 --script scripts/work-sweep.mjs "Work sweep"
+node schedule.mjs add every 2h 09:10 --script scripts/work-comments.mjs "Linear comments"
+```
+
+**Nothing is lost when Linear is down.** `bg.mjs` and the daemon write each change to a
+local outbox first and send it in order. One that fails three times is set aside in
+`work-tracker/outbox/failed/`. `bg.mjs ps` shows what waits. The last batch of comments is
+kept: `node scripts/work.mjs comments --again` shows it again.
 
 ## Security
 

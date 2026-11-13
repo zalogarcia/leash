@@ -181,6 +181,9 @@ const M = await import(
         // at the lift, and a death the cooldown turned away asks how the
         // rotation behind it ended. Recorded, and steerable from a test.
         `export const WALL_DEATHS = [];`,
+        // THE WORK TRACKER (work-track.mjs): writeFullReport hands every report to it.
+        `export const WORK_REPORTED = [];`,
+        `const workTracker = { started: () => null, reported: (...a) => { WORK_REPORTED.push(a); return null; } };`,
         `const wallGuard = { jobOf: () => null };`,
         `const noteWallDeath = (runId, task, opts) => { WALL_DEATHS.push({ runId, task, ...opts }); };`,
         `export let BEHIND = null;`,

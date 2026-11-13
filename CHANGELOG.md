@@ -4,6 +4,27 @@ All notable changes to Leash. Dates are release dates.
 
 ## Unreleased
 
+### Optional Linear work tracker
+
+- **Every background job can be a Linear issue**, off by default. With a team and a personal
+  API key in the config, `bg.mjs` opens the job's issue in Queued, the daemon moves it to
+  Running when its worker starts, and the report's `## Remaining` block files each leftover:
+  `owed` and `follow-up` lines as Queued sub-issues, the `waiting-owner` lines as one card in
+  Waiting on you. A clean finish closes the job. README, "Track jobs in Linear".
+- **`scripts/work.mjs`**: `setup`, `open`, `status`, `comment`, `lint`, `plan`, `sweep`,
+  `comments`, `outbox`, `drain`. Owed work is never moved to Backlog, Blocked needs a reason,
+  and card titles are checked for plain reading on a phone.
+- **`bg.mjs --card "Area: title | sentence"`** sets the card's text and **`--no-track`** skips
+  the issue. `bg.mjs ps` shows the outbox when the tracker is on.
+- **`/comments`** reads your new comments on cards as one chat turn and moves a card you
+  answered from Waiting on you to Answered. `scripts/work-sweep.mjs` and
+  `scripts/work-comments.mjs` run as schedule script entries and print nothing when there is
+  nothing to say.
+- **A local outbox** keeps every change until Linear takes it, in order. Only titles, run ids
+  and `## Remaining` lines reach Linear; briefs and reports stay on the machine.
+- **`scripts/probes/linear-probe.mjs`** checks every query against the live API and writes
+  nothing.
+
 ### Schedules: every N hours, script entries and runs that wait for Claude
 
 - **`schedule.mjs add every <N>h <HH:MM>`** fires once per slot, N from 1 to 23. It takes `--run`

@@ -126,6 +126,7 @@ export const REPORTED = [];
 const send = (t) => { SENT.push(t); return Promise.resolve(); };
 export const codexRuns = new Map();
 export const registry = new Map();
+const workTracker = { started: () => null, reported: () => null }; // work-track.mjs
 const inflight = {
   add: (id, rec) => registry.set(id, rec),
   clear: (id) => registry.delete(id),
@@ -2657,6 +2658,7 @@ const tg = (method, payload) => { TG.push({ method, payload }); if (method === '
 const editProgress = (id, html, plain) => { PROGRESS.push(plain()); return Promise.resolve(); };
 export const codexRuns = new Map();
 export const registry = new Map();
+const workTracker = { started: () => null, reported: () => null }; // work-track.mjs
 const inflight = { add: (id, rec) => registry.set(id, rec), clear: (id) => registry.delete(id), read: () => Object.fromEntries(registry) };
 const closeStdin = (c) => { try { c?.stdin?.destroy(); } catch {} };
 const reportCodexOutcome = (task, outcome, runId, meta) => { HANDBACKS.push({ task, outcome, runId, meta }); };
@@ -5333,6 +5335,7 @@ const __realLog = console.log;
 console.log = (...a) => { LOGS.push(a.join(' ')); __realLog(...a); };
 export const codexRuns = new Map();
 export const registry = new Map();
+const workTracker = { started: () => null, reported: () => null }; // work-track.mjs
 const inflight = {
   add: (id, rec) => registry.set(id, rec),
   clear: (id) => registry.delete(id),
