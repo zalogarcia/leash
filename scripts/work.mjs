@@ -13,7 +13,9 @@
 //   node scripts/work.mjs comment <ID> "text"
 //   node scripts/work.mjs lint [--json]            every open card's title against the plain card check
 //   node scripts/work.mjs sweep                    what needs the chat session; prints nothing when nothing does
-//   node scripts/work.mjs comments [--again]       the owner's new comments on cards, as one batch
+//   node scripts/work.mjs comments [--again]       the owner's comments on cards not yet acted on, as one batch
+//   node scripts/work.mjs comments --done <time>   the chat session acted on every comment up to that time
+//   node scripts/work.mjs retry                    put the set aside ops back and send them
 //   node scripts/work.mjs plan <PLAN.md> [--section <heading>]   one Queued issue per row of a step table
 //   node scripts/work.mjs drain [--budget-ms N]    send the outbox now
 //   node scripts/work.mjs outbox                   what waits in it
@@ -29,15 +31,16 @@
 //
 // THE OUTBOX. job, link-run and report write their op to a local file first
 // and send within a budget, so a slow or dead Linear never blocks a dispatch
-// and never loses a report. Ops are sent in order; one that fails 3 times is
-// set aside in outbox/failed/. Every op is idempotent by its work key, stored
+// and never loses a report. Ops are sent in order. Linear being unreachable
+// costs an op nothing (it waits); one Linear refuses 3 times is set aside in
+// outbox/failed/ until `retry` puts it back. Every op is idempotent by its work key, stored
 // in the issue's tracker data block, so a re-send never duplicates.
 //
 // WHAT REACHES LINEAR: a job's title (or its --card text), its engine and repo
 // folder name, run ids, and the `## Remaining` lines of its report. Never the
 // brief and never the rest of the report.
 
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
@@ -239,43 +242,52 @@ export const Q = {
   update: `mutation WorkIssueUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { ${FIELDS} } } }`,
   comment: 'mutation WorkComment($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }',
   open: `query WorkOpen($team: ID!, $after: String) { issues(first: 100, after: $after, filter: { team: { id: { eq: $team } }, state: { type: { nin: ["completed", "canceled"] } } }) { nodes { ${FIELDS} } pageInfo { hasNextPage endCursor } } }`,
-  comments: 'query WorkComments($team: ID!, $since: DateTimeOrDuration!, $after: String) { comments(first: 50, after: $after, filter: { createdAt: { gt: $since }, issue: { team: { id: { eq: $team } } } }) { nodes { id body createdAt user { id name } issue { id identifier title state { id name type } } } pageInfo { hasNextPage endCursor } } }',
+  comments: 'query WorkComments($team: ID!, $since: DateTimeOrDuration!, $after: String) { comments(first: 50, after: $after, filter: { createdAt: { gt: $since }, issue: { team: { id: { eq: $team } } } }) { nodes { id body createdAt user { id name } issue { id identifier title description state { id name type } } } pageInfo { hasNextPage endCursor } } }',
 };
 
 /** A refusal is not retried: the op goes to failed/ at once. */
 export class Refusal extends Error {}
 
-/** gql(query, variables) -> data, over fetch. The key goes in the header only;
- *  an error names the HTTP status and Linear's first message, never the key. */
+/** Linear could not be asked (no network, a timeout, 5xx, 429, a key it
+ *  refused): the op is not at fault, so it keeps its place and its tries. */
+export class Transient extends Error {}
+
+/** gql(query, variables) -> data, over fetch. The key goes in the header only.
+ *  An error names the HTTP status and Linear's first message; a failure before
+ *  any answer (fetch's own error text can quote the header value) is replaced
+ *  by a fixed text, so the key can never travel in an error. */
 export function linearTransport({ key, url = LINEAR_URL, fetchImpl = globalThis.fetch, timeoutMs = 30_000 } = {}) {
   return async (query, variables = {}) => {
-    if (!key) throw new Error('no Linear API key (set LINEAR_API_KEY or the key file)');
+    if (!key) throw new Transient('no usable Linear API key (set LINEAR_API_KEY, or the key alone on one line in the key file)');
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    let res;
     try {
-      const res = await fetchImpl(url, {
+      res = await fetchImpl(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: key },
         body: JSON.stringify({ query, variables }),
         signal: ctl.signal,
       });
-      let body = null;
-      try {
-        body = await res.json();
-      } catch {
-        body = null;
-      }
-      if (!res.ok || body?.errors?.length) {
-        const why = oneLine(body?.errors?.[0]?.message || res.statusText || 'error').slice(0, 200);
-        throw new Error(`Linear ${res.status}: ${why}`);
-      }
-      return body?.data ?? {};
     } catch (e) {
-      if (e?.name === 'AbortError') throw new Error(`Linear did not answer in ${Math.round(timeoutMs / 1000)} s`);
-      throw e;
+      if (e?.name === 'AbortError') throw new Transient(`Linear did not answer in ${Math.round(timeoutMs / 1000)} s`);
+      const code = String(e?.cause?.code || e?.code || e?.name || 'error').replace(/[^\w.-]/g, '').slice(0, 40);
+      throw new Transient(`Linear could not be reached (${code})`);
     } finally {
       clearTimeout(timer);
     }
+    let body = null;
+    try {
+      body = await res.json();
+    } catch {
+      body = null;
+    }
+    if (!res.ok || body?.errors?.length) {
+      const why = oneLine(body?.errors?.[0]?.message || res.statusText || 'error').slice(0, 200);
+      const E = res.status >= 500 || res.status === 429 || res.status === 401 || res.status === 403 ? Transient : Error;
+      throw new E(`Linear ${res.status}: ${why}`);
+    }
+    return body?.data ?? {};
   };
 }
 
@@ -291,7 +303,7 @@ export function statePaths(stateDir) {
     lock: path.join(stateDir, 'drain.lock'),
     cursor: path.join(stateDir, 'comments-cursor.json'),
     ledger: path.join(stateDir, 'comment-ledger.json'),
-    lastBatch: path.join(stateDir, 'comments-last.txt'),
+    pending: path.join(stateDir, 'comments-pending.json'),
   };
 }
 
@@ -349,34 +361,57 @@ const pidAlive = (pid) => {
   }
 };
 
-/** One drainer at a time. A lock older than 10 minutes, or whose pid is gone, is broken. */
-function takeLock(p) {
-  mkdirSync(p.dir, { recursive: true, mode: 0o700 });
-  for (let i = 0; i < 2; i++) {
-    try {
-      const fd = openSync(p.lock, 'wx', 0o600);
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
-      closeSync(fd);
-      return () => {
-        try {
-          unlinkSync(p.lock);
-        } catch {
-          /* already gone */
-        }
-      };
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      const held = readJson(p.lock, {});
-      const stale = !held.pid || !pidAlive(held.pid) || Date.now() - (held.at || 0) > LOCK_STALE_MS;
-      if (!stale) return null;
+/** One holder at a time. The lock file is created whole and atomically (a
+ *  hard link of a finished temp file), so nobody ever reads it half written. A
+ *  lock older than 10 minutes, or whose pid is gone, is broken, and only after
+ *  a second read shows the same holder. Release removes only our own lock. */
+export function takeLock(p, lockFile = p.lock) {
+  mkdirSync(path.dirname(lockFile), { recursive: true, mode: 0o700 });
+  const mine = JSON.stringify({ pid: process.pid, at: Date.now(), nonce: crypto.randomBytes(6).toString('hex') });
+  const tmp = `${lockFile}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  writeFileSync(tmp, mine, { mode: 0o600 });
+  try {
+    for (let i = 0; i < 2; i++) {
       try {
-        unlinkSync(p.lock);
-      } catch {
-        /* a racing drainer took it */
+        linkSync(tmp, lockFile);
+        return () => {
+          try {
+            if (readFileSync(lockFile, 'utf8') === mine) unlinkSync(lockFile);
+          } catch {
+            /* already gone */
+          }
+        };
+      } catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+        let raw = '';
+        try {
+          raw = readFileSync(lockFile, 'utf8');
+        } catch {
+          continue; // released between the two calls: try again
+        }
+        let held = {};
+        try {
+          held = JSON.parse(raw);
+        } catch {
+          held = {};
+        }
+        const stale = !held.pid || !pidAlive(held.pid) || Date.now() - (held.at || 0) > LOCK_STALE_MS;
+        if (!stale) return null;
+        try {
+          if (readFileSync(lockFile, 'utf8') === raw) unlinkSync(lockFile);
+        } catch {
+          /* a racing holder took it */
+        }
       }
     }
+    return null;
+  } finally {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* gone */
+    }
   }
-  return null;
 }
 
 // ── the tracker ─────────────────────────────────────────────────────────────
@@ -386,7 +421,7 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
   const ids = () => readJson(p.ids, null);
   const need = () => {
     const v = ids();
-    if (!v?.teamId) throw new Error('not set up yet: run node scripts/work.mjs setup');
+    if (!v?.teamId) throw new Transient('not set up yet: run node scripts/work.mjs setup');
     return v;
   };
   const keys = () => readJson(p.keys, {});
@@ -397,7 +432,7 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
   };
   const stateId = (role) => {
     const s = need().states?.[role];
-    if (!s?.id) throw new Error(`no "${names[role]}" state saved: run node scripts/work.mjs setup`);
+    if (!s?.id) throw new Transient(`no "${names[role]}" state saved: run node scripts/work.mjs setup`);
     return s.id;
   };
   const roleOf = (stateName) => {
@@ -457,6 +492,22 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
     return (await findByKey(spec.key)) || create(spec);
   }
 
+  /** The job's card. When its own job op never reached Linear (set aside, or
+   *  lost), the start or the report opens it, so neither is ever stranded
+   *  behind a missing card. */
+  async function jobCard(op, role) {
+    return (
+      (await findByKey(op.key)) ||
+      create({
+        key: op.key,
+        title: op.title || `Job: ${op.key}`,
+        description: renderCard({ what: 'A background job dispatched through the bridge.', stands: `${names[role]}: opened by its ${op.op === 'report' ? 'report' : 'worker start'}.` }),
+        role,
+        meta: { kind: 'job' },
+      })
+    );
+  }
+
   // The ops the outbox carries.
   const ops = {
     async job(op) {
@@ -487,8 +538,7 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
       return `created ${issue.identifier}`;
     },
     async 'link-run'(op) {
-      const issue = await findByKey(op.key);
-      if (!issue) throw new Error(`no issue for ${op.key} yet`);
+      const issue = await jobCard(op, 'running');
       const meta = readMeta(issue.description);
       const runs = Array.isArray(meta.runs) ? meta.runs : [];
       const description = withStands(withMeta(issue.description, { ...meta, runs: [...runs.filter((r) => r !== op.run), op.run].slice(-10) }), `Running: worker ${op.run} started ${new Date(now()).toISOString().slice(0, 16).replace('T', ' ')} UTC.`);
@@ -496,11 +546,19 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
       return `${issue.identifier} running`;
     },
     async report(op) {
-      const job = await findByKey(op.key);
-      if (!job) throw new Error(`no issue for ${op.key} yet`);
+      const job = await jobCard(op, 'queued');
       const finished = op.status === 'finished';
       const parsed = op.remaining || { valid: false, error: 'no report text' };
+      // ONE REPORT IS APPLIED ONCE. Its identity (run, status, block) is kept in
+      // the card's tracker data, so a replay (a re-sent op, a re-run of the
+      // command) neither comments again nor closes a card that was reopened.
+      const rid = shortHash(JSON.stringify([op.run || '', op.status || '', parsed]));
+      const jmeta = readMeta(job.description);
+      const applied = Array.isArray(jmeta.reports) ? jmeta.reports : [];
+      if (applied.includes(rid)) return `${job.identifier}: this report was already applied`;
+      const markApplied = (description) => withMeta(description, { ...readMeta(description), reports: [...applied, rid].slice(-20) });
       if (!parsed.valid) {
+        await update(job, { description: markApplied(job.description) });
         await comment(job, `The report landed (${op.status}) with no valid ## Remaining block: ${parsed.error}. This card stays open for a look.`);
         return `${job.identifier}: no valid block, commented`;
       }
@@ -536,10 +594,11 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
         made.push(issue.identifier);
       }
       if (finished) {
-        await update(job, { stateId: stateId('done'), description: withStands(job.description, parsed.none ? 'Done: finished with nothing left.' : `Done: finished; its leftovers are ${made.join(', ')}.`) });
+        await update(job, { stateId: stateId('done'), description: markApplied(withStands(job.description, parsed.none ? 'Done: finished with nothing left.' : `Done: finished; its leftovers are ${made.join(', ')}.`)) });
         await comment(job, parsed.none ? `Finished (run ${op.run || 'unknown'}), nothing left.` : `Finished (run ${op.run || 'unknown'}). Leftovers filed: ${made.join(', ')}.`);
         return `${job.identifier} done${made.length ? `, ${made.length} filed` : ''}`;
       }
+      await update(job, { description: markApplied(job.description) });
       await comment(job, `The run ended as ${op.status}${made.length ? `; leftovers filed: ${made.join(', ')}` : ''}. This card stays open.`);
       return `${job.identifier} ${op.status}${made.length ? `, ${made.length} filed` : ''}`;
     },
@@ -551,51 +610,92 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
     return fn(op);
   }
 
-  /** Send the outbox in order within a budget. */
+  /** Send the outbox in order within a budget. The list is read again before
+   *  every op and once more after the lock is let go, so an op queued while
+   *  this drain ran is sent by it, not left for the next one. A Transient
+   *  failure (Linear unreachable, a key it refused, not set up yet) stops the
+   *  drain and costs the op nothing; any other failure counts one of its 3
+   *  tries, and a Refusal sets it aside at once. */
   async function drain({ budgetMs = 20_000 } = {}) {
-    const release = takeLock(p);
-    if (!release) return { busy: true, sent: 0, left: outboxFiles(p).length, lines: [] };
     const started = now();
     const lines = [];
     let sent = 0;
-    try {
-      for (const name of outboxFiles(p)) {
-        if (now() - started > budgetMs) break;
-        const file = path.join(p.outbox, name);
-        const op = readJson(file, null);
-        if (!op) {
-          try {
-            unlinkSync(file);
-          } catch {
-            /* gone */
+    let busy = false;
+    let stopped = false;
+    for (let pass = 0; pass < 3 && !stopped; pass++) {
+      const release = takeLock(p);
+      if (!release) {
+        busy = pass === 0;
+        break;
+      }
+      try {
+        for (;;) {
+          if (now() - started > budgetMs) {
+            stopped = true;
+            break;
           }
-          continue;
-        }
-        try {
-          const said = await apply(op);
-          unlinkSync(file);
-          sent++;
-          lines.push(`${op.op} ${op.key || ''}: ${said}`);
-          log(`[work] ${op.op} ${op.key || ''}: ${said}`);
-        } catch (e) {
-          const attempts = (op.attempts || 0) + 1;
-          const why = oneLine(e.message).slice(0, 200);
-          if (e instanceof Refusal || attempts >= MAX_ATTEMPTS) {
-            mkdirSync(p.failed, { recursive: true, mode: 0o700 });
-            writeJson(path.join(p.failed, name), { ...op, attempts, lastError: why });
-            unlinkSync(file);
-            lines.push(`${op.op} ${op.key || ''}: set aside after ${attempts} tries (${why})`);
+          const name = outboxFiles(p)[0];
+          if (!name) break;
+          const file = path.join(p.outbox, name);
+          const op = readJson(file, null);
+          if (!op) {
+            try {
+              unlinkSync(file);
+            } catch {
+              /* gone */
+            }
             continue;
           }
-          writeJson(file, { ...op, attempts, lastError: why });
-          lines.push(`${op.op} ${op.key || ''}: not sent yet (${why})`);
-          break; // order matters: a later op may need this one
+          try {
+            const said = await apply(op);
+            unlinkSync(file);
+            sent++;
+            lines.push(`${op.op} ${op.key || ''}: ${said}`);
+            log(`[work] ${op.op} ${op.key || ''}: ${said}`);
+          } catch (e) {
+            const why = oneLine(e.message).slice(0, 200);
+            if (e instanceof Transient) {
+              writeJson(file, { ...op, lastError: why });
+              lines.push(`${op.op} ${op.key || ''}: waiting for Linear (${why})`);
+              stopped = true;
+              break;
+            }
+            const attempts = (op.attempts || 0) + 1;
+            if (e instanceof Refusal || attempts >= MAX_ATTEMPTS) {
+              mkdirSync(p.failed, { recursive: true, mode: 0o700 });
+              writeJson(path.join(p.failed, name), { ...op, attempts, lastError: why });
+              unlinkSync(file);
+              lines.push(`${op.op} ${op.key || ''}: set aside after ${attempts} tries (${why}); node scripts/work.mjs retry puts it back`);
+              continue;
+            }
+            writeJson(file, { ...op, attempts, lastError: why });
+            lines.push(`${op.op} ${op.key || ''}: not sent yet (${why})`);
+            stopped = true; // order matters: a later op may need this one
+            break;
+          }
         }
+      } finally {
+        release();
       }
-    } finally {
-      release();
+      if (!outboxFiles(p).length) break;
     }
-    return { busy: false, sent, left: outboxFiles(p).length, lines };
+    return { busy, sent, left: outboxFiles(p).length, lines };
+  }
+
+  /** Put every set aside op back in the outbox, in its old order, with fresh tries. */
+  function retryFailed() {
+    let names = [];
+    try {
+      names = readdirSync(p.failed).filter((f) => f.endsWith('.json')).sort();
+    } catch {
+      names = [];
+    }
+    for (const name of names) {
+      const op = readJson(path.join(p.failed, name), null);
+      if (op) writeJson(path.join(p.outbox, name), { ...op, attempts: 0 });
+      unlinkSync(path.join(p.failed, name));
+    }
+    return names.length;
   }
 
   async function openIssues() {
@@ -643,10 +743,14 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
     return { ok: true, team: t, created, viewer };
   }
 
-  /** The comments on the team's cards since the cursor, by the key's own user,
-   *  that the tracker did not post. A card in "Waiting on you" that got one moves
-   *  to "Answered". Returns { text, cursor } or { text: '' }. */
-  async function readComments({ ownerName = 'the owner' } = {}) {
+  /** New comments on the tracker's cards since the cursor, by the key's own
+   *  user, that the tracker did not post. Each is added to the pending list on
+   *  disk BEFORE the cursor moves, and stays there until `comments --done`
+   *  says the chat session has acted on it, so a batch that never reached a
+   *  turn (a wall, a restart, a second batch behind it) is printed again by the
+   *  next run, never lost. A card in "Waiting on you" that got one moves to
+   *  "Answered". Returns { added, pending }. */
+  async function readComments() {
     const v = need();
     const since = readJson(p.cursor, null)?.since || new Date(now()).toISOString();
     const ledger = new Set(readJson(p.ledger, []));
@@ -659,38 +763,62 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
       after = d.comments.pageInfo.endCursor;
     }
     const cursor = got.reduce((m, c) => (c.createdAt > m ? c.createdAt : m), since);
-    const mine = got
-      .filter((c) => c.user?.id && c.user.id === v.viewerId && !ledger.has(c.id) && !String(c.body || '').trimStart().startsWith(MARK) && c.issue)
-      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
-    if (!mine.length) return { text: '', cursor, count: 0 };
-    const byCard = new Map();
-    for (const c of mine) {
-      if (!byCard.has(c.issue.identifier)) byCard.set(c.issue.identifier, { issue: c.issue, comments: [] });
-      byCard.get(c.issue.identifier).comments.push(c);
-    }
+    const pending = readJson(p.pending, []);
+    const seen = new Set(pending.map((c) => c.id));
+    const fresh = got.filter((c) => c.user?.id && c.user.id === v.viewerId && !ledger.has(c.id) && !seen.has(c.id) && !String(c.body || '').trimStart().startsWith(MARK) && c.issue && isTracked(c.issue));
     const waitingId = v.states?.waiting?.id;
-    const moved = [];
-    for (const { issue } of byCard.values()) {
-      if (waitingId && issue.state?.id === waitingId && v.states?.answered?.id) {
-        try {
-          await gql(Q.update, { id: issue.id, input: { stateId: v.states.answered.id } });
-          moved.push(issue.identifier);
-        } catch (e) {
-          log(`[work] ${issue.identifier} not moved to ${names.answered}: ${oneLine(e.message).slice(0, 120)}`);
-        }
+    const moved = new Set();
+    for (const c of fresh) {
+      if (moved.has(c.issue.id) || !waitingId || c.issue.state?.id !== waitingId || !v.states?.answered?.id) continue;
+      try {
+        await gql(Q.update, { id: c.issue.id, input: { stateId: v.states.answered.id } });
+        moved.add(c.issue.id);
+      } catch (e) {
+        log(`[work] ${c.issue.identifier} not moved to ${names.answered}: ${oneLine(e.message).slice(0, 120)}`);
       }
     }
-    const out = [`[Linear comments by ${ownerName}, ${mine.length} on ${byCard.size} card${byCard.size === 1 ? '' : 's'}]`];
-    out.push('Each is their answer on that card. Act on it, then move or comment on the card (node scripts/work.mjs status|comment).');
-    for (const { issue, comments } of byCard.values()) {
-      out.push('', `${issue.identifier} · ${issue.title} (${moved.includes(issue.identifier) ? `now ${names.answered}` : issue.state?.name || 'unknown state'})`);
-      for (const c of comments) out.push(...String(c.body).trim().split('\n').map((l) => `> ${l}`));
-    }
-    return { text: out.join('\n'), cursor, count: mine.length };
+    const records = fresh.map((c) => ({ id: c.id, body: String(c.body || ''), createdAt: c.createdAt, card: c.issue.identifier, title: c.issue.title, state: moved.has(c.issue.id) ? names.answered : c.issue.state?.name || '' }));
+    const all = [...pending, ...records].sort((x, y) => (x.createdAt < y.createdAt ? -1 : 1)).slice(-200);
+    writeJson(p.pending, all);
+    writeJson(p.cursor, { since: cursor });
+    return { added: records.length, pending: all };
   }
 
-  return { names, roleOf, getIssue, findByKey, create, update, comment, ensure, apply, drain, openIssues, setup, readComments, ids, need, stateId };
+  /** Drop the pending comments the chat session has acted on: every one made at or before `upTo`. */
+  function doneComments(upTo) {
+    const all = readJson(p.pending, []);
+    const left = all.filter((c) => !(c.createdAt <= upTo));
+    writeJson(p.pending, left);
+    return all.length - left.length;
+  }
+
+  return { names, roleOf, getIssue, findByKey, create, update, comment, ensure, apply, drain, retryFailed, openIssues, setup, readComments, doneComments, ids, need, stateId };
 }
+
+/** The pending comments as ONE batch for the chat session, or '' when none. */
+export function commentsBatch(pending, { ownerName = 'the owner' } = {}) {
+  if (!pending?.length) return '';
+  const byCard = new Map();
+  for (const c of pending) {
+    if (!byCard.has(c.card)) byCard.set(c.card, { title: c.title, state: c.state, comments: [] });
+    const e = byCard.get(c.card);
+    e.state = c.state || e.state;
+    e.comments.push(c);
+  }
+  const upTo = pending.reduce((m, c) => (c.createdAt > m ? c.createdAt : m), '');
+  const out = [`[Linear comments by ${ownerName}, ${pending.length} on ${byCard.size} card${byCard.size === 1 ? '' : 's'}]`];
+  out.push(`Each is their answer on that card. Act on it, move or comment on the card (node scripts/work.mjs status|comment), then run: node scripts/work.mjs comments --done ${upTo}`);
+  out.push('Until then they are shown again on every read, so none is lost.');
+  for (const [card, e] of byCard) {
+    out.push('', `${card} · ${e.title} (${e.state || 'unknown state'})`);
+    for (const c of e.comments) out.push(...c.body.trim().split('\n').map((l) => `> ${l}`));
+  }
+  return out.join('\n');
+}
+
+/** A card the tracker made: its description carries tracker data with a key.
+ *  Everything else in the team (a teammate's issue) is not the tracker's. */
+export const isTracked = (issue) => Boolean(readMeta(issue?.description).key);
 
 // ── sweep ───────────────────────────────────────────────────────────────────
 
@@ -702,7 +830,9 @@ export const QUEUED_STALE_HOURS = 2;
  * (`bg.mjs ps` output, or null when it could not be read). Empty string when
  * nothing does, so a schedule script entry starts no turn.
  */
-export function sweepText(issues, { names, psText = null, now = Date.now(), lintMax = 10 } = {}) {
+export function sweepText(allIssues, { names, psText = null, now = Date.now(), lintMax = 10 } = {}) {
+  // Only the tracker's own cards: a team can hold a teammate's issues too.
+  const issues = allIssues.filter(isTracked);
   const roleName = (i) => String(i.state?.name || '').toLowerCase();
   const is = (i, role) => roleName(i) === String(names[role]).toLowerCase();
   const age = (i) => (now - Date.parse(i.updatedAt || i.createdAt || now)) / HOUR;
@@ -790,7 +920,7 @@ export function parseArgs(argv) {
   return { pos, flags };
 }
 
-const USAGE = 'usage: node scripts/work.mjs setup [--check] | open | status <ID> <state> [--comment why] | comment <ID> text | lint | sweep | comments [--again] | plan <file> [--section heading] | drain | outbox';
+const USAGE = 'usage: node scripts/work.mjs setup [--check] | open | status <ID> <state> [--comment why] | comment <ID> text | lint | sweep | comments [--again | --done <time>] | plan <file> [--section heading] | drain | retry | outbox';
 
 function readStdin() {
   try {
@@ -800,14 +930,20 @@ function readStdin() {
   }
 }
 
+/** The key, or '' when there is none usable. Only one line of printable
+ *  characters with no space is a key: anything else (a comment line above it,
+ *  two keys) would reach fetch as a header value fetch refuses, and its error
+ *  text quotes the value. */
 function readKey(settings, env) {
-  const fromEnv = String(env.LINEAR_API_KEY || '').trim();
-  if (fromEnv) return fromEnv;
-  try {
-    return readFileSync(settings.keyFile, 'utf8').trim();
-  } catch {
-    return '';
+  let raw = String(env.LINEAR_API_KEY || '').trim();
+  if (!raw) {
+    try {
+      raw = readFileSync(settings.keyFile, 'utf8').trim();
+    } catch {
+      raw = '';
+    }
   }
+  return /^[\x21-\x7e]{8,256}$/.test(raw) ? raw : '';
 }
 
 function psOutput(root, timeoutMs = 15_000) {
@@ -837,7 +973,7 @@ export async function main(argv, { env = process.env, out = (s) => process.stdou
     return cmd === 'outbox' || cmd === 'drain' ? 0 : 1;
   }
   const p = statePaths(s.stateDir);
-  const transport = gql || linearTransport({ key: readKey(s, env), url: env.LINEAR_API_URL || LINEAR_URL });
+  const transport = gql || linearTransport({ key: readKey(s, env) });
   const t = createTracker({ gql: transport, paths: p, states: s.states, team: s.team, now, log: (m) => err(m) });
   const drainMs = flags['drain-ms'] !== undefined ? Number(flags['drain-ms']) : 20_000;
   const queueAndSend = async (op) => {
@@ -869,13 +1005,13 @@ export async function main(argv, { env = process.env, out = (s) => process.stdou
       }
       case 'link-run': {
         if (!isKey(flags.key) || !flags.run) return (err('link-run needs --key and --run'), 2);
-        return queueAndSend({ op: 'link-run', key: flags.key, run: String(flags.run).slice(0, 120) });
+        return queueAndSend({ op: 'link-run', key: flags.key, run: String(flags.run).slice(0, 120), title: flags.title ? oneLine(flags.title).slice(0, 200) : null });
       }
       case 'report': {
         if (!isKey(flags.key)) return (err('report needs --key'), 2);
         const text = flags.stdin ? stdin() : flags.file && existsSync(flags.file) ? readFileSync(flags.file, 'utf8') : '';
         // Only the parsed block is kept and sent; the report text stays here.
-        return queueAndSend({ op: 'report', key: flags.key, run: String(flags.run || '').slice(0, 120), status: String(flags.status || 'finished'), remaining: parseRemaining(text) });
+        return queueAndSend({ op: 'report', key: flags.key, run: String(flags.run || '').slice(0, 120), status: String(flags.status || 'finished'), title: flags.title ? oneLine(flags.title).slice(0, 200) : null, remaining: parseRemaining(text) });
       }
       case 'unqueue': {
         // bg.mjs, when the drop box write failed: the job op it queued (and has
@@ -901,7 +1037,7 @@ export async function main(argv, { env = process.env, out = (s) => process.stdou
       case 'outbox': {
         const st = outboxStatus(p);
         for (const f of st.files) out(f);
-        out(`${st.waiting} waiting, ${st.failed} set aside${st.waiting ? ' (node scripts/work.mjs drain sends them)' : ''}`);
+        out(`${st.waiting} waiting, ${st.failed} set aside${st.waiting ? ' (node scripts/work.mjs drain sends them)' : ''}${st.failed ? ' (node scripts/work.mjs retry puts the set aside ones back)' : ''}`);
         return 0;
       }
       case 'open': {
@@ -955,7 +1091,7 @@ export async function main(argv, { env = process.env, out = (s) => process.stdou
         return 0;
       }
       case 'lint': {
-        const issues = await t.openIssues();
+        const issues = (await t.openIssues()).filter(isTracked);
         const bad = issues.map((i) => ({ id: i.identifier, title: i.title, problems: cardTitleProblems(i.title) })).filter((x) => x.problems.length);
         if (flags.json) out(JSON.stringify({ open: issues.length, readable: issues.length - bad.length, bad }));
         else {
@@ -973,25 +1109,42 @@ export async function main(argv, { env = process.env, out = (s) => process.stdou
         return 0;
       }
       case 'comments': {
-        if (flags.again) {
-          const last = existsSync(p.lastBatch) ? readFileSync(p.lastBatch, 'utf8') : '';
-          if (last.trim()) out(last.trim());
+        const ownerName = String(readBridgeConfig(env, root).ownerName || 'the owner');
+        if (flags.done !== undefined) {
+          if (!/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(String(flags.done))) return (err('usage: comments --done <the time the batch names>'), 2);
+          out(`${t.doneComments(String(flags.done))} comment(s) marked read`);
           return 0;
         }
-        const release = takeLock({ ...p, lock: path.join(p.dir, 'comments.lock') });
+        if (flags.again) {
+          const text = commentsBatch(readJson(p.pending, []), { ownerName });
+          if (text) out(text);
+          return 0;
+        }
+        const release = takeLock(p, path.join(p.dir, 'comments.lock'));
         if (!release) return (err('another comments run holds the lock'), 3);
         try {
-          const r = await t.readComments({ ownerName: String(readBridgeConfig(env, root).ownerName || 'the owner') });
-          if (r.text) {
-            writeFileSync(p.lastBatch, `${r.text}\n`, { mode: 0o600 });
-            out(r.text);
+          // Read first; when Linear cannot be asked, the comments already
+          // pending are still printed, so a slow Linear never hides an answer.
+          let pending;
+          try {
+            pending = (await t.readComments()).pending;
+          } catch (e) {
+            pending = readJson(p.pending, []);
+            if (!pending.length) throw e;
+            err(`work: new comments not read (${oneLine(e.message).slice(0, 160)}); the pending ones follow`);
           }
-          // The cursor moves only after the batch is printed (and kept for --again).
-          writeJson(p.cursor, { since: r.cursor });
+          const text = commentsBatch(pending, { ownerName });
+          if (text) out(text);
           return 0;
         } finally {
           release();
         }
+      }
+      case 'retry': {
+        out(`${t.retryFailed()} set aside op(s) back in the outbox`);
+        const r = await t.drain({ budgetMs: 30_000 });
+        out(`sent ${r.sent}, ${r.left} waiting`);
+        return 0;
       }
       case 'plan': {
         const file = pos[1];

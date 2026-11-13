@@ -20,8 +20,12 @@ All notable changes to Leash. Dates are release dates.
   answered from Waiting on you to Answered. `scripts/work-sweep.mjs` and
   `scripts/work-comments.mjs` run as schedule script entries and print nothing when there is
   nothing to say.
-- **A local outbox** keeps every change until Linear takes it, in order. Only titles, run ids
-  and `## Remaining` lines reach Linear; briefs and reports stay on the machine.
+- **A local outbox** keeps every change until Linear takes it, in order. An outage spends no
+  tries; a change Linear refuses three times is set aside and `retry` puts it back. Comments
+  stay pending until `comments --done`. Only titles, run ids and `## Remaining` lines reach
+  Linear; briefs and reports stay on the machine.
+- **Off means off.** With no `workTracker` block, `/help`, the command menu and `/comments`
+  (still passed to Claude Code) are exactly as before.
 - **`scripts/probes/linear-probe.mjs`** checks every query against the live API and writes
   nothing.
 

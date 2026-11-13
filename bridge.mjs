@@ -3106,8 +3106,11 @@ const RESERVED_COMMANDS = new Set([
   '/resume',
   '/chats',
   '/compact',
-  '/comments',
 ]);
+// The Linear tracker's /comments is a daemon command only when the tracker is
+// on. Off, it is not reserved, so a user's own /comments command still goes to
+// Claude Code exactly as before.
+if (WORK_SETTINGS) RESERVED_COMMANDS.add('/comments');
 
 // ---------- schedules ----------
 // Stored in their own file (not state.json) so `schedule.mjs` — the CLI Claude
@@ -12379,8 +12382,8 @@ Commands:
 /stop [bg|all] · kill the running task (chat lane by default)
 /restart · restart the daemon (if something feels stuck)
 /logs · last lines of the daemon log
-/remind daily HH:MM <text> · every 3d HH:MM <text> · once [date] HH:MM · in 2h · prefix "run:" to run it as a task
-/schedules lists them · /unschedule <id> removes one
+/remind daily HH:MM <text> · every 3d HH:MM <text> · once [date] HH:MM · in 2h · prefix "run:" to run it as a Claude task
+/schedules · list them · /unschedule <id> removes one
 /yolo on|off · permission bypass (default: ON, as you run CC)
 /help · this message
 
@@ -12429,6 +12432,8 @@ async function handleCommand(text, msg = null) {
         name: BRIDGE_NAME,
         host: hostname().replace(/\.local$/, ''),
         reference: HELP,
+        // The optional Linear tracker's command, listed only when it is on.
+        extraCommands: WORK_SETTINGS ? ['/comments'] : [],
         // The budget is on what actually goes out. escHtml expands & < > in the
         // reference, so a raw length that fits can compose to a rejected send,
         // and a rejected /help falls back to the index with the whole reference

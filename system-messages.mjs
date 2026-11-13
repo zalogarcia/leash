@@ -372,7 +372,7 @@ export const HELP_GROUPS = [
   { icon: '🌙', commands: ['/status', '/steer', '/btw', '/stop'] },
   { icon: '🧠', commands: ['/engine', '/codex', '/model', '/yolo'] },
   { icon: '📊', commands: ['/usage', '/account', '/context'] },
-  { icon: '⏰', commands: ['/remind', '/schedules', '/unschedule', '/comments'] },
+  { icon: '⏰', commands: ['/remind', '/schedules', '/unschedule'] },
   { icon: '📁', commands: ['/cd', '/logs', '/restart', '/help'] },
 ];
 
@@ -395,12 +395,17 @@ export function helpMessage({
   // so the pure form is still callable with no arguments.
   escape = (t) => t,
   composedMax = HELP_COMPOSED_MAX,
+  // Commands of an optional feature that is on (the Linear tracker's
+  // /comments), listed with the schedules. Empty by default, so an install
+  // without the feature sees the index exactly as it was.
+  extraCommands = [],
 } = {}) {
+  const extra = (g) => (g.icon === '⏰' ? extraCommands : []);
   const visible = [
     `📖 ${name}${host ? ` on ${host}` : ''}`,
     'Send any text · it runs and replies.',
     '',
-    ...HELP_GROUPS.map((g) => `${g.icon} ${g.commands.join(' ')}`),
+    ...HELP_GROUPS.map((g) => `${g.icon} ${[...g.commands, ...extra(g)].join(' ')}`),
     '',
     'Any other /command goes to Claude Code.',
   ];

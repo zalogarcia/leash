@@ -5,7 +5,10 @@
 //
 // A comment on a card is an answer: the reader collects every new one into ONE
 // batch, so ten replies on ten cards cost one chat turn, not ten. It runs on
-// /comments and from a schedule script entry (scripts/work-comments.mjs).
+// /comments and from a schedule script entry (scripts/work-comments.mjs). A
+// comment stays in the batch on every read until the chat session runs the
+// `comments --done <time>` line the batch ends with, so a batch that never
+// reached a turn is shown again, not lost.
 
 const BATCH_RE = /^\[Linear comments by /;
 
@@ -24,8 +27,8 @@ const line = (glyph, text) => `${glyph} Linear comments · ${text}`;
 /**
  * What /comments does with one run of the reader: { prompt } starts one chat
  * turn, { line } is one line from the daemon with no model turn. Exit 3 means
- * another run holds the reader's lock. The reader moves its cursor only after
- * it has printed, and keeps the last batch for `comments --again`.
+ * another run holds the reader's lock. Nothing read is lost on any path: a
+ * comment leaves the pending list only on `comments --done`.
  */
 export function commentsCommandResult({ code = 0, stdout = '', stderr = '', ownerName = 'the owner', enabled = true }) {
   if (!enabled) return { line: line('💬', 'the work tracker is off (README, "Track jobs in Linear")'), log: 'comments_off' };

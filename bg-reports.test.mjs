@@ -255,6 +255,13 @@ t('the full report is written even when it dwarfs the inline limit', () => {
   ok(disk.includes('status: finished'), 'status is not recorded');
 });
 
+t('every report is handed to the work tracker with its task, run id, text and status', () => {
+  const before = M.WORK_REPORTED.length;
+  M.writeFullReport('run-tracked', 'brief\n\n---\nWork item: job-x1. tracked', '## Remaining\n- none', 'failed');
+  const [task, id, opts] = M.WORK_REPORTED[before];
+  eq(JSON.stringify([task.endsWith('Work item: job-x1. tracked'), id, opts.output, opts.status]), JSON.stringify([true, 'run-tracked', '## Remaining\n- none', 'failed']));
+});
+
 t('an unwritable reports dir costs the file, never the handback', () => {
   // The pointer is a nicety; the report reaching M is not. A write failure must
   // degrade to "no file" and keep going.

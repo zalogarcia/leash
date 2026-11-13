@@ -50,6 +50,18 @@ export function workKeyLine(key) {
   return `Work item: ${key}. The bridge tracks this job in Linear. End your final report with a "## Remaining" section, one line per item: "- owed: <text>", "- waiting-owner: <text>", "- follow-up: <text>", or the single line "- none". Write each line as "Area: plain title | one plain sentence on what and why", so the owner can read the card on a phone; one "waiting-owner" line per decision the owner actually makes.`;
 }
 
+/** The job's own title: its first `# ` heading after the lane rules, else its
+ *  first line, 90 characters at most. bg.mjs titles the job the same way. */
+export function jobTitleOf(task) {
+  const text = String(task ?? '');
+  const at = text.indexOf('\n--- TASK ---\n');
+  const body = at === -1 ? text : text.slice(at + 14);
+  const lines = body.split('\n');
+  const heading = lines.find((l) => /^#\s+\S/.test(l));
+  const first = lines.find((l) => l.trim() && !/^(-{3,}|Work item: )/.test(l));
+  return String(heading ? heading.replace(/^#\s+/, '') : first || '').replace(/\s+/g, ' ').trim().slice(0, 90);
+}
+
 /** `<lane>-<startedAt>` for any run id shape (a watchdog id carries a -<pid> tail). */
 export function baseRunId(runId) {
   const m = /^([A-Za-z][A-Za-z0-9_]*-\d{10,})(?:-\d+)?$/.exec(String(runId ?? ''));
@@ -170,13 +182,13 @@ export function createWorkTracker({ cli = null, nodeBin = process.execPath, spaw
       const base = baseRunId(runId);
       if (!cli || !key || !runId || startedRuns.has(base)) return null;
       startedRuns.add(base);
-      return run(['link-run', '--key', key, '--run', String(runId), '--drain-ms', '20000']);
+      return run(['link-run', '--key', key, '--run', String(runId), '--title', jobTitleOf(task) || key, '--drain-ms', '20000']);
     },
     reported(task, runId, { output = '', status = 'finished' } = {}) {
       const key = workKeyOf(task);
       if (!cli || !key) return null;
       startedRuns.delete(baseRunId(runId));
-      return run(['report', '--key', key, '--run', String(runId || ''), '--status', String(status || 'finished'), '--stdin', '--drain-ms', '30000'], output);
+      return run(['report', '--key', key, '--run', String(runId || ''), '--status', String(status || 'finished'), '--title', jobTitleOf(task) || key, '--stdin', '--drain-ms', '30000'], output);
     },
   };
 }

@@ -125,7 +125,7 @@ function workOutboxLine(work) {
     failed = 0;
   }
   const setUp = existsSync(work.ids);
-  return `WORK TRACKER · outbox ${names.length} waiting for Linear · ${failed} set aside${setUp ? '' : ' · not set up yet (node scripts/work.mjs setup)'}${names.length ? ' · node scripts/work.mjs drain sends them' : ''}`;
+  return `WORK TRACKER · outbox ${names.length} waiting for Linear · ${failed} set aside${setUp ? '' : ' · not set up yet (node scripts/work.mjs setup)'}${names.length ? ' · node scripts/work.mjs drain sends them' : ''}${failed ? ' · node scripts/work.mjs retry puts the set aside ones back' : ''}`;
 }
 
 // --file <path> reads the brief from disk instead of argv. Use it for anything
@@ -617,6 +617,12 @@ if (engine !== 'codex' && !text.startsWith('LANE RULES')) text = `${LANE_RULES}$
 // re-dispatch of a brief that already names its key keeps that key. The words
 // are workKeyLine's in work-track.mjs, kept equal by work-tracker.test.mjs.
 const work = noTrack ? null : workTrackerSettings();
+// --no-track on a brief that carries a footer from an earlier tracked dispatch:
+// the footer goes, and any other `Work item:` line is reworded, or the daemon
+// would read the key back and track the job anyway.
+if (noTrack && /^Work item: /m.test(text)) {
+  text = text.replace(/\n*-{3,}\nWork item: [^\n]*\s*$/, '').replace(/^Work item: /gm, 'Untracked work item: ');
+}
 if (work) {
   const named = [...text.matchAll(/^Work item: ([a-z0-9][a-z0-9-]{1,120})\b/gm)].pop();
   work.key = named ? named[1] : `job-${Date.now().toString(36)}-${createHash('sha256').update(text).digest('hex').slice(0, 6)}`;

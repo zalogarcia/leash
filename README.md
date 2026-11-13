@@ -1060,7 +1060,10 @@ How it works:
    **Waiting on you**, assigned to you. A clean finish closes the job's issue.
 4. A comment you write on a card is an answer. `/comments` reads your new comments now and
    hands them to the chat session as one turn; a card in **Waiting on you** that you
-   commented on moves to **Answered**.
+   commented on moves to **Answered**. A comment stays in every batch until the chat
+   session runs the `comments --done` line the batch ends with, so an answer that never
+   reached a turn is shown again rather than lost. Only cards the tracker made count:
+   your comments on a teammate's issue in the same team are not read.
 
 Only the job title (or its `--card` text), the engine, the working folder's name, run ids
 and the `## Remaining` lines reach Linear. The brief and the rest of the report stay on
@@ -1123,9 +1126,15 @@ node schedule.mjs add every 2h 09:10 --script scripts/work-comments.mjs "Linear 
 ```
 
 **Nothing is lost when Linear is down.** `bg.mjs` and the daemon write each change to a
-local outbox first and send it in order. One that fails three times is set aside in
-`work-tracker/outbox/failed/`. `bg.mjs ps` shows what waits. The last batch of comments is
-kept: `node scripts/work.mjs comments --again` shows it again.
+local outbox first and send it in order. While Linear cannot be reached (no network, a
+timeout, an outage, a key it refuses), every change waits with no try spent, and a job's
+start or report opens its card if the dispatch never got through. A change Linear itself
+refuses three times is set aside in `work-tracker/outbox/failed/`, and
+`node scripts/work.mjs retry` puts it back. `bg.mjs ps` shows what waits.
+`node scripts/work.mjs comments --again` shows the comments not yet marked done.
+
+The key file holds the key alone on one line. A file with anything else in it is treated
+as no key, so the key can never end up in an error message.
 
 ## Security
 
