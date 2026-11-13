@@ -48,10 +48,23 @@ function fakeLinear({ states = ['Backlog', 'Todo', 'Done', 'Canceled'] } = {}) {
   const stateOf = (sid) => team.states.find((s) => s.id === sid);
   const view = (i) => ({ ...i, state: stateOf(i.stateId), team: { id: team.id, key: team.key }, assignee: i.assigneeId ? { id: i.assigneeId } : null, parent: i.parentId ? { id: i.parentId, identifier: db.issues.find((x) => x.id === i.parentId)?.identifier } : null });
   const find = (ref) => db.issues.find((i) => i.id === ref || i.identifier === ref);
+  // As live Linear pages a list: NEWEST first, `first:` from the query, `after`
+  // a cursor. Ties on createdAt fall back to the order things were made.
+  let seq = 0;
+  const seqOf = new WeakMap();
+  const stamp = (o) => (seqOf.has(o) || seqOf.set(o, ++seq), o);
+  const newest = (arr) => [...arr].map(stamp).sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : seqOf.get(b) - seqOf.get(a)));
+  const paged = (all, query, after) => {
+    const n = Number(/\(first: (\d+)/.exec(query)?.[1] || 50);
+    const start = after ? Number(after) : 0;
+    return { nodes: all.slice(start, start + n), pageInfo: { hasNextPage: start + n < all.length, endCursor: String(start + n) } };
+  };
+  db.pages = {};
   let failNext = 0;
   const gql = async (query, v = {}) => {
     const op = /^(?:query|mutation) (\w+)/.exec(query)[1];
     db.calls.push(op);
+    if (/after: \$after/.test(query)) db.pages[op] = (db.pages[op] || 0) + 1;
     if (db.before) db.before(op);
     if (db.failOp?.[op] > 0) {
       db.failOp[op]--;
@@ -75,10 +88,14 @@ function fakeLinear({ states = ['Backlog', 'Todo', 'Done', 'Canceled'] } = {}) {
         team.states.push(s);
         return { workflowStateCreate: { success: true, workflowState: s } };
       }
-      case 'WorkByKey':
-        return { issues: { nodes: db.issues.filter((i) => String(i.description).includes(v.needle)).map(view) } };
+      case 'WorkByKey': {
+        const r = paged(newest(db.issues.filter((i) => String(i.description).includes(v.needle))), query, v.after);
+        return { issues: { nodes: r.nodes.map(view), pageInfo: r.pageInfo } };
+      }
       case 'WorkIssue':
-        return { issue: find(v.id) ? view(find(v.id)) : null };
+        // Live Linear raises for a missing id; it does not answer null.
+        if (!find(v.id)) throw new Error('Linear 200: Entity not found: Issue');
+        return { issue: view(find(v.id)) };
       case 'WorkIssueCreate': {
         const i = { id: id('iss'), identifier: `ENG-${db.issues.length + 1}`, title: v.input.title, description: v.input.description, stateId: v.input.stateId, parentId: v.input.parentId || null, assigneeId: v.input.assigneeId || null, createdAt: new Date(NOW - 5 * 3600_000).toISOString(), updatedAt: new Date(NOW - 5 * 3600_000).toISOString() };
         db.issues.push(i);
@@ -96,9 +113,15 @@ function fakeLinear({ states = ['Backlog', 'Todo', 'Done', 'Canceled'] } = {}) {
         return { commentCreate: { success: true, comment: { id: c.id } } };
       }
       case 'WorkOpen':
-        return { issues: { nodes: db.issues.filter((i) => !['completed', 'canceled'].includes(stateOf(i.stateId)?.type)).map(view), pageInfo: { hasNextPage: false } } };
-      case 'WorkComments':
-        return { comments: { nodes: db.comments.filter((c) => c.createdAt > v.since).map((c) => ({ ...c, issue: view(find(c.issueId)) })), pageInfo: { hasNextPage: false } } };
+      case 'WorkOpenTracked': {
+        const open = db.issues.filter((i) => !['completed', 'canceled'].includes(stateOf(i.stateId)?.type) && (op === 'WorkOpen' || String(i.description).includes('work-meta')));
+        const r = paged(newest(open), query, v.after);
+        return { issues: { nodes: r.nodes.map(view), pageInfo: r.pageInfo } };
+      }
+      case 'WorkComments': {
+        const r = paged(newest(db.comments.filter((c) => c.createdAt > v.since && (!v.user || c.user?.id === v.user))), query, v.after);
+        return { comments: { nodes: r.nodes.map((c) => ({ ...c, issue: view(find(c.issueId)) })), pageInfo: r.pageInfo } };
+      }
       default:
         throw new Error(`fake Linear: no ${op}`);
     }
@@ -788,6 +811,148 @@ t('bridge.mjs: started at every worker start, reported in writeFullReport, /comm
   ok(src.includes("extraCommands: WORK_SETTINGS ? ['/comments'] : []"), 'in /help only when on');
   ok(src.includes("case '/comments': {"));
   ok(src.includes("...(WORK_SETTINGS ? [{ command: 'comments'"), 'in the menu only when on');
+});
+
+// ── the four known defects of the first review (each red on 1b653c8) ──────
+
+// An owner's answer on a Waiting card, then `n` newer comments by `user`.
+async function answerThenNoise(name, n, user, opts = {}) {
+  const f = fresh(name);
+  if (opts.pageLimit) f.tr = createTracker({ gql: f.L.gql, paths: f.p, team: 'ENG', now: () => clock, pageLimit: opts.pageLimit });
+  await f.run(['setup']);
+  await f.run(['job', '--key', `job-${name}`, '--title', 'Area: asks']);
+  await f.run(['report', '--key', `job-${name}`, '--status', 'finished', '--stdin'], { stdin: '## Remaining\n- waiting-owner: Area: which one? | A or B' });
+  const ask = f.L.byTitle('Area: which one?');
+  clock += 60_000;
+  f.L.db.comments.push({ id: `${name}-answer`, body: 'B, the answer', issueId: ask.id, createdAt: new Date(clock).toISOString(), user: { id: 'user-me', name: 'Me' } });
+  for (let i = 0; i < n; i++) {
+    clock += 1000;
+    f.L.db.comments.push({ id: `${name}-n${i}`, body: user === 'user-me' ? `${MARK} a tracker note ${i}` : `noise ${i}`, issueId: ask.id, createdAt: new Date(clock).toISOString(), user: { id: user, name: 'X' } });
+  }
+  return { f, ask };
+}
+
+t('comments: an answer under 205 newer comments by teammates is still read (no page cap skips it)', async () => {
+  const { f, ask } = await answerThenNoise('busy-team', 205, 'user-2');
+  f.out.length = 0;
+  eq(await f.run(['comments']), 0);
+  ok(f.out.join('\n').includes('B, the answer'), 'the answer is in the batch');
+  eq(f.L.stateOf(ask.stateId).name, 'Answered');
+});
+
+t('comments: an answer under 260 newer tracker notes by the same user is still read', async () => {
+  const { f } = await answerThenNoise('busy-tracker', 260, 'user-me');
+  f.out.length = 0;
+  eq(await f.run(['comments']), 0);
+  ok(f.out.join('\n').includes('B, the answer'), 'the answer is in the batch');
+});
+
+t('comments: a read cut at the page limit keeps its cursor and shows nothing twice', async () => {
+  const { f } = await answerThenNoise('cut-read', 0, 'user-me');
+  const cursorBefore = JSON.parse(readFileSync(f.p.cursor, 'utf8')).since;
+  for (let i = 0; i < 120; i++) {
+    clock += 1000;
+    f.L.db.comments.push({ id: `cut-own${i}`, body: `own answer ${i}`, issueId: f.L.byTitle('Area: which one?').id, createdAt: new Date(clock).toISOString(), user: { id: 'user-me' } });
+  }
+  const tr = createTracker({ gql: f.L.gql, paths: f.p, team: 'ENG', now: () => clock, pageLimit: 2 });
+  const r = await tr.readComments();
+  eq(r.complete, false, 'two pages of 50 do not reach the end');
+  eq(JSON.parse(readFileSync(f.p.cursor, 'utf8')).since, cursorBefore, 'the cursor did not move past what was not read');
+  const taken = r.pending.length;
+  eq(taken, 100);
+  tr.doneComments('2099-01-01T00:00:00.000Z');
+  // nothing was shown, so nothing was dropped; mark them shown and ack them
+  const { markShown: ms } = await import('./scripts/work.mjs');
+  writeFileSync(f.p.pending, JSON.stringify(ms(JSON.parse(readFileSync(f.p.pending, 'utf8')), { maxChars: 1e9 })));
+  tr.doneComments('2099-01-01T00:00:00.000Z');
+  const full = createTracker({ gql: f.L.gql, paths: f.p, team: 'ENG', now: () => clock });
+  const r2 = await full.readComments();
+  eq(r2.complete, true);
+  eq(r2.added, 21, 'the 21 not taken yet (the first answer and 20 more), none of the 100 again');
+});
+
+t('findByKey: a job with 12 leftovers quoting its key still finds its own card (no second job card)', async () => {
+  const f = fresh('many-leftovers');
+  await f.run(['setup']);
+  await f.run(['job', '--key', 'job-ml1', '--title', 'Area: many']);
+  const block = ['## Remaining', ...Array.from({ length: 12 }, (_, i) => `- owed: Area: part ${i} | piece ${i}`)].join('\n');
+  await f.run(['report', '--key', 'job-ml1', '--run', 'bg2-1790000000000', '--status', 'failed', '--stdin'], { stdin: block });
+  rmSync(f.p.keys, { force: true }); // the key map lost: the search alone must find it
+  eq(await f.run(['link-run', '--key', 'job-ml1', '--run', 'bg3-1790000000001']), 0);
+  const jobCards = f.L.db.issues.filter((i) => readMeta(i.description).key === 'job-ml1');
+  eq(jobCards.length, 1, 'one job card');
+  eq(f.L.stateOf(jobCards[0].stateId).name, 'Running');
+});
+
+t('sweep: an Answered card under 1050 newer teammate issues is still listed', async () => {
+  const f = fresh('busy-sweep');
+  await f.run(['setup']);
+  await f.run(['job', '--key', 'job-bs1', '--title', 'Area: old card']);
+  const card = f.L.byTitle('Area: old card');
+  card.stateId = f.L.team.states.find((x) => x.name === 'Answered').id;
+  for (let i = 0; i < 1050; i++) f.L.human(`teammate ${i}`);
+  f.out.length = 0;
+  eq(await f.run(['sweep']), 0);
+  ok(f.out.join('\n').includes('Area: old card'), f.out.join('\n').slice(0, 300));
+});
+
+t('a comments batch fits the schedule output limit as printed, and a long comment is clipped on its own', async () => {
+  const { BATCH_MAX_CHARS: max, BATCH_BODY_MAX: bodyMax } = await import('./scripts/work.mjs');
+  const { SCRIPT_OUTPUT_MAX } = await import('./schedule-script.mjs');
+  ok(max < SCRIPT_OUTPUT_MAX, 'the batch limit is under the schedule output limit');
+  // Many short lines: each costs a quote mark and a newline the old estimate missed.
+  const pending = Array.from({ length: 40 }, (_, i) => ({ id: `s${i}`, body: Array(200).fill('x').join('\n'), createdAt: new Date(NOW + i * 1000).toISOString(), card: `ENG-${i}`, title: `Area: card ${i} with a long enough title`, state: 'Answered', shown: 0 }));
+  const text = commentsBatch(pending, { cli: '/opt/leash/scripts/work.mjs' });
+  ok(text.length <= max, `printed ${text.length} > ${max}`);
+  const upTo = /comments --done (\S+)/.exec(text)[1];
+  const covered = pending.filter((c) => c.createdAt <= upTo);
+  for (const c of covered) ok(text.includes(`${c.card} · `), `${c.card} is covered by --done and shown`);
+  const one = commentsBatch([{ id: 'big', body: 'y'.repeat(9000), createdAt: new Date(NOW).toISOString(), card: 'ENG-1', title: 'Area: big', state: 'Answered', shown: 0 }]);
+  ok(one.length <= max && one.includes('read the rest on ENG-1'), `one huge comment: ${one.length}`);
+  ok(Number.isFinite(bodyMax) && bodyMax < max);
+});
+
+t('a Linear: link to an issue that does not exist is set aside at once, not tried 3 times', async () => {
+  const f = fresh('missing-link');
+  await f.run(['setup']);
+  enqueue(f.p, { op: 'job', key: 'job-nolink', title: 'x', link: 'ENG-404' });
+  f.out.length = 0;
+  await f.run(['drain']);
+  eq([outboxStatus(f.p).waiting, outboxStatus(f.p).failed], [0, 1], 'set aside after one try');
+  ok(f.out.join('\n').includes('after 1 try'), f.out.join('\n'));
+});
+
+t('getIssue over the real transport: Linear raising "Entity not found" is null, not a failure', async () => {
+  const fetchImpl = async () => ({ ok: true, status: 200, statusText: 'OK', json: async () => ({ errors: [{ message: 'Entity not found: Issue', extensions: { type: 'invalid input' } }] }) });
+  const dir = path.join(TMP, 'nf-transport');
+  const tr = createTracker({ gql: linearTransport({ key: 'k', fetchImpl }), paths: statePaths(dir), team: 'ENG', now: () => clock });
+  eq(await tr.getIssue('ENG-404'), null);
+});
+
+t('a printed command names a CLI under a folder with a space as one shell word', async () => {
+  const { shellArg } = await import('./work-track.mjs');
+  eq(typeof shellArg, 'function', 'work-track.mjs exports shellArg');
+  const spaced = path.join(TMP, 'my leash', "it's", 'scripts', 'work.mjs');
+  eq(shellArg('/opt/leash/scripts/work.mjs'), '/opt/leash/scripts/work.mjs', 'a plain path stays bare');
+  eq(execFileSync('/bin/sh', ['-c', `printf %s ${shellArg(spaced)}`], { encoding: 'utf8' }), spaced, 'the shell reads it back whole');
+  const pending = [{ id: 'q1', body: 'yes', createdAt: new Date(NOW).toISOString(), card: 'ENG-1', title: 'Area: q', state: 'Answered', shown: 0 }];
+  ok(commentsBatch(pending, { cli: spaced }).includes(`node ${shellArg(spaced)} comments --done `), 'the --done line');
+  // The tracker's own lines: not set up, and an op set aside.
+  const f = fresh('spaced-cli');
+  const tr = createTracker({ gql: f.L.gql, paths: f.p, team: 'ENG', now: () => clock, cli: spaced });
+  enqueue(f.p, { op: 'job', key: 'job-sp1', title: 'x' });
+  const r = await tr.drain();
+  ok(r.lines.join('\n').includes(`node ${shellArg(spaced)} setup`), r.lines.join('\n'));
+  await f.run(['setup']);
+  enqueue(f.p, { op: 'nope', key: 'job-sp2' });
+  const r2 = await tr.drain();
+  ok(r2.lines.join('\n').includes(`node ${shellArg(spaced)} retry`), r2.lines.join('\n'));
+  // bg.mjs carries the same helper (it imports nothing), and uses it on the ps line.
+  const bgSrc = readFileSync(path.join(DIR, 'bg.mjs'), 'utf8');
+  const wtSrc = readFileSync(path.join(DIR, 'work-track.mjs'), 'utf8');
+  const body = (src, head) => (src.split('\n').find((l) => l.startsWith(head)) || '').slice(head.length);
+  ok(body(wtSrc, 'export const shellArg = ') && body(bgSrc, 'const shellArg = ') === body(wtSrc, 'export const shellArg = '), 'the two shellArg lines are equal');
+  ok(/const cli = shellArg\(work\.cli\);/.test(bgSrc) && !/node \$\{work\.cli\}/.test(bgSrc), 'the ps outbox line quotes the CLI');
 });
 
 for (const run of queue) await run();

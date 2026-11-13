@@ -827,6 +827,52 @@ t('★ the direct path carries the write approval when the entry has it', () => 
   ok(B.DISPATCH_OPTS[0].schedule.executionId, 'approved fire has an execution receipt');
 });
 
+// A MODEL PER SCHEDULE ENTRY (schedule.mjs --model): the entry's `model` goes
+// with its job on both paths, and a value the drain's allow list does not know
+// is the pool model, as for a bg.mjs job.
+t('★ the direct path starts a model entry\'s job on that model', () => {
+  B.resetPool();
+  B.setCap(3);
+  writeQueue([]);
+  B.setSchedules([schedule({ id: 71, model: 'sonnet' })]);
+  B.checkSchedules();
+  eq(B.DISPATCHED.length, 1);
+  eq(B.DISPATCH_OPTS[0].jobModel, 'sonnet');
+  eq(B.DISPATCH_OPTS[0].schedule.id, 71, 'the scheduled run mark is kept');
+  ok(B.DISPATCHED[0] === 'nightly report', 'the entry is not pinned to an engine by its model');
+});
+t('★ the QUEUED path writes the model on the drop box item, and the drain starts it on that model', () => {
+  B.resetPool();
+  B.setCap(1);
+  B.startFakeWorker('busy');
+  writeQueue([]);
+  B.setSchedules([schedule({ id: 72, model: 'haiku' })]);
+  B.checkSchedules();
+  const q = readQueue();
+  eq(q.length, 1);
+  eq(JSON.stringify([q[0].scheduleId, q[0].model]), JSON.stringify([72, 'haiku']));
+  B.finishFakeWorker();
+  B.drainBgHandoff();
+  eq(B.DISPATCH_OPTS[0].jobModel, 'haiku');
+});
+t('an entry with no model, or one the allow list does not know, runs on the pool model', () => {
+  for (const [model, want] of [[undefined, null], ['gpt-9', null], ['fable', null], [{ a: 1 }, null]]) {
+    B.resetPool();
+    B.setCap(3);
+    writeQueue([]);
+    B.setSchedules([schedule({ id: 73, ...(model === undefined ? {} : { model }) })]);
+    B.checkSchedules();
+    eq(B.DISPATCH_OPTS[0].jobModel ?? null, want, JSON.stringify(model));
+    B.resetPool();
+    B.setCap(1);
+    B.startFakeWorker('busy');
+    writeQueue([]);
+    B.setSchedules([schedule({ id: 74, ...(model === undefined ? {} : { model }) })]);
+    B.checkSchedules();
+    eq('model' in readQueue()[0], false, `queued with ${JSON.stringify(model)}`);
+  }
+});
+
 t('only a literal true is approval: a truthy string is not', () => {
   B.resetPool();
   B.setCap(3);
@@ -974,6 +1020,36 @@ t('★ a resume carries its model decision to the dispatch; an ordinary job carr
   eq(B.DISPATCH_OPTS[1].carriedModel, null);
   writeQueue([]);
 });
+
+// ---------------------------------------------------------------------------
+console.log('\n14. a job names its own model (bg.mjs --model)');
+// ---------------------------------------------------------------------------
+
+B.resetPool();
+B.setCap(5);
+B.DISPATCH_OPTS.length = 0;
+writeQueue([job('M-SONNET', { model: 'sonnet', engine: 'claude' }), job('M-NONE'), job('M-FORGED', { model: 'gpt-9' }), job('M-OBJECT', { model: { a: 1 } })]);
+B.drainBgHandoff();
+
+t('the job that named sonnet is dispatched with it, pinned to Claude', () => {
+  const at = B.DISPATCHED.findIndex((x) => titleOf(x) === 'M-SONNET');
+  ok(at !== -1, 'never dispatched');
+  eq(B.DISPATCH_OPTS[at].jobModel, 'sonnet');
+  ok(B.DISPATCHED[at].startsWith('claude: '), 'the pin was lost');
+});
+t('a job with no model is dispatched with none, so it runs on BG_MODEL', () => {
+  const at = B.DISPATCHED.findIndex((x) => titleOf(x) === 'M-NONE');
+  ok(at !== -1, 'never dispatched');
+  eq(B.DISPATCH_OPTS[at].jobModel, null);
+});
+t('a value outside the allow list never reaches the spawn: the drop box is a file any worker can write', () => {
+  for (const name of ['M-FORGED', 'M-OBJECT']) {
+    const at = B.DISPATCHED.findIndex((x) => titleOf(x) === name);
+    ok(at !== -1, `${name} never dispatched`);
+    eq(B.DISPATCH_OPTS[at].jobModel, null, name);
+  }
+});
+writeQueue([]);
 
 // ---------------------------------------------------------------------------
 console.log(`\n${pass} passed, ${failures.length} failed`);

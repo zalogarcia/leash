@@ -169,7 +169,7 @@ test('held queue acknowledgement does not claim the task started', () => {
   assert.equal(item.ackResolved, 'held');
 });
 test('held chat release preserves task metadata and its background lane', () => {
-  const item = { text: 'review the patch', forcedEngine: 'codex', heldOnBg: true, priority: true, schedule: { id: 4, allowWrite: false }, handback: { id: 9 }, cwd: '/worktree', images: ['photo.png'], kinds: ['photo'], retried: true, prepend: 'Original criteria', replyQuote: { block: 'Owner quote' } };
+  const item = { text: 'review the patch', forcedEngine: 'codex', heldOnBg: true, priority: true, schedule: { id: 4, allowWrite: false }, handback: { id: 9 }, cwd: '/worktree', images: ['photo.png'], kinds: ['photo'], retried: true, prepend: 'Original criteria', replyQuote: { block: 'Owner quote' }, jobModel: 'sonnet' };
   const bgLane = { name: 'bg2', isBg: true };
   const state = { held: [item], dispatched: [] };
   const bindings = {
@@ -191,7 +191,7 @@ test('held chat release preserves task metadata and its background lane', () => 
   assert.deepEqual(state.dispatched, [[`codex: ${item.text}`, bgLane, {
     priority: true, schedule: item.schedule, handback: item.handback, cwd: item.cwd,
     allowCodexFallback: true, images: item.images, kinds: item.kinds, retried: true,
-    carriedModel: null, prepend: item.prepend, replyQuote: item.replyQuote,
+    carriedModel: null, jobModel: 'sonnet', prepend: item.prepend, replyQuote: item.replyQuote,
   }]]);
   assert.equal(state.held.length, 0);
 });

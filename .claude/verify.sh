@@ -10,7 +10,7 @@
 #   ./.claude/verify.sh probes-live     the two probes that spawn the real codex and SPEND MONEY
 #   ./.claude/verify.sh --list          what is available
 #
-#   VERIFY_QUICK=1   skip the 72 offline suites, keep the fast gates
+#   VERIFY_QUICK=1   skip the 74 offline suites, keep the fast gates
 #
 # One PASS / FAIL / SKIP line per check. Exit 0 only when nothing FAILed.
 # A check that cannot run where it is run SKIPs and names the real command; it
@@ -179,7 +179,7 @@ probes_live() {
 usage() {
   cat <<'USAGE'
 local checks (default):
-  syntax bridge.mjs · syntax all .mjs · syntax all .sh · offline suites (45)
+  syntax bridge.mjs · syntax all .mjs · syntax all .sh · offline suites (74)
   probe steer-probe · shared modules · installer rehearsal
 deploy surfaces:
   daemon · docs · all

@@ -74,9 +74,11 @@ if (teams && !team) {
 }
 const teamId = team?.id || Z;
 await probe('team states', Q.teamStates, { id: teamId });
-await probe('issue by key', Q.byNeedle, { team: teamId, needle: '"job-probe-never-exists"' });
+await probe('issue by key', Q.byNeedle, { team: teamId, needle: '"key":"job-probe-never-exists"', after: null });
 await probe('open issues', Q.open, { team: teamId, after: null });
-await probe('comments since', Q.comments, { team: teamId, since: new Date(Date.now() - 3600_000).toISOString(), after: null });
+await probe('open tracker cards', Q.openTracked, { team: teamId, after: null });
+const viewer = (await probe('viewer again, for the comment filter', Q.viewer, {}))?.viewer;
+await probe('comments since', Q.comments, { team: teamId, user: viewer?.id || Z, since: new Date(Date.now() - 3600_000).toISOString(), after: null });
 await probe('issue', Q.issue, { id: Z }, { write: true });
 await probe('issue update', Q.update, { id: Z, input: { stateId: Z } }, { write: true });
 await probe('comment create', Q.comment, { input: { issueId: Z, body: 'probe' } }, { write: true });

@@ -36,6 +36,13 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 export const WORK_CLI = path.join(ROOT, 'scripts', 'work.mjs');
 
+/** A path as one shell word, for a command a message prints for someone to
+ *  paste: bare when it holds only safe characters, else single quoted. An
+ *  install under a folder with a space in its name must still paste whole.
+ *  bg.mjs carries the same three lines (it imports nothing on purpose);
+ *  work-tracker.test.mjs holds the two equal. */
+export const shellArg = (s) => (/^[\w@%+=:,./-]+$/.test(String(s)) ? String(s) : `'${String(s).replace(/'/g, `'\\''`)}'`);
+
 const KEY_LINE = /^Work item: ([a-z0-9][a-z0-9-]{1,120})\b/gm;
 
 /** The work key a brief carries on its `Work item:` line (the last one), or null. */

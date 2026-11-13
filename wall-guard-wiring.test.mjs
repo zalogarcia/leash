@@ -637,6 +637,38 @@ await t('★ the pace is a setting: another number rides on the item, and 0 puts
   B.setConf({});
 });
 
+await t('★ a job that ran on its own model (the spawn record keeps it) resumes on it after the wall', async () => {
+  const id = 'bg94-1791294000940';
+  B.setConf({});
+  B.wallGuard.job(id, { model: 'sonnet', jobModel: 'sonnet' });
+  B.wallGuard.death(id, { text: 'LANE RULES\n\n--- TASK ---\n\n# SONNET-SWEEP-1113\n\nDo the thing.', title: 'SONNET-SWEEP-1113' });
+  B.wallWake.raised({ until: LIFT_AT + 270 * MIN, now: LIFT_AT + 260 * MIN });
+  B.wallWake.worker({ runId: id, title: 'SONNET-SWEEP-1113', died: true, handback: 'held' });
+  B.setNow(LIFT_AT + 271 * MIN);
+  const r = B.resumeWallDeaths(B.wallWake.current(), { readyAt: LIFT_AT + 270 * MIN, now: LIFT_AT + 271 * MIN });
+  eq(r.resumed.map((x) => x.runId), [id]);
+  const q = JSON.parse(readFileSync(P('bg-queue.json'), 'utf8'));
+  eq(q.at(-1).model, 'sonnet');
+  eq(q.at(-1).resumeOf, id);
+});
+
+await t('a drop box job that named its model has it on its spawn record (noteWallGuardJob), so its resume keeps it', async () => {
+  const id = 'bg95-1791294000950';
+  B.noteWallGuardJob(id, { text: 'x', model: 'haiku', cwd: '/tmp' });
+  eq(B.wallGuard.jobOf(id)?.jobModel, 'haiku');
+  B.noteWallGuardJob('bg96-1791294000960', { text: 'y' });
+  eq(B.wallGuard.jobOf('bg96-1791294000960')?.jobModel, undefined, 'a job with none records none');
+});
+
+await t('★ the spawn record keeps the job model for every start, not only the drain\'s', async () => {
+  const text = SRC.join('\n');
+  const rc = text.indexOf('\nasync function runClaude(');
+  const at = text.indexOf("wallGuard.job(`${lane.name || 'bg'}-${startedAt}`", rc);
+  ok(rc > 0 && at > rc, 'the record moved');
+  const record = text.slice(at, text.indexOf('});', at));
+  ok(/jobModel && lane\.isBg \? \{ jobModel \} : \{\}/.test(record), record);
+});
+
 await t('★ a resume of one death (a refusal of Fable only) carries its model decision and leaves every other death alone', async () => {
   B.setConf({});
   const old = 'bg80-1791290000800', mine = 'bg81-1791290000810', near = 'bg82-1791290000820';

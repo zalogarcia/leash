@@ -8,6 +8,7 @@
 //   node bg.mjs --now --file ./brief.md             (start it past the concurrency cap)
 //   node bg.mjs "codex: review the last commit"     (same thing, inline prefix)
 //   node bg.mjs --engine claude --file /tmp/b.md    (pin to Claude on a Codex-first install)
+//   node bg.mjs --model sonnet --file ./brief.md    (this job's own Claude model; every other job keeps the pool's)
 //   node bg.mjs steer <lane|runId|pid|latest> "one more instruction"
 //   node bg.mjs steer <lane|runId|pid|latest> --file ./steer.md
 //   node bg.mjs btw <lane|runId|pid|latest> "a side question"
@@ -110,8 +111,13 @@ function workTrackerSettings() {
     drainMs: Number.isFinite(drain) && drain >= 0 ? Math.min(drain, 20_000) : 6000,
   };
 }
+// A path as one shell word for a printed command (work-track.mjs shellArg, the
+// same three lines: this file imports nothing on purpose; work-tracker.test.mjs
+// holds the two equal). A folder with a space in its name still pastes whole.
+const shellArg = (s) => (/^[\w@%+=:,./-]+$/.test(String(s)) ? String(s) : `'${String(s).replace(/'/g, `'\\''`)}'`);
 function workOutboxLine(work) {
   if (!work) return null;
+  const cli = shellArg(work.cli);
   let names = [];
   let failed = 0;
   try {
@@ -125,7 +131,7 @@ function workOutboxLine(work) {
     failed = 0;
   }
   const setUp = existsSync(work.ids);
-  return `WORK TRACKER · outbox ${names.length} waiting for Linear · ${failed} set aside${setUp ? '' : ` · not set up yet (node ${work.cli} setup)`}${names.length ? ` · node ${work.cli} drain sends them` : ''}${failed ? ` · node ${work.cli} retry puts the set aside ones back` : ''}`;
+  return `WORK TRACKER · outbox ${names.length} waiting for Linear · ${failed} set aside${setUp ? '' : ` · not set up yet (node ${cli} setup)`}${names.length ? ` · node ${cli} drain sends them` : ''}${failed ? ` · node ${cli} retry puts the set aside ones back` : ''}`;
 }
 
 // --file <path> reads the brief from disk instead of argv. Use it for anything
@@ -324,7 +330,7 @@ if (argv[0] === 'btw') {
 // typing a flag means "go do this"; the flags this command really takes are
 // handled below and never arrive first except with a value. Print the usage
 // the typist was asking for instead of burning a worker on it.
-const KNOWN_FLAGS = new Set(['--file', '--engine', '--repo', '--cwd', '--now', '--card', '--no-track']);
+const KNOWN_FLAGS = new Set(['--file', '--engine', '--repo', '--cwd', '--now', '--card', '--no-track', '--model']);
 if (typeof argv[0] === 'string' && argv[0].startsWith('-') && !KNOWN_FLAGS.has(argv[0])) {
   const usage = [
     'usage:',
@@ -335,6 +341,7 @@ if (typeof argv[0] === 'string' && argv[0].startsWith('-') && !KNOWN_FLAGS.has(a
     '  node bg.mjs --now --file <path>                         start it past the concurrency cap',
     '  node bg.mjs --card "Area: title | sentence" --file <path>   its Linear card text (work tracker on)',
     '  node bg.mjs --no-track --file <path>                    no Linear issue for this job',
+    '  node bg.mjs --model sonnet|opus|haiku --file <path>     this job\'s own Claude model (the pool keeps its own)',
     '  node bg.mjs steer <lane|runId|pid|latest> "<text>"      one more instruction, mid run',
     '  node bg.mjs steer <target> --file <path>',
     '  node bg.mjs btw <lane|runId|pid|latest> "<question>"    a side question, answered in one message',
@@ -473,6 +480,32 @@ if (engineFlag !== -1) {
   dispatchArgs.splice(engineFlag, 2);
 }
 
+// --model: THIS JOB'S OWN CLAUDE MODEL. Workers run on the pool's model
+// (BG_MODEL in bridge.mjs, `bgModel` in config.json) and the chat lane's /model
+// cannot move them; this moves one job and nothing else, so a routine job can
+// run on a cheaper model. It travels on the queue item, and the daemon's drain
+// reads it through the same list (KEEP IN SYNC: bg-job-model.test.mjs compares
+// them; this file imports node built-ins only).
+//
+// The list is the aliases the bridge knows less Fable: Fable's fallback to Opus
+// is decided per lane, and a job's own model skips that decision.
+//
+// A job that names a Claude model is a Claude job, so it is pinned to Claude
+// below: while every account is walled it waits behind the wall instead of going
+// to Codex, where the model means nothing.
+const JOB_MODELS = ['sonnet', 'opus', 'haiku'];
+let jobModel = null;
+const modelFlag = dispatchArgs.indexOf('--model');
+if (modelFlag !== -1) {
+  const v = String(dispatchArgs[modelFlag + 1] ?? '').trim().toLowerCase();
+  if (!JOB_MODELS.includes(v)) {
+    console.error(`bg.mjs: --model takes ${JOB_MODELS.join(', ')} (got ${JSON.stringify(dispatchArgs[modelFlag + 1] ?? '')}). Nothing was queued.`);
+    process.exit(1);
+  }
+  jobModel = v;
+  dispatchArgs.splice(modelFlag, 2);
+}
+
 // --repo / --cwd: STATE the working directory instead of letting it be inferred.
 //
 // A Codex job's sandbox WRITE ROOT is its cwd, and without this flag the daemon
@@ -553,6 +586,14 @@ if (enginePrefix) {
   text = text.replace(ENGINE_PREFIX_RE, '');
 }
 
+if (jobModel) {
+  if (engine === 'codex') {
+    console.error(`bg.mjs: --model ${jobModel} is a Claude model and this job is pinned to Codex. Nothing was queued.`);
+    process.exit(1);
+  }
+  engine = 'claude';
+}
+
 if (!text) {
   console.error(
     [
@@ -560,6 +601,7 @@ if (!text) {
       '       node bg.mjs --engine codex|claude --file <path>   (pick the engine for this job)',
       '       node bg.mjs --now --file <path>                   (start it past the concurrency cap)',
       '       node bg.mjs --repo <name|path> --file <path>       (pin the working dir, required for parallel Codex jobs)',
+      '       node bg.mjs --model sonnet|opus|haiku --file <path> (this job\'s own Claude model)',
       '       node bg.mjs "codex: <task>" | "claude: <task>"    (same, inline prefix)',
       '       node bg.mjs steer <lane|runId|pid|latest> "<text>" | --file <path>',
       '       node bg.mjs btw <lane|runId|pid|latest> "<question>" | --file <path>',
@@ -681,7 +723,7 @@ const scheduled =
           : {}),
       }
     : {};
-const queuedItem = { text, queuedAt, ...(engine ? { engine } : {}), ...(cwd ? { cwd } : {}), ...(now ? { now: true } : {}), ...scheduled };
+const queuedItem = { text, queuedAt, ...(engine ? { engine } : {}), ...(jobModel ? { model: jobModel } : {}), ...(cwd ? { cwd } : {}), ...(now ? { now: true } : {}), ...scheduled };
 if (scheduled.allowWrite) {
   try {
     const c = JSON.parse(process.env.LEASH_WRITE_GRANT);

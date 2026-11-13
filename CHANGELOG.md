@@ -28,13 +28,33 @@ All notable changes to Leash. Dates are release dates.
   (still passed to Claude Code) are exactly as before.
 - **`scripts/probes/linear-probe.mjs`** checks every query against the live API and writes
   nothing.
+- **Nothing is skipped on a busy team.** The comment reader asks for your own comments only and
+  pages to the end; a read cut short keeps its place instead of moving past answers it has not
+  seen. The sweep and `lint` read the tracker's own cards only, and say so if a list is cut. A
+  job with many leftovers still finds its own card. A comments batch, as printed, stays under
+  the schedule output limit, so its `--done` line never covers text that was cut. A `Linear:`
+  link to an issue that does not exist is set aside at once. Printed commands quote the CLI's
+  path, so an install under a folder with a space in its name still pastes whole.
+
+### A job's own model
+
+- **`bg.mjs --model sonnet|opus|haiku`** runs that one job on that Claude model instead of
+  `bgModel`. Every other job keeps the pool's model, and `/model` still steers the chat lane
+  only. A job that names a model is pinned to Claude; `--engine codex` with it is refused.
+- **`schedule.mjs add ... --run --model sonnet`** (and `update <id> --model sonnet|none`) does
+  the same for a scheduled run. `list` shows it as `run (model sonnet)`; turning `--run` off
+  takes it off.
+- **The model survives a usage wall.** A job held in memory, resumed after a wall or started by
+  a schedule keeps the model it named.
+- The daemon reads a job's model through an allow list, so any other value in the drop box runs
+  on `bgModel`, with one log line. With no model named, nothing changes.
 
 ### Schedules: every N hours, script entries and runs that wait for Claude
 
 - **`schedule.mjs add every <N>h <HH:MM>`** fires once per slot, N from 1 to 23. It takes `--run`
   or `--script`. A slot that comes up while the entry's last job still waits folds into it. A slot
   in the hour a spring clock change skips fires at the first minute after it, and a slot in the
-  repeated autumn hour fires once.
+  repeated autumn hour fires once. `list` names its first slot of the day.
 - **`--script <path>`** runs a file on that cadence. Only non-empty output reaches the chat lane, as
   a turn the daemon wrote. A script that fails with no output gets one line, until it runs clean.
 - **`schedule.mjs update <id> --claude-only true`** makes a `--run` entry wait through a Claude

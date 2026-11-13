@@ -1934,7 +1934,7 @@ function editWorkerNotice(runId, patch, { keepAlive = false } = {}) {
 async function runClaude(
   rawText,
   lane = LANES.main,
-  { prepend = '', kinds = [], images = [], priority = false, retried = false, carriedModel = null, replyQuote = null, schedule = null, handback = null, cwd: requestedCwd = null } = {},
+  { prepend = '', kinds = [], images = [], priority = false, retried = false, carriedModel = null, replyQuote = null, schedule = null, handback = null, cwd: requestedCwd = null, jobModel = null } = {},
 ) {
   const st = chatState();
   // THREE STRINGS, not two, once a reply is in play: what you TYPED (rawText),
@@ -1967,16 +1967,21 @@ async function runClaude(
     gotResult: false, // set on the first result event; a steer written before it was acted on
   };
   lane.current = run;
+  // A JOB THAT NAMED ITS OWN MODEL (bg.mjs --model, a schedule entry's
+  // --model) runs on it, and that decision is the job's alone: it writes
+  // nothing to the lane's record and moves no other worker. Every other run
+  // asks the one owner. A background lane only: the chat lane's model is /model's.
   let selectedModel;
-  try { selectedModel = startModel(lane, carriedModel); }
+  try { selectedModel = jobModel && lane.isBg ? jobModel : startModel(lane, carriedModel); }
   catch (error) { console.error('[bridge] start model failed:', error.message); selectedModel = laneModel(lane); }
   if (run.stopped) { lane.current = null; drainQueue(lane); return; }
   run.requestedModel = selectedModel;
   return new Promise(async (resolve) => {
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'];
     if (lane.sessionKey && st[lane.sessionKey]) args.push('--resume', st[lane.sessionKey]);
-    // Background lanes are pinned to BG_MODEL; /model only steers the chat
-    // lane. Unset model/effort = whatever the `claude` CLI itself defaults to.
+    // Background lanes are pinned to BG_MODEL, or to the job's own --model;
+    // /model only steers the chat lane. Unset model/effort = whatever the
+    // `claude` CLI itself defaults to.
     if (selectedModel) args.push('--model', selectedModel);
     if (DEFAULT_EFFORT) args.push('--effort', DEFAULT_EFFORT);
     args.push('--add-dir', INBOX_DIR); // without this, reading attachments outside cwd gets permission-denied
@@ -2213,6 +2218,11 @@ async function runClaude(
         wallGuard.job(`${lane.name || 'bg'}-${startedAt}`, {
           account: spawnAccount || null,
           model: selectedModel,
+          // THE JOB'S OWN MODEL, for every start and not only the drain's
+          // (noteWallGuardJob): a wall resume reads it back (resumeWallDeaths),
+          // so a job a lift or a schedule started directly on a model of its
+          // own resumes on it too.
+          ...(jobModel && lane.isBg ? { jobModel } : {}),
           ...(schedule?.id != null ? { scheduleId: schedule.id, executionId: schedule.executionId || null, allowWrite: schedule.allowWrite === true } : {}),
         });
       } catch (e) {
@@ -5963,6 +5973,9 @@ async function wallGuardTick(now = Date.now()) {
 function noteWallGuardJob(runId, it) {
   const patch = {};
   if (it.cwd) patch.cwd = it.cwd;
+  // A job's own --model, so a resume runs on it too. Read again through the
+  // drain's allow list when the resume is drained.
+  if (it.model) patch.jobModel = it.model;
   if (it.resumeOf) {
     patch.resumeOf = it.resumeOf;
     patch.resumeCount = Number(it.resumeCount) || 1;
@@ -6128,6 +6141,9 @@ function resumeWallDeaths(ep, { readyAt = null, now = Date.now(), only = null } 
     // An approved scheduled run keeps its approval through the resume as a
     // fresh grant (write-grant.mjs): the drain carries nothing without one.
     if (r.executionId) item.executionId = r.executionId;
+    // A job that named its own model resumes on it (the drain reads it again).
+    const jobModel = wallGuard.jobOf?.(r.runId)?.jobModel;
+    if (jobModel) item.model = jobModel;
     // `only` is ONE death resumed at once (handleLimitDeath): it may carry the
     // model decision of that death, and a scheduled run's retry may carry the
     // time it may not start before (its account's reset, when the swap failed).
@@ -10891,6 +10907,10 @@ function flushParkedWalledChats({ fold = null } = {}) {
       kinds: it.kinds || [],
       retried: Boolean(it.retried),
       carriedModel: it.carriedModel ?? null,
+      // A JOB'S OWN MODEL (bg.mjs --model, a schedule entry's --model) goes
+      // back with it too: without it a job that waited out a wall in memory
+      // restarted on the pool model.
+      jobModel: it.jobModel ?? null,
       prepend: note ? [note, it.prepend].filter(Boolean).join('\n\n') : (it.prepend ?? null),
       replyQuote: it.replyQuote ?? null,
     });
@@ -11646,7 +11666,15 @@ function drainBgHandoff() {
     const itemPrepend = typeof it === 'object' && typeof it?.prepend === 'string' && it.prepend ? it.prepend : null;
     // A resume carries the model decision of the death it resumes (startModel).
     const carriedModel = typeof it === 'object' && it ? it.carriedModel ?? null : null;
-    dispatchPrompt(pinnedClaude ? `claude: ${text}` : text, lane, { priority: true, schedule, cwd, prepend: itemPrepend, carriedModel }); // a declared job directory survives on either engine
+    // A JOB'S OWN MODEL (bg.mjs --model, a schedule entry's --model). Read
+    // through an allow list because the drop box is a file any worker can
+    // write: anything else runs on BG_MODEL, said in one log line. KEEP IN SYNC
+    // with JOB_MODELS in bg.mjs (bg-job-model.test.mjs compares them). No Fable
+    // here: its fallback to Opus is the lane's decision, which a job's own
+    // model skips.
+    const jobModel = typeof it === 'object' && /^(?:sonnet|opus|haiku)$/.test(String(it?.model ?? '')) ? it.model : null;
+    if (typeof it === 'object' && it?.model && !jobModel) console.log(`[bridge] a job named the model ${JSON.stringify(it.model).slice(0, 40)}, which is not a job model; it runs on ${BG_MODEL || 'the default model'}`);
+    dispatchPrompt(pinnedClaude ? `claude: ${text}` : text, lane, { priority: true, schedule, cwd, prepend: itemPrepend, carriedModel, jobModel }); // a declared job directory survives on either engine
     // A refused approval is said, not silent (the Codex branch above says why).
     if (schedule && it.allowWrite === true && !schedule.allowWrite) console.log(`[bridge] job for schedule #${it.scheduleId} runs WITHOUT write approval: the entry no longer approves it, or its write grant is missing, already used or does not match the item`);
     started.push(it);
@@ -11686,12 +11714,10 @@ function drainBgHandoff() {
           brief: text,
           running: active,
           queued,
-          // The same two values runClaude puts in argv, so the card cannot
-          // claim a model the worker is not on.
-          // The pool's pin, not the chat lane's /model: the same two values
-          // runClaude puts in argv, so the card cannot claim a model the
-          // worker is not on.
-          model: BG_MODEL || 'default',
+          // The pool's pin or the job's own --model, never the chat lane's
+          // /model: the same two values runClaude puts in argv, so the card
+          // cannot claim a model the worker is not on.
+          model: jobModel || BG_MODEL || 'default',
           effort: DEFAULT_EFFORT || 'default',
         },
         // Read through the lane, not a captured `run`: /stop and a restart both
@@ -11830,7 +11856,9 @@ function queueScheduledRun(s) {
   // behind a wall, as it holds a resume, rather than send it to Codex. An HOURS
   // entry's job is marked, so its next slot can tell it from a bg.mjs child that
   // only carries the id (scheduleJobWaiting).
-  const item = { text: s.text, queuedAt: new Date().toISOString(), scheduleId: s.id, ...(s.claudeOnly === true ? { engine: 'claude', claudeOnly: true } : {}), ...(s.kind === 'hours' ? { hoursRun: true } : {}), ...(s.executionId ? { executionId: s.executionId } : {}), ...(s.allowWrite === true ? { allowWrite: true } : {}) };
+  // AN ENTRY'S OWN MODEL (schedule.mjs --model) rides as `model`, the field
+  // the drain reads through its allow list (the same aliases here).
+  const item = { text: s.text, queuedAt: new Date().toISOString(), scheduleId: s.id, ...(s.claudeOnly === true ? { engine: 'claude', claudeOnly: true } : {}), ...(s.kind === 'hours' ? { hoursRun: true } : {}), ...(s.executionId ? { executionId: s.executionId } : {}), ...(s.allowWrite === true ? { allowWrite: true } : {}), ...(/^(?:sonnet|opus|haiku)$/.test(String(s.model ?? '')) ? { model: s.model } : {}) };
   if (s.allowWrite === true) writeGrants.seal(item, `queued-${s.id}-${item.queuedAt}`);
   items.push(item);
   try {
@@ -12063,11 +12091,15 @@ function checkSchedules() {
         // DISPATCH FIRST, then the notice, exactly as the bg.mjs drain does: a
         // throw while composing must never cost the job.
         const schedLane = getBgLane();
+        // THE ENTRY'S OWN MODEL (schedule.mjs --model), through the same allow
+        // list as the drain: anything else is the pool model. It picks the
+        // model, not the engine.
+        const schedModel = /^(?:sonnet|opus|haiku)$/.test(String(s.model ?? '')) ? s.model : null;
         // THE SCHEDULED RUN MARK: the worker's env says a schedule started it
         // (LEASH_TRIGGER, LEASH_SCHEDULE_ID) and whether the user approved
         // database writes for this entry (LEASH_ALLOW_WRITE), so a hook can tell
         // an unattended run from a worker the user asked for. See worker-env.mjs.
-        dispatchPrompt(claudeOnly ? `claude: ${s.text}` : s.text, schedLane, { priority: true, schedule: { id: s.id, executionId: s.executionId || null, allowWrite: s.allowWrite === true } });
+        dispatchPrompt(claudeOnly ? `claude: ${s.text}` : s.text, schedLane, { priority: true, schedule: { id: s.id, executionId: s.executionId || null, allowWrite: s.allowWrite === true }, jobModel: schedModel });
         // WHETHER THIS JOB IS EVEN ON CLAUDE. dispatchPrompt re-resolves the
         // engine on every route in, so a bg lane settled to Codex (or a machine
         // with no `claude` at all) sends this job to runCodex and leaves
@@ -12093,7 +12125,7 @@ function checkSchedules() {
             running: bgLanes.filter((l) => l.current || l.queue.length || l.finishing).length,
             // A scheduled job that DID land on a bg lane runs on the pool's pin
             // like every other worker, so it carries it too.
-            ...(onClaudeLane ? { model: BG_MODEL || 'default', effort: DEFAULT_EFFORT || 'default' } : {}),
+            ...(onClaudeLane ? { model: schedModel || BG_MODEL || 'default', effort: DEFAULT_EFFORT || 'default' } : {}),
           },
           () =>
             schedRun && schedLane.current === schedRun
@@ -13588,7 +13620,7 @@ function pickLane(prompt) {
 // (grab() in bg-codex-wiring.test.mjs) and its extractor stops at the first
 // unindented line, so a signature wrapped onto a `) {` of its own is grabbed
 // truncated and the whole harness fails to parse.
-function queueItem(text, { images = [], kinds = [], forcedEngine = null, priority = false, allowCodexFallback = false, retried = false, carriedModel = null, prepend = null, replyQuote = null, schedule = null, handback = null, cwd = null } = {}) {
+function queueItem(text, { images = [], kinds = [], forcedEngine = null, priority = false, allowCodexFallback = false, retried = false, carriedModel = null, prepend = null, replyQuote = null, schedule = null, handback = null, cwd = null, jobModel = null } = {}) {
   // `kinds` is what ARRIVED, not what is being sent to a model: the run bubble's
   // first frame says "📎 3 photos" so a slow album is visibly landing rather
   // than silently missing.
@@ -13609,6 +13641,10 @@ function queueItem(text, { images = [], kinds = [], forcedEngine = null, priorit
     // carried: a forged or stale value in the drop box can at worst run one job
     // on Opus.
     carriedModel: carriedModel?.model === 'opus' ? { model: 'opus', told: carriedModel.told === true } : null,
+    // The model this job named (bg.mjs --model, a schedule entry's --model).
+    // The drain and checkSchedules read it through their allow list, so
+    // nothing else reaches here.
+    jobModel: jobModel || null,
     prepend: prepend == null ? null : String(prepend),
     // The bubble you were replying to, parsed once at the edge and carried, for
     // the same reason `prepend` is: a queued message is drained by a different
@@ -13873,7 +13909,7 @@ function startResolvedRun(decision, lane, item, { laneBusy = false } = {}) {
 // priority = a completed worker's report: never drop it for queue limits, and
 // jump the line so results surface before newer user prompts.
 // One line for the same reason as queueItem above: grab() extracts it by source.
-function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallback = false, images = [], kinds = [], retried = false, carriedModel = null, prepend = null, replyQuote = null, schedule = null, handback = null, cwd = null } = {}) {
+function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallback = false, images = [], kinds = [], retried = false, carriedModel = null, prepend = null, replyQuote = null, schedule = null, handback = null, cwd = null, jobModel = null } = {}) {
   // A `codex:` or `claude:` prefix on a typed message pins THIS message's
   // engine, beating both /engine and the config. Stripped before dispatch so
   // the model never sees the routing instruction as part of its prompt.
@@ -13889,7 +13925,7 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
   const p2 = parseEnginePrefix(p1.text.replace(/^\s*bg:\s*/i, ''));
   const forcedEngine = p1.engine || p2.engine;
   const text = p2.text;
-  const item = queueItem(text, { images, kinds, forcedEngine, priority, allowCodexFallback, retried, carriedModel, prepend, replyQuote, schedule, handback, cwd });
+  const item = queueItem(text, { images, kinds, forcedEngine, priority, allowCodexFallback, retried, carriedModel, prepend, replyQuote, schedule, handback, cwd, jobModel });
   // NO ENGINE WILL TAKE THIS. Only for a message they typed: internal traffic
 
   // ignores the wall by construction (see engineForItem). Spawning here
@@ -14045,6 +14081,8 @@ function dispatchPrompt(prompt, forcedLane, { priority = false, allowCodexFallba
     // A worker report keeps its mark into the run (see queueItem).
     handback,
     cwd,
+    // The model this job named (bg.mjs --model, a schedule entry's --model).
+    jobModel: item.jobModel || null,
   }).catch((e) => console.error('[bridge] runClaude error:', e));
 }
 
@@ -14128,6 +14166,8 @@ function drainQueue(lane) {
     // And a queued WORKER REPORT is still marked as one.
     handback: item.handback || null,
     cwd: item.cwd || null,
+    // And a queued job still runs on the model it named.
+    jobModel: item.jobModel || null,
   }).catch((e) => console.error('[bridge] runClaude error:', e));
 }
 

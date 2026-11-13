@@ -45,7 +45,7 @@ import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { baseRunId, readBridgeConfig, workTrackerSettings } from '../work-track.mjs';
+import { baseRunId, readBridgeConfig, shellArg, workTrackerSettings } from '../work-track.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // The CLI by its absolute path, for every command a message tells someone to
@@ -239,13 +239,20 @@ export const Q = {
   teams: 'query WorkTeams { teams(first: 100) { nodes { id key name } } }',
   teamStates: 'query WorkTeamStates($id: String!) { team(id: $id) { id key name states(first: 100) { nodes { id name type } } } }',
   stateCreate: 'mutation WorkStateCreate($input: WorkflowStateCreateInput!) { workflowStateCreate(input: $input) { success workflowState { id name type } } }',
-  byNeedle: `query WorkByKey($team: ID!, $needle: String!) { issues(first: 10, includeArchived: true, filter: { team: { id: { eq: $team } }, description: { contains: $needle } }) { nodes { ${FIELDS} } } }`,
+  // Paged: a job's key is quoted in its leftovers' tracker data too ("from"),
+  // so one page of a busy job's matches can hold no card of its own.
+  byNeedle: `query WorkByKey($team: ID!, $needle: String!, $after: String) { issues(first: 50, after: $after, includeArchived: true, filter: { team: { id: { eq: $team } }, description: { contains: $needle } }) { nodes { ${FIELDS} } pageInfo { hasNextPage endCursor } } }`,
   issue: `query WorkIssue($id: String!) { issue(id: $id) { ${FIELDS} } }`,
   create: `mutation WorkIssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { ${FIELDS} } } }`,
   update: `mutation WorkIssueUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { ${FIELDS} } } }`,
   comment: 'mutation WorkComment($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }',
   open: `query WorkOpen($team: ID!, $after: String) { issues(first: 100, after: $after, filter: { team: { id: { eq: $team } }, state: { type: { nin: ["completed", "canceled"] } } }) { nodes { ${FIELDS} } pageInfo { hasNextPage endCursor } } }`,
-  comments: 'query WorkComments($team: ID!, $since: DateTimeOrDuration!, $after: String) { comments(first: 50, after: $after, filter: { createdAt: { gt: $since }, issue: { team: { id: { eq: $team } } } }) { nodes { id body createdAt user { id name } issue { id identifier title description state { id name type } } } pageInfo { hasNextPage endCursor } } }',
+  // The tracker's own open cards only (their tracker data block), for the sweep
+  // and lint: a team full of a teammate's issues cannot push a card off the list.
+  openTracked: `query WorkOpenTracked($team: ID!, $after: String) { issues(first: 100, after: $after, filter: { team: { id: { eq: $team } }, state: { type: { nin: ["completed", "canceled"] } }, description: { contains: "work-meta" } }) { nodes { ${FIELDS} } pageInfo { hasNextPage endCursor } } }`,
+  // The key's own user only: an owner's answer is one of theirs, and a busy
+  // team's other comments no longer fill the pages before it.
+  comments: 'query WorkComments($team: ID!, $user: ID!, $since: DateTimeOrDuration!, $after: String) { comments(first: 50, after: $after, filter: { createdAt: { gt: $since }, user: { id: { eq: $user } }, issue: { team: { id: { eq: $team } } } }) { nodes { id body createdAt user { id name } issue { id identifier title description state { id name type } } } pageInfo { hasNextPage endCursor } } }',
 };
 
 /** A refusal is not retried: the op goes to failed/ at once. */
@@ -426,12 +433,19 @@ export function takeLock(p, lockFile = p.lock) {
 
 // ── the tracker ─────────────────────────────────────────────────────────────
 
-export function createTracker({ gql, paths: p, states = {}, team = '', now = () => Date.now(), log = () => {} }) {
+// How far one read pages before it stops. A read that stops short moves no
+// cursor (readComments) or says it was cut (openIssues), so a cap costs time,
+// never a card or an answer.
+export const PAGE_LIMIT = 100;
+
+export function createTracker({ gql, paths: p, states = {}, team = '', now = () => Date.now(), log = () => {}, cli = CLI, pageLimit = PAGE_LIMIT }) {
   const names = stateNames(states);
+  // The CLI as one shell word in every command a message prints.
+  const cliArg = shellArg(cli);
   const ids = () => readJson(p.ids, null);
   const need = () => {
     const v = ids();
-    if (!v?.teamId) throw new Transient(`not set up yet: run node ${CLI} setup`);
+    if (!v?.teamId) throw new Transient(`not set up yet: run node ${cliArg} setup`);
     return v;
   };
   const keys = () => readJson(p.keys, {});
@@ -442,7 +456,7 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
   };
   const stateId = (role) => {
     const s = need().states?.[role];
-    if (!s?.id) throw new Transient(`no "${names[role]}" state saved: run node ${CLI} setup`);
+    if (!s?.id) throw new Transient(`no "${names[role]}" state saved: run node ${cliArg} setup`);
     return s.id;
   };
   const roleOf = (stateName) => {
@@ -451,9 +465,30 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
     return null;
   };
 
+  /** The issue, or null when Linear has none by that id. Live Linear RAISES
+   *  "Entity not found: Issue" for a missing id rather than answering null, and
+   *  a missing issue is an answer, not a failure to retry. */
   async function getIssue(ref) {
-    const d = await gql(Q.issue, { id: String(ref) });
-    return d?.issue || null;
+    try {
+      const d = await gql(Q.issue, { id: String(ref) });
+      return d?.issue || null;
+    } catch (e) {
+      if (/\bEntity not found\b/i.test(String(e?.message || ''))) return null;
+      throw e;
+    }
+  }
+
+  /** Every page of a description search, up to the page limit. */
+  async function searchAll(needle, match) {
+    let after = null;
+    for (let page = 0; page < pageLimit; page++) {
+      const d = await gql(Q.byNeedle, { team: need().teamId, needle, after });
+      const hit = (d?.issues?.nodes || []).find(match);
+      if (hit) return hit;
+      if (!d?.issues?.pageInfo?.hasNextPage) return null;
+      after = d.issues.pageInfo.endCursor;
+    }
+    return null;
   }
 
   async function findByKey(key) {
@@ -462,11 +497,14 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
       const hit = await getIssue(known.id).catch(() => null);
       if (hit) return hit;
     }
-    const d = await gql(Q.byNeedle, { team: need().teamId, needle: `"${key}"` });
-    const hit = (d?.issues?.nodes || []).find((i) => {
-      const m = readMeta(i.description);
-      return m.key === key || (Array.isArray(m.links) && m.links.includes(key));
-    });
+    // The card that owns the key first: withMeta writes it as `"key":"<key>"`,
+    // which no leftover's `"from":"<key>"` matches. Then a linked issue.
+    const hit =
+      (await searchAll(`"key":"${key}"`, (i) => readMeta(i.description).key === key)) ||
+      (await searchAll(`"${key}"`, (i) => {
+        const m = readMeta(i.description);
+        return Array.isArray(m.links) && m.links.includes(key);
+      }));
     if (hit) remember(key, hit);
     return hit || null;
   }
@@ -680,7 +718,7 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
               mkdirSync(p.failed, { recursive: true, mode: 0o700 });
               writeJson(path.join(p.failed, name), { ...op, attempts, lastError: why });
               unlinkSync(file);
-              lines.push(`${op.op} ${op.key || ''}: set aside after ${attempts} tries (${why}); node ${CLI} retry puts it back`);
+              lines.push(`${op.op} ${op.key || ''}: set aside after ${attempts} ${attempts === 1 ? 'try' : 'tries'} (${why}); node ${cliArg} retry puts it back`);
               continue;
             }
             writeJson(file, { ...op, attempts, lastError: why });
@@ -713,16 +751,20 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
     return names.length;
   }
 
-  async function openIssues() {
+  /** The team's open issues, or with `tracked` the tracker's own open cards
+   *  only. Every page up to the page limit; a list cut there carries
+   *  `truncated: true`, and the commands that print it say so. */
+  async function openIssues({ tracked = false } = {}) {
     const v = need();
     const out = [];
     let after = null;
-    for (let page = 0; page < 10; page++) {
-      const d = await gql(Q.open, { team: v.teamId, after });
+    for (let page = 0; page < pageLimit; page++) {
+      const d = await gql(tracked ? Q.openTracked : Q.open, { team: v.teamId, after });
       out.push(...(d?.issues?.nodes || []));
-      if (!d?.issues?.pageInfo?.hasNextPage) break;
+      if (!d?.issues?.pageInfo?.hasNextPage) return out;
       after = d.issues.pageInfo.endCursor;
     }
+    out.truncated = true;
     return out;
   }
 
@@ -767,20 +809,27 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
    *  "Answered". Returns { added, pending }. */
   async function readComments() {
     const v = need();
-    const since = readJson(p.cursor, null)?.since || new Date(now()).toISOString();
+    const saved = readJson(p.cursor, null) || {};
+    const since = saved.since || new Date(now()).toISOString();
+    // The comments a read cut short already took, while it holds the cursor.
+    const taken = new Set(Array.isArray(saved.taken) ? saved.taken : []);
     const ledger = new Set(readJson(p.ledger, []));
     const got = [];
     let after = null;
-    for (let page = 0; page < 4; page++) {
-      const d = await gql(Q.comments, { team: v.teamId, since, after });
+    let complete = false;
+    for (let page = 0; page < pageLimit; page++) {
+      const d = await gql(Q.comments, { team: v.teamId, user: v.viewerId, since, after });
       got.push(...(d?.comments?.nodes || []));
-      if (!d?.comments?.pageInfo?.hasNextPage) break;
+      if (!d?.comments?.pageInfo?.hasNextPage) {
+        complete = true;
+        break;
+      }
       after = d.comments.pageInfo.endCursor;
     }
     const cursor = got.reduce((m, c) => (c.createdAt > m ? c.createdAt : m), since);
     const pending = readJson(p.pending, []);
     const seen = new Set(pending.map((c) => c.id));
-    const fresh = got.filter((c) => c.user?.id && c.user.id === v.viewerId && !ledger.has(c.id) && !seen.has(c.id) && !String(c.body || '').trimStart().startsWith(MARK) && c.issue && isTracked(c.issue));
+    const fresh = got.filter((c) => c.user?.id && c.user.id === v.viewerId && !ledger.has(c.id) && !seen.has(c.id) && !taken.has(c.id) && !String(c.body || '').trimStart().startsWith(MARK) && c.issue && isTracked(c.issue));
     const waitingId = v.states?.waiting?.id;
     const moved = new Set();
     for (const c of fresh) {
@@ -793,10 +842,20 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
       }
     }
     const records = fresh.map((c) => ({ id: c.id, body: String(c.body || ''), createdAt: c.createdAt, card: c.issue.identifier, title: c.issue.title, state: moved.has(c.issue.id) ? names.answered : c.issue.state?.name || '', shown: 0 }));
-    const all = [...pending, ...records].sort((x, y) => (x.createdAt < y.createdAt ? -1 : 1)).slice(-200);
+    // Never cut: each one is an answer, and it leaves only on `comments --done`.
+    const all = [...pending, ...records].sort((x, y) => (x.createdAt < y.createdAt ? -1 : 1));
     writeJson(p.pending, all);
-    writeJson(p.cursor, { since: cursor });
-    return { added: records.length, pending: all };
+    // THE CURSOR MOVES ONLY AFTER A COMPLETE READ. Linear lists comments newest
+    // first, so a read cut at the page limit has not seen the OLDEST ones after
+    // the cursor, and moving it to the newest it saw would skip those for good.
+    // A cut read keeps the cursor and remembers what it took, so the next read
+    // neither loses one nor shows one twice.
+    if (complete) writeJson(p.cursor, { since: cursor });
+    else {
+      writeJson(p.cursor, { since, taken: [...taken, ...records.map((c) => c.id)] });
+      log(`[work] comments: more than ${pageLimit} pages since ${since}; the cursor stays there, so none is skipped`);
+    }
+    return { added: records.length, pending: all, complete };
   }
 
   /** Drop the pending comments the chat session has acted on: every one made at or before `upTo`. */
@@ -813,16 +872,14 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
 }
 
 export const BATCH_MAX_CHARS = 5000;
+// One comment's quoted text in a batch at most; the rest is on its card.
+export const BATCH_BODY_MAX = 2500;
 
-/** The pending comments as ONE batch for the chat session, or '' when none.
- *  At most BATCH_MAX_CHARS, oldest first, and its --done line covers only the
- *  comments it shows, so one cut short by a length limit is never marked read.
- *  A comment shown before says so, and its card's state is not repeated (it
- *  may have moved since): the session checks the card before acting twice. */
-export function commentsBatch(pending, { ownerName = 'the owner', cli = CLI, maxChars = BATCH_MAX_CHARS } = {}) {
-  if (!pending?.length) return '';
-  const sorted = [...pending].sort((x, y) => (x.createdAt < y.createdAt ? -1 : 1));
-  const shown = shownOf(pending, maxChars);
+const byTime = (x, y) => (x.createdAt < y.createdAt ? -1 : 1);
+
+/** The batch text for exactly these comments (oldest first). */
+function renderBatch(shown, total, { ownerName, cli }) {
+  const cliArg = shellArg(cli);
   const byCard = new Map();
   for (const c of shown) {
     if (!byCard.has(c.card)) byCard.set(c.card, { title: c.title, comments: [] });
@@ -830,35 +887,50 @@ export function commentsBatch(pending, { ownerName = 'the owner', cli = CLI, max
   }
   const upTo = shown[shown.length - 1].createdAt;
   const again = shown.filter((c) => c.shown > 0).length;
-  const out = [`[Linear comments by ${ownerName}, ${shown.length} on ${byCard.size} card${byCard.size === 1 ? '' : 's'}]`];
-  out.push(`Each is their answer on that card. Act on it, move or comment on the card (node ${cli} status|comment), then run: node ${cli} comments --done ${upTo}`);
-  out.push(`Until then they are shown again on every read, so none is lost.${again ? ` ${again} of them were shown before: check the card first, and act only if it still needs it.` : ''}${sorted.length > shown.length ? ` ${sorted.length - shown.length} more wait for the next read.` : ''}`);
+  const out = [`[Linear comments by ${oneLine(ownerName).slice(0, 60)}, ${shown.length} on ${byCard.size} card${byCard.size === 1 ? '' : 's'}]`];
+  out.push(`Each is their answer on that card. Act on it, move or comment on the card (node ${cliArg} status|comment), then run: node ${cliArg} comments --done ${upTo}`);
+  out.push(`Until then they are shown again on every read, so none is lost.${again ? ` ${again} of them were shown before: check the card first, and act only if it still needs it.` : ''}${total > shown.length ? ` ${total - shown.length} more wait for the next read.` : ''}`);
   for (const [card, e] of byCard) {
     const fresh = e.comments.filter((c) => !(c.shown > 0));
     const state = fresh.length ? fresh[fresh.length - 1].state : '';
-    out.push('', `${card} · ${e.title}${state ? ` (${state})` : ' (shown before; its state may have changed)'}`);
-    for (const c of e.comments) out.push(...c.body.trim().split('\n').map((l) => `> ${l}`));
+    out.push('', `${card} · ${oneLine(e.title).slice(0, 120)}${state ? ` (${state})` : ' (shown before; its state may have changed)'}`);
+    for (const c of e.comments) {
+      const quoted = c.body.trim().split('\n').map((l) => `> ${l}`).join('\n');
+      out.push(quoted.length <= BATCH_BODY_MAX ? quoted : `${quoted.slice(0, BATCH_BODY_MAX)}\n> [cut here: ${quoted.length - BATCH_BODY_MAX} more characters, read the rest on ${card}]`);
+    }
   }
   return out.join('\n');
 }
 
-/** The comments a batch shows: oldest first, within maxChars. */
-export function shownOf(pending, maxChars = BATCH_MAX_CHARS) {
-  const sorted = [...(pending || [])].sort((x, y) => (x.createdAt < y.createdAt ? -1 : 1));
+/** The comments a batch shows: oldest first, while the RENDERED batch stays
+ *  within maxChars (quote marks, card lines and the header counted), so a
+ *  schedule's output limit (SCRIPT_OUTPUT_MAX, 6000) never cuts a comment its
+ *  --done line covers. One comment always shows, its text clipped on its own. */
+export function shownOf(pending, { ownerName = 'the owner', cli = CLI, maxChars = BATCH_MAX_CHARS } = {}) {
+  const sorted = [...(pending || [])].sort(byTime);
   const shown = [];
-  let size = 0;
   for (const c of sorted) {
-    const cost = c.body.length + c.title.length + 40;
-    if (shown.length && size + cost > maxChars) break;
+    if (shown.length && renderBatch([...shown, c], sorted.length, { ownerName, cli }).length > maxChars) break;
     shown.push(c);
-    size += cost;
   }
   return shown;
 }
 
-/** The pending list after a batch was printed: each comment it showed counts one more showing. */
-export function markShown(pending, maxChars = BATCH_MAX_CHARS) {
-  const ids = new Set(shownOf(pending, maxChars).map((c) => c.id));
+/** The pending comments as ONE batch for the chat session, or '' when none.
+ *  At most maxChars as printed, oldest first, and its --done line covers only
+ *  the comments it shows, so one left out by the length limit is never marked
+ *  read. A comment shown before says so, and its card's state is not repeated
+ *  (it may have moved since): the session checks the card before acting twice. */
+export function commentsBatch(pending, { ownerName = 'the owner', cli = CLI, maxChars = BATCH_MAX_CHARS } = {}) {
+  if (!pending?.length) return '';
+  const shown = shownOf(pending, { ownerName, cli, maxChars });
+  return renderBatch(shown, pending.length, { ownerName, cli });
+}
+
+/** The pending list after a batch was printed: each comment it showed counts
+ *  one more showing. Takes the options the batch was printed with. */
+export function markShown(pending, opts = {}) {
+  const ids = new Set(shownOf(pending, opts).map((c) => c.id));
   return pending.map((c) => (ids.has(c.id) ? { ...c, shown: (c.shown || 0) + 1 } : c));
 }
 
@@ -1024,7 +1096,10 @@ export async function main(argv, { env = process.env, out = (s) => process.stdou
   }
   const p = statePaths(s.stateDir);
   const transport = gql || linearTransport({ key: readKey(s, env) });
-  const t = createTracker({ gql: transport, paths: p, states: s.states, team: s.team, now, log: (m) => err(m) });
+  // The CLI the commands it prints should name, as one shell word.
+  const cli = s.cli || CLI;
+  const cliArg = shellArg(cli);
+  const t = createTracker({ gql: transport, paths: p, states: s.states, team: s.team, now, log: (m) => err(m), cli });
   const drainMs = flags['drain-ms'] !== undefined ? Number(flags['drain-ms']) : 20_000;
   const queueAndSend = async (op) => {
     enqueue(p, op, now());
@@ -1087,7 +1162,7 @@ export async function main(argv, { env = process.env, out = (s) => process.stdou
       case 'outbox': {
         const st = outboxStatus(p);
         for (const f of st.files) out(f);
-        out(`${st.waiting} waiting, ${st.failed} set aside${st.waiting ? ` (node ${CLI} drain sends them)` : ''}${st.failed ? ` (node ${CLI} retry puts the set aside ones back)` : ''}`);
+        out(`${st.waiting} waiting, ${st.failed} set aside${st.waiting ? ` (node ${cliArg} drain sends them)` : ''}${st.failed ? ` (node ${cliArg} retry puts the set aside ones back)` : ''}`);
         return 0;
       }
       case 'open': {
@@ -1095,7 +1170,7 @@ export async function main(argv, { env = process.env, out = (s) => process.stdou
         if (flags.json) out(JSON.stringify(issues.map((i) => ({ id: i.identifier, state: i.state?.name, title: i.title, updatedAt: i.updatedAt, url: i.url }))));
         else {
           for (const i of issues) out(`${i.identifier}\t${i.state?.name}\t${Math.round((now() - Date.parse(i.updatedAt || i.createdAt)) / HOUR)}h\t${i.title}`);
-          out(`${issues.length} open`);
+          out(`${issues.length} open${issues.truncated ? `, and more past ${PAGE_LIMIT} pages (the list is cut)` : ''}`);
         }
         return 0;
       }
@@ -1141,28 +1216,31 @@ export async function main(argv, { env = process.env, out = (s) => process.stdou
         return 0;
       }
       case 'lint': {
-        const issues = (await t.openIssues()).filter(isTracked);
+        const listed = await t.openIssues({ tracked: true });
+        const issues = listed.filter(isTracked);
         const bad = issues.map((i) => ({ id: i.identifier, title: i.title, problems: cardTitleProblems(i.title) })).filter((x) => x.problems.length);
         if (flags.json) out(JSON.stringify({ open: issues.length, readable: issues.length - bad.length, bad }));
         else {
           for (const b of bad) out(`${b.id}\t${b.title}\t(${b.problems.join(', ')})`);
-          out(`${issues.length - bad.length} of ${issues.length} readable`);
+          out(`${issues.length - bad.length} of ${issues.length} readable${listed.truncated ? `, of the first ${PAGE_LIMIT} pages (the list is cut)` : ''}`);
         }
         return 0;
       }
       case 'sweep': {
         await t.drain({ budgetMs: 15_000 });
-        const issues = await t.openIssues();
+        const issues = await t.openIssues({ tracked: true });
         const psText = ps === undefined ? await psOutput(root) : ps;
         const text = sweepText(issues, { names: t.names, psText, now: now() });
         if (text) out(text);
+        // A list cut at the page limit is said, never silent: a card past it was not swept.
+        if (issues.truncated) out(`${text ? '\n' : ''}The open card list is cut at ${PAGE_LIMIT} pages: cards past it were not swept. Close or cancel finished cards.`);
         return 0;
       }
       case 'comments': {
         const ownerName = String(readBridgeConfig(env, root).ownerName || 'the owner');
         if (flags.done !== undefined && !/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(String(flags.done))) return (err('usage: comments --done <the time the batch names>'), 2);
         if (flags.again) {
-          const text = commentsBatch(readJson(p.pending, []), { ownerName });
+          const text = commentsBatch(readJson(p.pending, []), { ownerName, cli });
           if (text) out(text);
           return 0;
         }
@@ -1185,10 +1263,10 @@ export async function main(argv, { env = process.env, out = (s) => process.stdou
             if (!pending.length) throw e;
             err(`work: new comments not read (${oneLine(e.message).slice(0, 160)}); the pending ones follow`);
           }
-          const text = commentsBatch(pending, { ownerName });
+          const text = commentsBatch(pending, { ownerName, cli });
           if (text) {
             out(text);
-            writeJson(p.pending, markShown(pending));
+            writeJson(p.pending, markShown(pending, { ownerName, cli }));
           }
           return 0;
         } finally {

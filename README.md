@@ -300,6 +300,7 @@ Two more shapes live in the CLI, not in `/remind`:
 node schedule.mjs add every 2h 00:05 --script ~/sweep.mjs "text"   # every N hours (1..23)
 node schedule.mjs add every 6h 00:00 --run "text"                  # a run on the same cadence
 node schedule.mjs update <id> --claude-only true|false             # a run that waits for Claude
+node schedule.mjs add daily 03:00 --run --model sonnet "text"      # a run on its own Claude model
 ```
 
 An `every N hours` entry fires once per slot. `HH:MM` sets the phase, not a start: the
@@ -314,7 +315,14 @@ file itself, which must be executable) for up to 2 minutes, and only when it pri
 something does that output reach the chat lane, as a turn the daemon wrote with the entry's
 text on top. No output is one log line and no turn, so a sweep that is usually empty costs
 nothing. A script that fails with no output gets you one line, said once until it runs
-clean.
+clean. A directory or a file the daemon cannot start is refused when you add it. Because the
+daemon runs the script outside any worker, a background worker or a scheduled run cannot add
+a script entry or point one at another script: that is yours, from a terminal or the chat lane.
+
+`--model sonnet|opus|haiku` (with `--run` only) runs that entry's job on that Claude model
+instead of `bgModel`, through a usage wall too. `update <id> --model none` takes it off, and
+`list` shows it as `run (model sonnet)`. It picks the model, not the engine: a run that goes
+to Codex while Claude is walled stays on Codex.
 
 `--claude-only` marks a `--run` entry whose job needs Claude tools. While every Claude
 account is at its limit an unflagged run goes to Codex when Codex can take it (a Claude
@@ -526,7 +534,9 @@ configured for Fable runs on Opus, on the same account, while that account's
 Fable week is full, and returns to Fable when it frees, with one line each way.
 The live account's model state is written to `~/.claude/state/model-limits.json`
 (0600, no credentials) for any tool that wants it. Background workers run on
-`bgModel` (default: the configured `model`); `/model` steers the chat lane only.
+`bgModel` (default: the configured `model`), or on the model one job names
+(`bg.mjs --model`, a schedule entry's `--model`), kept through a usage wall;
+`/model` steers the chat lane only.
 
 **Usage from your own sessions.** Every Claude run the daemon starts reports the
 plan's windows after each API response, so when Anthropic's usage lookup is
@@ -557,6 +567,7 @@ node bg.mjs ps                                               # what is running
 node bg.mjs --engine codex --file ./brief.md                 # hand a job to the other engine
 node bg.mjs "codex: review the last commit"                  # same, inline prefix
 node bg.mjs --now --file ./brief.md                          # start it past the concurrency cap
+node bg.mjs --model sonnet --file ./brief.md                 # this job on its own Claude model
 ```
 
 The target is a lane name (`bg`, `bg2`), a run id (`bg2-1788453512237`), a pid,
@@ -1232,6 +1243,8 @@ node tg-governor.test.mjs        # the write governor: bucket, cooldown, outbox,
 node stream-usage.test.mjs       # usage readings from the live sessions, and whose they are
 node model-limits.test.mjs       # per model limits and the one start model decision
 node model-limits-wiring.test.mjs  # the model functions against the real store and reader
+node bg-job-model.test.mjs       # bg.mjs --model: the queue entry, the refusals, the model in argv
+node schedule-model.test.mjs     # schedule.mjs --model: add, update, list, one alias list
 node opus-limits.test.mjs        # an Opus wall never blocks the other lanes
 node model-owner.test.mjs        # one owner of the start model, every review case as a behaviour test
 node bg-model-pin.test.mjs       # workers run bgModel, whatever /model says for the chat
