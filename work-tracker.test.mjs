@@ -118,8 +118,9 @@ function fakeLinear({ states = ['Backlog', 'Todo', 'Done', 'Canceled'] } = {}) {
         const r = paged(newest(open), query, v.after);
         return { issues: { nodes: r.nodes.map(view), pageInfo: r.pageInfo } };
       }
-      case 'WorkComments': {
-        const r = paged(newest(db.comments.filter((c) => c.createdAt > v.since && (!v.user || c.user?.id === v.user))), query, v.after);
+      case 'WorkComments':
+      case 'WorkCommentsBefore': {
+        const r = paged(newest(db.comments.filter((c) => c.createdAt > v.since && (!v.before || c.createdAt <= v.before) && (!v.user || c.user?.id === v.user))), query, v.after);
         return { comments: { nodes: r.nodes.map((c) => ({ ...c, issue: view(find(c.issueId)) })), pageInfo: r.pageInfo } };
       }
       default:
@@ -847,28 +848,41 @@ t('comments: an answer under 260 newer tracker notes by the same user is still r
   ok(f.out.join('\n').includes('B, the answer'), 'the answer is in the batch');
 });
 
-t('comments: a read cut at the page limit keeps its cursor and shows nothing twice', async () => {
+t('comments: a read cut at the page limit keeps its place, goes further back each time, and shows nothing twice', async () => {
   const { f } = await answerThenNoise('cut-read', 0, 'user-me');
+  const card = f.L.byTitle('Area: which one?');
   const cursorBefore = JSON.parse(readFileSync(f.p.cursor, 'utf8')).since;
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < 121; i++) {
     clock += 1000;
-    f.L.db.comments.push({ id: `cut-own${i}`, body: `own answer ${i}`, issueId: f.L.byTitle('Area: which one?').id, createdAt: new Date(clock).toISOString(), user: { id: 'user-me' } });
+    f.L.db.comments.push({ id: `cut-own${i}`, body: `own answer ${i}`, issueId: card.id, createdAt: new Date(clock).toISOString(), user: { id: 'user-me' } });
   }
-  const tr = createTracker({ gql: f.L.gql, paths: f.p, team: 'ENG', now: () => clock, pageLimit: 2 });
-  const r = await tr.readComments();
-  eq(r.complete, false, 'two pages of 50 do not reach the end');
-  eq(JSON.parse(readFileSync(f.p.cursor, 'utf8')).since, cursorBefore, 'the cursor did not move past what was not read');
-  const taken = r.pending.length;
-  eq(taken, 100);
-  tr.doneComments('2099-01-01T00:00:00.000Z');
-  // nothing was shown, so nothing was dropped; mark them shown and ack them
-  const { markShown: ms } = await import('./scripts/work.mjs');
-  writeFileSync(f.p.pending, JSON.stringify(ms(JSON.parse(readFileSync(f.p.pending, 'utf8')), { maxChars: 1e9 })));
-  tr.doneComments('2099-01-01T00:00:00.000Z');
-  const full = createTracker({ gql: f.L.gql, paths: f.p, team: 'ENG', now: () => clock });
-  const r2 = await full.readComments();
-  eq(r2.complete, true);
-  eq(r2.added, 21, 'the 21 not taken yet (the first answer and 20 more), none of the 100 again');
+  const newest = new Date(clock).toISOString();
+  const tr = createTracker({ gql: f.L.gql, paths: f.p, team: 'ENG', now: () => clock, pageLimit: 1 });
+  const seen = [];
+  const reads = [];
+  for (let i = 0; i < 6; i++) {
+    const r = await tr.readComments();
+    reads.push([r.complete, r.added]);
+    const cur = JSON.parse(readFileSync(f.p.cursor, 'utf8'));
+    if (!r.complete) eq(cur.since, cursorBefore, 'a cut read never moves the cursor past what it did not read');
+    for (const c of r.pending) seen.push(c.id);
+    // the chat session acts on what it got, so the pending list empties
+    writeFileSync(f.p.pending, JSON.stringify(r.pending.map((c) => ({ ...c, shown: 1 }))));
+    tr.doneComments('2099-01-01T00:00:00.000Z');
+    if (r.complete) break;
+  }
+  // 50 a page, one page a read; each later read takes its boundary comment again and drops it as taken.
+  eq(reads.map((x) => x[1]), [50, 49, 23], 'each cut read reaches further back');
+  eq(reads.reduce((n, x) => n + x[1], 0), 122, 'the answer and the 121 after it, each once');
+  eq(reads.at(-1)[0], true, 'the window is read to its end');
+  ok(seen.includes('cut-read-answer'), 'the oldest answer is delivered');
+  eq(new Set(seen).size, seen.length, 'nothing shown twice');
+  eq(JSON.parse(readFileSync(f.p.cursor, 'utf8')).since, newest, 'the cursor ends at the newest comment the first cut read saw');
+  // A comment made meanwhile is read by the next read, once.
+  clock += 1000;
+  f.L.db.comments.push({ id: 'cut-late', body: 'one more', issueId: card.id, createdAt: new Date(clock).toISOString(), user: { id: 'user-me' } });
+  const r2 = await tr.readComments();
+  eq([r2.complete, r2.added, r2.pending.map((c) => c.id)], [true, 1, ['cut-late']]);
 });
 
 t('findByKey: a job with 12 leftovers quoting its key still finds its own card (no second job card)', async () => {
@@ -897,7 +911,7 @@ t('sweep: an Answered card under 1050 newer teammate issues is still listed', as
 });
 
 t('a comments batch fits the schedule output limit as printed, and a long comment is clipped on its own', async () => {
-  const { BATCH_MAX_CHARS: max, BATCH_BODY_MAX: bodyMax } = await import('./scripts/work.mjs');
+  const { BATCH_MAX_CHARS: max } = await import('./scripts/work.mjs');
   const { SCRIPT_OUTPUT_MAX } = await import('./schedule-script.mjs');
   ok(max < SCRIPT_OUTPUT_MAX, 'the batch limit is under the schedule output limit');
   // Many short lines: each costs a quote mark and a newline the old estimate missed.
@@ -907,9 +921,24 @@ t('a comments batch fits the schedule output limit as printed, and a long commen
   const upTo = /comments --done (\S+)/.exec(text)[1];
   const covered = pending.filter((c) => c.createdAt <= upTo);
   for (const c of covered) ok(text.includes(`${c.card} · `), `${c.card} is covered by --done and shown`);
-  const one = commentsBatch([{ id: 'big', body: 'y'.repeat(9000), createdAt: new Date(NOW).toISOString(), card: 'ENG-1', title: 'Area: big', state: 'Answered', shown: 0 }]);
-  ok(one.length <= max && one.includes('read the rest on ENG-1'), `one huge comment: ${one.length}`);
-  ok(Number.isFinite(bodyMax) && bodyMax < max);
+  // A long comment that fits is delivered whole; only one the batch cannot hold is clipped.
+  const fits = 'z'.repeat(4100);
+  const whole = commentsBatch([{ id: 'long', body: fits, createdAt: new Date(NOW).toISOString(), card: 'ENG-1', title: 'Area: long', state: 'Answered', shown: 0 }]);
+  ok(whole.includes(`> ${fits}`) && !whole.includes('cut here'), `a 4100 character comment is whole (${whole.length})`);
+  const one = commentsBatch([{ id: 'big', body: 'y'.repeat(9000), createdAt: new Date(NOW).toISOString(), card: 'ENG-1', title: 'Area: big', state: 'Answered', shown: 0 }], { cli: '/opt/leash/scripts/work.mjs' });
+  ok(one.length <= max && one.includes('comments --show big'), `one huge comment: ${one.length}`);
+});
+
+t('comments --show prints one pending comment whole, and says so when it is gone', async () => {
+  const f = fresh('show-one');
+  await f.run(['setup']);
+  const body = `${'w'.repeat(7000)}\nthe last line`;
+  writeFileSync(f.p.pending, JSON.stringify([{ id: 'c-long', body, createdAt: new Date(NOW).toISOString(), card: 'ENG-1', title: 'Area: long', state: 'Answered', shown: 1 }]));
+  f.out.length = 0;
+  eq(await f.run(['comments', '--show', 'c-long']), 0);
+  ok(f.out.join('\n').includes(body), 'the whole body');
+  eq(await f.run(['comments', '--show', 'c-none']), 1);
+  ok(f.err.join('\n').includes('no pending comment c-none'));
 });
 
 t('a Linear: link to an issue that does not exist is set aside at once, not tried 3 times', async () => {

@@ -15,6 +15,7 @@
 //   node scripts/work.mjs sweep                    what needs the chat session; prints nothing when nothing does
 //   node scripts/work.mjs comments [--again]       the owner's comments on cards not yet acted on, as one batch
 //   node scripts/work.mjs comments --done <time>   the chat session acted on every comment up to that time
+//   node scripts/work.mjs comments --show <id>     one pending comment whole (a batch clips a long one)
 //   node scripts/work.mjs retry                    put the set aside ops back and send them
 //   node scripts/work.mjs plan <PLAN.md> [--section <heading>]   one Queued issue per row of a step table
 //   node scripts/work.mjs drain [--budget-ms N]    send the outbox now
@@ -253,6 +254,9 @@ export const Q = {
   // The key's own user only: an owner's answer is one of theirs, and a busy
   // team's other comments no longer fill the pages before it.
   comments: 'query WorkComments($team: ID!, $user: ID!, $since: DateTimeOrDuration!, $after: String) { comments(first: 50, after: $after, filter: { createdAt: { gt: $since }, user: { id: { eq: $user } }, issue: { team: { id: { eq: $team } } } }) { nodes { id body createdAt user { id name } issue { id identifier title description state { id name type } } } pageInfo { hasNextPage endCursor } } }',
+  // The same read bounded above: what a read cut at the page limit left behind,
+  // everything at or before the oldest comment it took.
+  commentsBefore: 'query WorkCommentsBefore($team: ID!, $user: ID!, $since: DateTimeOrDuration!, $before: DateTimeOrDuration!, $after: String) { comments(first: 50, after: $after, filter: { createdAt: { gt: $since, lte: $before }, user: { id: { eq: $user } }, issue: { team: { id: { eq: $team } } } }) { nodes { id body createdAt user { id name } issue { id identifier title description state { id name type } } } pageInfo { hasNextPage endCursor } } }',
 };
 
 /** A refusal is not retried: the op goes to failed/ at once. */
@@ -811,14 +815,20 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
     const v = need();
     const saved = readJson(p.cursor, null) || {};
     const since = saved.since || new Date(now()).toISOString();
-    // The comments a read cut short already took, while it holds the cursor.
+    // A read cut short left a window behind: everything after `since` and at
+    // or before `before` (the oldest comment it took). `high` is the newest
+    // comment the first cut read saw, where the cursor goes once the window is
+    // read to its end. `taken` holds what the cut reads already took.
+    const before = typeof saved.before === 'string' ? saved.before : null;
     const taken = new Set(Array.isArray(saved.taken) ? saved.taken : []);
     const ledger = new Set(readJson(p.ledger, []));
     const got = [];
     let after = null;
     let complete = false;
     for (let page = 0; page < pageLimit; page++) {
-      const d = await gql(Q.comments, { team: v.teamId, user: v.viewerId, since, after });
+      const d = before
+        ? await gql(Q.commentsBefore, { team: v.teamId, user: v.viewerId, since, before, after })
+        : await gql(Q.comments, { team: v.teamId, user: v.viewerId, since, after });
       got.push(...(d?.comments?.nodes || []));
       if (!d?.comments?.pageInfo?.hasNextPage) {
         complete = true;
@@ -846,14 +856,21 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
     const all = [...pending, ...records].sort((x, y) => (x.createdAt < y.createdAt ? -1 : 1));
     writeJson(p.pending, all);
     // THE CURSOR MOVES ONLY AFTER A COMPLETE READ. Linear lists comments newest
-    // first, so a read cut at the page limit has not seen the OLDEST ones after
-    // the cursor, and moving it to the newest it saw would skip those for good.
-    // A cut read keeps the cursor and remembers what it took, so the next read
-    // neither loses one nor shows one twice.
-    if (complete) writeJson(p.cursor, { since: cursor });
+    // first, so a read cut at the page limit has seen everything from its
+    // oldest comment up, and nothing older. Moving the cursor to the newest it
+    // saw would skip the older ones for good, and keeping it would read the
+    // same newest pages forever. So a cut read narrows the window instead: the
+    // next read takes only what is at or before the oldest comment this one
+    // took (ties at that time come again and are dropped by `taken`), each cut
+    // read reaches further back, and the window's last read moves the cursor
+    // to the newest comment the first cut read saw. Nothing is lost, nothing
+    // is shown twice, and every read makes progress.
+    const high = typeof saved.high === 'string' && saved.high > cursor ? saved.high : cursor;
+    if (complete) writeJson(p.cursor, { since: before ? high : cursor });
     else {
-      writeJson(p.cursor, { since, taken: [...taken, ...records.map((c) => c.id)] });
-      log(`[work] comments: more than ${pageLimit} pages since ${since}; the cursor stays there, so none is skipped`);
+      const oldest = got.reduce((m, c) => (!m || c.createdAt < m ? c.createdAt : m), null) || before || since;
+      writeJson(p.cursor, { since, before: oldest, high, taken: [...taken, ...records.map((c) => c.id)] });
+      log(`[work] comments: more than ${pageLimit} pages since ${since}; the next read goes on from ${oldest} back`);
     }
     return { added: records.length, pending: all, complete };
   }
@@ -872,13 +889,15 @@ export function createTracker({ gql, paths: p, states = {}, team = '', now = () 
 }
 
 export const BATCH_MAX_CHARS = 5000;
-// One comment's quoted text in a batch at most; the rest is on its card.
-export const BATCH_BODY_MAX = 2500;
 
 const byTime = (x, y) => (x.createdAt < y.createdAt ? -1 : 1);
 
-/** The batch text for exactly these comments (oldest first). */
-function renderBatch(shown, total, { ownerName, cli }) {
+/** The batch text for exactly these comments (oldest first). A batch of ONE
+ *  comment too long for maxChars clips that comment's text to fit and prints
+ *  the command that shows it whole (`comments --show <id>`), so its --done
+ *  line never covers text nobody can read. Two or more never clip: shownOf
+ *  stops before the batch is too long. */
+function renderBatch(shown, total, { ownerName, cli, maxChars = BATCH_MAX_CHARS }) {
   const cliArg = shellArg(cli);
   const byCard = new Map();
   for (const c of shown) {
@@ -894,11 +913,15 @@ function renderBatch(shown, total, { ownerName, cli }) {
     const fresh = e.comments.filter((c) => !(c.shown > 0));
     const state = fresh.length ? fresh[fresh.length - 1].state : '';
     out.push('', `${card} · ${oneLine(e.title).slice(0, 120)}${state ? ` (${state})` : ' (shown before; its state may have changed)'}`);
-    for (const c of e.comments) {
-      const quoted = c.body.trim().split('\n').map((l) => `> ${l}`).join('\n');
-      out.push(quoted.length <= BATCH_BODY_MAX ? quoted : `${quoted.slice(0, BATCH_BODY_MAX)}\n> [cut here: ${quoted.length - BATCH_BODY_MAX} more characters, read the rest on ${card}]`);
-    }
+    for (const c of e.comments) out.push(c.body.trim().split('\n').map((l) => `> ${l}`).join('\n'));
   }
+  const text = out.join('\n');
+  if (shown.length !== 1 || text.length <= maxChars) return text;
+  const c = shown[0];
+  const quoted = out[out.length - 1];
+  const note = `\n> [cut here: the whole comment is printed by: node ${cliArg} comments --show ${c.id}]`;
+  const room = Math.max(200, maxChars - (text.length - quoted.length) - note.length);
+  out[out.length - 1] = `${quoted.slice(0, room)}${note}`;
   return out.join('\n');
 }
 
@@ -910,7 +933,7 @@ export function shownOf(pending, { ownerName = 'the owner', cli = CLI, maxChars 
   const sorted = [...(pending || [])].sort(byTime);
   const shown = [];
   for (const c of sorted) {
-    if (shown.length && renderBatch([...shown, c], sorted.length, { ownerName, cli }).length > maxChars) break;
+    if (shown.length && renderBatch([...shown, c], sorted.length, { ownerName, cli, maxChars }).length > maxChars) break;
     shown.push(c);
   }
   return shown;
@@ -924,7 +947,7 @@ export function shownOf(pending, { ownerName = 'the owner', cli = CLI, maxChars 
 export function commentsBatch(pending, { ownerName = 'the owner', cli = CLI, maxChars = BATCH_MAX_CHARS } = {}) {
   if (!pending?.length) return '';
   const shown = shownOf(pending, { ownerName, cli, maxChars });
-  return renderBatch(shown, pending.length, { ownerName, cli });
+  return renderBatch(shown, pending.length, { ownerName, cli, maxChars });
 }
 
 /** The pending list after a batch was printed: each comment it showed counts
@@ -1042,7 +1065,7 @@ export function parseArgs(argv) {
   return { pos, flags };
 }
 
-const USAGE = 'usage: node scripts/work.mjs setup [--check] | open | status <ID> <state> [--comment why] | comment <ID> text | lint | sweep | comments [--again | --done <time>] | plan <file> [--section heading] | drain | retry | outbox';
+const USAGE = 'usage: node scripts/work.mjs setup [--check] | open | status <ID> <state> [--comment why] | comment <ID> text | lint | sweep | comments [--again | --done <time> | --show <id>] | plan <file> [--section heading] | drain | retry | outbox';
 
 function readStdin() {
   try {
@@ -1239,6 +1262,15 @@ export async function main(argv, { env = process.env, out = (s) => process.stdou
       case 'comments': {
         const ownerName = String(readBridgeConfig(env, root).ownerName || 'the owner');
         if (flags.done !== undefined && !/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(String(flags.done))) return (err('usage: comments --done <the time the batch names>'), 2);
+        // One pending comment whole, by its id: a batch that had to clip a
+        // long one names this command, and nothing here has a length limit.
+        if (flags.show !== undefined) {
+          const hit = readJson(p.pending, []).find((c) => c.id === String(flags.show));
+          if (!hit) return (err(`no pending comment ${String(flags.show).slice(0, 80)} (already marked read, or never read)`), 1);
+          out(`${hit.card} · ${hit.title} · ${hit.createdAt}`);
+          out(hit.body);
+          return 0;
+        }
         if (flags.again) {
           const text = commentsBatch(readJson(p.pending, []), { ownerName, cli });
           if (text) out(text);

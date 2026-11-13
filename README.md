@@ -1144,7 +1144,9 @@ timeout, an outage, a rate limit, a key it refuses), every change waits with no 
 start or report opens its card if the dispatch never got through. A change Linear itself
 refuses three times is set aside in `work-tracker/outbox/failed/`, and
 `node scripts/work.mjs retry` puts it back. `bg.mjs ps` shows what waits.
-`node scripts/work.mjs comments --again` shows the comments not yet marked done.
+`node scripts/work.mjs comments --again` shows the comments not yet marked done, and
+`comments --show <id>` prints one whole (a batch clips a single comment too long for it and
+names that command).
 
 The key file holds the key alone on one line. A file with anything else in it is treated
 as no key, so the key can never end up in an error message.

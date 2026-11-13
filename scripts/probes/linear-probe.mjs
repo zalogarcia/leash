@@ -79,6 +79,7 @@ await probe('open issues', Q.open, { team: teamId, after: null });
 await probe('open tracker cards', Q.openTracked, { team: teamId, after: null });
 const viewer = (await probe('viewer again, for the comment filter', Q.viewer, {}))?.viewer;
 await probe('comments since', Q.comments, { team: teamId, user: viewer?.id || Z, since: new Date(Date.now() - 3600_000).toISOString(), after: null });
+await probe('comments in a window', Q.commentsBefore, { team: teamId, user: viewer?.id || Z, since: new Date(Date.now() - 7200_000).toISOString(), before: new Date(Date.now() - 3600_000).toISOString(), after: null });
 await probe('issue', Q.issue, { id: Z }, { write: true });
 await probe('issue update', Q.update, { id: Z, input: { stateId: Z } }, { write: true });
 await probe('comment create', Q.comment, { input: { issueId: Z, body: 'probe' } }, { write: true });
