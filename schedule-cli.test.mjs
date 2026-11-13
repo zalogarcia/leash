@@ -9,7 +9,7 @@
 //
 //   node schedule-cli.test.mjs
 
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -564,6 +564,85 @@ t('a script entry cannot be turned into a --run', () => {
   const r = run('update', String(id), '--run', 'true');
   eq(r.code, 1);
   ok(!read().items[0].run, 'unchanged');
+});
+
+// A SCRIPT THE DAEMON CAN START. A directory and a file it cannot execute were
+// both accepted, then failed on every slot, said once, and went quiet.
+t('a directory is refused as a script, nothing saved', () => {
+  seed([]);
+  const r = run('add', 'every', '2h', '00:05', '--script', WORK, 'x');
+  eq(r.code, 1);
+  ok(r.err.includes('not a file'), r.err);
+  eq(read().items.length, 0);
+});
+
+t('a file the daemon executes itself needs its execute bit, a node file does not', () => {
+  seed([]);
+  const sh = path.join(WORK, 'sweep.sh');
+  writeFileSync(sh, '#!/bin/sh\necho hi\n');
+  chmodSync(sh, 0o644);
+  const r = run('add', 'every', '2h', '00:05', '--script', sh, 'x');
+  eq(r.code, 1);
+  ok(r.err.includes('not executable'), r.err);
+  eq(read().items.length, 0);
+  chmodSync(sh, 0o755);
+  eq(run('add', 'every', '2h', '00:05', '--script', sh, 'x').code, 0, 'executable now');
+  chmodSync(SCRIPT, 0o644);
+  eq(run('add', 'every', '2h', '00:05', '--script', SCRIPT, 'y').code, 0, 'a .mjs runs under node');
+});
+
+t('update --script takes the same checks', () => {
+  seed([]);
+  run('add', 'every', '2h', '00:05', '--script', SCRIPT, 'sweep');
+  const id = String(read().items[0].id);
+  const r = run('update', id, '--script', WORK);
+  eq(r.code, 1);
+  ok(r.err.includes('not a file'), r.err);
+  eq(read().items[0].script, SCRIPT, 'unchanged');
+});
+
+// A SCRIPT ENTRY IS THE OWNER'S: the daemon runs it outside any worker's
+// guards, so a worker or a scheduled run cannot add one or repoint one.
+t('a background worker or a scheduled run cannot add a script entry', () => {
+  seed([]);
+  for (const env of [{ LEASH_LANE: 'bg' }, { LEASH_TRIGGER: 'schedule' }]) {
+    const r = runEnv(env, 'add', 'every', '2h', '00:05', '--script', SCRIPT, 'x');
+    eq(r.code, 1, JSON.stringify(env));
+    ok(r.err.includes('outside any worker'), r.err);
+  }
+  eq(read().items.length, 0);
+  eq(runEnv({ LEASH_LANE: 'chat' }, 'add', 'every', '2h', '00:05', '--script', SCRIPT, 'a').code, 0, 'the chat lane can');
+  eq(runEnv({ LEASH_LANE: 'bg', TMUX: '/tmp/tmux-501/default,1,0' }, 'add', 'every', '2h', '00:05', '--script', SCRIPT, 'b').code, 0, 'a tmux pane can');
+});
+
+t('a background worker cannot repoint a script entry', () => {
+  const id = String(read().items[0].id);
+  const other = path.join(WORK, 'other.mjs');
+  writeFileSync(other, '// another\n');
+  const r = runEnv({ LEASH_LANE: 'bg' }, 'update', id, '--script', other);
+  eq(r.code, 1);
+  ok(r.err.includes('outside any worker'), r.err);
+  eq(read().items[0].script, SCRIPT, 'unchanged');
+});
+
+// THE RULE `add` ENFORCES HOLDS ON `update`: an hours entry runs a script or a
+// task, never a reminder every few hours.
+t('update --run false or --no-run cannot turn an hours run into a reminder', () => {
+  seed([]);
+  run('add', 'every', '3h', '09:00', '--run', 'check the queue');
+  const id = String(read().items[0].id);
+  for (const args of [['--run', 'false'], ['--no-run']]) {
+    const r = run('update', id, ...args);
+    eq(r.code, 1, args.join(' '));
+    ok(r.err.includes('needs --script <path> or --run'), r.err);
+    eq(read().items[0].run, true, 'unchanged');
+  }
+});
+
+t('list names the first slot of the day, not the time it was added at', () => {
+  seed([]);
+  run('add', 'every', '5h', '09:00', '--run', 'check the queue');
+  ok(run('list').out.includes('every 5h from 04:00'), run('list').out);
 });
 
 // ---------------------------------------------------------------------------

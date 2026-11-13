@@ -122,10 +122,18 @@ export function isHoursDue(item, nowMs = Date.now()) {
   return !(Number.isFinite(last) && last >= slot);
 }
 
-/** The label both the daemon and the CLI print for an item. */
+/** The label both the daemon and the CLI print for an item. An hours item
+ *  names its FIRST slot of the day, the one the count restarts from: `every 5h`
+ *  added at 09:00 fires at 04:00 too, and "from 09:00" hid that. */
 export function describeWhen(item) {
   if (!item) return '';
-  if (item.kind === 'hours') return `every ${everyHours(item) || '?'}h from ${item.at}`;
+  if (item.kind === 'hours') {
+    const every = everyHours(item);
+    const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(item.at ?? ''));
+    if (!every || !m) return `every ${every || '?'}h from ${item.at}`;
+    const first = (Number(m[1]) * 60 + Number(m[2])) % (every * 60);
+    return `every ${every}h from ${String(Math.floor(first / 60)).padStart(2, '0')}:${String(first % 60).padStart(2, '0')}`;
+  }
   if (item.kind === 'daily') {
     const every = everyDays(item);
     return every > 1 ? `every ${every}d ${item.at}` : `daily ${item.at}`;

@@ -248,6 +248,16 @@ t('describeWhen labels an hours item', () => {
   eq(describeWhen(hours()), 'every 2h from 00:05');
 });
 
+t('describeWhen names the FIRST slot of the day, which is where the count restarts', () => {
+  // every 5h added at 09:00 fires at 04:00, 09:00, 14:00 and 19:00. "from
+  // 09:00" hid the 04:00 fire.
+  eq(describeWhen(hours({ every: 5, at: '09:00' })), 'every 5h from 04:00');
+  eq(describeWhen(hours({ every: 3, at: '09:00' })), 'every 3h from 00:00');
+  eq(describeWhen(hours({ every: 7, at: '23:30' })), 'every 7h from 02:30');
+  eq(describeWhen(hours({ every: 23, at: '22:59' })), 'every 23h from 22:59');
+  eq(describeWhen(hours({ at: 'garbage' })), 'every 2h from garbage', 'an unreadable phase is printed as it is');
+});
+
 t('an hours item is inert for a daemon that predates it (its at is not a number)', () => {
   // The old checkSchedules: not daily, so `Date.now() >= s.at`, which is false
   // for a string, so it never fires and is never removed.

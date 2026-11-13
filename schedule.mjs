@@ -12,11 +12,13 @@
 //   node schedule.mjs add once 2026-07-30 09:30 "text"  # specific date+time
 //   node schedule.mjs add in 90m "text"                 # relative: m|h|d
 //   node schedule.mjs add daily 03:00 --run --allow-write "text"  # a run approved for db writes
+//   node schedule.mjs add daily 03:00 --run --model sonnet "text"  # a run on its own Claude model
 //   node schedule.mjs add once 10:05 --switch-account you@example.com   # move the Claude login then
 //   node schedule.mjs remove <id>
 //   node schedule.mjs update <id> [--at HH:MM|YYYY-MM-DDTHH:MM] [--text "…"] [--run true|false]
 //                                 [--every N] [--anchor YYYY-MM-DD] [--allow-write true|false]
 //                                 [--claude-only true|false] [--script <path>]
+//                                 [--model sonnet|opus|haiku|none]
 //
 // Flags: --run  → execute the text as a Claude task instead of sending a
 //        plain reminder (same as the "run:" prefix in Telegram's /remind).
@@ -47,11 +49,16 @@
 //        one instead of going to Codex, and it fires once however many days it
 //        waited. Read when the entry comes due: a job already waiting keeps
 //        waiting if the flag is turned off.
+//        --model sonnet|opus|haiku  → with --run only: the job runs on that
+//        Claude model instead of the pool's (the same aliases as bg.mjs
+//        --model), kept through a wall park and its resume. It picks the model,
+//        not the engine: a run that goes to Codex while Claude is walled stays
+//        on Codex. `update <id> --model none` takes it off; turning --run off
+//        takes it too. Absent, the pool model, as before.
 
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, statSync, accessSync, constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync } from 'node:fs';
 import { addDays, describeWhen, everyDays, everyHours, latestHoursSlot, nextDaily } from './schedule-due.mjs';
 
 const FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'schedules.json');
@@ -83,7 +90,7 @@ const localToday = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
 const runNotes = (s) => {
-  const notes = [s.allowWrite === true ? 'writes approved' : null, s.claudeOnly === true ? 'claude only' : null].filter(Boolean);
+  const notes = [s.allowWrite === true ? 'writes approved' : null, s.claudeOnly === true ? 'claude only' : null, knownModel(s.model) ? `model ${s.model}` : null].filter(Boolean);
   return notes.length ? ` (${notes.join(', ')})` : '';
 };
 // The cadence is the one thing you cannot read off "every 3d 12:00" alone, so
@@ -108,6 +115,17 @@ const die = (m) => {
   console.error(m);
   process.exit(1);
 };
+// A RUN'S OWN CLAUDE MODEL (2026-11-13): the aliases bg.mjs --model takes and
+// the daemon's drain reads (KEEP IN SYNC with JOB_MODELS in bg.mjs and the allow
+// list in bridge.mjs drainBgHandoff; schedule-model.test.mjs compares them). No
+// Fable: its fallback to Opus is the lane's decision, not a job's.
+const SCHEDULE_MODELS = ['sonnet', 'opus', 'haiku'];
+const knownModel = (v) => SCHEDULE_MODELS.includes(String(v ?? ''));
+const parseModel = (v, usage) => {
+  const m = String(v ?? '').trim().toLowerCase();
+  if (!m || m.startsWith('--') || !knownModel(m)) die(usage);
+  return m;
+};
 const parseEvery = (v, usage) => {
   const n = Number(v);
   if (!/^\d+$/.test(String(v ?? '')) || !Number.isInteger(n) || n < 2 || n > 365) die(usage);
@@ -126,7 +144,7 @@ const hasFlag = (name) => argv.includes(`--${name}`);
 // `update` documents below. Treating every flag as value-taking made
 // `add daily 08:00 --run "text"` swallow the text and die with "missing text".
 // `--allow-write` follows the same rule, for the same reason.
-const VALUE_FLAGS = new Set(['at', 'text', 'every', 'anchor', 'switch-account', 'script']);
+const VALUE_FLAGS = new Set(['at', 'text', 'every', 'anchor', 'switch-account', 'script', 'model']);
 const BOOL_FLAGS = new Set(['run', 'allow-write', 'claude-only']);
 
 // THE WRITE APPROVAL IS THE OWNER'S. A background worker or a scheduled run
@@ -144,6 +162,32 @@ const REFUSE_GRANT =
 // Claude account the whole machine runs on.
 const REFUSE_SWITCH =
   "--switch-account moves the Claude login for every run on this machine, and a background worker or a scheduled run cannot schedule that (only the owner's own lanes can). Nothing was changed. Put it in your report; the owner or the chat lane schedules it.";
+// A SCRIPT ENTRY IS THE OWNER'S too. The daemon runs the script itself, every
+// few hours, outside any worker and so outside the hooks that guard a worker,
+// and its output becomes a turn in the owner's chat. A worker that could add
+// one could run code past its own guards for as long as the entry lives.
+const REFUSE_SCRIPT =
+  "--script makes the daemon run a script every few hours, outside any worker's guards, and a background worker or a scheduled run cannot set that up (only the owner's own lanes can). Nothing was changed. Put it in your report; the owner or the chat lane adds it.";
+// A SCRIPT THE DAEMON CAN START, or why not. The rule is schedule-script.mjs
+// scriptCommand's: a .mjs, .cjs or .js file runs under node, anything else is
+// executed itself and needs its execute bit. A directory, or a file the daemon
+// cannot start, fails on every slot, says so once and then goes quiet.
+const scriptProblem = (full, raw) => {
+  let st;
+  try {
+    st = statSync(full);
+  } catch {
+    return `--script ${raw}: no such file (${full})`;
+  }
+  if (!st.isFile()) return `--script ${raw}: not a file (${full})`;
+  if (/\.(mjs|cjs|js)$/i.test(full)) return null;
+  try {
+    accessSync(full, fsConstants.X_OK);
+    return null;
+  } catch {
+    return `--script ${raw}: not executable (chmod +x it, or use a .mjs file)`;
+  }
+};
 // The stored account names, from accounts.json beside this file. Names and
 // emails only: nothing else in that file is read into anything.
 const storedAccounts = () => {
@@ -238,9 +282,11 @@ if (cmd === 'list') {
     if (!raw || raw.startsWith('--')) die('add every <N>h <HH:MM> --script <path> "text"');
     if (item.kind !== 'hours') die('--script goes with an every <N>h schedule only');
     if (hasFlag('run') || hasFlag('switch-account') || hasFlag('allow-write')) die('--script does not go with --run, --switch-account or --allow-write');
+    if (grantFromUnattended()) die(REFUSE_SCRIPT);
     const home = process.env.HOME || '';
     const full = path.resolve(raw.startsWith('~/') ? path.join(home, raw.slice(2)) : raw);
-    if (!existsSync(full)) die(`--script ${raw}: no such file (${full}); nothing scheduled`);
+    const problem = scriptProblem(full, raw);
+    if (problem) die(`${problem}; nothing scheduled`);
     item.script = full;
   } else if (item.kind === 'hours' && !hasFlag('run')) {
     die('an every <N>h schedule needs --script <path> or --run: a reminder every few hours is not a schedule anyone wants');
@@ -256,6 +302,11 @@ if (cmd === 'list') {
     if (grantFromUnattended()) die(REFUSE_GRANT);
     if (!item.run) die('--allow-write needs --run: only a scheduled run can be approved for database writes and migrations');
     item.allowWrite = true;
+  }
+  if (hasFlag('model')) {
+    const model = parseModel(flag('model'), 'add <when> --run --model sonnet|opus|haiku "text"  (nothing was added)');
+    if (!item.run) die('--model needs --run: only a scheduled run has a model to pick. Nothing was added.');
+    item.model = model;
   }
   item.id = store.nextId = (store.nextId || 0) + 1;
   store.items.push(item);
@@ -350,9 +401,11 @@ if (cmd === 'list') {
     const raw = String(flag('script') ?? '').trim();
     if (!raw || raw.startsWith('--')) die('update <id> --script <path>');
     if (!item.script) die('--script changes the script of a script entry; this one has none');
+    if (grantFromUnattended()) die(REFUSE_SCRIPT);
     const home = process.env.HOME || '';
     const full = path.resolve(raw.startsWith('~/') ? path.join(home, raw.slice(2)) : raw);
-    if (!existsSync(full)) die(`--script ${raw}: no such file (${full}); nothing changed`);
+    const problem = scriptProblem(full, raw);
+    if (problem) die(`${problem}; nothing changed`);
     item.script = full;
   }
   const text = flag('text');
@@ -391,10 +444,26 @@ if (cmd === 'list') {
       item.claudeOnly = true;
     } else die('update <id> --claude-only true|false');
   }
-  // A reminder cannot carry the approval or an engine, so turning --run off takes both.
+  // `--model sonnet|opus|haiku|none`, read AFTER --run for the same reason.
+  // `none` (or `default`) takes it off: the pool model again.
+  if (argv.includes('--model')) {
+    const raw = String(flag('model') ?? '').trim().toLowerCase();
+    if (raw === 'none' || raw === 'default') delete item.model;
+    else {
+      const model = parseModel(raw, 'update <id> --model sonnet|opus|haiku|none  (nothing was changed)');
+      if (!item.run) die('--model needs a --run schedule: only a scheduled run has a model to pick. Nothing was changed.');
+      item.model = model;
+    }
+  }
+  // THE RULE `add` ENFORCES, kept here: an every N hours entry runs a script or
+  // a task. `--run false` on one with no script made it a reminder every few
+  // hours, which add refuses as a schedule nobody wants.
+  if (item.kind === 'hours' && !item.script && !item.run) die('an every <N>h schedule needs --script <path> or --run, so --run cannot come off it; remove it instead. Nothing was changed.');
+  // A reminder cannot carry the approval, an engine or a model, so turning --run off takes all three.
   if (!item.run) {
     delete item.allowWrite;
     delete item.claudeOnly;
+    delete item.model;
   }
   save(store);
   console.log(`updated ${fmt(item)}${writeNote(item, hadWrite && item.allowWrite !== true)}`);
