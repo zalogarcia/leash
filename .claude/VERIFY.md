@@ -17,10 +17,10 @@ There is no package.json, no build step and no bundler. Node is the only
 runtime requirement (verified against node v22.16.0).
 
 - syntax gate (entry point): `node --check bridge.mjs` (exit 0)
-- syntax gate (everything): `for f in *.mjs scripts/*.mjs scripts/probes/*.mjs; do node --check "$f" || echo "FAIL $f"; done` (133 files, 0 failures)
+- syntax gate (everything): `for f in *.mjs scripts/*.mjs scripts/probes/*.mjs; do node --check "$f" || echo "FAIL $f"; done` (134 files, 0 failures)
 - shell syntax gate: `for f in *.sh scripts/*.sh; do bash -n "$f" || echo "FAIL $f"; done` (5 files, 0 failures)
 - offline suites: `for f in test.mjs *.test.mjs; do node "$f" >/dev/null 2>&1 || echo "FAIL $f"; done`
-  (74 suites: `test.mjs` plus 73 `*.test.mjs`. 3884 assertions passed, 0 failed,
+  (75 suites: `test.mjs` plus 74 `*.test.mjs`. 3889 assertions passed, 0 failed,
   summed from each suite's last pass count: most print `N passed, M failed`, and
   `lane-marker.test.mjs`, `detached-workers.test.mjs`, `watchdog.test.mjs` and
   `bg-model-pin.test.mjs` print `N/N`.)
