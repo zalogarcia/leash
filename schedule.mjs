@@ -59,6 +59,7 @@
 import { readFileSync, writeFileSync, renameSync, statSync, accessSync, constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { addDays, describeWhen, everyDays, everyHours, latestHoursSlot, nextDaily } from './schedule-due.mjs';
 
 const FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'schedules.json');
@@ -154,7 +155,70 @@ const BOOL_FLAGS = new Set(['run', 'allow-write', 'claude-only']);
 // tmux pane is the owner's own session (its env can carry LEASH_LANE from the
 // tmux server), and the chat lane is where they ask for it.
 const grantFromUnattended = () =>
-  !process.env.TMUX && (process.env.LEASH_LANE === 'bg' || !!process.env.LEASH_TRIGGER);
+  !process.env.TMUX && ((!!process.env.LEASH_LANE && process.env.LEASH_LANE !== 'chat') || !!process.env.LEASH_TRIGGER);
+
+// A JOB ANOTHER MAC SENT over the Mac link (LEASH_LANE=link) PLANTS NOTHING HERE:
+// its entry would fire later as an ordinary local job, with the link lane, and
+// every refusal that lane carries, gone. Read from this process's env AND from
+// the nearest Claude session above it, whose env the bridge set at spawn and a
+// worker cannot change for its parent (the BRIDGE-STEER-GUARD rule: the chain
+// outranks the claim). A tmux pane is the owner's own session, but only the
+// session's TMUX counts, never this process's own.
+// EVERY Claude session above this process, nearest first, each with its lane
+// and whether it runs in tmux, read from its own env.
+function claudesAbove() {
+  if (process.platform !== 'darwin' && process.platform !== 'linux') return [];
+  const out = [];
+  let pid = process.ppid;
+  for (let hop = 0; hop < 40 && pid > 1; hop++) {
+    let row = '';
+    try {
+      row = execFileSync('/bin/ps', ['-o', 'ppid=,comm=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).trim();
+    } catch {
+      return out;
+    }
+    const m = row.match(/^(\d+)\s+(.+)$/);
+    if (!m) return out;
+    const comm = m[2].trim();
+    if (path.basename(comm) === 'claude' || /\/claude\/versions\/[^/]+$/.test(comm)) {
+      // ITS ENVIRONMENT ONLY, never its arguments (review round 6): macOS ps
+      // -wwE prints the arguments, then the env, with no marker between, so the
+      // env is what follows the arguments-only listing. Linux: NUL separated.
+      let words = [];
+      try {
+        if (process.platform === 'linux') words = readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0').filter(Boolean);
+        else {
+          const opt = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 };
+          const full = execFileSync('/bin/ps', ['-wwE', '-o', 'command=', '-p', String(pid)], opt).replace(/\n+$/, '');
+          const args = execFileSync('/bin/ps', ['-ww', '-o', 'command=', '-p', String(pid)], opt).replace(/\n+$/, '');
+          words = full.startsWith(args) ? full.slice(args.length).split(/\s+/).filter(Boolean) : [];
+        }
+      } catch {
+        words = [];
+      }
+      const lanes = words.filter((w) => w.startsWith('LEASH_LANE='));
+      out.push({ pid, lane: lanes.length ? lanes[lanes.length - 1].slice('LEASH_LANE='.length) : null, tmux: words.some((w) => w.startsWith('TMUX=')) });
+    }
+    pid = Number(m[1]);
+  }
+  return out;
+}
+function linkLaneHere() {
+  // ANY LINK SESSION ABOVE DECIDES (review rounds 4 and 5): the link worker the
+  // bridge spawned is an ancestor of everything it starts, and it cannot rewrite
+  // its own env, so a nested Claude session it starts with a forged TMUX or a
+  // dropped lane is still under it. TMUX exempts only with no link session above
+  // (the owner's own pane). This process's own env counts only with no Claude
+  // session above at all.
+  const above = claudesAbove();
+  const link = above.find((a) => a.lane === 'link' && !a.tmux);
+  if (link) return `a Claude session above this (pid ${link.pid}) is a job another Mac sent (LEASH_LANE=link)`;
+  // A claim of the link lane is believed (claiming MORE restriction is never a
+  // way past this), except in the owner's own tmux pane.
+  const ownersPane = above.some((a) => a.tmux) || (!above.length && Boolean(process.env.TMUX));
+  if (process.env.LEASH_LANE === 'link' && !ownersPane) return 'this process has LEASH_LANE=link';
+  return null;
+}
 const REFUSE_GRANT =
   "--allow-write is the owner's approval for database writes and migrations, and a background worker or a scheduled run cannot grant it (that is the run the write guard holds). Nothing was changed. Put the write in your report for the owner; they approve it from their own chat.";
 // THE ACCOUNT SWITCH IS THE OWNER'S too, for the same reason and by the same
@@ -209,6 +273,9 @@ const store = load();
 
 if (cmd === 'list') {
   console.log(store.items.length ? store.items.map(fmt).join('\n') : 'No schedules.');
+} else if ((cmd === 'add' || cmd === 'update' || cmd === 'remove') && linkLaneHere()) {
+  console.error(`schedule.mjs: refused, ${linkLaneHere()}. A job from another Mac adds, changes and removes no schedule on this Mac: nothing was changed. Put the schedule in your report; the Mac that sent the job decides it with the owner.`);
+  process.exit(5);
 } else if (cmd === 'add') {
   if (hasFlag('claude-only')) die('--claude-only is set on an entry that exists: add it, then update <id> --claude-only true. Nothing was added.');
   const kind = (positional[1] || '').toLowerCase();
